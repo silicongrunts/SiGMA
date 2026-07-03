@@ -1,0 +1,164 @@
+import { useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
+import { X, Check } from 'lucide-react'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+
+// Configure marked for line breaks
+marked.setOptions({ gfm: true, breaks: true })
+
+const MarkdownContent = ({ content }) => {
+  const html = useMemo(() => {
+    try {
+      const tokens = marked.lexer(content || '')
+      const parsed = marked.parser(tokens)
+      return DOMPurify.sanitize(parsed)
+    } catch (e) {
+      console.error('Markdown parsing error:', e)
+      // Sanitize the raw content as a fallback — never insert untrusted
+      // text into dangerouslySetInnerHTML without purification.
+      return DOMPurify.sanitize(content || '')
+    }
+  }, [content])
+
+  return (
+    <div
+      className="text-sm leading-relaxed break-words prose prose-sm max-w-none"
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  )
+}
+
+/**
+ * Parse diff tags from text
+ * Extracts all <diff>...</diff> blocks
+ */
+export function parseDiffs(text) {
+  const diffRegex = /<diff>\s*<before>(.*?)<\/before>\s*<after>(.*?)<\/after>\s*<\/diff>/gs
+  const diffs = []
+  let match
+  let lastIndex = 0
+  let parts = []
+
+  while ((match = diffRegex.exec(text)) !== null) {
+    // Add text before this diff
+    if (match.index > lastIndex) {
+      parts.push({ type: 'text', content: text.slice(lastIndex, match.index) })
+    }
+
+    diffs.push({
+      before: match[1],
+      afterText: match[2]
+    })
+
+    parts.push({
+      type: 'diff',
+      before: match[1],
+      after: match[2],
+      diffIndex: diffs.length - 1
+    })
+
+    lastIndex = match.index + match[0].length
+  }
+
+  // Add remaining text
+  if (lastIndex < text.length) {
+    parts.push({ type: 'text', content: text.slice(lastIndex) })
+  }
+
+  return { diffs, parts }
+}
+
+/**
+ * Side-by-side Diff Viewer Component
+ */
+export function SideBySideDiffViewer({ before, after, onAccept, onReject }) {
+  const { t } = useTranslation()
+  return (
+    <div className="flex gap-0 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden text-sm h-full flex flex-col">
+      {/* Title bar - outside scroll area */}
+      <div className="flex border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
+        <div className="flex-1 text-xs font-bold text-red-700 dark:text-red-300 py-1 px-3 bg-red-50 dark:bg-red-900/30 border-r border-gray-200 dark:border-gray-700">{t('diff.original')}</div>
+        <div className="flex-1 text-xs font-bold text-green-700 dark:text-green-300 py-1 px-3 bg-green-50 dark:bg-green-900/30">{t('diff.suggested')}</div>
+      </div>
+
+      {/* Content area - scrollable */}
+      <div className="flex-1 overflow-y-auto min-h-0">
+        <div className="flex">
+          {/* Before (left side) - light red background */}
+          <div className="flex-1 p-3 font-mono text-xs leading-snug border-r border-gray-200 dark:border-gray-700 bg-red-50 dark:bg-red-900/20">
+            <div className="whitespace-pre-wrap text-gray-800 dark:text-red-300">{before}</div>
+          </div>
+          {/* After (right side) - light green background */}
+          <div className="flex-1 p-3 font-mono text-xs leading-snug bg-green-50 dark:bg-green-900/20">
+            <div className="whitespace-pre-wrap text-gray-800 dark:text-green-300">{after}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Diff Viewer with inline expansion - simplified to only show buttons
+ */
+export function InlineDiffViewer({ annotation, message, onApplyDiff, onDeleteAnnotation, onExpandDiff, expandedDiff, editorContent }) {
+  // Use message.content if message is provided, otherwise use annotation text.
+  const textToParse = message?.content || annotation.text
+  const { diffs, parts } = parseDiffs(textToParse)
+
+  if (diffs.length === 0) {
+    // No diffs, render entire message as markdown
+    return <MarkdownContent content={textToParse} />
+  }
+
+  const handleExpand = (diffIndex) => {
+    const diff = diffs[diffIndex]
+    if (onExpandDiff) {
+      onExpandDiff({
+        before: diff.before,
+        after: diff.afterText,
+        diffIndex: diffIndex
+      })
+    }
+  }
+
+  return (
+    <div className="text-sm leading-relaxed">
+      {parts.map((part, i) => {
+        if (part.type === 'text') {
+          // Render text parts as markdown
+          return <MarkdownContent key={i} content={part.content} />
+        }
+
+        const diff = diffs[part.diffIndex]
+        const isExpanded = expandedDiff && expandedDiff.diffIndex === part.diffIndex
+        const found = editorContent?.includes(diff.before)
+
+        return (
+          <div key={i} className="my-0.5">
+            {!isExpanded ? (
+              <button
+                onClick={() => handleExpand(part.diffIndex)}
+                className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-bold rounded transition-colors ${
+                  found
+                    ? 'bg-blue-100 hover:bg-blue-200 text-blue-700 dark:bg-blue-900/30 dark:hover:bg-blue-800/50 dark:text-blue-300'
+                    : 'bg-gray-100 hover:bg-gray-200 text-gray-400 line-through dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-500'
+                }`}
+              >
+                View Changes ({diff.before.slice(0, 20)}...)
+              </button>
+            ) : (
+              <button
+                onClick={() => onExpandDiff(null)}
+                className="inline-flex items-center gap-1 px-2 py-1 bg-gray-200 hover:bg-gray-300 text-gray-700 dark:bg-gray-700 dark:hover:bg-gray-600 dark:text-gray-300 text-xs font-bold rounded transition-colors"
+              >
+                Hide Changes
+              </button>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}

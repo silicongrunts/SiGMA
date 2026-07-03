@@ -1,0 +1,10 @@
+.env
+.claude/
+userdata/*
+!userdata/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store
+.SiGMA/
+!docker/userdata-defaults/.SiGMA/
+!docker/userdata-defaults/.SiGMA/**

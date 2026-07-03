@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head><title>SiGMA Browser</title>
+<style>*{margin:0;padding:0}body{overflow:hidden;background:#000}#screen{width:100vw;height:100vh}</style>
+</head>
+<body><div id="screen"></div>
+<script type="module">
+const params = new URLSearchParams(location.search);
+const wsPath = params.get('ws') || '/api/v1/browser/default/vnc';
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const wsUrl = wsProto + '//' + location.host + wsPath;
+
+import RFB from './novnc/core/rfb.js';
+let rfb;
+
+function connect() {
+  const div = document.getElementById('screen');
+  div.innerHTML = '';
+  rfb = new RFB(div, wsUrl);
+  rfb.scaleViewport = true;
+  rfb.resizeSession = true;
+  rfb.background = '#000';
+  rfb.addEventListener('disconnect', (e) => {
+    if (!e.detail.clean) {
+      div.innerHTML =
+        '<div style="color:#fff;padding:40px;font:14px sans-serif">Connection lost. <a href="" style="color:#6fa8dc">Reconnect</a></div>';
+    }
+  });
+}
+
+connect();
+</script>
+</body>
+</html>

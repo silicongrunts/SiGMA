@@ -1,0 +1,1 @@
+# SiGMA Core Configuration

@@ -1,0 +1,6 @@
+{
+  "name": "LaTeX",
+  "icon": "TeX",
+  "desc": "Academic paper with BibTeX",
+  "main_file": "main.tex"
+}

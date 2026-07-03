@@ -1,0 +1,477 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global styles */
+[x-cloak] {
+  display: none !important;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #e5e7eb;
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #d1d5db;
+}
+
+/* Markdown preview styles */
+.markdown-body {
+  padding: 40px;
+  color: #24292f;
+  /* Ensure long words/URLs wrap instead of overflowing the 48rem column.
+     Inline KaTeX still overflows by design (formulas cannot break mid-way). */
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+/* Sigma Markdown Chat Styles */
+.sigma-markdown {
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+/* Chat bubble markdown content */
+.sigma-content {
+  font-size: 0.875rem;
+  line-height: 1.6;
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+  word-break: break-word;
+  max-width: 100%;
+}
+
+.sigma-content * {
+  max-width: 100%;
+}
+
+.sigma-content p { margin-bottom: 0.75em; }
+.sigma-content p:last-child { margin-bottom: 0; }
+.sigma-content h1, .sigma-content h2, .sigma-content h3 {
+  font-weight: 700; margin-top: 1em; margin-bottom: 0.5em;
+}
+.sigma-content h1 { font-size: 1.25em; }
+.sigma-content h2 { font-size: 1.15em; }
+.sigma-content h3 { font-size: 1.05em; }
+.sigma-content code {
+  background-color: rgba(0,0,0,0.05); padding: 0.2em 0.4em; border-radius: 4px; font-size: 0.9em; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+.sigma-content pre {
+  background-color: #1f2937;
+  color: #f9fafb;
+  padding: 1em;
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 1em 0;
+  max-width: 100%;
+}
+.sigma-content pre code {
+  background-color: transparent;
+  padding: 0;
+  color: inherit;
+  font-size: 0.85em;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+.sigma-content ul, .sigma-content ol { margin-left: 1.5em; margin-bottom: 0.75em; list-style-type: disc; }
+.sigma-content ol { list-style-type: decimal; }
+.sigma-content li { margin-bottom: 0.25em; }
+.sigma-content blockquote { border-left: 4px solid #e5e7eb; padding-left: 1em; color: #6b7280; font-style: italic; }
+.sigma-content table {
+  border-collapse: collapse;
+  width: auto;
+  max-width: 100%;
+  margin-bottom: 1em;
+  overflow: auto;
+  display: block;
+}
+.sigma-content th,
+.sigma-content td {
+  border: 1px solid #e5e7eb;
+  padding: 0.5em;
+  min-width: 50px;
+}
+.sigma-content th {
+  background-color: #f9fafb;
+  font-weight: 600;
+}
+.sigma-markdown p { margin-bottom: 0.75em; }
+.sigma-markdown p:last-child { margin-bottom: 0; }
+.sigma-markdown h1, .sigma-markdown h2, .sigma-markdown h3 { 
+  font-weight: 700; margin-top: 1em; margin-bottom: 0.5em; 
+}
+.sigma-markdown h1 { font-size: 1.25em; }
+.sigma-markdown h2 { font-size: 1.15em; }
+.sigma-markdown h3 { font-size: 1.05em; }
+.sigma-markdown code { 
+  background-color: rgba(0,0,0,0.05); padding: 0.2em 0.4em; border-radius: 4px; font-size: 0.9em; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.sigma-markdown pre {
+  background-color: #1f2937; color: #f9fafb; padding: 1em; border-radius: 8px; overflow-x: auto; margin: 1em 0;
+}
+.sigma-markdown pre code { background-color: transparent; padding: 0; color: inherit; font-size: 0.85em; }
+.sigma-markdown ul, .sigma-markdown ol { margin-left: 1.5em; margin-bottom: 0.75em; list-style-type: disc; }
+.sigma-markdown ol { list-style-type: decimal; }
+.sigma-markdown li { margin-bottom: 0.25em; }
+.sigma-markdown blockquote { border-left: 4px solid #e5e7eb; padding-left: 1em; color: #6b7280; font-style: italic; }
+
+.markdown-body h1 {
+  font-size: 2em;
+  font-weight: 600;
+  margin-bottom: 0.5em;
+  border-bottom: 1px solid #e5e7eb;
+  padding-bottom: 0.3em;
+}
+
+.markdown-body h2 {
+  font-size: 1.5em;
+  font-weight: 600;
+  margin-bottom: 0.5em;
+  border-bottom: 1px solid #e5e7eb;
+  padding-bottom: 0.3em;
+}
+
+.markdown-body h3 {
+  font-size: 1.25em;
+  font-weight: 600;
+  margin-bottom: 0.5em;
+}
+
+.markdown-body p {
+  margin-bottom: 1em;
+  line-height: 1.6;
+}
+
+.markdown-body code {
+  background-color: #f3f4f6;
+  padding: 0.2em 0.4em;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+
+.markdown-body pre {
+  background-color: #1f2937;
+  color: #f9fafb;
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin-bottom: 1em;
+}
+
+.markdown-body pre code {
+  background-color: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  margin-left: 1.5em;
+  margin-bottom: 1em;
+}
+
+.markdown-body li {
+  margin-bottom: 0.25em;
+}
+
+.markdown-body blockquote {
+  border-left: 4px solid #e5e7eb;
+  padding-left: 1em;
+  margin-bottom: 1em;
+  color: #6b7280;
+}
+
+.markdown-body a {
+  color: #2563eb;
+  text-decoration: underline;
+}
+
+.markdown-body table {
+  border-collapse: collapse;
+  width: 100%;
+  max-width: 100%;
+  margin-bottom: 1em;
+  /* Become a scroll container so wide tables scroll horizontally instead of
+     pushing past the 48rem column. Mirrors the .sigma-content table pattern. */
+  display: block;
+  overflow-x: auto;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid #e5e7eb;
+  padding: 0.5em;
+}
+
+.markdown-body th {
+  background-color: #f9fafb;
+  font-weight: 600;
+}
+
+/* Display math ($$...$$): horizontal scroll for long equations.
+   KaTeX already sets display:block; we only add overflow control.
+   overflow-y:hidden avoids a stray vertical scrollbar from baseline alignment. */
+.markdown-body .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* Images and inline SVGs must not exceed the column width. */
+.markdown-body img,
+.markdown-body svg {
+  max-width: 100%;
+}
+
+/* Highlight sync — mirrors editor cursor line in the preview */
+.markdown-body > .md-highlight {
+  background-color: rgba(219, 234, 254, 0.45);
+  border-left: 3px solid rgba(59, 130, 246, 0.35);
+  border-radius: 2px;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+
+/* Code blocks: preserve dark background, highlight via border/outline only */
+.markdown-body > pre.md-highlight {
+  background-color: #1f2937;
+  border-left: 3px solid rgba(96, 165, 250, 0.7);
+  outline: 1px solid rgba(96, 165, 250, 0.35);
+}
+
+/* Modal shadow */
+.modal-shadow {
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1),
+              0 10px 10px -5px rgba(0, 0, 0, 0.04);
+}
+
+/* CodeMirror styles override */
+.cm-editor {
+  height: 100% !important;
+}
+
+.cm-scroller {
+  overflow: auto !important;
+}
+
+.cm-gutters {
+  background-color: #f8f9fa !important;
+  border-right: 1px solid #dee2e6 !important;
+  color: #adb5bd !important;
+  min-width: 40px !important;
+}
+
+.cm-activeLine {
+  background-color: #f0f7ff !important;
+}
+
+.cm-line {
+  padding: 0 0;
+}
+
+/* PDF text layer */
+.textLayer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  overflow: hidden;
+  opacity: 0.2;
+  line-height: 1.0;
+}
+
+.textLayer > span {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+
+.textLayer .highlight {
+  background-color: rgba(255, 255, 0, 0.3);
+}
+
+.textLayer .highlight.begin {
+  border-radius: 4px 0px 0px 4px;
+}
+
+.textLayer .highlight.end {
+  border-radius: 0px 4px 4px 0px;
+}
+
+/* Resizer styles */
+.resizer {
+  width: 6px;
+  cursor: col-resize;
+  background-color: #f3f4f6;
+  transition: all 0.2s;
+  z-index: 50;
+  position: relative;
+}
+
+.resizer:hover,
+.resizer.resizing {
+  background-color: #3b82f6;
+}
+
+/* SyncTeX Forward Jump Highlight */
+@keyframes synctex-pulse {
+  0% { transform: scale(0.5); opacity: 0; }
+  50% { transform: scale(1.2); opacity: 0.6; }
+  100% { transform: scale(1); opacity: 0; }
+}
+
+/* Custom Animations */
+.animate-in {
+  animation-duration: 150ms;
+  animation-fill-mode: forwards;
+}
+
+.fade-in {
+  animation-name: fadeIn;
+}
+
+.zoom-in {
+  animation-name: zoomIn;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes zoomIn {
+  from { transform: scale(0.95); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+.synctex-indicator {
+  position: absolute;
+  width: 40px;
+  height: 40px;
+  margin-left: -20px;
+  margin-top: -20px;
+  background: rgba(37, 99, 235, 0.2);
+  border: 2px solid rgba(37, 99, 235, 0.6);
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 100;
+  animation: synctex-pulse 0.33s ease-out 3; /* 3 times, total ~1s */
+}
+
+/* AI field extraction shimmer */
+@keyframes aiShimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+/* LOGS button breathing alert */
+@keyframes logsAlert {
+  0%, 100% { color: #9ca3af; border-color: #e5e7eb; background-color: transparent; }
+  50% { color: #d97706; border-color: #fcd34d; background-color: #fffbeb; }
+}
+.logs-alert {
+  animation: logsAlert 2s ease-in-out infinite;
+}
+
+/* ───────────────────────── Dark mode overrides ─────────────────────────
+   These cover hardcoded colors that Tailwind `dark:` variants can't reach:
+   markdown bodies, CodeMirror gutters (the !important rules above win over
+   the editor theme), scrollbars, the resizer, and the logs-alert animation.
+   ------------------------------------------------------------------------ */
+
+/* Scrollbars */
+.dark ::-webkit-scrollbar-thumb {
+  background: #374151;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #4b5563;
+}
+
+/* Markdown preview body */
+.dark .markdown-body {
+  color: #e5e7eb;
+}
+.dark .markdown-body h1,
+.dark .markdown-body h2 {
+  border-bottom-color: #374151;
+}
+.dark .markdown-body code {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+.dark .markdown-body blockquote {
+  border-left-color: #374151;
+  color: #9ca3af;
+}
+.dark .markdown-body a {
+  color: #60a5fa;
+}
+.dark .markdown-body th,
+.dark .markdown-body td {
+  border-color: #374151;
+}
+.dark .markdown-body th {
+  background-color: #1f2937;
+}
+/* Inline-code highlight sync — keep readable on dark */
+.dark .markdown-body > .md-highlight {
+  background-color: rgba(59, 130, 246, 0.18);
+  border-left-color: rgba(96, 165, 250, 0.6);
+}
+
+/* Chat markdown (.sigma-content / .sigma-markdown) */
+.dark .sigma-content code,
+.dark .sigma-markdown code {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+.dark .sigma-content blockquote,
+.dark .sigma-markdown blockquote {
+  border-left-color: #374151;
+  color: #9ca3af;
+}
+.dark .sigma-content th,
+.dark .sigma-content td,
+.dark .sigma-markdown th,
+.dark .sigma-markdown td {
+  border-color: #374151;
+}
+.dark .sigma-content th,
+.dark .sigma-markdown th {
+  background-color: #1f2937;
+}
+/* pre (code blocks) already use a dark background in light mode — keep as-is. */
+
+/* CodeMirror gutter / active line — index.css !important rules above override
+   the editor theme, so they need their own dark overrides. */
+.dark .cm-gutters {
+  background-color: #0f172a !important;
+  border-right: 1px solid #1f2937 !important;
+  color: #4b5563 !important;
+}
+.dark .cm-activeLine {
+  background-color: #1e293b !important;
+}
+
+/* Resizer between panels */
+.dark .resizer {
+  background-color: #1f2937;
+}
+
+/* LOGS button breathing alert — resting state must stay visible on a dark header */
+@keyframes logsAlertDark {
+  0%, 100% { color: #6b7280; border-color: #374151; background-color: transparent; }
+  50% { color: #fbbf24; border-color: #fcd34d; background-color: rgba(251, 191, 36, 0.12); }
+}
+.dark .logs-alert {
+  animation: logsAlertDark 2s ease-in-out infinite;
+}

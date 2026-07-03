@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# SiGMA Python dependencies (single source of truth).
+# ---------------------------------------------------------------------------
+
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.13.3
+PyYAML==6.0.3
+python-multipart==0.0.12
+aiofiles==24.1.0
+httpx==0.28.1
+websockets==14.1
+
+# RAG / embeddings / reranking
+chromadb==1.5.9
+llama-index-core==0.14.21
+llama-index-embeddings-huggingface==0.7.0
+llama-index-vector-stores-chroma==0.5.5
+llama-index-retrievers-bm25==0.7.1
+llama-index-postprocessor-flag-embedding-reranker==0.5.0
+llama-index-instrumentation==0.5.0
+llama-index-workflows==2.20.0
+sentence-transformers==5.4.1
+FlagEmbedding==1.4.0
+
+# Model runtimes (pinned because they're version-sensitive and pull C libs).
+# torch and torchvision must be installed together from the same wheel index
+# (see Dockerfile); mixing CPU-torch with CUDA-built torchvision corrupts the
+# C++ operator ABI.
+torch==2.11.0
+torchvision==0.26.0
+transformers==5.8.0
+tokenizers==0.22.2
+numpy==2.4.4
+onnxruntime==1.25.1
+
+# LLM proxy
+litellm==1.81.16
+
+# PDF processing
+docling==2.92.0
+modelscope==1.35.3
+
+# Database / migrations
+sqlalchemy==2.0.36
+aiosqlite==0.20.0
+alembic==1.18.4
+
+# Task queue
+huey==3.0.0
+
+# Utilities
+pylatexenc==2.10
+zipstream-new==1.1.8
+tiktoken==0.8.0
+playwright==1.58.0
+html2text==2025.4.15

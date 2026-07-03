@@ -1,0 +1,37 @@
+# SiGMA — GPU deployment.
+# Builds the GPU torch image and attaches all NVIDIA GPUs to the container.
+# Usage:
+#   docker compose -f docker-compose.gpu.yml up -d
+# Image tag: sigma:local-gpu (matches ./docker/build-gpu.sh)
+#
+# Host requirements (enforced by the nvidia runtime at container start):
+#   - NVIDIA driver installed on the host
+#   - nvidia-container-toolkit installed
+# If either is missing the container fails to start with a clear error from
+# the nvidia runtime — it never silently falls back to CPU.
+services:
+  sigma:
+    build:
+      context: .
+      args:
+        TORCH_VARIANT: gpu
+    image: sigma:local-gpu
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./userdata:/app/userdata
+      - texlive:/usr/local/texlive
+    environment:
+      SIGMA_USERDATA_DIR: /app/userdata
+      # If Hugging Face is not reachable, uncomment the mirror endpoint below.
+      # HF_ENDPOINT: https://hf-mirror.com
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  texlive:

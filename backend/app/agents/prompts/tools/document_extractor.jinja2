@@ -1,0 +1,27 @@
+Analyze the following document content and extract key metadata fields.
+Return ONLY a valid JSON object with this exact structure (no markdown, no explanation, no code fences):
+{"title": "suggested title", "description": "bibliographic/context sentence followed by abstract or summary", "keywords": ["keyword1", "keyword2", ...]}
+
+Current title: {{ current_title }}
+
+Title rule:
+- If the current title has any meaningful relationship to the document content, even a weak one, return it exactly unchanged.
+- Change the title only when it is clearly meaningless, pure noise, a hash-like filename, or unrelated to the document.
+
+Description rules:
+- Start with one concise sentence describing the document's author(s), institution(s), year, publication/source, and document type when those facts are identifiable in the content.
+- Include only facts supported by the document content. Omit unknown author, institution, year, source, or type details instead of guessing.
+- Document type may include, but is not limited to, review, blog post, technical paper, research article, report, documentation, forum post, proposal, tutorial, or presentation.
+- After that context sentence, provide the abstract/summary.
+- If the document contains an explicit abstract or summary section, copy that abstract or summary text exactly.
+- If the document does not contain an explicit abstract or summary section, write a highly condensed summary in no more than 3 sentences.
+
+Keyword rules:
+- Return up to 5 relevant keywords.
+- Every keyword must be an exact word or phrase that appears in the document content.
+- Do not invent synonyms, normalize terminology, translate terms, or add broader topic labels that do not appear in the content.
+
+Document content (truncated to {{ max_tokens }} estimated tokens):
+---CONTENT START---
+{{ content }}
+---CONTENT END---

@@ -1,0 +1,25 @@
+# SiGMA — CPU deployment (default).
+# Builds the CPU-only torch image; no NVIDIA GPU required.
+# Usage:
+#   docker compose up -d
+# Image tag: sigma:local-cpu (matches ./docker/build-cpu.sh)
+services:
+  sigma:
+    container_name: sigma
+    build:
+      context: .
+      args:
+        TORCH_VARIANT: cpu
+    image: sigma:local-cpu
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./userdata:/app/userdata
+      - texlive:/usr/local/texlive
+    environment:
+      SIGMA_USERDATA_DIR: /app/userdata
+      # If Hugging Face is not reachable, uncomment the mirror endpoint below.
+      # HF_ENDPOINT: https://hf-mirror.com
+
+volumes:
+  texlive:

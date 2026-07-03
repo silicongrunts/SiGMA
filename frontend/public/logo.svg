@@ -1,0 +1,67 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 1024 1024"
+  width="1024"
+  height="1024"
+  fill="none"
+>
+  <defs>
+    <linearGradient
+      id="sigma-gradient"
+      x1="80"
+      y1="80"
+      x2="944"
+      y2="944"
+      gradientUnits="userSpaceOnUse"
+    >
+      <stop offset="0%" stop-color="#1d4ed8"/>
+      <stop offset="42%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#60a5fa"/>
+    </linearGradient>
+  </defs>
+
+  <g
+    stroke="url(#sigma-gradient)"
+    stroke-width="150"
+    stroke-linejoin="round"
+    stroke-miterlimit="10"
+  >
+    <path
+      d="M791.4 80.9
+         C912.6 80.9 947.4 129.7 947.4 188.3
+         C947.3 246.8 910.7 301.8 791.3 300.6"
+      stroke-linecap="round"
+    />
+
+    <path
+      d="M789.4 80.9 L246 81.5"
+      stroke-linecap="butt"
+    />
+
+    <path
+      d="M248.6 81.5
+         C146.3 79.8 47.1 170.1 92.6 281.9
+         C138 393.7 290.7 438.7 428.9 539.3"
+      stroke-linecap="round"
+    />
+
+    <path
+      d="M236.3 944.9
+         C114.9 944.8 80.1 895.9 80.2 837.4
+         C80.3 778.9 117 723.9 236.3 725.2"
+      stroke-linecap="round"
+    />
+
+    <path
+      d="M238.1 944.9 L781.6 944.7"
+      stroke-linecap="butt"
+    />
+
+    <path
+      d="M778.9 944.6
+         C881.3 946.4 980.5 856.2 935.1 744.4
+         C889.7 632.6 737 587.5 599 486.8"
+      stroke-linecap="round"
+    />
+  </g>
+</svg>
