@@ -7,6 +7,7 @@ import { SideBySideDiffViewer } from './DiffViewer'
 import { useStore } from '../store/useStore'
 import { createSSEStreamParser } from '../utils/sse'
 import { ThinkingProcess } from './ChatShared'
+import { toastError } from './Toast'
 
 const MIN_WIDTH = 320
 const MIN_HEIGHT = 200
@@ -420,7 +421,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       try {
         const active = await filesAPI.getActiveAnnotationReply(projectId, annotation.id)
         if (cancelled || !active?.active || !active.task_id) return
-        if (active.status !== 'queued' && active.status !== 'running') return
+        if (active.status !== 'queued' && active.status !== 'running' && active.status !== 'cancelling') return
         if (useStore.getState().siGMADOProcessingAnnotationId) return
 
         setSiGMADOProcessingAnnotationId(annotation.id)
@@ -513,7 +514,13 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     }
 
     if (annotation.isPending && annotation.thread.length === 0) {
-      const persistedId = await onPersist?.(annotation.id, replyText)
+      let persistedId = null
+      try {
+        persistedId = await onPersist?.(annotation.id, replyText)
+      } catch (e) {
+        toastError(e.message || t('common.saveFailed'))
+        return
+      }
       if (!persistedId) return
       setReply('')
       // Update ref to new ID so handleSiGMADO uses the correct one
@@ -524,17 +531,25 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     }
 
     if (annotation.status === 'modified' || annotation.status === 'fuzzy') {
-      await onConfirmAnchor?.(annotation.id)
+      try {
+        await onConfirmAnchor?.(annotation.id)
+      } catch (e) {
+        toastError(e.message || t('common.saveFailed'))
+        return
+      }
+    }
+
+    try {
+      // Persist only the user reply — does NOT wipe existing intermediate messages
+      await filesAPI.replyAnnotation(projectId, annotation.id, replyText)
+    } catch (e) {
+      toastError(e.message || t('common.saveFailed'))
+      return
     }
 
     // Append user message via store (functional update — no stale closure)
     appendToThread(newMsg)
     setReply('')
-
-    try {
-      // Persist only the user reply — does NOT wipe existing intermediate messages
-      await filesAPI.replyAnnotation(projectId, annotation.id, replyText)
-    } catch { /* continue even if save fails */ }
 
     // Trigger streaming AI reply
     startSiGMADOStream()

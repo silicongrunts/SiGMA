@@ -14,6 +14,12 @@ from app.core.message_format import (
     finalize_assistant_turn,
 )
 from app.core.utils import generate_id, to_iso
+from app.core.task_status import (
+    STATUS_AWAITING_INPUT,
+    STATUS_CANCELLING,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+)
 from app.database.unit_of_work import UnitOfWork
 from app.services.file_service import file_service
 
@@ -260,7 +266,10 @@ class AnnotationService:
                 }
 
             return {
-                "active": liveness in ("queued", "running", "awaiting_input"),
+                "active": liveness in (
+                    STATUS_QUEUED, STATUS_RUNNING,
+                    STATUS_AWAITING_INPUT, STATUS_CANCELLING,
+                ),
                 "task_id": active["task_id"],
                 "status": liveness,
                 "task_type": active.get("task_type"),
@@ -328,7 +337,7 @@ class AnnotationService:
             annotation_id=annotation_id,
         )
 
-        return task_id, ai_service.sse_listen(task_id)
+        return task_id, ai_service.sse_listen(task_id, project_id=project_id)
 
 
 # Singleton instance

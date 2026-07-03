@@ -8,12 +8,18 @@ from typing import Optional
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.task_status import (
+    ACTIVE_STATUSES,
+    STATUS_CANCELLED,
+    STATUS_CANCELLING,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+    TERMINAL_STATUSES,
+)
 from app.core.utils import generate_id, utcnow
 from app.database.models import BackgroundTask
-
-
-TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
-ACTIVE_STATUSES = {"queued", "running", "cancelling"}
 
 
 class BackgroundTaskRepository:
@@ -57,7 +63,7 @@ class BackgroundTaskRepository:
             task.project_id = project_id
             task.kind = kind
             task.queue = queue
-            task.status = "queued"
+            task.status = STATUS_QUEUED
             task.priority = priority
             task.payload_json = payload_json
             task.dedupe_key = dedupe_key
@@ -77,7 +83,7 @@ class BackgroundTaskRepository:
                 project_id=project_id,
                 kind=kind,
                 queue=queue,
-                status="queued",
+                status=STATUS_QUEUED,
                 priority=priority,
                 payload_json=payload_json,
                 dedupe_key=dedupe_key,
@@ -108,9 +114,9 @@ class BackgroundTaskRepository:
                 .where(
                     BackgroundTask.queue == queue,
                     or_(
-                        BackgroundTask.status == "queued",
+                        BackgroundTask.status == STATUS_QUEUED,
                         and_(
-                            BackgroundTask.status == "running",
+                            BackgroundTask.status == STATUS_RUNNING,
                             BackgroundTask.lease_expires_at <= now,
                         ),
                     ),
@@ -123,9 +129,9 @@ class BackgroundTaskRepository:
                 return None
 
             claim_conditions = [BackgroundTask.id == task.id]
-            if task.status == "running":
+            if task.status == STATUS_RUNNING:
                 claim_conditions.extend([
-                    BackgroundTask.status == "running",
+                    BackgroundTask.status == STATUS_RUNNING,
                     BackgroundTask.lease_expires_at <= now,
                 ])
                 next_attempt = task.attempt_count + 1
@@ -134,7 +140,7 @@ class BackgroundTaskRepository:
                         update(BackgroundTask)
                         .where(*claim_conditions)
                         .values(
-                            status="failed",
+                            status=STATUS_FAILED,
                             attempt_count=next_attempt,
                             error="Task lease expired too many times; marking failed",
                             lease_owner=None,
@@ -149,14 +155,14 @@ class BackgroundTaskRepository:
                         return task
                     continue
             else:
-                claim_conditions.append(BackgroundTask.status == "queued")
+                claim_conditions.append(BackgroundTask.status == STATUS_QUEUED)
                 next_attempt = task.attempt_count
 
             result = await self._session.execute(
                 update(BackgroundTask)
                 .where(*claim_conditions)
                 .values(
-                    status="running",
+                    status=STATUS_RUNNING,
                     attempt_count=next_attempt,
                     lease_owner=owner,
                     lease_expires_at=now + timedelta(seconds=lease_seconds),
@@ -175,7 +181,7 @@ class BackgroundTaskRepository:
         task = await self.get_by_id(task_id)
         if not task or task.lease_owner != owner:
             return False
-        if task.status not in {"running", "cancelling"}:
+        if task.status not in {STATUS_RUNNING, STATUS_CANCELLING}:
             return False
         now = utcnow()
         task.heartbeat_at = now
@@ -187,14 +193,14 @@ class BackgroundTaskRepository:
 
     async def is_cancelling(self, task_id: str) -> bool:
         task = await self.get_by_id(task_id)
-        return bool(task and task.status == "cancelling")
+        return bool(task and task.status == STATUS_CANCELLING)
 
     async def mark_completed(self, task_id: str, owner: str) -> None:
         task = await self.get_by_id(task_id)
         if not task or task.lease_owner != owner:
             return
         now = utcnow()
-        task.status = "completed"
+        task.status = STATUS_COMPLETED
         task.lease_owner = None
         task.lease_expires_at = None
         task.heartbeat_at = now
@@ -209,7 +215,7 @@ class BackgroundTaskRepository:
         if not task or (owner and task.lease_owner != owner):
             return
         now = utcnow()
-        task.status = "cancelled"
+        task.status = STATUS_CANCELLED
         task.lease_owner = None
         task.lease_expires_at = None
         task.heartbeat_at = now
@@ -229,10 +235,10 @@ class BackgroundTaskRepository:
         task.heartbeat_at = utcnow()
         task.updated_at = utcnow()
         if task.attempt_count >= task.max_attempts:
-            task.status = "failed"
+            task.status = STATUS_FAILED
             task.completed_at = utcnow()
         else:
-            task.status = "queued"
+            task.status = STATUS_QUEUED
         status = task.status
         self._session.add(task)
         await self._session.commit()
@@ -248,9 +254,9 @@ class BackgroundTaskRepository:
         )
         tasks = list(result.scalars().all())
         for task in tasks:
-            task.status = "cancelling" if task.status == "running" else "cancelled"
+            task.status = STATUS_CANCELLING if task.status == STATUS_RUNNING else STATUS_CANCELLED
             task.updated_at = utcnow()
-            if task.status == "cancelled":
+            if task.status == STATUS_CANCELLED:
                 task.completed_at = utcnow()
         if tasks:
             await self._session.commit()
@@ -263,9 +269,9 @@ class BackgroundTaskRepository:
         tasks = list(result.scalars().all())
         now = utcnow()
         for task in tasks:
-            task.status = "cancelling" if task.status == "running" else "cancelled"
+            task.status = STATUS_CANCELLING if task.status == STATUS_RUNNING else STATUS_CANCELLED
             task.updated_at = now
-            if task.status == "cancelled":
+            if task.status == STATUS_CANCELLED:
                 task.completed_at = now
         if tasks:
             await self._session.commit()

@@ -9,13 +9,22 @@ from typing import Optional, Dict
 
 import json
 
-from sqlalchemy import select, delete as sql_delete, and_
+from sqlalchemy import select, delete as sql_delete, and_, update, case
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import TaskState
 
 from app.core.logging import get_logger
+from app.core.task_status import (
+    STATUS_AWAITING_INPUT,
+    STATUS_CANCELLED,
+    STATUS_CANCELLING,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+)
 from app.core.utils import utcnow, parse_iso
 
 logger = get_logger(__name__)
@@ -64,7 +73,7 @@ class TaskStateRepository:
             session_id=session_id or None,
             owner_type=owner_type,
             owner_id=resolved_owner_id,
-            status="queued",
+            status=STATUS_QUEUED,
             task_type=task_type,
             error=None,
             heartbeat_at=None,
@@ -78,7 +87,7 @@ class TaskStateRepository:
                 "session_id": session_id or None,
                 "owner_type": owner_type,
                 "owner_id": resolved_owner_id,
-                "status": "queued",
+                "status": STATUS_QUEUED,
                 "task_type": task_type,
                 "error": None,
                 "heartbeat_at": None,
@@ -91,66 +100,200 @@ class TaskStateRepository:
         await self._session.commit()  # Required: raw execute() doesn't auto-commit in async sessions
 
     async def heartbeat(self, task_id: str) -> None:
-        """Update heartbeat timestamp for active worker-owned states.
+        """Refresh the heartbeat for runnable worker-owned tasks.
 
-        Heartbeats are emitted independently from the stream loop. They must not
-        overwrite a task that has paused for user input or already reached a
-        terminal state.
+        A guarded, cancel-aware UPDATE: it promotes a queued task to running
+        and refreshes a running task, but never touches a cancelling task.
+        Leaving cancelling alone is deliberate: it freezes ``heartbeat_at`` at
+        the last pre-cancel value so that, if the worker gets stuck inside a
+        non-cooperative operation that keeps the heartbeat loop alive, the task
+        still ages into staleness and recovers via the stale-grace path rather
+        than hanging on ``cancelling`` forever. The status predicate in the
+        WHERE clause also makes this safe against a concurrent cancel write
+        from the web process, which the previous read-then-mutate form was not.
         """
         now = _utcnow_iso()
-        result = await self._session.execute(
-            select(TaskState).where(TaskState.task_id == task_id)
+        await self._session.execute(
+            update(TaskState)
+            .where(
+                TaskState.task_id == task_id,
+                TaskState.status.in_((STATUS_QUEUED, STATUS_RUNNING)),
+            )
+            .values(
+                status=case(
+                    (TaskState.status == STATUS_QUEUED, STATUS_RUNNING),
+                    else_=TaskState.status,
+                ),
+                heartbeat_at=now,
+                updated_at=now,
+            )
         )
-        task = result.scalar_one_or_none()
-        if task:
-            if task.status in ("awaiting_input", "completed", "failed"):
-                return
-            task.status = "running"
-            task.heartbeat_at = now
-            task.updated_at = now
-            await self._session.commit()
+        await self._session.commit()
 
     async def mark_completed(self, task_id: str) -> None:
-        """Mark a task as completed."""
+        """Mark a task completed, honoring a cancel requested mid-run.
+
+        Guarded UPDATE: a cancelling task finalizes as cancelled (the user's
+        intent outranks a clean completion); tasks paused for input or already
+        terminal are left untouched.
+        """
         now = _utcnow_iso()
-        result = await self._session.execute(
-            select(TaskState).where(TaskState.task_id == task_id)
+        await self._session.execute(
+            update(TaskState)
+            .where(
+                TaskState.task_id == task_id,
+                TaskState.status.in_((STATUS_QUEUED, STATUS_RUNNING, STATUS_CANCELLING)),
+            )
+            .values(
+                status=case(
+                    (TaskState.status == STATUS_CANCELLING, STATUS_CANCELLED),
+                    else_=STATUS_COMPLETED,
+                ),
+                heartbeat_at=now,
+                updated_at=now,
+            )
         )
-        task = result.scalar_one_or_none()
-        if task:
-            task.status = "completed"
-            task.heartbeat_at = now
-            task.updated_at = now
-            await self._session.commit()
+        await self._session.commit()
 
     async def mark_failed(self, task_id: str, error: str) -> None:
-        """Mark a task as failed with an error message."""
+        """Mark a task failed, honoring a cancel requested mid-run.
+
+        Guarded UPDATE: a cancelling task finalizes as cancelled with no error
+        surfaced, since the failure is a side effect of winding down. The WHERE
+        predicate also protects terminal/input-paused tasks from a stale late
+        write (the previous unguarded form could clobber any status).
+        """
         now = _utcnow_iso()
-        result = await self._session.execute(
-            select(TaskState).where(TaskState.task_id == task_id)
+        await self._session.execute(
+            update(TaskState)
+            .where(
+                TaskState.task_id == task_id,
+                TaskState.status.in_((STATUS_QUEUED, STATUS_RUNNING, STATUS_CANCELLING)),
+            )
+            .values(
+                status=case(
+                    (TaskState.status == STATUS_CANCELLING, STATUS_CANCELLED),
+                    else_=STATUS_FAILED,
+                ),
+                error=case(
+                    (TaskState.status == STATUS_CANCELLING, None),
+                    else_=error,
+                ),
+                heartbeat_at=now,
+                updated_at=now,
+            )
         )
-        task = result.scalar_one_or_none()
-        if task:
-            task.status = "failed"
-            task.error = error
-            task.heartbeat_at = now
-            task.updated_at = now
-            await self._session.commit()
+        await self._session.commit()
+
+    async def mark_cancelled(self, task_id: str) -> None:
+        """Finalize a cancelling task as cancelled.
+
+        Used by the worker when it observes the task was already cancelled
+        before it could start running. Only transitions out of the cancelling
+        state and clears any parked interaction state.
+        """
+        now = _utcnow_iso()
+        await self._session.execute(
+            update(TaskState)
+            .where(
+                TaskState.task_id == task_id,
+                TaskState.status == STATUS_CANCELLING,
+            )
+            .values(
+                status=STATUS_CANCELLED,
+                interaction_state=None,
+                heartbeat_at=now,
+                updated_at=now,
+            )
+        )
+        await self._session.commit()
+
+    async def request_cancel(self, task_id: str) -> str:
+        """Record cancel intent and return the resulting effective status.
+
+        Two guarded UPDATEs committed together:
+          * queued/running -> cancelling: the worker will wind the current
+            step down and finalize as cancelled.
+          * awaiting_input -> cancelled: the worker has already exited, so go
+            straight to terminal and clear the parked interaction state.
+
+        Idempotent: re-cancelling an already cancelling or terminal task
+        returns its current status with no side effect. Returns ``"not_found"``
+        if no such task exists.
+        """
+        now = _utcnow_iso()
+        update_result = await self._session.execute(
+            update(TaskState)
+            .where(
+                TaskState.task_id == task_id,
+                TaskState.status.in_((STATUS_QUEUED, STATUS_RUNNING)),
+            )
+            .values(status=STATUS_CANCELLING, updated_at=now)
+        )
+        if update_result.rowcount == 0:
+            await self._session.execute(
+                update(TaskState)
+                .where(
+                    TaskState.task_id == task_id,
+                    TaskState.status == STATUS_AWAITING_INPUT,
+                )
+                .values(
+                    status=STATUS_CANCELLED,
+                    interaction_state=None,
+                    heartbeat_at=now,
+                    updated_at=now,
+                )
+            )
+        await self._session.commit()
+
+        status_result = await self._session.execute(
+            select(TaskState.status).where(TaskState.task_id == task_id)
+        )
+        status = status_result.scalar_one_or_none()
+        return status if status is not None else "not_found"
+
+    async def is_cancelling(self, task_id: str) -> bool:
+        """Return True if the task is in the cancelling state."""
+        result = await self._session.execute(
+            select(TaskState.status).where(TaskState.task_id == task_id)
+        )
+        return result.scalar_one_or_none() == STATUS_CANCELLING
+
+    async def get_status(self, task_id: str) -> Optional[str]:
+        """Return the raw persisted status for a task, or None if no row exists.
+
+        Unlike ``check_liveness``, this does not derive staleness, so it is the
+        right read for deciding whether a dequeued worker job should run: a
+        long-queued task that liveness would call ``stale`` is still legitimately
+        ``queued`` here and must not be skipped.
+        """
+        result = await self._session.execute(
+            select(TaskState.status).where(TaskState.task_id == task_id)
+        )
+        return result.scalar_one_or_none()
 
     async def mark_awaiting_input(self, task_id: str, interaction_state: dict) -> None:
-        """Mark task as waiting for user input. Survives indefinitely (never GC'd)."""
+        """Park a task to await user input, unless it was cancelled mid-run.
+
+        Guarded UPDATE: only transitions from queued/running, so a cancel that
+        lands while an interactive tool is preparing its pause is honored
+        rather than overwritten back to awaiting_input.
+        """
         now = _utcnow_iso()
-        result = await self._session.execute(
-            select(TaskState).where(TaskState.task_id == task_id)
+        await self._session.execute(
+            update(TaskState)
+            .where(
+                TaskState.task_id == task_id,
+                TaskState.status.in_((STATUS_QUEUED, STATUS_RUNNING)),
+            )
+            .values(
+                status=STATUS_AWAITING_INPUT,
+                interaction_state=json.dumps(interaction_state, ensure_ascii=False),
+                heartbeat_at=now,
+                updated_at=now,
+            )
         )
-        task = result.scalar_one_or_none()
-        if task:
-            task.status = "awaiting_input"
-            task.interaction_state = json.dumps(interaction_state, ensure_ascii=False)
-            task.heartbeat_at = now
-            task.updated_at = now
-            await self._session.commit()
-            logger.debug("mark_awaiting_input: task_id=%s status=%s", task_id, task.status)
+        await self._session.commit()
 
     async def clear_interaction_by_session(self, session_id: str) -> None:
         """Clear interaction state for all awaiting_input tasks in a session."""
@@ -158,13 +301,13 @@ class TaskStateRepository:
         result = await self._session.execute(
             select(TaskState).where(
                 TaskState.session_id == session_id,
-                TaskState.status == "awaiting_input",
+                TaskState.status == STATUS_AWAITING_INPUT,
             )
         )
         tasks = list(result.scalars().all())
         if tasks:
             for task in tasks:
-                task.status = "completed"
+                task.status = STATUS_COMPLETED
                 task.interaction_state = None
                 task.heartbeat_at = now
                 task.updated_at = now
@@ -199,7 +342,7 @@ class TaskStateRepository:
             select(TaskState)
             .where(
                 TaskState.session_id == session_id,
-                TaskState.status == "awaiting_input",
+                TaskState.status == STATUS_AWAITING_INPUT,
                 TaskState.interaction_state.isnot(None),
             )
             .order_by(TaskState.created_at.desc())
@@ -215,7 +358,11 @@ class TaskStateRepository:
     # ------------------------------------------------------------------
 
     async def get_active_by_session(self, session_id: str) -> Optional[Dict]:
-        """Return the latest active (queued, running, or awaiting_input) task for a session."""
+        """Return the latest active task for a session.
+
+        Active here spans runnable and paused states: queued, running,
+        awaiting_input, and cancelling (wind-down in progress).
+        """
         return await self.get_active_by_owner("chat_session", session_id)
 
     async def get_active_annotation_reply(self, annotation_id: str) -> Optional[Dict]:
@@ -232,7 +379,10 @@ class TaskStateRepository:
                 and_(
                     TaskState.owner_type == owner_type,
                     TaskState.owner_id == owner_id,
-                    TaskState.status.in_(["queued", "running", "awaiting_input"]),
+                    TaskState.status.in_([
+                        STATUS_QUEUED, STATUS_RUNNING,
+                        STATUS_AWAITING_INPUT, STATUS_CANCELLING,
+                    ]),
                 )
             )
             .order_by(TaskState.created_at.desc())
@@ -269,13 +419,15 @@ class TaskStateRepository:
     async def check_liveness(self, task_id: str) -> str:
         """
         Return the task's effective status:
-        'not_found'     -- no record
-        'queued'        -- waiting for worker
-        'running'       -- worker is alive (heartbeat fresh)
-        'stale'         -- was running but heartbeat is stale (worker likely dead)
+        'not_found'      -- no record
+        'queued'         -- waiting for worker
+        'running'        -- worker is alive (heartbeat fresh)
+        'cancelling'     -- cancel requested, worker winding down (heartbeat fresh)
+        'stale'          -- was running/cancelling but heartbeat is stale (worker likely dead)
         'awaiting_input' -- worker paused, waiting for user feedback
-        'completed'     -- finished successfully
-        'failed'        -- finished with error
+        'completed'      -- finished successfully
+        'failed'         -- finished with error
+        'cancelled'      -- finished by user cancellation
         """
         result = await self._session.execute(
             select(TaskState).where(TaskState.task_id == task_id)
@@ -284,10 +436,10 @@ class TaskStateRepository:
         if not task:
             return "not_found"
 
-        if task.status in ("completed", "failed", "awaiting_input"):
+        if task.status in (STATUS_COMPLETED, STATUS_FAILED, STATUS_AWAITING_INPUT, STATUS_CANCELLED):
             return task.status
 
-        if task.status == "queued":
+        if task.status == STATUS_QUEUED:
             # If queued for > 60 seconds without being picked up, it's stale
             try:
                 created = parse_iso(task.created_at)
@@ -296,7 +448,32 @@ class TaskStateRepository:
                     return "stale"
             except (ValueError, TypeError):
                 return "stale"
-            return "queued"
+            return STATUS_QUEUED
+
+        if task.status == STATUS_CANCELLING:
+            # The worker is winding down. heartbeat() deliberately stops
+            # refreshing a cancelling task, so heartbeat_at is frozen at the
+            # last pre-cancel value and ages into staleness on the same bound as
+            # a running task — that is what bounds a stuck non-cooperative
+            # wind-down. If the task was cancelled before the worker ever
+            # heartbeated, age it from created_at (like queued) so a pending Huey
+            # job still has a bounded window to observe the cancel rather than
+            # the lock releasing instantly.
+            if not task.heartbeat_at:
+                try:
+                    age = (utcnow() - parse_iso(task.created_at)).total_seconds()
+                    if age > QUEUED_STALE_SECONDS:
+                        return "stale"
+                except (ValueError, TypeError):
+                    return "stale"
+                return STATUS_CANCELLING
+            try:
+                age = (utcnow() - parse_iso(task.heartbeat_at)).total_seconds()
+                if age > HEARTBEAT_STALE_SECONDS:
+                    return "stale"
+            except (ValueError, TypeError):
+                return "stale"
+            return STATUS_CANCELLING
 
         # Status is 'running' -- check heartbeat freshness
         if not task.heartbeat_at:

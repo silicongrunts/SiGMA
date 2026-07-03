@@ -4,19 +4,30 @@ AI Service — single entry point for AI / chat orchestration.
 Uses QueryLoop for all AI interactions.
 """
 
+import asyncio
 import json
 import re
 from typing import AsyncGenerator, Dict, Any
 
+from sqlalchemy.exc import OperationalError
+
 from app.core.exceptions import TaskActiveError, SkillError, ValidationError
 from app.core.logging import get_logger
 from app.core.utils import generate_id, utcnow
+from app.core.task_status import (
+    STATUS_AWAITING_INPUT,
+    STATUS_CANCELLING,
+    STATUS_CANCELLED,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+)
 from app.core.chat_attachments import (
     render_attachments_tag,
     strip_internal_image_tags,
 )
 from app.services.query_loop import QueryLoop
 from app.database.unit_of_work import UnitOfWork
+from app.database.seq_utils import MAX_RETRIES, RETRY_DELAY
 from app.services.task_service import task_to_dict
 from app.services.token_budget import TokenBudgetTracker
 from app.services.session_temp_service import session_temp_service
@@ -257,7 +268,7 @@ class AIService:
                 existing = await uow.task_state.get_active_by_session(session_id)
                 if existing:
                     liveness = await uow.task_state.check_liveness(existing["task_id"])
-                    if liveness in ("queued", "running"):
+                    if liveness in (STATUS_QUEUED, STATUS_RUNNING, STATUS_CANCELLING):
                         raise TaskActiveError(task_id=existing["task_id"])
 
         # Resolve or create session before persisting messages
@@ -330,7 +341,10 @@ class AIService:
             existing = await uow.task_state.get_active_by_session(session_id)
             if existing:
                 liveness = await uow.task_state.check_liveness(existing["task_id"])
-                if liveness in ("queued", "running", "awaiting_input"):
+                if liveness in (
+                    STATUS_QUEUED, STATUS_RUNNING,
+                    STATUS_AWAITING_INPUT, STATUS_CANCELLING,
+                ):
                     raise TaskActiveError(task_id=existing["task_id"])
 
         full_content = self._build_user_message_content(message, context)
@@ -406,14 +420,17 @@ class AIService:
                 }
 
             result = {
-                "active": liveness in ("queued", "running", "awaiting_input"),
+                "active": liveness in (
+                    STATUS_QUEUED, STATUS_RUNNING,
+                    STATUS_AWAITING_INPUT, STATUS_CANCELLING,
+                ),
                 "task_id": active["task_id"],
                 "status": liveness,
                 "task_type": active.get("task_type"),
                 "session_id": active.get("session_id"),
             }
             # Include interaction data so frontend can restore modal on page reload
-            if liveness == "awaiting_input":
+            if liveness == STATUS_AWAITING_INPUT:
                 interaction = active.get("interaction_state")
                 if interaction:
                     interaction["task_id"] = active["task_id"]
@@ -441,10 +458,46 @@ class AIService:
         query_loop = QueryLoop(project_id=project_id, session_id=session_id)
         return await query_loop.context_stats()
 
-    async def cancel_task(self, task_id: str) -> None:
-        """Cancel a running LLM task via StreamServer TCP signal."""
+    async def cancel_task(self, project_id: str, task_id: str) -> dict:
+        """Cancel a task truthfully and durably.
+
+        Records the cancel intent in the database — the source of truth the
+        worker polls at startup and on every heartbeat — and additionally prods
+        the worker through the StreamServer TCP signal as a best-effort fast
+        path. Returns the task's effective status so the caller can report
+        honestly. A TCP failure never masks the database truth.
+        """
         from app.workers.stream_server import stream_server
-        await stream_server.cancel_task(task_id)
+
+        status = await self._request_cancel_with_retry(project_id, task_id)
+
+        try:
+            await stream_server.cancel_task(task_id)
+        except Exception:
+            logger.warning("Cancel signal failed for task %s", task_id, exc_info=True)
+
+        return {
+            "cancelled": status in (STATUS_CANCELLING, STATUS_CANCELLED),
+            "status": status,
+            "task_id": task_id,
+        }
+
+    async def _request_cancel_with_retry(self, project_id: str, task_id: str) -> str:
+        """Record cancel intent, retrying on a transient database lock.
+
+        ``request_cancel`` is a compare-and-swap and therefore idempotent, so
+        retrying the whole sequence on a locked-DB ``OperationalError`` is safe.
+        This avoids surfacing a 500 when the worker and the web process contend
+        on SQLite's single writer, which the durable-cancel design relies on.
+        """
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with UnitOfWork(project_id) as uow:
+                    return await uow.task_state.request_cancel(task_id)
+            except OperationalError:
+                if attempt >= MAX_RETRIES - 1:
+                    raise
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
 
     # ==================================================================
     # 4. Streaming — main chat (via QueryLoop)
@@ -529,15 +582,26 @@ class AIService:
     # 5. SSE listening
     # ==================================================================
 
-    async def sse_listen(self, task_id: str) -> AsyncGenerator[str, None]:
-        """Subscribe to SSE stream from StreamServer for a given task_id."""
+    async def sse_listen(
+        self, task_id: str, project_id: str = None
+    ) -> AsyncGenerator[str, None]:
+        """Subscribe to the SSE stream for a task.
+
+        ``project_id`` lets the subscriber poll task liveness while waiting for
+        the worker to connect, so a task cancelled during the connect window is
+        surfaced promptly instead of blocking until the connect timeout. It may
+        be omitted when the caller cannot supply it (the subscriber then falls
+        back to the connect timeout).
+        """
         from app.workers.stream_server import stream_server
 
         # Yield task_id as the first event so the frontend can cancel the task
         yield self._format_sse("task_id", {"task_id": task_id})
 
         try:
-            async for event in stream_server.subscribe(task_id, timeout=1800):
+            async for event in stream_server.subscribe(
+                task_id, timeout=1800, project_id=project_id
+            ):
                 yield event
         except Exception:
             logger.warning("Stream subscription lost for task %s", task_id, exc_info=True)

@@ -501,7 +501,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
           useStore.getState().clearPendingInteraction()
         }
 
-        if (active.status === 'running' || active.status === 'queued') {
+        if (active.status === 'running' || active.status === 'queued' || active.status === 'cancelling') {
           const preserved = []
           while (history.length > 0 && history[history.length - 1].role === 'SiGMA') {
             const popped = history.pop()
@@ -547,7 +547,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
       } catch { /* ignore */ }
 
       // 4. Reconnect to live SSE stream if a task is running
-      if (active?.active && (active.status === 'running' || active.status === 'queued')) {
+      if (active?.active && (active.status === 'running' || active.status === 'queued' || active.status === 'cancelling')) {
         if (cancelled) return
         setIsStreaming(true)
         abortRef.current = abortController
@@ -1545,6 +1545,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   // ---- Send a new message ----
   async function handleSendMessage() {
     const msg = chatInput.trim()
+    const submittedInput = chatInput
     const attachments = pendingAttachments
     if ((!msg && attachments.length === 0) || isStreaming || isUploadingAttachment || awaiting || !projectId) return
 
@@ -1589,6 +1590,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
 
     const controller = new AbortController()
     abortRef.current = controller
+    let streamStarted = false
 
     try {
       const streamBody = { message: msg || t('chat.inspectImage') }
@@ -1600,6 +1602,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
 
       const body = await chatAPI.stream(projectId, streamBody, controller.signal)
       if (controller.signal.aborted) return
+      streamStarted = true
       const reader = body.getReader()
       const decoder = new TextDecoder()
       processSSEStream(reader, decoder, controller.signal).finally(async () => {
@@ -1616,6 +1619,18 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
       })
     } catch (err) {
       if (err.name === 'AbortError') return
+      if (!streamStarted) {
+        setMessages(prev => {
+          if (prev.length < 2) return prev
+          const last = prev[prev.length - 1]
+          const previous = prev[prev.length - 2]
+          if (last.role === 'SiGMA' && !last.content && previous.role === 'user' && previous.content === displayMessageText(msg, t('chat.planDisplay'))) {
+            return prev.slice(0, -2)
+          }
+          return prev
+        })
+      }
+      setChatInput(prev => prev || submittedInput)
       setPendingAttachments(attachments)
       toastError(t('chat.toast.connectionFailed', { message: err.message || '' }))
       if (genRef.current === gen) setIsStreaming(false)

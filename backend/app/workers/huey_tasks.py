@@ -36,6 +36,7 @@ from app.core.document_status import (
     STATUS_PENDING, STATUS_PROCESSING, STATUS_INDEXING,
     STATUS_CANCELLING,
 )
+from app.core.task_status import STATUS_AWAITING_INPUT, TERMINAL_STATUSES
 
 # Initialize logging for the worker process (web process does this in main.py)
 from app.core.logging import setup_logging
@@ -234,9 +235,28 @@ class _StreamingTaskRunner:
         if not _project_is_active(self.project_id):
             return {"status": "ignored", "reason": "project_inactive"}
 
+        # Honor a cancel that landed while this task was queued or connecting,
+        # and bail out if the task is already terminal (e.g. cancelled straight
+        # to terminal from awaiting_input, or finalized by an earlier run). In
+        # both cases the worker must not connect or run, so a late Huey job does
+        # not produce an orphan run on a task the user already cancelled.
+        # STATUS_CANCELLING is imported locally because document_status exports
+        # a same-named constant for a different domain (library documents).
+        from app.core.task_status import STATUS_CANCELLING as TASK_CANCELLING
+
+        async with UnitOfWork(self.project_id) as uow:
+            status = await uow.task_state.get_status(self.task_id)
+            if status == TASK_CANCELLING:
+                await uow.task_state.mark_cancelled(self.task_id)
+                return {"status": "cancelled", "reason": "cancelled_before_start"}
+            if status in TERMINAL_STATUSES:
+                return {"status": "ignored", "reason": f"already_{status}"}
+
         self.connected = await self.client.connect(self.task_id, self.project_id)
         async with UnitOfWork(self.project_id) as uow:
             await uow.task_state.heartbeat(self.task_id)
+            if await uow.task_state.is_cancelling(self.task_id):
+                self.client.cancel_event.set()
 
         stop_heartbeat = asyncio.Event()
         hb_task = asyncio.create_task(self._heartbeat_loop(stop_heartbeat))
@@ -306,6 +326,11 @@ class _StreamingTaskRunner:
                     return
                 async with UnitOfWork(self.project_id) as uow:
                     await uow.task_state.heartbeat(self.task_id)
+                    # Bridge cancel intent recorded in the DB to the in-memory
+                    # event the loop observes. Covers a TCP signal lost because
+                    # the worker connection dropped mid-run.
+                    if await uow.task_state.is_cancelling(self.task_id):
+                        self.client.cancel_event.set()
                 if self.connected:
                     await self.client.send_heartbeat()
             except Exception:
@@ -323,6 +348,11 @@ class _StreamingTaskRunner:
         try:
             async with UnitOfWork(self.project_id) as uow:
                 await uow.task_state.heartbeat(self.task_id)
+                # Bridge a DB-recorded cancel during active streaming, when
+                # this inline heartbeat fires more often than the 5s loop and
+                # the TCP signal may have been lost.
+                if await uow.task_state.is_cancelling(self.task_id):
+                    self.client.cancel_event.set()
             if self.connected:
                 await self.client.send_heartbeat()
         except Exception:
@@ -340,7 +370,7 @@ class _StreamingTaskRunner:
             await uow.task_state.heartbeat(self.task_id)
             liveness = await uow.task_state.check_liveness(self.task_id)
             # Don't overwrite awaiting_input status (interactive tool paused)
-            if liveness != "awaiting_input":
+            if liveness != STATUS_AWAITING_INPUT:
                 await uow.task_state.mark_completed(self.task_id)
         await self.client.send_done()
         return {"response": full_response, "status": "completed"}

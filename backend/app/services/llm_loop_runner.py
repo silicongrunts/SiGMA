@@ -15,6 +15,7 @@ from typing import AsyncIterator, Callable, Awaitable, Any
 
 from app.core.chat_attachments import render_image_refs_tag, strip_image_refs_tag
 from app.core.logging import get_logger
+from app.core.task_status import SSE_CANCELLED, SSE_DONE, SSE_ERROR
 from app.agents.tools.registry import tool_registry
 from app.services.token_budget import TokenBudgetTracker, TokenBudgetExceeded, extract_llm_usage
 
@@ -23,14 +24,14 @@ logger = get_logger(__name__)
 MAX_TOOL_OUTPUT_CHARS = 50_000
 MAX_CONSECUTIVE_TOOL_ERRORS = 3
 AGENT_TOOL_ERROR_PREFIX = "Agent error:"
-# SSE event types (shared by all loop consumers)
+# SSE event types (shared by all loop consumers). The terminal event names
+# (SSE_CANCELLED/SSE_DONE/SSE_ERROR) are imported at the top of this module
+# from app.core.task_status — they are the wire contract with the frontend and
+# must not drift from the stream relay's emission/matching.
 SSE_DELTA = "delta"
 SSE_TOOL_START = "tool_start"
 SSE_TOOL_END = "tool_end"
 SSE_THOUGHT = "thought"
-SSE_CANCELLED = "cancelled"
-SSE_DONE = "done"
-SSE_ERROR = "error"
 SSE_FILE_CHANGED = "file_changed"
 SSE_ANNOTATION_CHANGED = "annotation_changed"
 SSE_TASK_LIST = "task_list"
@@ -431,6 +432,16 @@ class LLMLoopRunner:
                     turn_usage = self._build_turn_usage(
                         ctx, accumulated_input, accumulated_output, accumulated_cached,
                     )
+                    # If cancel landed while the interactive tool was preparing
+                    # its prompt, honor it: record a cancelled tool result (this
+                    # keeps tool_call/result pairing intact) and let the outer
+                    # loop emit the cancelled event instead of parking for input.
+                    if ctx.cancel_event and ctx.cancel_event.is_set():
+                        messages.append(self.msg(
+                            "tool", "Tool cancelled by user.",
+                            tool_call_id=tool_call_id,
+                        ))
+                        break
                     if ctx.persist_messages:
                         await ctx.persist_messages(messages)
 

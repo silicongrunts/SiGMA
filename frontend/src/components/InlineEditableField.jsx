@@ -25,12 +25,23 @@ export function InlineEditableField({
   const { t } = useTranslation()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(value || '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
 
-  const startEdit = () => { setDraft(value || ''); setEditing(true) }
-  const cancel = () => { setEditing(false); setDraft(value || '') }
-  const save = () => {
-    onSave(draft)
-    setEditing(false)
+  const startEdit = () => { setDraft(value || ''); setError(''); setEditing(true) }
+  const cancel = () => { if (saving) return; setEditing(false); setDraft(value || ''); setError('') }
+  const save = async () => {
+    if (saving) return
+    setSaving(true)
+    setError('')
+    try {
+      await onSave(draft)
+      setEditing(false)
+    } catch (e) {
+      setError(e.message || t('common.saveFailed'))
+    } finally {
+      setSaving(false)
+    }
   }
   const onKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !multiline) { e.preventDefault(); save() }
@@ -42,28 +53,31 @@ export function InlineEditableField({
       <div className="group">
         <div className="flex items-center gap-1.5 mb-1">
           <span className="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-wider">{label}</span>
-          <button onClick={save} className="p-0.5 text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/20 rounded transition-colors"><Check className="w-3 h-3" /></button>
-          <button onClick={cancel} className="p-0.5 text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors"><X className="w-3 h-3" /></button>
+          <button disabled={saving} onClick={save} className="p-0.5 text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/20 rounded transition-colors disabled:opacity-50"><Check className="w-3 h-3" /></button>
+          <button disabled={saving} onClick={cancel} className="p-0.5 text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors disabled:opacity-50"><X className="w-3 h-3" /></button>
         </div>
         {multiline ? (
           <textarea
             autoFocus
+            disabled={saving}
             value={draft}
             onChange={e => setDraft(e.target.value)}
             onKeyDown={e => { if (e.key === 'Escape') cancel() }}
             rows={Math.max(8, draft.split('\n').length)}
-            className="w-full px-3 py-2 border border-sigma-300 dark:border-sigma-600/60 rounded-lg text-sm font-mono leading-relaxed focus:ring-2 focus:ring-sigma-600/20 focus:border-sigma-600 outline-none resize-y bg-white dark:bg-gray-800 dark:text-gray-200"
+            className="w-full px-3 py-2 border border-sigma-300 dark:border-sigma-600/60 rounded-lg text-sm font-mono leading-relaxed focus:ring-2 focus:ring-sigma-600/20 focus:border-sigma-600 outline-none resize-y bg-white dark:bg-gray-800 dark:text-gray-200 disabled:opacity-60"
           />
         ) : (
           <input
             autoFocus
+            disabled={saving}
             type={type}
             value={draft}
             onChange={e => setDraft(e.target.value)}
             onKeyDown={onKeyDown}
-            className="w-full px-3 py-1.5 border border-sigma-300 dark:border-sigma-600/60 rounded-lg text-sm focus:ring-2 focus:ring-sigma-600/20 focus:border-sigma-600 outline-none bg-white dark:bg-gray-800 dark:text-gray-200"
+            className="w-full px-3 py-1.5 border border-sigma-300 dark:border-sigma-600/60 rounded-lg text-sm focus:ring-2 focus:ring-sigma-600/20 focus:border-sigma-600 outline-none bg-white dark:bg-gray-800 dark:text-gray-200 disabled:opacity-60"
           />
         )}
+        {error && <div className="mt-1 text-[10px] font-medium text-red-500">{error}</div>}
       </div>
     )
   }

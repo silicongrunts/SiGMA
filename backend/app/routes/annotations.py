@@ -74,7 +74,6 @@ async def resume_annotation_stream(task_id: str):
 
 @router.post("/cancel/{project_id}/{task_id}")
 async def cancel_annotation_reply(project_id: str, task_id: str):
-    """Cancel a running annotation reply task."""
+    """Cancel a running annotation reply task durably; returns its effective status."""
     project_service.get_project_path(project_id)
-    await ai_service.cancel_task(task_id)
-    return ok({"cancelled": True})
+    return ok(await ai_service.cancel_task(project_id, task_id))

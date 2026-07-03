@@ -23,7 +23,7 @@ async def test_stream_chat_passes_context_and_session(monkeypatch):
     monkeypatch.setattr(
         chat,
         "ai_service",
-        SimpleNamespace(submit_chat=submit_chat, sse_listen=lambda task_id: _empty_stream()),
+        SimpleNamespace(submit_chat=submit_chat, sse_listen=lambda task_id, project_id=None: _empty_stream()),
     )
 
     response = await chat.stream_chat(
@@ -57,8 +57,9 @@ async def test_stream_chat_passes_context_and_session(monkeypatch):
 async def test_cancel_task_validates_project_before_cancel(monkeypatch):
     calls = []
 
-    async def cancel_task(task_id):
-        calls.append(("cancel", task_id))
+    async def cancel_task(project_id, task_id):
+        calls.append(("cancel", project_id, task_id))
+        return {"cancelled": True, "status": "cancelling", "task_id": task_id}
 
     monkeypatch.setattr(
         chat,
@@ -69,8 +70,13 @@ async def test_cancel_task_validates_project_before_cancel(monkeypatch):
 
     result = await chat.cancel_task("project-1", "task-1")
 
-    assert result["data"] == {"cancelled": True}
-    assert calls == [("project", "project-1"), ("cancel", "task-1")]
+    assert result["data"] == {
+        "cancelled": True,
+        "status": "cancelling",
+        "task_id": "task-1",
+    }
+    # Project validation precedes the cancel call.
+    assert calls == [("project", "project-1"), ("cancel", "project-1", "task-1")]
 
 
 @pytest.mark.route
@@ -109,7 +115,7 @@ async def test_edit_chat_message_passes_replace_request(monkeypatch):
     monkeypatch.setattr(
         chat,
         "ai_service",
-        SimpleNamespace(edit_and_submit_chat=edit_and_submit_chat, sse_listen=lambda task_id: _empty_stream()),
+        SimpleNamespace(edit_and_submit_chat=edit_and_submit_chat, sse_listen=lambda task_id, project_id=None: _empty_stream()),
     )
 
     response = await chat.edit_chat_message(

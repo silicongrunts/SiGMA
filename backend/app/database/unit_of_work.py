@@ -30,7 +30,8 @@ Methods that self-commit (**every mutation except those listed below**):
   ``update_fields``, ``mark_failed``, ``reset_processing``
 * ``TaskRepository``: ``create``, ``replace_all``, ``delete_by_session``
 * ``TaskStateRepository``: ``set_queued``, ``heartbeat``, ``mark_completed``,
-  ``mark_failed``, ``mark_awaiting_input``, ``clear_interaction_by_session``,
+  ``mark_failed``, ``mark_cancelled``, ``request_cancel``,
+  ``mark_awaiting_input``, ``clear_interaction_by_session``,
   ``delete_by_session``
 * ``ProjectConfigRepository``: ``set``
 * ``BackgroundTaskRepository``: all mutation methods

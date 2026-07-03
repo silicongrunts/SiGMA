@@ -1457,6 +1457,7 @@ function ContentField({ docId, projectId, value, previewValue = '', truncated = 
   const [preview, setPreview] = useState(false)
   const [fullValue, setFullValue] = useState(value || '')
   const [loadingFull, setLoadingFull] = useState(false)
+  const [saving, setSaving] = useState(false)
   const [draft, setDraft] = useState(value || previewValue || '')
 
   const loadFull = async () => {
@@ -1479,8 +1480,26 @@ function ContentField({ docId, projectId, value, previewValue = '', truncated = 
     setEditing(true)
     setPreview(false)
   }
-  const cancel = () => { setEditing(false); setPreview(false); setDraft(fullValue || value || previewValue || '') }
-  const save = () => { onSave(draft); setFullValue(draft); setEditing(false); setPreview(false) }
+  const cancel = () => {
+    if (saving) return
+    setEditing(false)
+    setPreview(false)
+    setDraft(fullValue || value || previewValue || '')
+  }
+  const save = async () => {
+    if (saving) return
+    setSaving(true)
+    try {
+      await onSave(draft)
+      setFullValue(draft)
+      setEditing(false)
+      setPreview(false)
+    } catch (e) {
+      toastError(e.message || t('common.saveFailed'))
+    } finally {
+      setSaving(false)
+    }
+  }
 
   if (editing) {
     return (
@@ -1491,8 +1510,8 @@ function ContentField({ docId, projectId, value, previewValue = '', truncated = 
             {preview ? <Edit3 className="w-3 h-3" /> : <ScrollText className="w-3 h-3" />}
           </button>
           <span className="flex-1" />
-          <button onClick={save} className="p-0.5 text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30 rounded transition-colors"><Check className="w-3 h-3" /></button>
-          <button onClick={cancel} className="p-0.5 text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors"><X className="w-3 h-3" /></button>
+          <button disabled={saving} onClick={save} className="p-0.5 text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30 rounded transition-colors disabled:opacity-50"><Check className="w-3 h-3" /></button>
+          <button disabled={saving} onClick={cancel} className="p-0.5 text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors disabled:opacity-50"><X className="w-3 h-3" /></button>
         </div>
         {preview ? (
           <div className="w-full px-4 py-3 border border-gray-200 dark:border-gray-700 rounded-lg min-h-[120px]">
@@ -1501,11 +1520,12 @@ function ContentField({ docId, projectId, value, previewValue = '', truncated = 
         ) : (
           <textarea
             autoFocus
+            disabled={saving}
             value={draft}
             onChange={e => setDraft(e.target.value)}
             onKeyDown={e => { if (e.key === 'Escape') cancel() }}
             rows={Math.max(8, draft.split('\n').length)}
-            className="w-full px-3 py-2 border border-sigma-300 rounded-lg text-sm font-mono leading-relaxed focus:ring-2 focus:ring-sigma-600/20 focus:border-sigma-600 outline-none resize-y bg-white dark:bg-gray-900 dark:text-gray-200"
+            className="w-full px-3 py-2 border border-sigma-300 rounded-lg text-sm font-mono leading-relaxed focus:ring-2 focus:ring-sigma-600/20 focus:border-sigma-600 outline-none resize-y bg-white dark:bg-gray-900 dark:text-gray-200 disabled:opacity-60"
           />
         )}
       </div>

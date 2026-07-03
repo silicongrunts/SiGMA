@@ -55,3 +55,30 @@ async def test_reply_annotation_appends_user_message(monkeypatch):
         "content": "answer",
         "role": "user",
     }
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_cancel_annotation_reply_validates_project_before_cancel(monkeypatch):
+    calls = []
+
+    async def cancel_task(project_id, task_id):
+        calls.append(("cancel", project_id, task_id))
+        return {"cancelled": True, "status": "cancelling", "task_id": task_id}
+
+    monkeypatch.setattr(
+        annotations,
+        "project_service",
+        SimpleNamespace(get_project_path=lambda project_id: calls.append(("project", project_id))),
+    )
+    monkeypatch.setattr(annotations, "ai_service", SimpleNamespace(cancel_task=cancel_task))
+
+    result = await annotations.cancel_annotation_reply("project-1", "task-1")
+
+    assert result["data"] == {
+        "cancelled": True,
+        "status": "cancelling",
+        "task_id": "task-1",
+    }
+    # Project validation precedes the cancel call.
+    assert calls == [("project", "project-1"), ("cancel", "project-1", "task-1")]

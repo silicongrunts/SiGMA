@@ -23,6 +23,15 @@ import struct
 from typing import Dict, Optional
 
 from app.core.logging import get_logger
+from app.core.task_status import (
+    SSE_CANCELLED,
+    SSE_DONE,
+    SSE_ERROR,
+    STATUS_AWAITING_INPUT,
+    STATUS_CANCELLED,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+)
 from app.database.unit_of_work import UnitOfWork
 
 logger = get_logger(__name__)
@@ -32,6 +41,7 @@ MAX_MSG = 10 * 1024 * 1024                       # 10 MB sanity cap
 SESSION_RETENTION_SECONDS = 300                  # keep session for late SSE reconnects
 STREAM_LIVENESS_POLL_SECONDS = 5
 STREAM_STALE_GRACE_SECONDS = 120
+CONNECT_LIVENESS_INTERVAL = 1.0  # poll DB liveness this often while awaiting worker connect
 
 
 def _worker_error_payload(msg: dict) -> tuple[str, dict]:
@@ -43,6 +53,33 @@ def _worker_error_payload(msg: dict) -> tuple[str, dict]:
     if "error" not in payload:
         payload = {**payload, "error": message}
     return message, payload
+
+
+def _terminal_sse(liveness: str) -> Optional[str]:
+    """Return a terminal SSE event for a liveness value, or None if not terminal."""
+    if liveness == STATUS_COMPLETED:
+        return "event: " + SSE_DONE + "\ndata: {}\n\n"
+    if liveness == STATUS_FAILED:
+        return "event: " + SSE_ERROR + '\ndata: {"error": "Task failed"}\n\n'
+    if liveness == STATUS_CANCELLED:
+        return "event: " + SSE_CANCELLED + '\ndata: {"message": "Task cancelled by user"}\n\n'
+    return None
+
+
+def _finalize_sse(final_liveness: str, error_payload: dict) -> str:
+    """Render the terminal SSE for a task's final state after ``mark_failed``.
+
+    Cancel and completion intent outrank the failure that triggered the call:
+    if the DB finalizes as ``cancelled`` (user cancel won the race) or
+    ``completed`` (the task had already succeeded, so ``mark_failed`` was a
+    no-op), surface that truth rather than a spurious error. Only a genuine
+    ``failed`` final state surfaces the error payload, which may carry usage.
+    """
+    if final_liveness == STATUS_CANCELLED:
+        return _terminal_sse(STATUS_CANCELLED)
+    if final_liveness == STATUS_COMPLETED:
+        return _terminal_sse(STATUS_COMPLETED)
+    return "event: " + SSE_ERROR + "\ndata: " + json.dumps(error_payload, ensure_ascii=False) + "\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -196,18 +233,48 @@ class StreamServer:
         return True
 
     # -- SSE subscriber -----------------------------------------------------
-    async def subscribe(self, task_id: str, timeout: int = 1800):
+    async def subscribe(
+        self, task_id: str, timeout: int = 1800, project_id: str = None
+    ):
         """Subscribe to a task's SSE stream. Yields SSE-formatted strings.
 
         Blocks until the worker connects (creates the session) and pushes chunks.
-        Yields each chunk as it arrives. Yields a final 'done' event when the
-        worker signals completion, or an 'error' event on failure.
+        Yields each chunk as it arrives. Yields a terminal ``done`` / ``error`` /
+        ``cancelled`` event when the worker signals completion, failure, or
+        user cancellation.
+
+        When ``project_id`` is supplied the connect wait also polls task
+        liveness, so a task that finishes or is cancelled before the worker
+        connects — notably a cancel during the queued→connect window, where the
+        worker aborts without emitting anything — is surfaced promptly instead
+        of after the full connect timeout.
         """
-        # Wait for the worker to connect and create the session
+        # Wait for the worker to connect, but surface a terminal task early.
+        # The session's replay buffer retains any chunks the worker pushed
+        # before a subscriber registers, so the responsive 0.1s session check
+        # is preserved alongside a throttled DB liveness poll.
         waited = 0.0
+        last_liveness = 0.0
         while task_id not in self.sessions and waited < 30:  # 30s connect timeout
             await asyncio.sleep(0.1)
             waited += 0.1
+            if project_id and waited - last_liveness >= CONNECT_LIVENESS_INTERVAL:
+                last_liveness = waited
+                try:
+                    async with UnitOfWork(project_id) as uow:
+                        liveness = await uow.task_state.check_liveness(task_id)
+                except Exception:
+                    # A transient DB error must not tear down the stream while
+                    # the task may still be running; keep waiting.
+                    logger.debug(
+                        "Liveness poll failed during connect wait for %s",
+                        task_id, exc_info=True,
+                    )
+                    continue
+                terminal = _terminal_sse(liveness)
+                if terminal is not None:
+                    yield terminal
+                    return
 
         session = self.sessions.get(task_id)
         if session is None:
@@ -256,17 +323,27 @@ class StreamServer:
                                     "Worker stopped sending heartbeats and did not recover. "
                                     "The task was marked failed."
                                 )
-                                async with UnitOfWork(session.project_id) as uow:
-                                    await uow.task_state.mark_failed(task_id, message)
-                                session.done = True
-                                session.error = message
-                                yield (
-                                    "event: error\ndata: "
-                                    + json.dumps(
-                                        {"error": message}, ensure_ascii=False,
+                                final = STATUS_FAILED
+                                try:
+                                    async with UnitOfWork(session.project_id) as uow:
+                                        await uow.task_state.mark_failed(task_id, message)
+                                        # mark_failed is cancel-aware: a cancelling
+                                        # task finalizes as cancelled, and an
+                                        # already-terminal task is left untouched.
+                                        final = await uow.task_state.check_liveness(task_id)
+                                except Exception:
+                                    # A DB failure must not strand the subscriber
+                                    # without a terminal event; fall back to the
+                                    # failure message and let the logs explain.
+                                    logger.warning(
+                                        "mark_failed failed during stale-grace for "
+                                        "task %s; surfacing failure anyway",
+                                        task_id, exc_info=True,
                                     )
-                                    + "\n\n"
-                                )
+                                rendered = _finalize_sse(final, {"error": message})
+                                session.done = True
+                                session.error = message if final == STATUS_FAILED else None
+                                yield rendered
                                 asyncio.get_running_loop().call_later(
                                     SESSION_RETENTION_SECONDS, lambda: self.sessions.pop(task_id, None),
                                 )
@@ -274,19 +351,10 @@ class StreamServer:
                             continue
                         stale_since = None
                         stale_notice_sent = False
-                        if liveness in ("completed", "failed"):
-                            if liveness == "failed":
-                                session.done = True
-                                yield (
-                                    "event: error\ndata: "
-                                    + json.dumps(
-                                        {"error": "Task failed"}, ensure_ascii=False,
-                                    )
-                                    + "\n\n"
-                                )
-                            else:
-                                session.done = True
-                                yield "event: done\ndata: {}\n\n"
+                        terminal = _terminal_sse(liveness)
+                        if terminal is not None:
+                            session.done = True
+                            yield terminal
                             asyncio.get_running_loop().call_later(
                                 SESSION_RETENTION_SECONDS, lambda: self.sessions.pop(task_id, None),
                             )
@@ -301,8 +369,12 @@ class StreamServer:
 
                 yield data
 
-                # If this is a done or error event, stop
-                if data.startswith("event: done") or data.startswith("event: error"):
+                # If this is a terminal event from the worker, stop
+                if (
+                    data.startswith("event: " + SSE_DONE)
+                    or data.startswith("event: " + SSE_ERROR)
+                    or data.startswith("event: " + SSE_CANCELLED)
+                ):
                     return
         finally:
             session.unsubscribe(q)
@@ -348,15 +420,31 @@ class StreamServer:
                     session.push(msg.get("data", ""))
 
                 elif msg_type == "done":
-                    session.push("event: done\ndata: {}\n\n")
-                    session.done = True
-
-                    # Don't overwrite awaiting_input (interactive tool paused)
+                    # The worker finalized in the DB before sending done; honor
+                    # that truth. If a cancel won the race, mark_completed (or
+                    # the worker's own finalize) left the task as cancelled, and
+                    # the user's cancel intent outranks a clean 'done'. Don't
+                    # overwrite an awaiting_input task (interactive tool paused).
+                    final = STATUS_COMPLETED
                     if project_id:
-                        async with UnitOfWork(project_id) as uow:
-                            liveness = await uow.task_state.check_liveness(task_id)
-                            if liveness != "awaiting_input":
-                                await uow.task_state.mark_completed(task_id)
+                        try:
+                            async with UnitOfWork(project_id) as uow:
+                                liveness = await uow.task_state.check_liveness(task_id)
+                                if liveness == STATUS_AWAITING_INPUT:
+                                    final = STATUS_AWAITING_INPUT
+                                else:
+                                    await uow.task_state.mark_completed(task_id)
+                                    final = await uow.task_state.check_liveness(task_id)
+                        except Exception:
+                            logger.warning(
+                                "mark_completed failed for task %s; surfacing "
+                                "done anyway", task_id, exc_info=True,
+                            )
+                    if final == STATUS_CANCELLED:
+                        session.push(_terminal_sse(STATUS_CANCELLED))
+                    else:
+                        session.push("event: " + SSE_DONE + "\ndata: {}\n\n")
+                    session.done = True
 
                     logger.info("Task %s completed (%d chunks)", task_id, session.chunk_count)
                     # Keep session alive for 5 minutes for late SSE reconnects
@@ -366,17 +454,29 @@ class StreamServer:
                     break
 
                 elif msg_type == "error":
-                    session.error, error_payload = _worker_error_payload(msg)
-                    session.push(
-                        "event: error\ndata: "
-                        + json.dumps(error_payload, ensure_ascii=False)
-                        + "\n\n"
-                    )
-                    session.done = True
-
+                    message, error_payload = _worker_error_payload(msg)
+                    # Finalize in the DB first, then surface the truth: if the
+                    # task was cancelling, mark_failed finalizes it as cancelled
+                    # and the user's cancel intent outranks this error. Only a
+                    # genuine failure carries the (possibly usage-bearing) error.
+                    final = STATUS_FAILED
                     if project_id:
-                        async with UnitOfWork(project_id) as uow:
-                            await uow.task_state.mark_failed(task_id, session.error)
+                        try:
+                            async with UnitOfWork(project_id) as uow:
+                                await uow.task_state.mark_failed(task_id, message)
+                                final = await uow.task_state.check_liveness(task_id)
+                        except Exception:
+                            # A DB failure must not strand the subscriber
+                            # without a terminal event; fall back to the
+                            # worker's error and let the outer handler log it.
+                            logger.warning(
+                                "mark_failed failed for task %s; surfacing "
+                                "worker error anyway", task_id, exc_info=True,
+                            )
+                    rendered = _finalize_sse(final, error_payload)
+                    session.done = True
+                    session.error = message if final == STATUS_FAILED else None
+                    session.push(rendered)
 
                     asyncio.get_running_loop().call_later(
                         SESSION_RETENTION_SECONDS, lambda: self.sessions.pop(task_id, None),

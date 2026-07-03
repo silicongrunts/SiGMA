@@ -25,7 +25,7 @@ async def stream_chat(project_id: str, data: StreamChatRequest):
         interaction_response=data.interaction_response,
     )
     return StreamingResponse(
-        ai_service.sse_listen(result["task_id"]),
+        ai_service.sse_listen(result["task_id"], project_id=project_id),
         media_type="text/event-stream",
     )
 
@@ -47,10 +47,9 @@ async def get_active_task(project_id: str, session_id: str = Query(None)):
 
 @router.post("/cancel/{project_id}/{task_id}")
 async def cancel_task(project_id: str, task_id: str):
-    """Cancel a running LLM task. The worker checks for this on each turn."""
+    """Cancel a running chat task durably; returns its effective status."""
     project_service.get_project_path(project_id)
-    await ai_service.cancel_task(task_id)
-    return ok({"cancelled": True})
+    return ok(await ai_service.cancel_task(project_id, task_id))
 
 
 @router.get("/tasks/{project_id}")
@@ -95,7 +94,7 @@ async def edit_chat_message(project_id: str, session_id: str, data: EditChatMess
         },
     )
     return StreamingResponse(
-        ai_service.sse_listen(result["task_id"]),
+        ai_service.sse_listen(result["task_id"], project_id=project_id),
         media_type="text/event-stream",
     )
 
