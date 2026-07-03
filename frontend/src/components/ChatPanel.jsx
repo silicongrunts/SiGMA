@@ -1448,21 +1448,12 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
     }
 
     const editIndex = messages.findIndex(m => m.id === messageId)
-    setMessages(prev => {
-      const idx = prev.findIndex(m => m.id === messageId)
-      const kept = idx >= 0 ? prev.slice(0, idx) : prev
-      return [
-        ...kept,
-        { role: 'user', content: displayMessageText(text, t('chat.planDisplay')), attachments, created_at: new Date().toISOString() },
-        { role: 'SiGMA', content: '', process: [] },
-      ]
-    })
-    cancelEditMessage()
     setIsStreaming(true)
     currentHintRef.current = t('chat.thinking')
     const gen = genRef.current
     const controller = new AbortController()
     abortRef.current = controller
+    let streamStarted = false
     try {
       const body = await chatAPI.editMessage(projectId, sessionId, {
         message_id: messageId,
@@ -1472,6 +1463,17 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         ...(tokenBudget ? { token_budget: tokenBudget } : {}),
       }, controller.signal)
       if (controller.signal.aborted) return
+      streamStarted = true
+      setMessages(prev => {
+        const idx = prev.findIndex(m => m.id === messageId)
+        const kept = idx >= 0 ? prev.slice(0, idx) : prev
+        return [
+          ...kept,
+          { role: 'user', content: displayMessageText(text, t('chat.planDisplay')), attachments, created_at: new Date().toISOString() },
+          { role: 'SiGMA', content: '', process: [] },
+        ]
+      })
+      cancelEditMessage()
       const reader = body.getReader()
       const decoder = new TextDecoder()
       await processSSEStream(reader, decoder, controller.signal)
@@ -1489,7 +1491,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
       }
     } finally {
       if (genRef.current === gen) {
-        if (!controller.signal.aborted && projectId && sessionId) {
+        if (streamStarted && !controller.signal.aborted && projectId && sessionId) {
           try {
             if (genRef.current === gen) await refreshLatestHistory()
           } catch { /* best-effort */ }
@@ -1836,15 +1838,16 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
                   <textarea
                     value={editingText}
                     onChange={e => setEditingText(e.target.value)}
+                    disabled={isStreaming}
                     autoFocus
-                    className="w-full min-h-24 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 px-3 py-2 text-sm text-gray-800 dark:text-gray-200 outline-none placeholder:text-gray-400 focus:ring-2 focus:ring-sigma-300 focus:border-sigma-300"
+                    className="w-full min-h-24 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 px-3 py-2 text-sm text-gray-800 dark:text-gray-200 outline-none placeholder:text-gray-400 focus:ring-2 focus:ring-sigma-300 focus:border-sigma-300 disabled:opacity-60"
                   />
                   <div className="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5">
                     {t('chat.editWarning')}
                   </div>
                   <div className="flex justify-end gap-2 mt-2">
-                    <button onClick={cancelEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800">{t('common.cancel')}</button>
-                    <button onClick={submitEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sigma-600 text-white hover:bg-sigma-700">{t('common.send')}</button>
+                    <button disabled={isStreaming} onClick={cancelEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">{t('common.cancel')}</button>
+                    <button disabled={isStreaming} onClick={submitEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sigma-600 text-white hover:bg-sigma-700 disabled:opacity-50">{t('common.send')}</button>
                   </div>
                 </div>
               )}
