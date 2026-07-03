@@ -352,6 +352,7 @@
   "chat.toast.unknownError": "未知错误",
   "chat.toast.copyFailed": "复制消息失败",
   "chat.toast.editFailed": "编辑失败：{{message}}",
+  "chat.toast.stopStillRunning": "无法确认任务已停止。请再次尝试停止。",
   "chat.toast.imageUploadFailed": "图片上传失败",
   "filetree.uploadFile": "上传文件",
   "filetree.refreshTree": "刷新文件树",

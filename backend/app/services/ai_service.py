@@ -421,7 +421,14 @@ class AIService:
             return result
         except Exception:
             logger.debug("Failed to read active chat task for session %s", session_id, exc_info=True)
-            return {"active": False, "task_id": None, "status": None}
+            return {
+                "active": False,
+                "task_id": None,
+                "status": "unknown",
+                "session_id": session_id,
+                "recoverable": True,
+                "message": "Could not confirm whether a task is still active.",
+            }
 
     async def get_tasks(self, project_id: str, session_id: str) -> list[Dict]:
         """Get all active (non-deleted) tasks for a session."""

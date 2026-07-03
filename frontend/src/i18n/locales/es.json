@@ -352,6 +352,7 @@
   "chat.toast.unknownError": "Error desconocido",
   "chat.toast.copyFailed": "Error al copiar el mensaje",
   "chat.toast.editFailed": "Error de edición: {{message}}",
+  "chat.toast.stopStillRunning": "No se pudo confirmar que la tarea se detuvo. Intenta detenerla de nuevo.",
   "chat.toast.imageUploadFailed": "Error al subir la imagen",
   "filetree.uploadFile": "Subir archivo",
   "filetree.refreshTree": "Actualizar árbol",

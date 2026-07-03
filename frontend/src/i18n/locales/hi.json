@@ -352,6 +352,7 @@
   "chat.toast.unknownError": "अज्ञात त्रुटि",
   "chat.toast.copyFailed": "संदेश कॉपी करने में विफल",
   "chat.toast.editFailed": "संपादन विफल: {{message}}",
+  "chat.toast.stopStillRunning": "कार्य रुकने की पुष्टि नहीं हो सकी। कृपया फिर से रोकने का प्रयास करें।",
   "chat.toast.imageUploadFailed": "छवि अपलोड विफल",
   "filetree.uploadFile": "फ़ाइल अपलोड करें",
   "filetree.refreshTree": "ट्री ताज़ा करें",

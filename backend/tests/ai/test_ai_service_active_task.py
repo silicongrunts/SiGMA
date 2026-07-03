@@ -34,6 +34,11 @@ class FakeTaskStateRepo:
         self.completed.append(task_id)
 
 
+class FailingTaskStateRepo:
+    async def get_active_by_session(self, session_id):
+        raise RuntimeError("database unavailable")
+
+
 @pytest.mark.asyncio
 async def test_get_active_task_reports_stale_without_marking_completed(monkeypatch):
     fake_repo = FakeTaskStateRepo()
@@ -48,3 +53,18 @@ async def test_get_active_task_reports_stale_without_marking_completed(monkeypat
     assert result["status"] == "stale"
     assert result["recoverable"] is True
     assert fake_repo.completed == []
+
+
+@pytest.mark.asyncio
+async def test_get_active_task_reports_unknown_on_read_failure(monkeypatch):
+    monkeypatch.setattr(
+        ai_service_module, "UnitOfWork", lambda pid: _FakeUow(FailingTaskStateRepo()),
+    )
+
+    result = await ai_service_module.ai_service.get_active_task("project-1", "session-1")
+
+    assert result["active"] is False
+    assert result["task_id"] is None
+    assert result["status"] == "unknown"
+    assert result["session_id"] == "session-1"
+    assert result["recoverable"] is True

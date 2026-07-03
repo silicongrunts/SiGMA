@@ -352,6 +352,7 @@
   "chat.toast.unknownError": "Erreur inconnue",
   "chat.toast.copyFailed": "Échec de la copie du message",
   "chat.toast.editFailed": "Échec de la modification : {{message}}",
+  "chat.toast.stopStillRunning": "Impossible de confirmer l'arrêt de la tâche. Réessayez de l'arrêter.",
   "chat.toast.imageUploadFailed": "Échec du téléversement de l'image",
   "filetree.uploadFile": "Téléverser un fichier",
   "filetree.refreshTree": "Actualiser l'arborescence",

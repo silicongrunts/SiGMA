@@ -352,6 +352,7 @@
   "chat.toast.unknownError": "알 수 없는 오류",
   "chat.toast.copyFailed": "메시지 복사 실패",
   "chat.toast.editFailed": "편집 실패: {{message}}",
+  "chat.toast.stopStillRunning": "작업이 중지되었는지 확인할 수 없습니다. 다시 중지해 주세요.",
   "chat.toast.imageUploadFailed": "이미지 업로드 실패",
   "filetree.uploadFile": "파일 업로드",
   "filetree.refreshTree": "트리 새로고침",

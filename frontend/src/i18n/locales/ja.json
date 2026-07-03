@@ -353,6 +353,7 @@
   "chat.toast.unknownError": "不明なエラー",
   "chat.toast.copyFailed": "メッセージのコピーに失敗しました",
   "chat.toast.editFailed": "編集に失敗しました：{{message}}",
+  "chat.toast.stopStillRunning": "タスクが停止したことを確認できませんでした。もう一度停止してください。",
   "chat.toast.imageUploadFailed": "画像のアップロードに失敗しました",
   "filetree.uploadFile": "ファイルをアップロード",
   "filetree.refreshTree": "ツリーを更新",

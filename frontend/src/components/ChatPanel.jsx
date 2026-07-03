@@ -474,6 +474,9 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         activeCheckFailed = true
         console.error('Failed to check active task:', e)
       }
+      if (isActiveStateUnknown(active)) {
+        activeCheckFailed = true
+      }
 
       if (cancelled) return
 
@@ -1242,15 +1245,75 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
     }
   }
 
+  async function showStopStillRunning() {
+    clearStopAbortTimer()
+    stopRequestedRef.current = false
+    toastError(t('chat.toast.stopStillRunning'))
+    if (projectId && sessionId) {
+      try {
+        await refreshLatestHistory()
+      } catch { /* best-effort */ }
+    }
+  }
+
+  async function abortStoppedStream(controller) {
+    controller.abort()
+    abortRef.current = null
+    stopAbortTimerRef.current = null
+    stopRequestedRef.current = false
+    if (projectId && sessionId) {
+      try {
+        await refreshLatestHistory()
+      } catch { /* best-effort */ }
+    }
+    setIsStreaming(false)
+  }
+
+  function isActiveStateUnknown(active) {
+    return active?.status === 'unknown'
+  }
+
   // ---- Stop an ongoing stream ----
   async function handleStop() {
     if (stopRequestedRef.current) return
 
-    const taskId = taskIdRef.current
+    let taskId = taskIdRef.current
     const controller = abortRef.current
-    if (!taskId || !projectId || !controller) {
-      if (controller) controller.abort()
+    if (!projectId) {
       abortRef.current = null
+      clearStopAbortTimer()
+      stopRequestedRef.current = false
+      setIsStreaming(false)
+      return
+    }
+    if (!controller) {
+      stopRequestedRef.current = true
+      if (sessionId) {
+        try {
+          const active = await chatAPI.getActive(projectId, sessionId)
+          if (isActiveStateUnknown(active)) {
+            await showStopStillRunning()
+            return
+          }
+          if (active?.active) {
+            const activeTaskId = active.task_id || taskId
+            if (activeTaskId) {
+              taskIdRef.current = activeTaskId
+              try { await chatAPI.cancel(projectId, activeTaskId) } catch {}
+            }
+            await showStopStillRunning()
+            return
+          }
+        } catch {
+          await showStopStillRunning()
+          return
+        }
+      }
+      if (taskId) {
+        try { await chatAPI.cancel(projectId, taskId) } catch {}
+        await showStopStillRunning()
+        return
+      }
       clearStopAbortTimer()
       stopRequestedRef.current = false
       setIsStreaming(false)
@@ -1258,24 +1321,69 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
     }
 
     stopRequestedRef.current = true
+    if (!taskId && sessionId) {
+      for (let attempt = 0; attempt < 3 && !taskId; attempt += 1) {
+        try {
+          const active = await chatAPI.getActive(projectId, sessionId)
+          if (active?.active && active.task_id) {
+            taskId = active.task_id
+            taskIdRef.current = taskId
+            break
+          }
+        } catch {
+          break
+        }
+        if (attempt < 2) {
+          await new Promise(resolve => setTimeout(resolve, 300))
+        }
+      }
+    }
+
+    if (!taskId) {
+      await showStopStillRunning()
+      return
+    }
+
     try { await chatAPI.cancel(projectId, taskId) } catch {}
 
     // Keep the SSE stream open so the backend can deliver cancelled/error
-    // usage. If the worker disappears, fall back to abort + history refresh.
-    clearStopAbortTimer()
-    stopAbortTimerRef.current = setTimeout(async () => {
-      if (abortRef.current !== controller) return
-      controller.abort()
-      abortRef.current = null
-      stopAbortTimerRef.current = null
-      stopRequestedRef.current = false
-      if (projectId && sessionId) {
+    // usage. If the worker stays active, surface that instead of pretending
+    // the stop succeeded.
+    const scheduleStopFallback = (attempt = 0) => {
+      clearStopAbortTimer()
+      stopAbortTimerRef.current = setTimeout(async () => {
+        if (abortRef.current !== controller) return
+        if (!sessionId) {
+          await showStopStillRunning()
+          return
+        }
         try {
-          await refreshLatestHistory()
-        } catch { /* best-effort */ }
-      }
-      setIsStreaming(false)
-    }, 10000)
+          const active = await chatAPI.getActive(projectId, sessionId)
+          if (isActiveStateUnknown(active)) {
+            await showStopStillRunning()
+            return
+          }
+          if (active?.active) {
+            const activeTaskId = active.task_id || taskId
+            if (activeTaskId) {
+              taskIdRef.current = activeTaskId
+              try { await chatAPI.cancel(projectId, activeTaskId) } catch {}
+            }
+            if (attempt < 2) {
+              scheduleStopFallback(attempt + 1)
+            } else {
+              await showStopStillRunning()
+            }
+            return
+          }
+        } catch {
+          await showStopStillRunning()
+          return
+        }
+        await abortStoppedStream(controller)
+      }, 10000)
+    }
+    scheduleStopFallback()
   }
 
   async function copyMessage(message) {
