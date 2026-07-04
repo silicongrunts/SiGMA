@@ -28,6 +28,62 @@ function isAgentToolName(tool) {
     return String(tool || '').toLowerCase() === 'agent'
 }
 
+// Internal context params the backend runner injects into tool_args before
+// calling a tool (see llm_loop_runner.py). They are required server-side but
+// should never be shown to the user in the workflow timeline.
+const INTERNAL_PARAM_KEYS = ['project_id', 'session_id', 'model_role']
+
+// Pre-compiled patterns used to scrub the params string when JSON.parse fails
+// (the backend truncates at 200 chars, so the blob is often unparseable).
+// Order matters: closed-value first, then numeric, then truncated-value, then
+// the rare case where the truncation lands inside the key name itself.
+const INTERNAL_PARAM_PATTERNS = INTERNAL_PARAM_KEYS.flatMap(k => [
+    new RegExp(`,?\\s*"${k}"\\s*:\\s*"(?:[^"\\\\]|\\\\.)*"`, 'g'), // closed string
+    new RegExp(`,?\\s*"${k}"\\s*:\\s*[0-9]+`, 'g'),                // numeric
+    new RegExp(`,?\\s*"${k}"\\s*:\\s*"[^"]*$`, 'g'),               // truncated value
+])
+// Tail fallback: an internal key whose name itself was cut by the 200-char
+// truncation, e.g. `"project_i`, `"session_`, `"model_r`. We match the three
+// known key names reduced to any of their own prefixes via a character-class
+// trick: build the prefix set once, match the longest one present at EOL.
+const INTERNAL_KEY_PREFIXES = [
+    'project_id', 'session_id', 'model_role',
+].flatMap(full => Array.from({ length: full.length }, (_, i) => full.slice(0, i + 1)))
+const INTERNAL_PARAM_TAIL = new RegExp(
+    `,?\\s*"(?:${[...new Set(INTERNAL_KEY_PREFIXES)].sort((a, b) => b.length - a.length).join('|')})[^"]*$`
+)
+
+/**
+ * Strip internal params from the tool_start `params` string before display.
+ * The backend truncates the JSON at 200 chars, so a regex fallback covers the
+ * case where the truncation lands mid-value (or mid-key) and JSON.parse fails.
+ * Returns '' when nothing meaningful remains (so the surrounding parentheses
+ * can be hidden entirely).
+ */
+function sanitizeToolParams(paramsStr) {
+    if (!paramsStr) return ''
+    let s = paramsStr
+    try {
+        const obj = JSON.parse(paramsStr)
+        if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+            for (const k of INTERNAL_PARAM_KEYS) delete obj[k]
+            s = JSON.stringify(obj)
+        }
+    } catch {
+        // truncated / not a flat object dict — scrub the raw string below
+        for (const re of INTERNAL_PARAM_PATTERNS) {
+            s = s.replace(re, '')
+        }
+        s = s.replace(INTERNAL_PARAM_TAIL, '')
+    }
+    // tidy dangling separators left by a removed leading/only/trailing key
+    s = s.replace(/\{\s*,/g, '{').replace(/,\s*,/g, ',').replace(/,\s*\}/g, '}').replace(/,\s*$/g, '')
+    // restore a brace dropped by truncation, so the chip doesn't read as broken
+    if (s.startsWith('{') && !s.endsWith('}')) s += '}'
+    const out = s.trim()
+    return out === '{}' ? '' : out
+}
+
 export const MarkdownContent = ({ content, projectId = null }) => {
     const parsed = marked.parse(content || '')
     const html = DOMPurify.sanitize(rewriteProjectImageSrc(parsed, projectId))
@@ -92,11 +148,12 @@ export const ThinkingStep = ({ step }) => {
 
         const Icon = step.status === 'running' ? Loader2 : CheckCircle2
         const iconCls = step.status === 'running' ? 'text-blue-400 animate-spin' : 'text-green-500'
+        const cleanParams = sanitizeToolParams(step.params)
         return <div className="flex items-start gap-1.5 py-0.5">
             <Icon className={`w-3 h-3 mt-0.5 flex-shrink-0 ${iconCls}`} />
             <div className="flex-1 min-w-0">
                 <span className="text-[10px] font-mono text-gray-500 dark:text-gray-400">{step.tool}</span>
-                {step.params && <span className="text-[9px] text-gray-400 dark:text-gray-500 ml-1 break-all">({step.params})</span>}
+                {cleanParams && <span className="text-[9px] text-gray-400 dark:text-gray-500 ml-1 break-all">({cleanParams})</span>}
                 {step.result && (
                     <div className="mt-0.5 text-[9px] text-gray-400 dark:text-gray-500 bg-gray-50/50 dark:bg-gray-900 rounded px-1.5 py-0.5 max-h-16 overflow-y-auto whitespace-pre-wrap break-all border border-gray-100 dark:border-gray-800">
                         {step.result}
