@@ -144,6 +144,10 @@ export default function SynthesisTab({
       {showPreview && (
         <aside className="h-full flex flex-col overflow-hidden shadow-inner">
           <Preview ref={previewRef} onPageClick={async (p, x, y) => {
+            // Backward SyncTeX jump is only meaningful for compiled PDFs,
+            // which carry a .synctex.gz. For standalone PDFs there is nothing
+            // to jump to, so the double-click is a no-op (no error toast).
+            if (useStore.getState().previewSource.kind !== 'pdf-compiled') return
             try {
               const res = await compileAPI.synctex(projectId, {
                 type: 'backward', page: p, x, y
