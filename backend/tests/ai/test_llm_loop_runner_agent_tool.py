@@ -1546,3 +1546,143 @@ async def test_agent_persist_does_not_update_old_assistant_without_persisted_mar
 
     # Only a system message was passed; nothing should be persisted.
     assert persisted_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: requires_session_id tools in session-less sub-loops
+# ---------------------------------------------------------------------------
+#
+# Bug: AnnotationLoop, _spawn_explore, and _fork built LoopContext with
+# ``session_id=None`` because they have no session row. The loop runner only
+# injects session_id when ``ctx.session_id`` is truthy, so read/notebook_read
+# (which declare session_id as a required positional param) raised
+# "missing 1 required positional argument: 'session_id'". The fix passes a
+# stable per-scope namespace key ("annotation:<id>" / "agent:explore:<uuid>"
+# / "agent:fork:<uuid>") so injection succeeds and read-state stays isolated.
+#
+# These tests drive the REAL tool-injection + execution path: a fake LLM emits
+# a read tool_call, run() injects project_id/session_id, and the real read tool
+# executes against a tmp_path sandbox. The assertions pin both directions — a
+# truthy scope key makes read succeed, and the legacy None still surfaces the
+# original error so future regressions are not silently masked.
+
+
+@pytest.mark.asyncio
+async def test_read_succeeds_with_annotation_scope_key(monkeypatch, tmp_path):
+    """The annotation namespace key must let read run via the real injection path."""
+    from app.services.file_service import file_service
+
+    (tmp_path / "doc.md").write_text("hello annotation")
+    monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
+
+    calls = {"n": 0}
+
+    async def fake_stream_llm(ctx, messages, delta_queue):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (
+                "",
+                "",
+                [{"id": "call_read", "name": "read", "params": {"file_path": "doc.md"}}],
+                {"prompt_tokens": 5, "completion_tokens": 1},
+            )
+        # Second turn: the read result is in context, so emit final text and stop.
+        return ("final", "", [], {"prompt_tokens": 5, "completion_tokens": 1})
+
+    monkeypatch.setattr(
+        LLMLoopRunner, "_stream_llm", staticmethod(fake_stream_llm)
+    )
+
+    ctx = LoopContext(
+        project_id="project-1",
+        session_id=f"annotation:ann-1",
+        model_role="supervisor",
+    )
+    messages = [{"role": "system", "content": "system"}]
+
+    events = [event async for event in LLMLoopRunner().run(ctx, messages)]
+
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert tool_msgs
+    assert "missing 1 required positional argument" not in tool_msgs[-1]["content"]
+    assert "hello annotation" in tool_msgs[-1]["content"]
+    assert any(e["type"] == "done" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_read_succeeds_with_agent_scope_key(monkeypatch, tmp_path):
+    """explore/fork one-shot scope keys must also let read run."""
+    from app.services.file_service import file_service
+
+    (tmp_path / "doc.md").write_text("hello agent")
+    monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
+
+    calls = {"n": 0}
+
+    async def fake_stream_llm(ctx, messages, delta_queue):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (
+                "",
+                "",
+                [{"id": "call_read", "name": "read", "params": {"file_path": "doc.md"}}],
+                {"prompt_tokens": 5, "completion_tokens": 1},
+            )
+        return ("final", "", [], {"prompt_tokens": 5, "completion_tokens": 1})
+
+    monkeypatch.setattr(
+        LLMLoopRunner, "_stream_llm", staticmethod(fake_stream_llm)
+    )
+
+    ctx = LoopContext(
+        project_id="project-1",
+        session_id=f"agent:explore:{'0' * 32}",
+        model_role="ra",
+    )
+    messages = [{"role": "system", "content": "system"}]
+
+    async for _ in LLMLoopRunner().run(ctx, messages):
+        pass
+
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert tool_msgs
+    assert "missing 1 required positional argument" not in tool_msgs[-1]["content"]
+    assert "hello agent" in tool_msgs[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_read_still_fails_when_session_id_is_none(monkeypatch, tmp_path):
+    """Guard against silent regression: a None session_id must surface the
+    original missing-argument error (it must NOT be masked), so a future
+    session-less sub-loop that forgets to pass a scope key fails loudly."""
+    from app.services.file_service import file_service
+
+    (tmp_path / "doc.md").write_text("hello")
+    monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
+
+    async def fake_stream_llm(ctx, messages, delta_queue):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (
+                "",
+                "",
+                [{"id": "call_read", "name": "read", "params": {"file_path": "doc.md"}}],
+                {"prompt_tokens": 5, "completion_tokens": 1},
+            )
+        return ("final", "", [], {"prompt_tokens": 5, "completion_tokens": 1})
+
+    monkeypatch.setattr(
+        LLMLoopRunner, "_stream_llm", staticmethod(fake_stream_llm)
+    )
+
+    calls = 0
+    ctx = LoopContext(project_id="project-1", session_id=None, model_role="supervisor")
+    messages = [{"role": "system", "content": "system"}]
+
+    async for _ in LLMLoopRunner().run(ctx, messages):
+        pass
+
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert tool_msgs
+    assert "missing 1 required positional argument: 'session_id'" in tool_msgs[-1]["content"]

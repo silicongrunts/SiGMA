@@ -207,3 +207,56 @@ async def test_edit_refreshes_cache_allowing_subsequent_write(tmp_path, monkeypa
     await _edit_file("proj", "sess", "e.txt", "hello", "goodbye")
     result = await _write_file("proj", "sess", "e.txt", "fresh content")
     assert result.startswith("File written:")
+
+
+# ── session-less sub-loops: annotation / agent scope keys ────────────
+#
+# AnnotationLoop and agent sub-loops (explore, fork) have no session row, so
+# they pass a stable namespace key ("annotation:<id>" / "agent:<kind>:<uuid>")
+# instead of a real session_id. The must-read-first contract must still work
+# within one scope and must NOT leak across scopes — otherwise a file read in
+# annotation A would let annotation B edit it without reading.
+
+
+@pytest.mark.asyncio
+async def test_write_succeeds_after_read_with_annotation_scope_key(tmp_path, monkeypatch):
+    _patch_file_service(monkeypatch, tmp_path)
+    (tmp_path / "f.txt").write_text("old")
+
+    await _read_file("proj", "annotation:ann-1", "f.txt")
+    result = await _write_file("proj", "annotation:ann-1", "f.txt", "new")
+    assert result.startswith("File written:")
+    assert (tmp_path / "f.txt").read_text() == "new"
+
+
+@pytest.mark.asyncio
+async def test_read_state_is_isolated_between_annotation_scopes(tmp_path, monkeypatch):
+    _patch_file_service(monkeypatch, tmp_path)
+    (tmp_path / "shared.txt").write_text("base")
+
+    # Annotation A reads the file.
+    await _read_file("proj", "annotation:ann-A", "shared.txt")
+
+    # Annotation B must NOT inherit A's read-state: the must-read-first
+    # contract should block the write.
+    result = await _write_file("proj", "annotation:ann-B", "shared.txt", "B-edit")
+    assert result.startswith("Error:")
+    assert "has not been read" in result
+
+    # A can still edit (its own read-state is intact).
+    result = await _write_file("proj", "annotation:ann-A", "shared.txt", "A-edit")
+    assert result.startswith("File written:")
+
+
+@pytest.mark.asyncio
+async def test_read_state_is_isolated_between_agent_scopes(tmp_path, monkeypatch):
+    _patch_file_service(monkeypatch, tmp_path)
+    (tmp_path / "shared.txt").write_text("base")
+
+    # One agent fork reads the file.
+    await _read_file("proj", "agent:fork:aaa", "shared.txt")
+
+    # A different fork must not inherit the prior read.
+    result = await _write_file("proj", "agent:fork:bbb", "shared.txt", "edit")
+    assert result.startswith("Error:")
+    assert "has not been read" in result

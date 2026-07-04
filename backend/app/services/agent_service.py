@@ -13,6 +13,7 @@ import asyncio
 import json
 from functools import partial
 from typing import Callable, Awaitable, Any
+from uuid import uuid4
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -449,9 +450,16 @@ class AgentService:
 
         tool_schemas = tool_schemas_for_model_role("ra", READ_ONLY_TOOLS)
 
+        # Explore is a single-shot, non-persistent sub-loop with no session
+        # row, but read-only tools (read/notebook_read) declare session_id as a
+        # required positional param and use it as the read-state cache key. A
+        # one-shot scope_id keeps each explore run's read-state isolated
+        # without impersonating a real session.
+        scope_id = f"agent:explore:{uuid4().hex}"
+
         ctx = LoopContext(
             project_id=project_id,
-            session_id=None,
+            session_id=scope_id,
             model_role="ra",
             is_agent_tool=True,
             context_kind="main",
@@ -461,7 +469,7 @@ class AgentService:
             cancel_event=cancel_event,
             prepare_messages=lambda msgs: self._prepare_agent_messages(
                 project_id=project_id,
-                session_id=None,
+                session_id=scope_id,
                 messages=msgs,
                 model_role="ra",
                 tools=tool_schemas,
@@ -585,9 +593,16 @@ class AgentService:
             else compaction_service.budget_for_role(model_role).response_max_tokens
         )
 
+        # Fork is a non-persistent sub-loop with no session row, yet it exposes
+        # writable tools (write/edit) whose must-read-first contract keys on
+        # session_id. A one-shot scope_id makes that contract behave correctly
+        # within the fork (reads must precede edits) instead of crashing on the
+        # missing positional argument and silently disabling the contract.
+        scope_id = f"agent:fork:{uuid4().hex}"
+
         ctx = LoopContext(
             project_id=project_id,
-            session_id=None,
+            session_id=scope_id,
             model_role=model_role,
             is_agent_tool=True,
             context_kind="main",
@@ -600,7 +615,7 @@ class AgentService:
             execute_tool=self._make_permission_executor(permission_requester),
             prepare_messages=lambda msgs: self._prepare_agent_messages(
                 project_id=project_id,
-                session_id=None,
+                session_id=scope_id,
                 messages=msgs,
                 model_role=model_role,
                 tools=active_tool_schemas,

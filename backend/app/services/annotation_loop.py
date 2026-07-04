@@ -15,6 +15,7 @@ from app.core.logging import get_logger
 from app.agents.prompt_service import prompt_service
 from app.agents.tool_schema_service import tool_schemas_for_model_role
 from app.agents.tools.annotation_tools import validate_diffs
+from app.agents.tools.read_state import read_state_cache
 from app.agents.toolsets import ANNOTATION_TOOLS, ALLOWED_AGENT_TYPES
 from app.services.file_service import file_service
 from app.database.unit_of_work import UnitOfWork
@@ -82,7 +83,14 @@ class AnnotationLoop:
         """Build LoopContext with annotation-specific restrictions."""
         ctx = LoopContext(
             project_id=self.project_id,
-            session_id=None,
+            # Annotations have no session row (messages live under annotation_id),
+            # but tools like read/notebook_read declare session_id as a required
+            # positional param and use it as the read-state cache key. A None
+            # session_id skips injection (llm_loop_runner) and the call raises
+            # "missing 1 required positional argument: 'session_id'". We pass a
+            # stable, annotation-scoped namespace key so read-state is isolated
+            # per annotation without impersonating a real session.
+            session_id=f"annotation:{self.annotation_id}",
             model_role="supervisor",
             context_kind="annotation",
             response_max_tokens=compaction_service.budget_for_role("supervisor").response_max_tokens,
@@ -132,6 +140,11 @@ class AnnotationLoop:
             await compaction_service.insert_annotation_boundary(
                 uow, self.annotation_id, result.boundary_content,
             )
+
+        # Mirror query_loop: compaction collapses the visible context, so the
+        # must-read-first cache must reset — the LLM must re-read a file before
+        # editing it again (prior tool output is no longer in context).
+        read_state_cache.clear(f"annotation:{self.annotation_id}")
 
         # Compaction replaced the message list — invalidate cached real tokens.
         if loop_ctx:
