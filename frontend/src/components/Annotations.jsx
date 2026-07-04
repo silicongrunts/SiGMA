@@ -648,7 +648,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
                   <span className="text-[9px] text-gray-300 dark:text-gray-600 select-none font-normal normal-case tracking-normal">{formatTimestamp(msg.created_at)}</span>
                 )}
               </div>
-              <div className={`max-w-[85%] rounded-2xl text-sm leading-relaxed shadow-sm ${
+              <div className={`max-w-[85%] rounded-2xl text-sm leading-relaxed shadow-sm overflow-hidden break-words ${
                 msg.role === 'SiGMA' ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-900 dark:text-blue-200 rounded-tl-none border border-blue-100 dark:border-blue-800/50 px-3 py-2' : 'bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200 rounded-tr-none border border-gray-200 dark:border-gray-700 px-3 py-2'
               }`}>
                 {msg.process?.length > 0 && (
@@ -664,6 +664,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
                       onExpandDiff={setExpandedDiff}
                       expandedDiff={expandedDiff}
                       editorContent={editorContent}
+                      projectId={projectId}
                     />
                   ) : !msg.process?.length && msg.isStreaming ? (
                     <div className="flex items-center gap-2">

@@ -1,33 +1,6 @@
-import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { X, Check } from 'lucide-react'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
-
-// Configure marked for line breaks
-marked.setOptions({ gfm: true, breaks: true })
-
-const MarkdownContent = ({ content }) => {
-  const html = useMemo(() => {
-    try {
-      const tokens = marked.lexer(content || '')
-      const parsed = marked.parser(tokens)
-      return DOMPurify.sanitize(parsed)
-    } catch (e) {
-      console.error('Markdown parsing error:', e)
-      // Sanitize the raw content as a fallback — never insert untrusted
-      // text into dangerouslySetInnerHTML without purification.
-      return DOMPurify.sanitize(content || '')
-    }
-  }, [content])
-
-  return (
-    <div
-      className="text-sm leading-relaxed break-words prose prose-sm max-w-none"
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
-  )
-}
+import { MarkdownContent } from './ChatShared'
 
 /**
  * Parse diff tags from text
@@ -102,14 +75,14 @@ export function SideBySideDiffViewer({ before, after, onAccept, onReject }) {
 /**
  * Diff Viewer with inline expansion - simplified to only show buttons
  */
-export function InlineDiffViewer({ annotation, message, onApplyDiff, onDeleteAnnotation, onExpandDiff, expandedDiff, editorContent }) {
-  // Use message.content if message is provided, otherwise use annotation text.
+export function InlineDiffViewer({ annotation, message, onApplyDiff, onDeleteAnnotation, onExpandDiff, expandedDiff, editorContent, projectId = null }) {
+  // Use message.content if message is given, otherwise use annotation text.
   const textToParse = message?.content || annotation.text
   const { diffs, parts } = parseDiffs(textToParse)
 
   if (diffs.length === 0) {
     // No diffs, render entire message as markdown
-    return <MarkdownContent content={textToParse} />
+    return <MarkdownContent content={textToParse} projectId={projectId} />
   }
 
   const handleExpand = (diffIndex) => {
@@ -128,7 +101,7 @@ export function InlineDiffViewer({ annotation, message, onApplyDiff, onDeleteAnn
       {parts.map((part, i) => {
         if (part.type === 'text') {
           // Render text parts as markdown
-          return <MarkdownContent key={i} content={part.content} />
+          return <MarkdownContent key={i} content={part.content} projectId={projectId} />
         }
 
         const diff = diffs[part.diffIndex]
