@@ -185,7 +185,14 @@ def _slice_and_record(
 
     result = "\n".join(lines[start_idx:end_idx])
     if defaulted and end_idx < len(lines):
-        result += f"\n\n... ({len(lines) - end_idx} more lines not shown)"
+        # 1-indexed range: lines are start_idx..end_idx-1 in 0-indexed terms.
+        shown_start = start_idx + 1
+        shown_end = end_idx
+        hidden = len(lines) - end_idx
+        result += (
+            f"\n\nShowing lines {shown_start}-{shown_end} of {len(lines)} "
+            f"({hidden} more not shown)"
+        )
     return result
 
 
@@ -561,7 +568,8 @@ async def _glob_search(project_id: str = "", pattern: str = "", path: str = ".")
     shown = matches[:_GLOB_MAX_RESULTS]
     result = "\n".join(shown)
     if len(matches) > _GLOB_MAX_RESULTS:
-        result += f"\n... ({len(matches) - _GLOB_MAX_RESULTS} more matches not shown)"
+        # Leading "\n\n" matches the read/library_read truncation suffix style.
+        result += f"\n\n... ({len(matches) - _GLOB_MAX_RESULTS} more matches not shown)"
     return result
 
 

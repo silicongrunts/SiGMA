@@ -134,6 +134,25 @@ class DomNode:
 
 # ── DomService ───────────────────────────────────────────────────────────
 
+def build_trunc_marker(ref_key: str, content: str, label: str) -> str:
+    """Build a clickable truncation marker with beginning/end preview.
+
+    Shared by DOM pagination (``label`` = truncated/excluded/continued) and
+    markdown pagination (``label`` = "truncated markdown") so the two paths do
+    not drift apart. ``content`` is the hidden text the marker stands in for.
+    """
+    preview_beginning = content[:200].strip()
+    preview_end = content[-200:].strip()
+    return (
+        f"\n[ref={ref_key}]\n"
+        f"--- {label} content ({len(content)} chars, click to expand) ---\n"
+        f'  Beginning: "{preview_beginning[:150]}..."\n'
+        f'  End: "...{preview_end[-150:]}"\n'
+        f"---\n"
+        f"[/ref={ref_key}]\n"
+    )
+
+
 class DomService:
     """Builds enhanced DOM snapshots via CDP DOMSnapshot.captureSnapshot."""
 
@@ -1153,16 +1172,7 @@ class DomService:
         self, ref_key: str, content: str, label: str
     ) -> str:
         """Build a clickable truncation marker with beginning/end preview."""
-        preview_beginning = content[:200].strip()
-        preview_end = content[-200:].strip()
-        return (
-            f"\n[ref={ref_key}]\n"
-            f"--- {label} content ({len(content)} chars, click to expand) ---\n"
-            f'  Beginning: "{preview_beginning[:150]}..."\n'
-            f'  End: "...{preview_end[-150:]}"\n'
-            f"---\n"
-            f"[/ref={ref_key}]\n"
-        )
+        return build_trunc_marker(ref_key, content, label)
 
     def _store_virtual_ref_paginated(
         self, ref_key: str, content: str, virtual_refs: dict[str, str]

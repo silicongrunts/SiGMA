@@ -22,7 +22,7 @@ from app.agents.tools.base import ToolDefinition
 from app.agents.tools.registry import tool_registry
 from app.agents.tools.browser_manager import get_browser_manager
 from app.agents.tools.browser_thread import dispatch as _dispatch
-from app.agents.tools.dom_service import get_dom_service
+from app.agents.tools.dom_service import build_trunc_marker, get_dom_service
 from app.agents.prompts import (
     PROMPT_BROWSER_NAVIGATE,
     PROMPT_BROWSER_SNAPSHOT,
@@ -106,7 +106,7 @@ def _paginate_markdown(text: str, limit: int) -> tuple[str, dict[str, str]]:
 
     if rest.strip():
         _store_md_paginated("m1", rest, virtual_refs)
-        result += _build_md_trunc_marker("m1", rest)
+        result += build_trunc_marker("m1", rest, "truncated markdown")
 
     return result, virtual_refs
 
@@ -125,21 +125,7 @@ def _store_md_paginated(
     sub_key = f"{ref_key}-a"
     _store_md_paginated(sub_key, rest, virtual_refs)
 
-    virtual_refs[ref_key] = chunk + "\n" + _build_md_trunc_marker(sub_key, rest)
-
-
-def _build_md_trunc_marker(ref_key: str, content: str) -> str:
-    """Build a clickable truncation marker for markdown content."""
-    preview_beginning = content[:200].strip()
-    preview_end = content[-200:].strip()
-    return (
-        f"\n[ref={ref_key}]\n"
-        f"--- truncated markdown ({len(content)} chars, click to expand) ---\n"
-        f'  Beginning: "{preview_beginning[:150]}..."\n'
-        f'  End: "...{preview_end[-150:]}"\n'
-        f"---\n"
-        f"[/ref={ref_key}]\n"
-    )
+    virtual_refs[ref_key] = chunk + "\n" + build_trunc_marker(sub_key, rest, "truncated markdown")
 
 
 def _is_url(text: str) -> bool:
