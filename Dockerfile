@@ -128,8 +128,9 @@ WORKDIR /app
 # Runtime apt deps only. No make/nodejs/npm/build-essential — those were
 # only needed at build time. git IS needed at runtime: git_service runs
 # `git init` / `git commit` for project snapshots when a user creates or
-# writes to a project. chromium pulls its own X11 / NSSS / ATK runtime
-# libs as deps.
+# writes to a project. ripgrep IS needed at runtime: the grep tool shells
+# out to `rg` for content search. chromium pulls its own X11 / NSSS / ATK
+# runtime libs as deps.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
@@ -147,6 +148,7 @@ RUN apt-get update \
         psmisc \
         python3-pygments \
         qpdf \
+        ripgrep \
         supervisor \
         tini \
         wget \
