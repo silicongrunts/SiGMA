@@ -232,6 +232,9 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   // Message editing
   const [editingMessageId, setEditingMessageId] = useState(null)
   const [editingText, setEditingText] = useState('')
+  // Message id of the most recently copied message; shows a check briefly,
+  // mirroring the docker-command copy feedback in BackendErrorOverlay.
+  const [copiedMessageId, setCopiedMessageId] = useState(null)
 
   // Archived sessions modal
   const [showArchived, setShowArchived] = useState(false)
@@ -1389,6 +1392,8 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   async function copyMessage(message) {
     try {
       await copyToClipboard(message.content || '')
+      setCopiedMessageId(message.id)
+      setTimeout(() => setCopiedMessageId(cur => (cur === message.id ? null : cur)), 1500)
     } catch {
       toastError(t('chat.toast.copyFailed'))
     }
@@ -1869,7 +1874,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
               {editingMessageId !== m.id && (
                 <div className={`mt-1 px-1 flex items-center gap-1 opacity-0 group-hover/message:opacity-100 transition-opacity ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <button onClick={() => copyMessage(m)} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800" title={t('chat.copy')}>
-                    <Copy className="w-3 h-3" />
+                    {copiedMessageId === m.id ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3" />}
                   </button>
                   {m.role === 'user' && m.can_edit && !isStreaming && !awaiting && (
                     <button onClick={() => startEditMessage(m)} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800" title={t('common.edit')}>
