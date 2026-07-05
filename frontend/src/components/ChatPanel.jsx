@@ -166,7 +166,7 @@ function AttachmentStrip({ projectId, attachments, onRemove = null, compact = fa
 const sessionInitLocks = new Map() // projectId → Promise<sessionId>
 const HISTORY_PAGE_SIZE = 10
 
-export default function ChatPanel({ projectId, placeholder, citation = null, onClearCitation = null, getCursorContext = null, onFileChanged = null, onAnnotationChanged = null, getUserState = null, onSaveBeforeChat = null }) {
+export default function ChatPanel({ projectId, placeholder, citation = null, onClearCitation = null, onFileChanged = null, onAnnotationChanged = null, getUserState = null, onSaveBeforeChat = null }) {
   const { t } = useTranslation()
   const resolvedPlaceholder = placeholder || t('chat.askPlaceholder')
   const [chatInput, setChatInput] = useState('')
@@ -178,7 +178,12 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   const [sessionId, setSessionId] = useState(null)
   const [sessionTitle, setSessionTitle] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
-  const [contextStats, setContextStats] = useState(null)
+  // Mirror isStreaming/awaiting into refs so the pendingAutoMessage effect and
+  // handleDirectSend read the latest values without being closed over a stale
+  // render (their effects would otherwise re-fire on every streaming token if
+  // these were added to the dependency arrays).
+  const isStreamingRef = useRef(false)
+  const awaitingRef = useRef(false)
   const [viewingCitation, setViewingCitation] = useState(null)
   const chatScrollRef = useRef(null)
   const currentHintRef = useRef('')
@@ -226,6 +231,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
 
   // Per-turn token budget
   const [tokenBudget, setTokenBudget] = useState(null)
+  const [contextStats, setContextStats] = useState(null)
   const [budgetDraft, setBudgetDraft] = useState('')
   const [budgetError, setBudgetError] = useState('')
 
@@ -235,6 +241,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   // Message id of the most recently copied message; shows a check briefly,
   // mirroring the docker-command copy feedback in BackendErrorOverlay.
   const [copiedMessageId, setCopiedMessageId] = useState(null)
+  const copiedTimerRef = useRef(null)  // tracks the copy-feedback timeout for unmount cleanup
 
   // Archived sessions modal
   const [showArchived, setShowArchived] = useState(false)
@@ -249,7 +256,10 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   const [deleteSessionTarget, setDeleteSessionTarget] = useState(null) // session id
   const [deleteArchivedTarget, setDeleteArchivedTarget] = useState(null) // session id
 
-  useEffect(() => () => clearStopAbortTimer(), [])
+  useEffect(() => () => {
+    clearStopAbortTimer()
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
+  }, [])
 
   // ---- Lazy-load enabled skills for the /skill submenu ----
   // Refetch when SkillPanel modifies skills (toggle/delete/import/edit-SKILL.md),
@@ -260,7 +270,8 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
     try {
       const list = await skillsAPI.list()
       setEnabledSkills(Array.isArray(list) ? list.filter(s => s.enabled) : [])
-    } catch {
+    } catch (e) {
+      console.warn('Failed to load enabled skills:', e)
       setEnabledSkills([])
     }
   }, [skillsVersion])
@@ -680,6 +691,11 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   const setInteractionDismissed = useStore(s => s.setInteractionDismissed)
   const pendingPermission = useStore(s => s.pendingPermission)
   const awaiting = !!(pendingInteraction || pendingPermission)
+  // Keep the refs in sync so async guards read the latest streaming/awaiting state.
+  useEffect(() => {
+    isStreamingRef.current = isStreaming
+    awaitingRef.current = awaiting
+  }, [isStreaming, awaiting])
   // When awaiting + dismissed, render the "reopen" button in place of textarea.
   const dismissedAny = interactionDismissed
   const reopenTarget = pendingInteraction ? 'interaction' : null
@@ -731,12 +747,15 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   useEffect(() => {
     if (!pendingAutoMessage) return
     useStore.getState().setPendingAutoMessage(null)
+    // Read the latest streaming/awaiting state from refs; the closure values
+    // here are from the render when the message arrived and can be stale.
+    if (isStreamingRef.current || awaitingRef.current) return
     handleDirectSend(pendingAutoMessage.text)
   }, [pendingAutoMessage])
 
   /** Send a message programmatically (not from user input). */
   async function handleDirectSend(text) {
-    if (!text || isStreaming || awaiting || !projectId || !sessionId) return
+    if (!text || isStreamingRef.current || awaitingRef.current || !projectId || !sessionId) return
     setIsStreaming(true)
     const gen = genRef.current
       setMessages(prev => [...prev, { role: 'user', content: displayMessageText(text, t('chat.planDisplay')), created_at: new Date().toISOString() }])
@@ -1055,8 +1074,9 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
           } else if (type === 'step') {
             lastMsg.process = [...currentProcess, data]
           } else if (type === 'step_delta') {
-            if (currentProcess.length > 0 && currentProcess[currentProcess.length - 1].type === 'agent' && currentProcess[currentProcess.length - 1].agent === data.agent) {
-              currentProcess[currentProcess.length - 1].content += data.content
+            const lastIdx = currentProcess.length - 1
+            if (lastIdx >= 0 && currentProcess[lastIdx].type === 'agent' && currentProcess[lastIdx].agent === data.agent) {
+              currentProcess[lastIdx] = { ...currentProcess[lastIdx], content: currentProcess[lastIdx].content + data.content }
             } else {
               currentProcess.push({ type: 'agent', agent: data.agent || t('chat.thinkingAgent'), content: data.content })
             }
@@ -1302,7 +1322,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
             const activeTaskId = active.task_id || taskId
             if (activeTaskId) {
               taskIdRef.current = activeTaskId
-              try { await chatAPI.cancel(projectId, activeTaskId) } catch {}
+              try { await chatAPI.cancel(projectId, activeTaskId) } catch (e) { console.warn('Failed to cancel task:', e) }
             }
             await showStopStillRunning()
             return
@@ -1313,7 +1333,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         }
       }
       if (taskId) {
-        try { await chatAPI.cancel(projectId, taskId) } catch {}
+        try { await chatAPI.cancel(projectId, taskId) } catch (e) { console.warn('Failed to cancel task:', e) }
         await showStopStillRunning()
         return
       }
@@ -1347,7 +1367,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
       return
     }
 
-    try { await chatAPI.cancel(projectId, taskId) } catch {}
+    try { await chatAPI.cancel(projectId, taskId) } catch (e) { console.warn('Failed to cancel task:', e) }
 
     // Keep the SSE stream open so the backend can deliver cancelled/error
     // usage. If the worker stays active, surface that instead of pretending
@@ -1370,7 +1390,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
             const activeTaskId = active.task_id || taskId
             if (activeTaskId) {
               taskIdRef.current = activeTaskId
-              try { await chatAPI.cancel(projectId, activeTaskId) } catch {}
+              try { await chatAPI.cancel(projectId, activeTaskId) } catch (e) { console.warn('Failed to cancel task:', e) }
             }
             if (attempt < 2) {
               scheduleStopFallback(attempt + 1)
@@ -1393,7 +1413,8 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
     try {
       await copyToClipboard(message.content || '')
       setCopiedMessageId(message.id)
-      setTimeout(() => setCopiedMessageId(cur => (cur === message.id ? null : cur)), 1500)
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
+      copiedTimerRef.current = setTimeout(() => setCopiedMessageId(cur => (cur === message.id ? null : cur)), 1500)
     } catch {
       toastError(t('chat.toast.copyFailed'))
     }

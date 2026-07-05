@@ -16,7 +16,6 @@ import { useStore } from '../store/useStore'
 
 export default function AskUserQuestionModal() {
   const pendingInteraction = useStore(s => s.pendingInteraction)
-  const currentProject = useStore(s => s.currentProject)
   const clearPendingInteraction = useStore(s => s.clearPendingInteraction)
   const interactionDismissed = useStore(s => s.interactionDismissed)
   const setInteractionDismissed = useStore(s => s.setInteractionDismissed)
@@ -36,7 +35,6 @@ export default function AskUserQuestionModal() {
   return (
     <AskUserQuestionDialog
       rawQuestions={rawQuestions}
-      projectId={currentProject?.id}
       sessionId={sessionId}
       onClose={() => setInteractionDismissed(true)}
       onResolved={clearPendingInteraction}
@@ -44,7 +42,7 @@ export default function AskUserQuestionModal() {
   )
 }
 
-function AskUserQuestionDialog({ rawQuestions, projectId, sessionId, onClose, onResolved }) {
+function AskUserQuestionDialog({ rawQuestions, sessionId, onClose, onResolved }) {
   const { t } = useTranslation()
   const [answers, setAnswers] = useState({})       // [i]: single→label, multi→[labels], text→string
   const [otherActive, setOtherActive] = useState({}) // [i]: single/multi only

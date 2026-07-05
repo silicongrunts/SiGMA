@@ -600,7 +600,7 @@ export default function SkillPanel({ isOpen, onClose }) {
           { key: 'Mod-s', run: () => { saveHandlerRef.current?.(); return true }, preventDefault: true },
           ...defaultKeymap, ...historyKeymap, indentWithTab,
         ]),
-        syntaxHighlighting(document.documentElement.classList.contains('dark') ? oneDarkHighlightStyle : defaultHighlightStyle),
+        cmSyntaxCompartment.of(syntaxHighlighting(document.documentElement.classList.contains('dark') ? oneDarkHighlightStyle : defaultHighlightStyle)),
         languageConf.of(lang),
         cmThemeCompartment.of(isDark ? darkCmTheme : lightCmTheme),
         EditorView.updateListener.of((update) => {

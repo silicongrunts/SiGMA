@@ -156,7 +156,7 @@ function CommitModal({ isOpen, onClose, commit, parentHash, projectId, onDownloa
 
   const downloadFromUrl = (url, filename) => {
     fetchBlob(url).then(blob => triggerDownload(blob, filename))
-      .catch(err => { toastError(t('history.downloadFailed') + ': ' + (err.message || String(err))) })
+      .catch(err => { toastError(t('history.toast.downloadFailed') + ': ' + (err.message || String(err))) })
   }
 
   const triggerDownload = (blobObj, filename) => {
@@ -336,7 +336,6 @@ function HistoryPanel() {
   const [selectedCommitIndex, setSelectedCommitIndex] = useState(-1)
   const [snapshotDownloading, setSnapshotDownloading] = useState(null)
   const sentinelRef = useRef(null)
-  const commitsLenRef = useRef(0)
   const lastCommitHashRef = useRef(null)
 
   const loadLog = useCallback(async (reset = false) => {
@@ -348,17 +347,24 @@ function HistoryPanel() {
       const newCommits = data.commits || []
       setCommits(prev => {
         const next = reset ? newCommits : [...prev, ...newCommits]
-        commitsLenRef.current = next.length
         lastCommitHashRef.current = next[next.length - 1]?.hash || null
         return next
       })
       setHasMore(newCommits.length === PAGE_SIZE)
-    } catch (err) { /* ignore */ }
+    } catch (err) {
+      // Keep whatever is already loaded so a transient pagination failure
+      // does not wipe the list; only a project switch / explicit reset clears it.
+      console.error('Failed to load git log:', err)
+      if (reset) {
+        setCommits([])
+        setHasMore(false)
+      }
+      toastError(err.message || t('history.toast.loadFailed'))
+    }
     finally { setLoading(false) }
-  }, [currentProjectId])
+  }, [currentProjectId, t])
 
   useEffect(() => {
-    commitsLenRef.current = 0
     lastCommitHashRef.current = null
     setCommits([])
     setHasMore(true)

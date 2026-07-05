@@ -11,11 +11,9 @@ import { useTranslation } from 'react-i18next'
 import { X } from 'lucide-react'
 import { MarkdownContent } from './ChatShared'
 import { useStore } from '../store/useStore'
-import { chatAPI } from '../api'
 
 export default function PlanApprovalDialog() {
   const pendingInteraction = useStore(s => s.pendingInteraction)
-  const currentProject = useStore(s => s.currentProject)
   const clearPendingInteraction = useStore(s => s.clearPendingInteraction)
   const interactionDismissed = useStore(s => s.interactionDismissed)
   const setInteractionDismissed = useStore(s => s.setInteractionDismissed)
@@ -29,7 +27,6 @@ export default function PlanApprovalDialog() {
   return (
     <PlanDialog
       planContent={planContent}
-      projectId={currentProject?.id}
       sessionId={sessionId}
       taskId={taskId}
       onClose={() => setInteractionDismissed(true)}
@@ -38,7 +35,7 @@ export default function PlanApprovalDialog() {
   )
 }
 
-function PlanDialog({ planContent, projectId, sessionId, taskId, onClose, onResolved }) {
+function PlanDialog({ planContent, sessionId, taskId, onClose, onResolved }) {
   const { t } = useTranslation()
   const [feedback, setFeedback] = useState('')
   const [showFeedback, setShowFeedback] = useState(false)

@@ -1,14 +1,18 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { create } from 'zustand'
 import { AlertCircle, CheckCircle2, Info, X } from 'lucide-react'
 
+// Monotonic id generator scoped to the store (Date.now() can collide when two
+// toasts are added within the same millisecond, leaving one unremovable).
 const useToastStore = create((set) => ({
   toasts: [],
-  addToast: (toast) => set((state) => ({ 
-    toasts: [...state.toasts, { ...toast, id: Date.now() }] 
+  seq: 1,
+  addToast: (toast) => set((state) => ({
+    seq: state.seq + 1,
+    toasts: [...state.toasts, { ...toast, id: state.seq }]
   })),
-  removeToast: (id) => set((state) => ({ 
-    toasts: state.toasts.filter((t) => t.id !== id) 
+  removeToast: (id) => set((state) => ({
+    toasts: state.toasts.filter((t) => t.id !== id)
   })),
 }))
 
@@ -27,14 +31,19 @@ export function ToastContainer() {
 
 function Toast({ toast, onRemove }) {
   const [visible, setVisible] = useState(false)
+  const hideTimerRef = useRef(null)
 
   useEffect(() => {
     const timer = setTimeout(() => setVisible(true), 10)
     const removeTimer = setTimeout(() => {
         setVisible(false)
-        setTimeout(onRemove, 400)
+        hideTimerRef.current = setTimeout(onRemove, 400)
     }, 4000) // Increased display time to 4s
-    return () => { clearTimeout(timer); clearTimeout(removeTimer); }
+    return () => {
+      clearTimeout(timer)
+      clearTimeout(removeTimer)
+      if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
+    }
   }, [onRemove])
 
   const icons = {

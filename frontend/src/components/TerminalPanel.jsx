@@ -70,9 +70,11 @@ export default function TerminalPanel({ projectId, visible }) {
 
   // ── Session discovery — always ask backend (single source of truth) ──
   useEffect(() => {
+    let cancelled = false
     setDiscovering(true)
     terminalAPI.listSessions(projectId)
       .then(res => {
+        if (cancelled) return
         const sessions = res.sessions
         if (sessions && sessions.length > 0) {
           const terms = sessions.map(s => ({ id: `t-${s.slot}`, slot: s.slot }))
@@ -81,7 +83,8 @@ export default function TerminalPanel({ projectId, visible }) {
         }
       })
       .catch(() => { /* network error — fall through to auto-create */ })
-      .finally(() => setDiscovering(false))
+      .finally(() => { if (!cancelled) setDiscovering(false) })
+    return () => { cancelled = true }
   }, [projectId])
 
   // ── Create first terminal when panel opens and no sessions exist ──

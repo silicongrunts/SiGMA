@@ -64,7 +64,6 @@ export default function EditorView() {
   const currentProject = useStore(s => s.currentProject)
   const setCurrentProject = useStore(s => s.setCurrentProject)
   const currentFile = useStore(s => s.currentFile)
-  const setCompileLogs = useStore(s => s.setCompileLogs)
   const setShowLogModal = useStore(s => s.setShowLogModal)
   const showLogModal = useStore(s => s.showLogModal)
   const compileLogs = useStore(s => s.compileLogs)
@@ -253,7 +252,7 @@ export default function EditorView() {
         const data = await filesAPI.read(projectId, cur)
         const content = typeof data === 'string' ? data : (data?.content || '')
         previewRef.current?.setMarkdownContent(content)
-      } catch {}
+      } catch (e) { console.warn('Failed to sync markdown preview:', e) }
     }
   }, [incrementFileVersion, incrementNotebookVersion, pathMatchesCurrentFile, projectId])
 
@@ -268,7 +267,7 @@ export default function EditorView() {
           const validated = editorRef.current?.revalidateBackendAnnos?.(data) ?? data
           setAnnotations(validated)
           editorRef.current?.dispatchSetAnnos?.(validated)
-        }).catch(() => {})
+        }).catch(e => console.warn('Failed to refresh annotations:', e))
       })
     }
   }, [projectId])
@@ -322,7 +321,7 @@ export default function EditorView() {
                   setCurrentProject(updated)
                 }
               })
-              .catch(() => {})
+              .catch(e => console.warn('Failed to sync cleared main_file:', e))
           }
         })
       }
@@ -339,7 +338,7 @@ export default function EditorView() {
       const validated = editorRef.current?.revalidateBackendAnnos?.(data) ?? data
       setAnnotations(validated)
       editorRef.current?.dispatchSetAnnos?.(validated)
-    }).catch(() => {})
+    }).catch(e => console.warn('Failed to load annotations on file ready:', e))
     const synthesis = storage.getSynthesis(pid)
     const editorRatio = synthesis.editorScrollRatioByFile[file]
     const previewRatio = synthesis.previewScrollRatioByFile[file]
@@ -474,7 +473,6 @@ export default function EditorView() {
                 placeholder={chatPlaceholder}
                 citation={pendingCitation}
                 onClearCitation={clearCitation}
-                getCursorContext={() => editorRef.current?.getCursorContext?.(50)}
                 onFileChanged={handleFileChanged}
                 onAnnotationChanged={handleAnnotationChanged}
                 getUserState={getUserState}
@@ -488,7 +486,6 @@ export default function EditorView() {
                 projectId={projectId}
                 editorRef={editorRef}
                 previewRef={previewRef}
-                handleCompile={handleCompile}
                 handleSave={handleSave}
                 handleFileSelect={handleFileSelect}
                 handleExitNotebook={handleExitNotebook}

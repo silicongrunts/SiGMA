@@ -216,7 +216,7 @@ export function matchAnnotation(doc, annotation) {
   }
 
   // 4b: Find best Levenshtein sliding-window match
-  const fuzzy = fuzzyFind(originalText, doc, storedFrom ?? 0, storedTo ?? 0 ?? 0)
+  const fuzzy = fuzzyFind(originalText, doc, storedFrom ?? 0, storedTo ?? 0)
 
   // Pick the better match
   const lcsScore = lcsMatch?.score ?? 0

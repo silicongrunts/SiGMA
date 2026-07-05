@@ -140,12 +140,12 @@ const actions = (set, get) => ({
   addAnnotation: (anno) => set(s => ({ annotations: [...s.annotations, anno], activeAnnotationId: anno.id, isAnnotationsLoaded: true })),
   updateAnnotation: (id, updates) => set(s => ({
     annotations: s.annotations.map(a => a.id === id ? { ...a, ...updates } : a),
-    isAnnotationsLoaded: s.isAnnotationsLoaded || true
+    isAnnotationsLoaded: true
   })),
   deleteAnnotation: (id) => set(s => ({
     annotations: s.annotations.filter(a => a.id !== id),
     activeAnnotationId: s.activeAnnotationId === id ? null : s.activeAnnotationId,
-    isAnnotationsLoaded: s.isAnnotationsLoaded || true
+    isAnnotationsLoaded: true
   })),
 
   setPendingCitation: (cite) => set({ pendingCitation: cite }),

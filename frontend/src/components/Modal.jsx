@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { X, FolderPlus, FilePlus, Edit3, Trash2, AlertTriangle, FileText, FileCode, TerminalSquare, Loader, Bot, UploadCloud, FileArchive } from 'lucide-react'
+import { X, Edit3, AlertTriangle, FileText, FileCode, TerminalSquare, Loader, Bot, UploadCloud, FileArchive } from 'lucide-react'
 import { projectsAPI } from '../api'
 
 export function ModalOverlay({ isOpen, onClose, children, isDanger }) {
@@ -200,7 +200,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreate }) {
           setTemplates(list)
           setTemplate(list[0].id)
         }
-      }).catch(() => {})
+      }).catch(e => console.warn('Failed to load project templates:', e))
     }
   }, [isOpen])
   useEffect(() => { if (isOpen) inputRef.current?.focus() }, [isOpen])

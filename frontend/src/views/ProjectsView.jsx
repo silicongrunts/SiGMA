@@ -18,7 +18,7 @@ import LanguageSelector from '../components/LanguageSelector'
 import { Spinner } from '../components/ui'
 import Toggle from '../components/Toggle'
 import { useTheme } from '../hooks/useTheme'
-import { Folder, Plus, Search, Trash2, Download, Pencil, Clock, Check, X, Wrench, Settings, Sun, Moon, ChevronDown, Globe, FileText, FilePlus, UploadCloud, FolderInput } from 'lucide-react'
+import { Folder, Plus, Search, Trash2, Download, Pencil, Clock, Check, X, Wrench, Settings, Sun, Moon, ChevronDown, Globe, FileText, FilePlus, UploadCloud } from 'lucide-react'
 
 function formatDate(dateStr, t) {
   if (!dateStr) return t('time.never')
@@ -79,6 +79,17 @@ export default function ProjectsView() {
   const [backendError, setBackendError] = useState(false)
   const nameEditRef = useRef(null)
   const descEditRef = useRef(null)
+  // Mirror the edit values into refs so finishEditing (called from the
+  // click-outside listener bound once per editingField change) reads the latest
+  // value instead of the one captured when editing started.
+  const nameEditValueRef = useRef('')
+  const descEditValueRef = useRef('')
+  useEffect(() => { nameEditValueRef.current = nameEditValue }, [nameEditValue])
+  useEffect(() => { descEditValueRef.current = descEditValue }, [descEditValue])
+  // Mirror forceSettings into a ref so loadProjects (captured once by the
+  // mount effect) reads the latest value instead of the initial false.
+  const forceSettingsRef = useRef(false)
+  useEffect(() => { forceSettingsRef.current = forceSettings }, [forceSettings])
 
   const loadProjects = async () => {
     try {
@@ -90,7 +101,7 @@ export default function ProjectsView() {
       // Backend is reachable — verify that critical models are configured.
       // If supervisor / RA / embedding are unset the platform can't function,
       // so force-open the system settings panel.
-      if (!forceSettings) {
+      if (!forceSettingsRef.current) {
         checkCriticalModels()
       }
     } catch (e) {
@@ -272,7 +283,7 @@ export default function ProjectsView() {
   const finishEditing = async (field) => {
     if (!field.projectId) { setEditingField({ projectId: null, field: null }); return }
     const isName = field.field === 'name'
-    const currentVal = isName ? nameEditValue : descEditValue
+    const currentVal = isName ? nameEditValueRef.current : descEditValueRef.current
     const trimmed = currentVal.trim()
 
     const maxLength = isName ? 100 : 500

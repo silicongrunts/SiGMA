@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useImperativeHandle, forwardRef, memo } from 'react'
 import { useTranslation } from 'react-i18next'
-import React from 'react'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.js?url'
 import { marked } from 'marked'
@@ -11,7 +10,7 @@ import { filesAPI, compileAPI } from '../api'
 import { storage } from '../utils/storage'
 import { getCompiledPdfName } from '../utils/constants'
 import { toastError } from './Toast'
-import { ZoomIn, ZoomOut, EyeOff, RotateCw, ArrowUp, Maximize2, FileSearch, FileText, Download, AlertTriangle, ChevronLeft, ChevronRight } from 'lucide-react'
+import { ZoomIn, ZoomOut, ArrowUp, Maximize2, FileSearch, FileText, Download, AlertTriangle, ChevronLeft, ChevronRight } from 'lucide-react'
 
 // Local worker (bundled, no CDN)
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
@@ -22,7 +21,6 @@ const PDFPage = memo(({ pdf, pageNumber, scale, onDoubleClick, isActive }) => {
   const canvasRef = useRef(null)
   const textLayerRef = useRef(null)
   const renderTaskRef = useRef(null)
-  const abortControllerRef = useRef(null)
 
   useEffect(() => {
     let isCancelled = false
@@ -235,7 +233,10 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
             const viewport = page.getViewport({ scale: 1.0, rotation: page.rotate })
             const padding = 80 // 40px each side
             setBaseScale((containerWidth - padding) / viewport.width)
-        } catch (e) {}
+        } catch (e) {
+            console.error('PDF base scale failed:', e)
+            toastError(t('preview.loadFailed'))
+        }
     }
     if (type === 'pdf') calcBase()
     else if (type === 'markdown') setBaseScale(1.0)
@@ -266,7 +267,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
       setNumPages(pdfDoc.numPages)
     } catch (e) {
       console.error("PDF Load Error:", e)
-      if (e.name !== 'AbortException') URL.revokeObjectURL(url)
+      if (e.name !== 'AbortException') { URL.revokeObjectURL(url); toastError(t('preview.loadFailed')) }
     }
   }, [])
 

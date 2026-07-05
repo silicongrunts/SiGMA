@@ -2,41 +2,32 @@
  * BrowserVNC - Chrome browser via noVNC
  * Uses iframe to embed noVNC client connecting through backend WebSocket proxy.
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Monitor, Loader2, AlertTriangle, RefreshCw } from 'lucide-react'
 import { browserAPI } from '../api'
+
+const POLL_INTERVAL_MS = 500
+const POLL_MAX_ATTEMPTS = 20
 
 export default function BrowserVNC({ projectId }) {
   const { t } = useTranslation()
   const [status, setStatus] = useState('starting') // starting | connected | error
   const [error, setError] = useState(null)
+  // Bumped on every start attempt; stale async chains bail out so they cannot
+  // call setStatus/setError after the component unmounts, projectId changes,
+  // or the user presses Retry while an earlier attempt is still in flight.
+  const activeTokenRef = useRef(0)
 
-  useEffect(() => {
-    if (!projectId) return
-    startBrowser()
-  }, [projectId])
-
-  const POLL_INTERVAL_MS = 500
-  const POLL_MAX_ATTEMPTS = 20
-
-  const waitForRunning = async (projectId) => {
-    for (let i = 0; i < POLL_MAX_ATTEMPTS; i++) {
-      try {
-        const data = await browserAPI.getStatus(projectId)
-        if (data && data.status === 'running') return true
-      } catch { /* ignore — may not be ready yet */ }
-      await new Promise(r => setTimeout(r, POLL_INTERVAL_MS))
-    }
-    return false
-  }
-
-  const startBrowser = async () => {
+  const startBrowser = useCallback(async () => {
+    const myToken = ++activeTokenRef.current
+    const isStale = () => myToken !== activeTokenRef.current
     setStatus('starting')
     setError(null)
     try {
       // Check if already running (shared across all projects)
       const statusData = await browserAPI.getStatus(projectId)
+      if (isStale()) return
       if (statusData && statusData.status === 'running') {
         setStatus('connected')
         return
@@ -44,21 +35,38 @@ export default function BrowserVNC({ projectId }) {
 
       // Not running — start it, then poll until ready
       const startData = await browserAPI.start(projectId)
+      if (isStale()) return
       if (startData && (startData.status === 'running' || startData.status === 'starting')) {
-        const ready = await waitForRunning(projectId)
-        if (ready) {
-          setStatus('connected')
-          return
+        // Poll until ready; abort early if a newer attempt supersedes this one.
+        for (let i = 0; i < POLL_MAX_ATTEMPTS; i++) {
+          if (isStale()) return
+          try {
+            const data = await browserAPI.getStatus(projectId)
+            if (isStale()) return
+            if (data && data.status === 'running') {
+              setStatus('connected')
+              return
+            }
+          } catch { /* ignore — may not be ready yet */ }
+          await new Promise(r => setTimeout(r, POLL_INTERVAL_MS))
         }
       }
 
+      if (isStale()) return
       throw new Error('Browser failed to start')
     } catch (err) {
+      if (isStale()) return
       console.error('BrowserVNC error:', err)
       setStatus('error')
       setError(err.message || t('browser.connectionFailed'))
     }
-  }
+  }, [projectId, t])
+
+  useEffect(() => {
+    if (!projectId) return
+    startBrowser()
+    return () => { activeTokenRef.current++ }  // invalidate the in-flight chain on unmount/projectId change
+  }, [projectId, startBrowser])
 
   if (status === 'error') {
     return (

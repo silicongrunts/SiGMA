@@ -54,11 +54,13 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   const stopAbortTimerRef = useRef(null)
   const stopRequestedRef = useRef(false)
   const scrollRef = useRef(null)
-  const headerRef = useRef(null)
   const replyInputRef = useRef(null)
   const wrapperRef = useRef(null)
   const isDraggingRef = useRef(false)
   const dragOffsetRef = useRef({ x: 0, y: 0 })
+  // Tracks the active drag/resize document listeners so they can be removed on
+  // unmount (a mouseup lost over an iframe would otherwise leak them forever).
+  const activeDragRef = useRef(null)
   const annoIdRef = useRef(annotation.id)
 
   // Keep ref in sync
@@ -87,6 +89,11 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       }
       stopRequestedRef.current = false
       taskIdRef.current = null
+      if (activeDragRef.current) {
+        document.removeEventListener('mousemove', activeDragRef.current.move)
+        document.removeEventListener('mouseup', activeDragRef.current.up)
+        activeDragRef.current = null
+      }
       setIsStreaming(false)
       setSiGMADOProcessingAnnotationId(null)
     }
@@ -175,9 +182,11 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       isDraggingRef.current = false
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
+      activeDragRef.current = null
     }
     document.addEventListener('mousemove', handleMouseMove)
     document.addEventListener('mouseup', handleMouseUp)
+    activeDragRef.current = { move: handleMouseMove, up: handleMouseUp }
   }
 
   // ── Resize handle ──
@@ -197,9 +206,11 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     const handleMouseUp = () => {
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
+      activeDragRef.current = null
     }
     document.addEventListener('mousemove', handleMouseMove)
     document.addEventListener('mouseup', handleMouseUp)
+    activeDragRef.current = { move: handleMouseMove, up: handleMouseUp }
   }
 
   // ── Functional store updates (avoid stale closures) ──
@@ -399,7 +410,8 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     if (!onSaveBeforeAnnotationChat) return true
     try {
       return await onSaveBeforeAnnotationChat()
-    } catch {
+    } catch (e) {
+      console.warn('saveBeforeAnnotationChat failed:', e)
       return false
     }
   }, [onSaveBeforeAnnotationChat])
@@ -479,12 +491,12 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       updateLastThreadEntry(entry => ({ ...entry, isStreaming: false }))
       setIsStreaming(false)
       setSiGMADOProcessingAnnotationId(null)
-      onReloadAnnotation?.(annotation.id).catch(() => {})
+      onReloadAnnotation?.(annotation.id).catch(e => console.warn('Failed to reload annotation:', e))
       return
     }
 
     stopRequestedRef.current = true
-    try { await filesAPI.cancelAnnotationReply(projectId, taskId) } catch {}
+    try { await filesAPI.cancelAnnotationReply(projectId, taskId) } catch (e) { console.warn('Failed to cancel annotation reply:', e) }
 
     clearStopAbortTimer()
     stopAbortTimerRef.current = setTimeout(async () => {
@@ -569,7 +581,6 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
 
   // Check if the expanded diff's "before" text can still be found in the editor
   const diffApplicable = expandedDiff && editorContent?.includes(expandedDiff.before)
-  const diffExpanded = !!expandedDiff
 
   const handleApplyDiffFromPanel = () => {
     if (expandedDiff && onApplyDiff && diffApplicable) {
@@ -594,7 +605,6 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       >
         {/* Header - Draggable */}
         <div
-          ref={headerRef}
           onMouseDown={handleDragStart}
           className="px-4 py-3 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between bg-gray-50/50 dark:bg-gray-800/50 cursor-move select-none"
         >

@@ -184,7 +184,8 @@ function TreeNode({ node, projectId, level = 0, onFileClick, currentFile, onRefr
     // Multi-file drag → move all selected paths
     const jsonPaths = e.dataTransfer.getData('application/json')
     if (jsonPaths) {
-      const paths = JSON.parse(jsonPaths)
+      let paths
+      try { paths = JSON.parse(jsonPaths) } catch { return }
       await onRefresh('move', paths, node.path)
       return
     }
@@ -302,7 +303,6 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
 
   // --- Multi-selection state ---
   const [selectedPaths, setSelectedPaths] = useState(new Set())
-  const [anchorPath, setAnchorPath] = useState(null)
   const [rubberBand, setRubberBand] = useState(null)
   const treeContainerRef = useRef(null)
   const visiblePathsRef = useRef([])
@@ -318,7 +318,6 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
   // clearSelection: optionally set a new anchor (used by plain clicks)
   const clearSelection = useCallback((newAnchor = null) => {
     setSelectedPaths(new Set())
-    setAnchorPath(newAnchor)
     anchorPathRef.current = newAnchor
   }, [])
 
@@ -376,7 +375,6 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
         return next
       })
       anchorPathRef.current = node.path
-      setAnchorPath(node.path)
       return
     }
     if (e.shiftKey) {
@@ -550,8 +548,10 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
       } catch {
         // File-state pruning is a cache cleanup; root loading still succeeded.
       }
+    } catch (err) {
+      toastError(err.message || t('filetree.loadFailed'))
     } finally { setLoading(false) }
-  }, [currentProjectId, clearSelection, reconcileRemovedPaths])
+  }, [currentProjectId, clearSelection, reconcileRemovedPaths, t])
 
   const loadChildren = useCallback(async (parentPath) => {
     if (!currentProjectId || cacheRef.current[parentPath]) return
@@ -779,7 +779,9 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
     // Multi-file drag → move all to root
     const jsonPaths = e.dataTransfer.getData('application/json')
     if (jsonPaths) {
-      await performMove(JSON.parse(jsonPaths), '.')
+      let paths
+      try { paths = JSON.parse(jsonPaths) } catch { return }
+      await performMove(paths, '.')
       return
     }
     // Single drag → move to root

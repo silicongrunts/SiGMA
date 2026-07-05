@@ -98,7 +98,7 @@ export default function TerminalInstance({ slot, projectId, active, onExit }) {
         // Defer to next frame so the browser has settled layout before xterm recalculates rows.
         // Prevents the last row being partially obscured during rapid drag resize.
         requestAnimationFrame(() => {
-          try { fitAddonRef.current.fit() } catch { /* ignore */ }
+          try { fitAddonRef.current.fit() } catch { /* container may not be visible yet */ }
         })
       }
     })
@@ -116,7 +116,7 @@ export default function TerminalInstance({ slot, projectId, active, onExit }) {
   useEffect(() => {
     if (active && fitAddonRef.current && containerRef.current?.offsetParent !== null) {
       requestAnimationFrame(() => {
-        try { fitAddonRef.current.fit() } catch { /* ignore */ }
+        try { fitAddonRef.current.fit() } catch { /* container may not be visible yet */ }
       })
     }
   }, [active])

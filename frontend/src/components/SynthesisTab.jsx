@@ -22,7 +22,6 @@ export default function SynthesisTab({
   projectId,
   editorRef,
   previewRef,
-  handleCompile,
   handleSave,
   handleFileSelect,
   handleExitNotebook,
@@ -45,6 +44,7 @@ export default function SynthesisTab({
       cancelAnimationFrame(editorScrollRafRef.current)
       cancelAnimationFrame(editorCursorRafRef.current)
       cancelAnimationFrame(previewScrollRafRef.current)
+      cancelAnimationFrame(mdPreviewRafRef.current)
     }
   }, [])
 
@@ -52,7 +52,6 @@ export default function SynthesisTab({
 
   return (
     <ResizablePanels
-      key={`${projectId}-${showPreview ? 3 : 2}`}
       initialSizes={showPreview ? ['50%', '1'] : ['1']}
       resizerContent={showPreview ? [(
         <button
@@ -65,7 +64,7 @@ export default function SynthesisTab({
               line, column
             }).then(res => {
               if (res.success) previewRef.current?.scrollToPage(res.page, res.x, res.y)
-            })
+            }).catch(() => { /* no SyncTeX mapping for this cursor, or transient network error — both non-fatal for the forward-jump button */ })
           }} style={{ display: isTexFile ? 'block' : 'none' }} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-[100] p-2.5 bg-sigma-600 text-white rounded-full shadow-2xl border-4 border-white hover:scale-110 active:scale-90 transition-all">
           <ChevronRight className="w-5 h-5" />
         </button>

@@ -626,7 +626,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
           }
         }
     }, { passive: true })
-    viewRef.current = view; return () => view.destroy()
+    viewRef.current = view; return () => { if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current); view.destroy() }
   }, [])
 
   // ── Reconfigure editor theme when dark mode toggles ──

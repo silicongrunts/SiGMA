@@ -3,10 +3,10 @@
  * Layout: left list + right detail/edit panel
  * Features: sort, folders, multi-select, context menu, drag-and-drop
  */
-import { useState, useEffect, useCallback, useRef, useLayoutEffect, useContext } from 'react'
+import { useState, useEffect, useCallback, useRef, useContext } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useClickOutside } from '../hooks/useClickOutside'
-import { Search, Plus, FileText, Trash2, Edit3, X, Upload, BookOpen, Tag, AlertCircle, File, CheckCircle, Loader, ScrollText, RotateCw, Redo2, Download, Pencil, Check, Sparkles, Folder, ChevronRight, FolderPlus, Move, ChevronDown, ArrowLeft } from 'lucide-react'
+import { FileText, Trash2, Edit3, X, Upload, Tag, AlertCircle, File, CheckCircle, Loader, ScrollText, Redo2, Download, Pencil, Check, Sparkles, Folder, ChevronRight, FolderPlus, Move, ChevronDown, ArrowLeft } from 'lucide-react'
 import { libraryAPI } from '../api'
 import { toastError, toastSuccess } from './Toast'
 import { MarkdownContent } from './ChatShared'
@@ -225,6 +225,8 @@ export default function LibraryBrowser({ projectId }) {
   const [searchQuery, setSearchQuery] = useState('')
   const [searchMode, setSearchMode] = useState(() => getStoredLibraryState().searchMode)
   const [selectedDocId, setSelectedDocId] = useState(() => getStoredLibraryState().selectedDocId)
+  const selectedDocIdRef = useRef(selectedDocId)
+  useEffect(() => { selectedDocIdRef.current = selectedDocId }, [selectedDocId])
   const [selectedDoc, setSelectedDoc] = useState(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [isSearchResult, setIsSearchResult] = useState(false)
@@ -284,7 +286,15 @@ export default function LibraryBrowser({ projectId }) {
   const [editingPage, setEditingPage] = useState(false)
   const [pageInput, setPageInput] = useState('')
   const pageInputRef = useRef(null)
+  // Mirror of `documents` for reading the latest snapshot inside async callbacks
+  // (polling) without scheduling side effects inside a state updater.
+  const documentsRef = useRef([])
+  // Monotonic id used to discard stale search responses (late old result must
+  // not overwrite a newer one).
+  const searchReqIdRef = useRef(0)
   const PAGE_SIZE = 50
+
+  useEffect(() => { documentsRef.current = documents }, [documents])
 
   // Refs
 
@@ -425,11 +435,13 @@ export default function LibraryBrowser({ projectId }) {
   // Silent polling
   useEffect(() => {
     if (!projectId) return
+    let cancelled = false
     const timer = setInterval(async () => {
       try {
         if (isSearchResult) {
           if (selectedDocId) {
             const doc = await libraryAPI.get(projectId, selectedDocId, { include_content: false })
+            if (cancelled) return
             setSelectedDoc(prev => {
               if (!prev || doc.processing_status !== prev.processing_status || doc.updated_at !== prev.updated_at) return doc
               return prev
@@ -446,69 +458,79 @@ export default function LibraryBrowser({ projectId }) {
         }
         if (currentFolderId) pollParams.parent_id = currentFolderId
         const data = await libraryAPI.list(projectId, pollParams)
+        if (cancelled) return
         const incoming = data.documents || []
         libraryAPI.statusSummary(projectId)
-          .then(summary => setStatusSummary(summary))
+          .then(summary => { if (!cancelled) setStatusSummary(summary) })
           .catch(e => console.debug('Library status poll failed:', e.message))
-        setDocuments(prev => {
-          const changed = incoming.length !== prev.length ||
-            incoming.some(d => {
-              const old = prev.find(p => p.id === d.id)
-              return !old || old.processing_status !== d.processing_status || old.updated_at !== d.updated_at
-            })
-          if (!changed) return prev
-          if (selectedDocId) {
-            const updated = incoming.find(d => d.id === selectedDocId)
-            const oldSel = prev.find(d => d.id === selectedDocId)
-            if (updated && oldSel && (updated.processing_status !== oldSel.processing_status || updated.updated_at !== oldSel.updated_at)) {
-              libraryAPI.get(projectId, selectedDocId, { include_content: false })
-                .then(doc => setSelectedDoc(doc))
-                .catch(() => {})
-            }
+        // Read the previous snapshot from a ref so the change check and the
+        // selected-doc side-effect live outside the setDocuments updater
+        // (updaters must be pure — StrictMode double-invokes them).
+        const prev = documentsRef.current
+        const changed = incoming.length !== prev.length ||
+          incoming.some(d => {
+            const old = prev.find(p => p.id === d.id)
+            return !old || old.processing_status !== d.processing_status || old.updated_at !== d.updated_at
+          })
+        if (!changed) return
+        setDocuments(incoming)
+        if (selectedDocId) {
+          const updated = incoming.find(d => d.id === selectedDocId)
+          const oldSel = prev.find(d => d.id === selectedDocId)
+          if (updated && oldSel && (updated.processing_status !== oldSel.processing_status || updated.updated_at !== oldSel.updated_at)) {
+            libraryAPI.get(projectId, selectedDocId, { include_content: false })
+              .then(doc => { if (!cancelled) setSelectedDoc(doc) })
+              .catch(() => {})
           }
-          return incoming
-        })
+        }
       } catch (e) {
+        if (cancelled) return
         console.debug('Library poll failed:', e.message)
         if (currentFolderId) resetToRoot()
       }
     }, 5000)
-    return () => clearInterval(timer)
+    return () => { cancelled = true; clearInterval(timer) }
   }, [projectId, selectedDocId, isSearchResult, sortBy, sortOrder, currentFolderId, page, resetToRoot])
 
   // Search handlers
   const handleSearch = async () => {
     if (!searchQuery.trim() || !projectId) return
+    const myId = ++searchReqIdRef.current
     setLoading(true)
     try {
       const api = searchMode === 'semantic' ? libraryAPI.ragSearch : libraryAPI.search
       const options = { limit: 100 }
       if (currentFolderId) options.parent_id = currentFolderId
       const data = await api(projectId, searchQuery, options)
+      if (myId !== searchReqIdRef.current) return  // a newer search superseded this one
       setIsSearchResult(true)
       setDocuments(data.documents || [])
       setSelectedIds(new Set())
     } catch (e) {
+      if (myId !== searchReqIdRef.current) return
       toastError(getLibrarySearchErrorMessage(e, t))
     } finally {
-      setLoading(false)
+      if (myId === searchReqIdRef.current) setLoading(false)
     }
   }
 
   const handleKeywordSearch = async (keyword) => {
     if (!keyword || !projectId) return
+    const myId = ++searchReqIdRef.current
     setSearchQuery(keyword)
     setLoading(true)
     try {
       const options = { limit: 100 }
       if (currentFolderId) options.parent_id = currentFolderId
       const data = await libraryAPI.search(projectId, keyword, options)
+      if (myId !== searchReqIdRef.current) return  // a newer search superseded this one
       setIsSearchResult(true)
       setDocuments(data.documents || [])
     } catch (e) {
+      if (myId !== searchReqIdRef.current) return
       toastError(getLibrarySearchErrorMessage(e, t))
     } finally {
-      setLoading(false)
+      if (myId === searchReqIdRef.current) setLoading(false)
     }
   }
 
@@ -677,7 +699,7 @@ export default function LibraryBrowser({ projectId }) {
   }
 
   const toggleSelectAll = () => {
-    const selectableIds = documents.filter(d => !d.is_folder || true).map(d => d.id)
+    const selectableIds = documents.map(d => d.id)
     if (selectedIds.size === selectableIds.length && selectableIds.length > 0) {
       setSelectedIds(new Set())
     } else {
@@ -908,7 +930,7 @@ export default function LibraryBrowser({ projectId }) {
     if (item.is_folder) {
       return [
         { label: t('library.open'), icon: <Folder className="w-4 h-4" />, action: () => navigateToFolder(item.id, item.title) },
-        { label: t('common.rename'), icon: <Edit3 className="w-4 h-4" />, action: () => startRename(item.id, item.title, true) },
+        { label: t('common.rename'), icon: <Edit3 className="w-4 h-4" />, action: () => startRename(item.id, item.title) },
         { separator: true },
         { label: t('library.deleteFolder'), icon: <Trash2 className="w-4 h-4" />, danger: true, action: () => handleDelete(item.id) },
       ]
@@ -916,7 +938,7 @@ export default function LibraryBrowser({ projectId }) {
 
     const opts = [
       { label: t('library.viewDetails'), icon: <FileText className="w-4 h-4" />, action: () => selectDocument(item.id) },
-      { label: t('common.rename'), icon: <Edit3 className="w-4 h-4" />, action: () => startRename(item.id, item.title, false) },
+      { label: t('common.rename'), icon: <Edit3 className="w-4 h-4" />, action: () => startRename(item.id, item.title) },
       { separator: true },
       { label: t('library.moveTo'), icon: <Move className="w-4 h-4" />, action: () => openMoveModal([item.id]) },
     ]
@@ -928,16 +950,13 @@ export default function LibraryBrowser({ projectId }) {
     return opts
   }
 
-  // Fix 7: Rename state and functions
   const [renamingItemId, setRenamingItemId] = useState(null)
   const [renameValue, setRenameValue] = useState('')
-  const [renameIsFolder, setRenameIsFolder] = useState(false)
   const renameInputRef = useRef(null)
 
-  const startRename = (id, title, isFolder) => {
+  const startRename = (id, title) => {
     setRenamingItemId(id)
     setRenameValue(title)
-    setRenameIsFolder(isFolder)
     setContextMenu(null)
   }
 
@@ -1212,10 +1231,17 @@ export default function LibraryBrowser({ projectId }) {
             onRefresh={async () => {
               await loadDocuments();
               if (selectedDocId) {
-                try { setSelectedDoc(await libraryAPI.get(projectId, selectedDocId, { include_content: false })); } catch {}
+                const targetId = selectedDocId
+                try {
+                  const doc = await libraryAPI.get(projectId, targetId, { include_content: false })
+                  // Guard against the selection changing during the await.
+                  if (targetId !== selectedDocIdRef.current) return
+                  setSelectedDoc(doc)
+                } catch (e) { console.warn('Failed to refresh selected document:', e) }
               }
             }}
             onKeywordSearch={handleKeywordSearch}
+            onEditKeywords={(docId, keywords) => setKeywordEdit({ docId, keywords })}
             width={panelWidth}
           />
         </>
@@ -1565,7 +1591,7 @@ function ContentField({ docId, projectId, value, previewValue = '', truncated = 
 /* =========================================================================
  * Detail Panel
  * ========================================================================= */
-function DetailPanel({ doc, projectId, onClose, getStatusBadge, onFieldSave, onReprocess, isReprocessing, onViewLog, onDelete, onRefresh, onKeywordSearch, width }) {
+function DetailPanel({ doc, projectId, onClose, getStatusBadge, onFieldSave, onReprocess, isReprocessing, onViewLog, onDelete, onRefresh, onKeywordSearch, onEditKeywords, width }) {
   const { t } = useTranslation()
   const parsedKeywords = doc.keywords || []
   const [aiExtracting, setAiExtracting] = useState(false)
@@ -1624,7 +1650,7 @@ function DetailPanel({ doc, projectId, onClose, getStatusBadge, onFieldSave, onR
           <div className="flex items-center gap-1.5 mb-1">
             <span className="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-wider">{t('library.keywords')}</span>
             <button
-              onClick={() => setKeywordEdit({ docId: doc.id, keywords: parsedKeywords })}
+              onClick={() => onEditKeywords?.(doc.id, parsedKeywords)}
               className="p-0.5 text-transparent group-hover:text-gray-400 dark:group-hover:text-gray-500 hover:!text-sigma-600 rounded transition-colors"
               title={t('library.editKeywords')}
             >

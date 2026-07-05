@@ -1,5 +1,4 @@
 import { useTranslation } from 'react-i18next'
-import { X, Check } from 'lucide-react'
 import { MarkdownContent } from './ChatShared'
 
 /**
@@ -79,6 +78,7 @@ export function InlineDiffViewer({ annotation, message, onApplyDiff, onDeleteAnn
   // Use message.content if message is given, otherwise use annotation text.
   const textToParse = message?.content || annotation.text
   const { diffs, parts } = parseDiffs(textToParse)
+  const { t } = useTranslation()
 
   if (diffs.length === 0) {
     // No diffs, render entire message as markdown
@@ -119,14 +119,14 @@ export function InlineDiffViewer({ annotation, message, onApplyDiff, onDeleteAnn
                     : 'bg-gray-100 hover:bg-gray-200 text-gray-400 line-through dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-500'
                 }`}
               >
-                View Changes ({diff.before.slice(0, 20)}...)
+                {t('diff.viewChanges', { preview: diff.before.slice(0, 20) })}
               </button>
             ) : (
               <button
                 onClick={() => onExpandDiff(null)}
                 className="inline-flex items-center gap-1 px-2 py-1 bg-gray-200 hover:bg-gray-300 text-gray-700 dark:bg-gray-700 dark:hover:bg-gray-600 dark:text-gray-300 text-xs font-bold rounded transition-colors"
               >
-                Hide Changes
+                {t('diff.hideChanges')}
               </button>
             )}
           </div>

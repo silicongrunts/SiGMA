@@ -85,11 +85,8 @@ export function useFileActions({ projectId, editorRef, previewRef, handleSave })
       const data = await filesAPI.read(projectId, node.path)
       validatedContent = data.content ?? ''
       if (data.hash) state.setFileHash(data.hash)
-      // Backend throws BinaryFileError for binary files; this check is
-      // a safety net for edge cases where the backend returns non-text.
-      if (!validatedContent && validatedContent !== '') {
-        isBinary = true
-      }
+      // Binary content is surfaced via BinaryFileError on the backend side
+      // (handled in the catch below); no client-side heuristic needed here.
     } catch (error) {
       if (error?.status === 400 && String(error.message || '').includes('Cannot open binary file')) {
         isBinary = true
@@ -132,13 +129,14 @@ export function useFileActions({ projectId, editorRef, previewRef, handleSave })
           .then(updated => {
             const current = useStore.getState()
             if (current.currentProject?.id !== project.id) return
+            // If the user is still on this file, sync the authoritative project
+            // record from the backend. Otherwise leave the optimistic update in
+            // place; a later file selection will reconcile as needed.
             if (current.currentFile === node.path) {
               current.setCurrentProject(updated)
-            } else if (!current.currentProject?.main_file && updated.main_file === node.path) {
-              projectsAPI.update(project.id, { main_file: '' }).catch(() => {})
             }
           })
-          .catch(() => { /* non-critical */ })
+          .catch(e => console.warn('Failed to auto-set main_file:', e))
       }
     } else if (ext === 'md') {
       state.setIsTexFile(false)

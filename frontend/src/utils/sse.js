@@ -108,7 +108,10 @@ export function createSSEStreamParser({ onEvent, onError, onDone }) {
         onError(err)
       }
     } finally {
-      try { reader.releaseLock() } catch {}
+      try { reader.releaseLock() } catch (e) {
+        // releaseLock throws if the reader is mid-read or already released;
+        // either way the stream is finished, so the lock state is irrelevant.
+      }
 
       // Fire done if we never received an explicit done event
       if (!receivedDoneEvent && onDone) {

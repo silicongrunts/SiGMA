@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { AlertTriangle, BookOpen, Check, CheckCircle2, ChevronDown, Circle, Code2, Eye, Globe2, Link2, Loader2, Minus, RotateCcw, Save, Sparkles, XCircle, X } from 'lucide-react'
 import { systemAPI } from '../api'
 import { createSSEStreamParser } from '../utils/sse'
-import { toastError, toastSuccess } from './Toast'
+import { toastError } from './Toast'
 
 const MODEL_ROLES = [
   ['supervisor', 'system.role.supervisor'],
@@ -724,6 +724,7 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
   const [checkPhase, setCheckPhase] = useState(null)   // null | 'confirming' | 'checking' | 'results'
   const [checkResults, setCheckResults] = useState([])
   const checkAbortRef = useRef(null)
+  const checkTimersRef = useRef([])
   const [restarting, setRestarting] = useState(false)
   const [restartCountdown, setRestartCountdown] = useState(10)
   const restartTimerRef = useRef(null)
@@ -794,7 +795,12 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
 
   // Cleanup timer on unmount.
   useEffect(() => {
-    return () => clearTimeout(restartTimerRef.current)
+    return () => {
+      clearTimeout(restartTimerRef.current)
+      checkAbortRef.current?.abort()
+      checkTimersRef.current.forEach(clearTimeout)
+      checkTimersRef.current = []
+    }
   }, [])
 
   if (!isOpen) return null
@@ -915,7 +921,7 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
     setSaving(true)
     setError('')
     try {
-      const result = await systemAPI.updateSettings(mode === 'yaml' ? { content: yamlContent } : { config })
+      await systemAPI.updateSettings(mode === 'yaml' ? { content: yamlContent } : { config })
       const reloaded = await systemAPI.getSettings()
       setConfig(cloneConfig(reloaded.config))
       setOriginalConfig(cloneConfig(reloaded.config))
@@ -944,6 +950,14 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
   const handleCheckAndSave = async () => {
     setCheckPhase('checking')
     setCheckResults([])
+    // Clear any timers left over from a previous check run so the array
+    // does not grow across repeated runs (they are already fired/no-op).
+    checkTimersRef.current.forEach(clearTimeout)
+    checkTimersRef.current = []
+    // Local mirror of the latest check results so the check_done branch can
+    // decide success/failure without scheduling side effects inside a state
+    // updater (which StrictMode double-invokes).
+    let latestResults = []
     const abort = new AbortController()
     checkAbortRef.current = abort
 
@@ -967,33 +981,33 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
               { role: 'embedding', label: 'system.checkEmbedding', status: 'pending' },
               { role: 'rerank', label: 'system.checkRerank', status: 'pending' },
             ]
+            latestResults = items
             setCheckResults(items)
           }
           if (type === 'check_progress') {
-            setCheckResults(prev => prev.map(r =>
+            latestResults = latestResults.map(r =>
               r.role === data.role ? { ...r, status: 'running' } : r
-            ))
+            )
+            setCheckResults(latestResults)
           }
           if (type === 'check_result') {
             const result = data.message
               ? { ...data, message: humanizeSettingsError(data.message, t) }
               : data
-            setCheckResults(prev => prev.map(r =>
+            latestResults = latestResults.map(r =>
               r.role === data.role ? { ...r, ...result } : r
-            ))
+            )
+            setCheckResults(latestResults)
           }
           if (type === 'check_done') {
-            setCheckResults(prev => {
-              const hasFailure = prev.some(r => r.status === 'fail')
-              if (!hasFailure) {
-                // Show results briefly then auto-save
-                setTimeout(() => setCheckPhase('results'), 0)
-                setTimeout(() => handleSaveDirect(), 1200)
-              } else {
-                setTimeout(() => setCheckPhase('results'), 0)
-              }
-              return prev
-            })
+            // Schedule side effects outside the state updater so StrictMode's
+            // double-invoke does not fire handleSaveDirect twice. Timers are
+            // tracked for cancellation on unmount/close.
+            const hasFailure = latestResults.some(r => r.status === 'fail')
+            checkTimersRef.current.push(setTimeout(() => setCheckPhase('results'), 0))
+            if (!hasFailure) {
+              checkTimersRef.current.push(setTimeout(() => handleSaveDirect(), 1200))
+            }
           }
         },
         onError: () => {
@@ -1004,15 +1018,19 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
       await parser.start(reader, decoder, abort.signal)
     } catch (err) {
       if (abort.signal.aborted) return
-      setCheckResults(prev => {
-        if (prev.length === 0) {
-          return [{ role: 'structure', label: 'system.checkConfigStructure', status: 'fail', message: humanizeSettingsError(err.message || t('system.toast.checkStartFailed'), t) }]
-        }
-        return prev
-      })
+      const failed = humanizeSettingsError(err.message || t('system.toast.checkStartFailed'), t)
+      latestResults = latestResults.length > 0 ? latestResults : [
+        { role: 'structure', label: 'system.checkConfigStructure', status: 'fail', message: failed },
+      ]
+      setCheckResults(latestResults)
       setCheckPhase('results')
     } finally {
       checkAbortRef.current = null
+      // Note: checkTimersRef is intentionally NOT reset here. The check_done
+      // handler schedules timers (setCheckPhase + handleSaveDirect) that may
+      // still be pending when the stream finishes; clearing the array would
+      // orphan them and prevent the unmount cleanup from cancelling them.
+      // Stale ids are cleared at the start of the next run instead.
     }
   }
 

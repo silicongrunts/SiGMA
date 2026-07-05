@@ -282,7 +282,7 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
         // the off state and the on+N-minutes state.
         setSnapshotInterval(config.snapshot_enabled === false ? 0 : (config.snapshot_interval_minutes || 5))
         setTips(config.tips || "")
-      }).catch(() => {})
+      }).catch(e => console.warn('Failed to load project config:', e))
     }
   }, [currentProject?.id])
 
@@ -393,7 +393,7 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
         }
         if (data.root?.children) scan(data.root.children)
         setTexFiles(list)
-      })
+      }).catch(e => console.warn('Failed to load TeX file list:', e))
     }
   }, [showSettings, currentProject?.id])
 

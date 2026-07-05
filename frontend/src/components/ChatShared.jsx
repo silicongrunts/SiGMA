@@ -2,7 +2,7 @@
  * ChatShared - Reusable chat sub-components
  * Extracted from App.jsx for use in sidebar chat, ExploreTab, and LibraryTab.
  */
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
@@ -85,8 +85,13 @@ function sanitizeToolParams(paramsStr) {
 }
 
 export const MarkdownContent = ({ content, projectId = null }) => {
-    const parsed = marked.parse(content || '')
-    const html = DOMPurify.sanitize(rewriteProjectImageSrc(parsed, projectId))
+    // Memoize parsing+sanitizing: in streaming chat the parent re-renders on
+    // every token delta, and without this every prior message re-parses its
+    // full markdown each frame.
+    const html = useMemo(() => {
+        const parsed = marked.parse(content || '')
+        return DOMPurify.sanitize(rewriteProjectImageSrc(parsed, projectId))
+    }, [content, projectId])
     return (
         <div
             className="sigma-content text-sm leading-relaxed break-words overflow-hidden"
@@ -103,7 +108,7 @@ export const MarkdownContent = ({ content, projectId = null }) => {
 function AgentToolStep({ step }) {
   const isRunning = step.status === 'running'
   const [agentOpen, setAgentOpen] = useState(isRunning)
-  const agentLabel = step.agentType || step.agentType || 'agent'
+  const agentLabel = step.agentType || 'agent'
   return <div className="flex flex-col gap-0.5 py-0.5">
       <button
           onClick={() => setAgentOpen(!agentOpen)}

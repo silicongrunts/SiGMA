@@ -63,7 +63,7 @@ export default function NotebookEditor({ projectId, filePath, onBack }) {
       const target = snapshot.selector ? doc.querySelector(snapshot.selector) : null
       if (target) target.scrollTop = snapshot.top
       else win.scrollTo(0, snapshot.top)
-    } catch {}
+    } catch { /* cross-origin iframe DOM access can throw; scroll restore is best-effort */ }
   }, [])
 
   const reloadNotebookFrame = useCallback((overlayDelay = 250) => {
