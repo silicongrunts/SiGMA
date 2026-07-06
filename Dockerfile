@@ -135,7 +135,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
         ca-certificates \
-        chromium \
+        chromium=147.0.7727.137-1~deb12u1 \
+        chromium-common=147.0.7727.137-1~deb12u1 \
         curl \
         fontconfig \
         git \
@@ -152,9 +153,10 @@ RUN apt-get update \
         supervisor \
         tini \
         wget \
-        x11vnc \
-        xvfb \
-        websockify \
+        x11vnc=0.9.16-9 \
+        xvfb=2:21.1.7-3+deb12u12 \
+        websockify=0.10.0+dfsg1-4+b1 \
+        python3-websockify=0.10.0+dfsg1-4+b1 \
         fonts-liberation \
         fonts-noto-cjk \
     && ln -sf /usr/bin/chromium /usr/bin/chromium-browser \
