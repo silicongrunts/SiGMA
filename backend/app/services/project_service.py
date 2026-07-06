@@ -282,15 +282,12 @@ class ProjectService:
     # ------------------------------------------------------------------
 
     def list_templates(self) -> List[Dict]:
-        """Scan template directories for available project templates."""
-        user_tpl_dir = self.SIGMA_DIR / "templates"
-        builtin_dir = Path(__file__).resolve().parent.parent / "templates"
+        """Scan the user template directory for available project templates."""
+        tpl_dir = self.SIGMA_DIR / "templates"
 
         results = {}
-        for base in [user_tpl_dir, builtin_dir]:
-            if not base.is_dir():
-                continue
-            for d in base.iterdir():
+        if tpl_dir.is_dir():
+            for d in tpl_dir.iterdir():
                 if not d.is_dir():
                     continue
                 meta_file = d / "template.json"
@@ -343,9 +340,9 @@ class ProjectService:
         project_path.mkdir(parents=True, exist_ok=True)
 
         # Resolve template directory
-        user_tpl = self.SIGMA_DIR / "templates" / template
-        builtin_tpl = Path(__file__).resolve().parent.parent / "templates" / template
-        src_dir = user_tpl if user_tpl.is_dir() else builtin_tpl if builtin_tpl.is_dir() else None
+        src_dir = self.SIGMA_DIR / "templates" / template
+        if not src_dir.is_dir():
+            src_dir = None
 
         main_file = ""
         if src_dir:

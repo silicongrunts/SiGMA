@@ -7,7 +7,7 @@ DEFAULTS_DIR="/app/docker/userdata-defaults"
 mkdir -p "${USERDATA_DIR}"
 
 # Seed userdata on first run (empty directory check).
-if [ -z "$(find "${USERDATA_DIR}" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+if [ ! -d "${USERDATA_DIR}/.SiGMA" ]; then
   echo "[entrypoint] seeding userdata from ${DEFAULTS_DIR}"
   cp -a "${DEFAULTS_DIR}/." "${USERDATA_DIR}/"
 fi
