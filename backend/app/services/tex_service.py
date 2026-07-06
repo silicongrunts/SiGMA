@@ -153,7 +153,7 @@ class TeXService:
     async def update_tlmgr(self) -> AsyncIterator[str]:
         yield self._event("start", {"operation": "update_tlmgr"})
         year = self._current_year()
-        async for event in self._run([self._update_tlmgr_bin(year), "--update"]):
+        async for event in self._run([self._update_tlmgr_bin(year), "--", "--update"]):
             yield event
 
     async def switch_year(self, repository: str | None = None, target_year: str | None = None) -> AsyncIterator[str]:
