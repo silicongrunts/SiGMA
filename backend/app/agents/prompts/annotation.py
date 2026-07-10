@@ -10,19 +10,20 @@ annotation_content may contain <diff> blocks to suggest code changes:
 <diff><before>original text</before><after>new text</after></diff>
 Each <before> must appear exactly once in the file — zero or multiple matches is not allowed..
 
-Output: "Annotation created successfully, ID: {id}" on success."""
+Tool result: "Annotation created successfully, ID: {id}" on success.  
+These IDs are for subsequent tool calls only and not visible to the user."""
 
 PROMPT_ANNOTATION_RM = """Delete one or more annotations.
 
 Accepts a single ID or an array of IDs. Provide at least the first 8 characters of each ID for prefix matching.
 
-Output per ID: "Annotation {id} deleted" or "Error for {id}: {reason}"."""
+Tool result, one line per ID: "Annotation {id} deleted" or "Error for {id}: {reason}". These IDs are for subsequent tool calls only."""
 
 PROMPT_ANNOTATION_GET = """Retrieve the full thread of one or more annotations.
 
 Accepts a single ID or an array of IDs. Provide at least the first 8 characters of each ID for prefix matching.
 
-Output (XML):
+Tool result (XML):
 <annotation><id>full-id</id><file_content>original text snapshot</file_content><reply><role>SiGMA|user</role><text>message content</text></reply>...</annotation>
 One block per matched annotation. Errors shown inline as "Error for {id}: {reason}"."""
 
@@ -34,13 +35,13 @@ Each <before> must appear exactly once in the annotation's file.
 
 Provide at least the first 8 characters of the ID for prefix matching.
 
-Output: "Reply added to annotation {id}" or "Error: {reason}"."""
+Tool result: "Reply added to annotation {id}" or "Error: {reason}"."""
 
 PROMPT_ANNOTATION_LIST = """List annotations on one or more project files.
 
 Accepts a single file path or an array of file paths.
 
-Output (XML):
+Tool result (XML):
 --- {file} ({N} annotations) ---
 <annotation><id>full-id</id><summary>first 80 chars of first reply...</summary></annotation>
 Grouped by file. Files with no annotations show "No annotations on {file}"."""
