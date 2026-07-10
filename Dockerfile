@@ -56,6 +56,32 @@ RUN python -m venv /opt/venv-sigma \
     && /opt/venv-sigma/bin/pip install --no-cache-dir \
         -r /tmp/requirements-sigma.txt
 
+# Slim the venv before COPY into the final image. Everything removed here is
+# either a transitive dep SiGMA never imports at runtime, or a dev-only
+# artifact no Python import path ever reads. Verified safe via import trace
+# and `from app.main import app` (127 routes) in a clean env:
+#   - kubernetes (83MB): litellm's optional K8s proxy support. litellm has
+#     zero top-level `import kubernetes`; SiGMA only calls litellm's
+#     completion / acompletion / Router.
+#   - Faker (25MB): polyfactory's test-data generator dep. SiGMA runtime
+#     imports neither polyfactory nor faker.
+#   - torch/test + torch/include + torch/share (143MB): C++ headers, unit
+#     tests, example data. Only needed to compile C++ extensions or run
+#     torch's own test suite.
+#   - __pycache__ / *.pyc (~470MB, 27k files): bytecode cache, auto-regenerated
+#     on first import. This is the single largest cleanup item.
+#   - pip itself (13MB): the venv is read-only at runtime; no pip needed.
+RUN /opt/venv-sigma/bin/pip uninstall -y kubernetes Faker 2>/dev/null || true \
+    && rm -rf \
+        /opt/venv-sigma/lib/python3.12/site-packages/torch/test \
+        /opt/venv-sigma/lib/python3.12/site-packages/torch/include \
+        /opt/venv-sigma/lib/python3.12/site-packages/torch/share \
+    && find /opt/venv-sigma -depth -type d -name __pycache__ -exec rm -rf {} + \
+    && find /opt/venv-sigma -depth -name '*.pyc' -delete \
+    && /opt/venv-sigma/bin/pip cache purge 2>/dev/null || true \
+    && rm -rf /opt/venv-sigma/lib/python3.12/site-packages/pip \
+              /opt/venv-sigma/lib/python3.12/site-packages/pip-*.dist-info
+
 # Dedicated Jupyter venv (kept separate so user pip installs in notebooks
 # can never contaminate the SiGMA venv).
 COPY backend/requirements-jupyter.txt /tmp/requirements-jupyter.txt
