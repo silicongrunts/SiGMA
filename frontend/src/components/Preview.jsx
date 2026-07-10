@@ -3,6 +3,9 @@ import { useTranslation } from 'react-i18next'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.js?url'
 import { marked } from 'marked'
+import { markedHighlight } from 'marked-highlight'
+import hljs from 'highlight.js'
+import 'highlight.js/styles/github-dark.css'
 import DOMPurify from 'dompurify'
 import renderMathInElement from 'katex/dist/contrib/auto-render.mjs'
 import { useStore } from '../store/useStore'
@@ -14,6 +17,22 @@ import { ZoomIn, ZoomOut, ArrowUp, Maximize2, FileSearch, FileText, Download, Al
 
 // Local worker (bundled, no CDN)
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
+
+// Extend the shared marked instance with syntax highlighting via highlight.js.
+// Applied as a marked extension (not setOptions) so it stays local to this file's
+// pipeline and does not alter token structure — ChatShared.jsx's own setOptions
+// (gfm/breaks) still govern block parsing.
+marked.use(markedHighlight({
+  langPrefix: 'hljs language-',
+  highlight(code, lang) {
+    const language = lang && hljs.getLanguage(lang) ? lang : 'plaintext'
+    try {
+      return hljs.highlight(code, { language }).value
+    } catch {
+      return code
+    }
+  },
+}))
 
 const PDFJS_ASSET_BASE = `${import.meta.env.BASE_URL || '/'}pdfjs/`
 
@@ -328,7 +347,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
 
   useEffect(() => {
     if (type === 'markdown' && containerRef.current) {
-        const el = containerRef.current.querySelector('.markdown-body')
+        const el = containerRef.current.querySelector('.prose')
         if (el) renderMathInElement(el, { delimiters: [{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}], throwOnError:false })
     }
   }, [mdContent, type, zoomLevel])
@@ -365,7 +384,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
       if (line.trimStart().startsWith('```')) { inCode = !inCode; return }
       if (!inCode && /^#{1,6}\s/.test(line)) srcLines.push(i)
     })
-    const domHeadings = containerRef.current.querySelectorAll('.markdown-body h1,h2,h3,h4,h5,h6')
+    const domHeadings = containerRef.current.querySelectorAll('.prose h1,h2,h3,h4,h5,h6')
     const count = Math.min(srcLines.length, domHeadings.length)
     const map = [{ srcLine: 0, el: null }]  // sentinel: top of document
     for (let i = 0; i < count; i++) {
@@ -405,7 +424,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
       }
 
       const tokens = marked.lexer(mdContent)
-      const domBlocks = containerRef.current.querySelectorAll('.markdown-body > *')
+      const domBlocks = containerRef.current.querySelectorAll('.prose > *')
       let searchOffset = 0
       const map = []
 
@@ -538,7 +557,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
         else hi = mid
       }
 
-      const mdBody = container.querySelector('.markdown-body')
+      const mdBody = container.querySelector('.prose')
       if (!mdBody) return
       const sectionEls = []
       let startEl = map[lo].el || mdBody.firstElementChild
@@ -688,7 +707,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
         ) : type === 'markdown' ? (
             <div className="flex flex-col items-center w-full m-auto py-12 px-8">
                 <div
-                    className="markdown-body bg-white dark:bg-gray-800 p-12 mx-auto shadow-2xl border border-gray-200 dark:border-gray-700 mb-12"
+                    className="prose dark:prose-invert max-w-none prose-pre:font-mono prose-code:font-mono prose-code:before:hidden prose-code:after:hidden bg-white dark:bg-gray-800 p-12 mx-auto shadow-2xl border border-gray-200 dark:border-gray-700 mb-12"
                     style={{ maxWidth: '48rem', width: '100%', fontSize: `${zoomLevel}rem` }}
                     dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(String(mdContent ?? ''))) }}
                 />

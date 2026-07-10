@@ -21,15 +21,8 @@
   background: #d1d5db;
 }
 
-/* Markdown preview styles */
-.markdown-body {
-  padding: 40px;
-  color: #24292f;
-  /* Ensure long words/URLs wrap instead of overflowing the 48rem column.
-     Inline KaTeX still overflows by design (formulas cannot break mid-way). */
-  overflow-wrap: break-word;
-  word-break: break-word;
-}
+/* Markdown preview base is now provided by Tailwind Typography (`.prose`).
+   Only project-specific overrides (highlight sync, KaTeX scroll) live here. */
 
 /* Sigma Markdown Chat Styles */
 .sigma-markdown {
@@ -125,125 +118,37 @@
 .sigma-markdown li { margin-bottom: 0.25em; }
 .sigma-markdown blockquote { border-left: 4px solid #e5e7eb; padding-left: 1em; color: #6b7280; font-style: italic; }
 
-.markdown-body h1 {
-  font-size: 2em;
-  font-weight: 600;
-  margin-bottom: 0.5em;
-  border-bottom: 1px solid #e5e7eb;
-  padding-bottom: 0.3em;
-}
-
-.markdown-body h2 {
-  font-size: 1.5em;
-  font-weight: 600;
-  margin-bottom: 0.5em;
-  border-bottom: 1px solid #e5e7eb;
-  padding-bottom: 0.3em;
-}
-
-.markdown-body h3 {
-  font-size: 1.25em;
-  font-weight: 600;
-  margin-bottom: 0.5em;
-}
-
-.markdown-body p {
-  margin-bottom: 1em;
-  line-height: 1.6;
-}
-
-.markdown-body code {
-  background-color: #f3f4f6;
-  padding: 0.2em 0.4em;
-  border-radius: 3px;
-  font-size: 0.9em;
-}
-
-.markdown-body pre {
-  background-color: #1f2937;
-  color: #f9fafb;
-  padding: 1em;
-  border-radius: 6px;
-  overflow-x: auto;
-  margin-bottom: 1em;
-}
-
-.markdown-body pre code {
-  background-color: transparent;
-  padding: 0;
-  color: inherit;
-}
-
-.markdown-body ul,
-.markdown-body ol {
-  margin-left: 1.5em;
-  margin-bottom: 1em;
-}
-
-.markdown-body li {
-  margin-bottom: 0.25em;
-}
-
-.markdown-body blockquote {
-  border-left: 4px solid #e5e7eb;
-  padding-left: 1em;
-  margin-bottom: 1em;
-  color: #6b7280;
-}
-
-.markdown-body a {
-  color: #2563eb;
-  text-decoration: underline;
-}
-
-.markdown-body table {
-  border-collapse: collapse;
-  width: 100%;
-  max-width: 100%;
-  margin-bottom: 1em;
-  /* Become a scroll container so wide tables scroll horizontally instead of
-     pushing past the 48rem column. Mirrors the .sigma-content table pattern. */
-  display: block;
-  overflow-x: auto;
-}
-
-.markdown-body th,
-.markdown-body td {
-  border: 1px solid #e5e7eb;
-  padding: 0.5em;
-}
-
-.markdown-body th {
-  background-color: #f9fafb;
-  font-weight: 600;
-}
+/* All markdown element typography (headings, lists, code, tables, etc.) is now
+   handled by Tailwind Typography (`.prose`). The rules below are project-specific
+   overrides that prose does not cover. */
 
 /* Display math ($$...$$): horizontal scroll for long equations.
    KaTeX already sets display:block; we only add overflow control.
    overflow-y:hidden avoids a stray vertical scrollbar from baseline alignment. */
-.markdown-body .katex-display {
+.prose .katex-display {
   overflow-x: auto;
   overflow-y: hidden;
 }
 
 /* Images and inline SVGs must not exceed the column width. */
-.markdown-body img,
-.markdown-body svg {
+.prose img,
+.prose svg {
   max-width: 100%;
 }
 
-/* Highlight sync — mirrors editor cursor line in the preview */
-.markdown-body > .md-highlight {
-  background-color: rgba(219, 234, 254, 0.45);
+/* Highlight sync — mirrors editor cursor line in the preview.
+   Applied to direct children of .prose (the rendered block elements).
+   `!important` ensures it overrides prose's element backgrounds. */
+.prose > .md-highlight {
+  background-color: rgba(219, 234, 254, 0.45) !important;
   border-left: 3px solid rgba(59, 130, 246, 0.35);
   border-radius: 2px;
   transition: background-color 0.15s, border-color 0.15s;
 }
 
-/* Code blocks: preserve dark background, highlight via border/outline only */
-.markdown-body > pre.md-highlight {
-  background-color: #1f2937;
-  border-left: 3px solid rgba(96, 165, 250, 0.7);
+/* Code blocks: keep the highlight.js (github-dark) background, highlight via border/outline only */
+.prose > pre.md-highlight {
+  border-left: 3px solid rgba(96, 165, 250, 0.7) !important;
   outline: 1px solid rgba(96, 165, 250, 0.35);
 }
 
@@ -398,34 +303,10 @@
   background: #4b5563;
 }
 
-/* Markdown preview body */
-.dark .markdown-body {
-  color: #e5e7eb;
-}
-.dark .markdown-body h1,
-.dark .markdown-body h2 {
-  border-bottom-color: #374151;
-}
-.dark .markdown-body code {
-  background-color: rgba(255, 255, 255, 0.1);
-}
-.dark .markdown-body blockquote {
-  border-left-color: #374151;
-  color: #9ca3af;
-}
-.dark .markdown-body a {
-  color: #60a5fa;
-}
-.dark .markdown-body th,
-.dark .markdown-body td {
-  border-color: #374151;
-}
-.dark .markdown-body th {
-  background-color: #1f2937;
-}
-/* Inline-code highlight sync — keep readable on dark */
-.dark .markdown-body > .md-highlight {
-  background-color: rgba(59, 130, 246, 0.18);
+/* Markdown preview dark-mode typography is handled by `dark:prose-invert`.
+   Only the cursor-sync highlight needs an explicit override here. */
+.dark .prose > .md-highlight {
+  background-color: rgba(59, 130, 246, 0.18) !important;
   border-left-color: rgba(96, 165, 250, 0.6);
 }
 
