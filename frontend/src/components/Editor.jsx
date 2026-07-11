@@ -78,6 +78,23 @@ const annotationField = StateField.define({
   provide: f => EditorView.decorations.from(f)
 })
 
+/**
+ * Read all annotation decorations from the LIVE CodeMirror field, sorted by
+ * document position. Module-level (pure, depends only on `annotationField`).
+ * Used by the annotation-nav imperative methods so they never read the stale
+ * Zustand `annotations` array.
+ */
+function readAnnoPositions(view) {
+  const field = view.state.field(annotationField)
+  const list = []
+  field.between(0, view.state.doc.length, (from, to, deco) => {
+    const id = deco.spec?.attributes?.['data-anno-id']
+    if (id) list.push({ id, from, to })
+  })
+  list.sort((a, b) => a.from - b.from || a.to - b.to)
+  return list
+}
+
 const lightEditorTheme = EditorView.theme({
   '&': { height: '100%', fontSize: '14px', backgroundColor: '#ffffff' },
   '&.cm-focused': { outline: 'none' },
@@ -140,7 +157,7 @@ const getLanguage = (path) => {
 let _pendingCounter = 0
 function _genPendingId() { return `pending_${Date.now()}_${++_pendingCounter}` }
 
-const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat }, ref) => {
+const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll }, ref) => {
   const { t } = useTranslation()
   const containerRef = useRef(null); const viewRef = useRef(null); const cursorRef = useRef({ line: 1, column: 0 })
   const autoSaveTimerRef = useRef(null)
@@ -153,6 +170,29 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   // Multiple annotation selection: when click hits overlapping annotations
   const [annoChoices, setAnnoChoices] = useState(null)
   const popupAnnoFromRef = useRef(null)
+
+  // ── Annotation navigation state ─────────────────────────────────────
+  // Two refs read by different consumers but always written together with
+  // the same value, keeping the navigation and display paths decoupled by
+  // intent even though they currently agree:
+  //   currentIndexRef — read by navToAnnotation as the base for its pure
+  //     cur±1 arithmetic.
+  //   displayIndexRef — read by getCurrentAnnotationIndex to render the
+  //     counter.
+  // Both are written by navToAnnotation (button click) and by the scroll
+  // listener (free-scroll geometry re-derivation, only outside the
+  // NAV_SUPPRESS_MS window). That suppression window is what keeps button
+  // steps exactly 1 and oscillation-free: the 0/1/many scroll events a
+  // single scrollIntoView may emit cannot overwrite the button's arithmetic
+  // while the window is open.
+  const currentIndexRef = useRef(1)
+  const displayIndexRef = useRef(1)
+  // lastNavScrollAt: timestamp of the last button-driven scroll. While inside
+  //   the NAV_SUPPRESS_MS window, the scroll listener skips geometry
+  //   re-derivation, so the scroll events emitted by a scrollIntoView cannot
+  //   fight the button's arithmetic.
+  const lastNavScrollAt = useRef(0)
+  const NAV_SUPPRESS_MS = 350
 
   // Pending annotations: created locally, not yet persisted to backend (no replies sent).
   // Live in a ref (not zustand) — they don't survive file switches.
@@ -175,8 +215,8 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   const compileDiagnostics = useStore(s => s.compileDiagnostics)
   const { isDark } = useTheme()
 
-  const callbacks = useRef({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat })
-  useEffect(() => { callbacks.current = { onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat } })
+  const callbacks = useRef({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll })
+  useEffect(() => { callbacks.current = { onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll } })
 
   // ── Annotation helpers ──────────────────────────────────────────────
 
@@ -515,6 +555,36 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     })
   }, [])
 
+  /**
+   * Re-derive the annotation index from viewport geometry. Called only on
+   * user-driven (free) scrolls to keep the counter in sync. The scroll
+   * listener writes the result to both currentIndexRef and displayIndexRef,
+   * but ONLY outside the NAV_SUPPRESS_MS window after a button click — so
+   * the button's pure-arithmetic index is never overwritten by geometry
+   * while a scrollIntoView is settling.
+   * Returns the derived index, or null when there are no annotations.
+   * Also stored in a ref so the mount-time scroll listener can call it.
+   */
+  const computeTopAnnoIndex = useCallback(() => {
+    const view = viewRef.current
+    if (!view) return null
+    const positions = readAnnoPositions(view)
+    if (!positions.length) return null
+    const scrollTop = view.scrollDOM.scrollTop
+    // Find the first annotation at or below the viewport top. If all are
+    // above (scrolled past the last), the last index is the display value.
+    let idx = positions.length
+    for (let i = 0; i < positions.length; i++) {
+      if (view.lineBlockAt(positions[i].from).top >= scrollTop) {
+        idx = i + 1
+        break
+      }
+    }
+    return Math.max(1, Math.min(idx, positions.length))
+  }, [])
+  const computeTopAnnoIndexRef = useRef(computeTopAnnoIndex)
+  useEffect(() => { computeTopAnnoIndexRef.current = computeTopAnnoIndex })
+
   const handleReloadAnnotations = useCallback(async (annotationId = null) => {
     const view = viewRef.current
     const pid = useStore.getState().currentProject?.id
@@ -618,6 +688,21 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     view.scrollDOM.addEventListener('scroll', () => {
         const topPos = view.scrollDOM.scrollTop; const lineBlock = view.lineBlockAtHeight(topPos); const lineNumber = view.state.doc.lineAt(lineBlock.from).number
         callbacks.current.onLineChange?.(lineNumber); if (view.scrollDOM.scrollHeight > view.scrollDOM.clientHeight) callbacks.current.onScroll?.(topPos / (view.scrollDOM.scrollHeight - view.scrollDOM.clientHeight))
+        // Button-driven scrolls set currentIndexRef via pure arithmetic and
+        // stamp lastNavScrollAt. During free scrolling (outside the
+        // suppression window), re-derive BOTH indices from geometry so the
+        // button picks up from where the user scrolled to. Inside the
+        // window (scrollIntoView settling), skip re-derivation entirely so
+        // the button's arithmetic is never overwritten by geometry noise.
+        if (Date.now() - lastNavScrollAt.current >= NAV_SUPPRESS_MS) {
+          const idx = computeTopAnnoIndexRef.current?.()
+          if (idx != null) {
+            currentIndexRef.current = idx
+            displayIndexRef.current = idx
+          }
+        }
+        // Echo the current display index to the UI.
+        callbacks.current.onAnnoNavScroll?.()
         const from = popupAnnoFromRef.current
         if (from != null) {
           const coords = view.coordsAtPos(from)
@@ -657,6 +742,10 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
 
     // Clear pending annotations on file switch
     pendingAnnosRef.current = []
+    // Reset nav indices — will be re-derived after decorations load
+    currentIndexRef.current = 1
+    displayIndexRef.current = 1
+    lastNavScrollAt.current = 0
 
     let savedScroll = null
     if (reloading && viewRef.current) {
@@ -790,6 +879,8 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
         a.from != null && a.to != null && a.from >= 0 && a.from < a.to && a.to <= docLen
       )
       view.dispatch({ effects: setAnnosEffect.of(placed) })
+      // Keep the annotation nav panel in sync after decorations change.
+      requestAnimationFrame(() => callbacks.current.onAnnoNavScroll?.())
     },
 
     /** Save-time annotation sync: matches, updates, deletes, saves to backend. */
@@ -797,6 +888,65 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
 
     /** Revalidate backend annotations against current document using matching algorithm. */
     revalidateBackendAnnos: revalidateBackendAnnotations,
+
+    // ── Annotation navigation ─────────────────────────────────────────
+    // Two independent code paths:
+    //  • Button clicks (navToAnnotation): pure arithmetic on currentIndexRef —
+    //    cur±1, clamp, scroll, echo. Step is always exactly 1, immune to
+    //    pixel-exact viewport comparisons.
+    //  • Free/user scrolling (computeTopAnnoIndex in the scroll listener):
+    //    re-derives the index from content-space geometry (lineBlock top vs
+    //    scrollTop), so the counter tracks where the user scrolled.
+    //    Approximate by nature, but only affects the displayed number — not
+    //    navigation.
+
+    /** Snapshot of all annotation decorations sorted by position.
+     *  Returns [{ id, from, to }, ...]. */
+    getAnnotationPositions: () => {
+      const view = viewRef.current
+      return view ? readAnnoPositions(view) : []
+    },
+
+    /** Current DISPLAY index (1-based) — what the counter shows. Set by
+     *  navToAnnotation immediately, and by free-scroll geometry re-derivation.
+     *  NEVER feeds back into button navigation. */
+    getCurrentAnnotationIndex: () => displayIndexRef.current,
+
+    /** Navigate to the previous or next annotation. Pure arithmetic on
+     *  currentIndexRef (cur±1, clamp) — never reads geometry. Writes both
+     *  currentIndexRef (navigation source of truth) and displayIndexRef (so
+     *  the counter updates instantly). Skips the scroll dispatch when the
+     *  index is already clamped at the boundary, which would otherwise cause
+     *  the editor to drift on repeated clicks at the boundary. */
+    navToAnnotation: (dir) => {
+      const view = viewRef.current
+      if (!view) return null
+      const positions = readAnnoPositions(view)
+      if (!positions.length) return null
+      const total = positions.length
+      const cur = currentIndexRef.current
+      let next = cur
+      if (dir === 'prev') next = Math.max(1, cur - 1)
+      else if (dir === 'next') next = Math.min(total, cur + 1)
+      else return null
+      // Always sync both refs so the display tracks the button immediately.
+      currentIndexRef.current = next
+      displayIndexRef.current = next
+      // Stamp the suppression window so free-scroll geometry re-derivation
+      // is skipped while this scrollIntoView is settling.
+      lastNavScrollAt.current = Date.now()
+      // Skip the scroll dispatch if the index didn't change (boundary clamp).
+      // Re-scrolling to the same position would cause the editor to drift on
+      // repeated clicks at the boundary.
+      if (next !== cur) {
+        view.dispatch({
+          effects: EditorView.scrollIntoView(positions[next - 1].from, { y: 'start' }),
+        })
+      }
+      // Echo the index to the display (covers no-op-scroll case).
+      requestAnimationFrame(() => callbacks.current.onAnnoNavScroll?.())
+      return next
+    },
   }))
 
   // ── Active annotation lookup ────────────────────────────────────────

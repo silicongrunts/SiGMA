@@ -6,7 +6,7 @@
  * the previous zustand EventBus pattern (_synthesis* refs) and the double-hook
  * problem where both EditorView and SynthesisTab called the same hooks.
  */
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useStore } from '../store/useStore'
 import { compileAPI } from '../api'
@@ -16,7 +16,7 @@ import Editor from './Editor'
 import Preview from './Preview'
 import NotebookEditor from './NotebookEditor'
 import { ResizablePanels } from './ResizablePanels'
-import { ChevronRight, FileText, Loader2 } from 'lucide-react'
+import { ChevronRight, ChevronUp, ChevronDown, FileText, Loader2 } from 'lucide-react'
 
 export default function SynthesisTab({
   projectId,
@@ -33,7 +33,57 @@ export default function SynthesisTab({
   const isTexFile = useStore(s => s.isTexFile)
   const isNotebookMode = useStore(s => s.isNotebookMode)
   const isLoadingFile = useStore(s => s.isLoadingFile)
+  const annotations = useStore(s => s.annotations)
   const setHasUnsavedChanges = useStore(s => s.setHasUnsavedChanges)
+
+  // ── Annotation navigation ────────────────────────────────────────────
+  // Count + current index read from the LIVE CodeMirror decoration field
+  // (via the Editor imperative handle), not from the annotations array —
+  // positions in Zustand go stale between save-time syncs and LLM-driven
+  // decoration refreshes. Refresh is triggered on scroll (rAF-throttled),
+  // on annotation store changes, and on file load.
+  const [annoCount, setAnnoCount] = useState(0)
+  const [topAnnoIndex, setTopAnnoIndex] = useState(null)
+  const annoNavRafRef = useRef(0)
+
+  const refreshAnnoNav = useCallback(() => {
+    if (!editorRef.current) return
+    const positions = editorRef.current.getAnnotationPositions?.() ?? []
+    setAnnoCount(positions.length)
+    // Read the explicit current index (set by button arithmetic or free-scroll
+    // geometry re-derivation inside the editor). Never re-derive here — the
+    // editor's scroll listener owns that decision.
+    setTopAnnoIndex(editorRef.current.getCurrentAnnotationIndex?.() ?? null)
+  }, [editorRef])
+
+  const onAnnoNavScroll = useCallback(() => {
+    cancelAnimationFrame(annoNavRafRef.current)
+    annoNavRafRef.current = requestAnimationFrame(refreshAnnoNav)
+  }, [refreshAnnoNav])
+
+  // Refresh after file load / ready
+  useEffect(() => {
+    if (!currentFile) { setAnnoCount(0); setTopAnnoIndex(null); return }
+    editorRef.current?.whenReady?.().then(refreshAnnoNav).catch(() => {})
+  }, [currentFile, editorRef, refreshAnnoNav])
+
+  // Refresh when decorations change via SSE (annotations array mutation)
+  useEffect(() => { refreshAnnoNav() }, [annotations, refreshAnnoNav])
+
+  useEffect(() => {
+    return () => cancelAnimationFrame(annoNavRafRef.current)
+  }, [])
+
+  const prevAnnotation = useCallback(() => {
+    // Pure arithmetic inside the editor (cur±1). Never reads geometry, so the
+    // step is always exactly 1 and the button never gets stuck.
+    editorRef.current?.navToAnnotation?.('prev')
+  }, [editorRef])
+
+  const nextAnnotation = useCallback(() => {
+    editorRef.current?.navToAnnotation?.('next')
+  }, [editorRef])
+
   const mdPreviewRafRef = useRef(0)
   const editorScrollRafRef = useRef(0)
   const editorCursorRafRef = useRef(0)
@@ -93,9 +143,34 @@ export default function SynthesisTab({
           </div>
         ) : (
           <div className="h-full flex flex-col min-h-0">
-            <div className="h-8 border-b border-gray-100 dark:border-gray-800 px-4 flex items-center bg-white dark:bg-gray-900 flex-shrink-0">
-              <FileText className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 mr-2 flex-shrink-0" />
-              <span className="text-xs font-bold text-gray-600 dark:text-gray-400 truncate">{currentFile}</span>
+            <div className="h-8 border-b border-gray-100 dark:border-gray-800 px-4 flex items-center justify-between bg-white dark:bg-gray-900 flex-shrink-0">
+              <div className="flex items-center min-w-0">
+                <FileText className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 mr-2 flex-shrink-0" />
+                <span className="text-xs font-bold text-gray-600 dark:text-gray-400 truncate">{currentFile}</span>
+              </div>
+              {annoCount > 0 && (
+                <div className="flex items-center gap-1.5 flex-shrink-0 ml-2">
+                  <span className="text-[11px] font-bold tabular-nums text-gray-500 dark:text-gray-400">
+                    {t('annotations.navPosition', { current: topAnnoIndex ?? '—', total: annoCount })}
+                  </span>
+                  <button
+                    onClick={prevAnnotation}
+                    disabled={topAnnoIndex === 1}
+                    title={t('annotations.prevAnnotation')}
+                    className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent transition-colors"
+                  >
+                    <ChevronUp className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={nextAnnotation}
+                    disabled={topAnnoIndex === annoCount}
+                    title={t('annotations.nextAnnotation')}
+                    className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent transition-colors"
+                  >
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
             </div>
             <div className="flex-1 min-h-0">
               <Editor
@@ -133,6 +208,7 @@ export default function SynthesisTab({
                     previewRef.current?.highlightLine(cursor.line)
                   }
                 }}
+                onAnnoNavScroll={onAnnoNavScroll}
               />
             </div>
           </div>
