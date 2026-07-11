@@ -3,7 +3,8 @@
  * Layout: left list + right detail/edit panel
  * Features: sort, folders, multi-select, context menu, drag-and-drop
  */
-import { useState, useEffect, useCallback, useRef, useContext } from 'react'
+import { useState, useEffect, useCallback, useRef, useContext, useLayoutEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { FileText, Trash2, Edit3, X, Upload, Tag, AlertCircle, File, CheckCircle, Loader, ScrollText, Redo2, Download, Pencil, Check, Sparkles, Folder, ChevronRight, FolderPlus, Move, ChevronDown, ArrowLeft } from 'lucide-react'
@@ -1390,6 +1391,87 @@ export default function LibraryBrowser({ projectId }) {
 }
 
 /* =========================================================================
+ * Folder-path badge shown on search results.
+ *
+ * Renders a pill matching the ``doc_type`` style, with the document's folder
+ * path truncated to 100 chars. Hovering reveals a portal-rendered tooltip
+ * (ported to document.body so the list's ``overflow-y-auto`` can't clip it)
+ * showing the full path. Mirrors the viewport-clamping used by ContextMenu.
+ * ========================================================================= */
+const PATH_MAX_CHARS = 100
+
+function truncatePath(path) {
+  if (path.length <= PATH_MAX_CHARS) return path
+  return path.slice(0, PATH_MAX_CHARS - 1) + '…'
+}
+
+function PathBadge({ path }) {
+  const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState({ x: 0, y: 0 })
+  const anchorRef = useRef(null)
+  const hideTimer = useRef(null)
+  const showTimer = useRef(null)
+
+  const cancelTimers = useCallback(() => {
+    if (showTimer.current) { clearTimeout(showTimer.current); showTimer.current = null }
+    if (hideTimer.current) { clearTimeout(hideTimer.current); hideTimer.current = null }
+  }, [])
+
+  const handleEnter = useCallback(() => {
+    cancelTimers()
+    showTimer.current = setTimeout(() => setOpen(true), 120)
+  }, [cancelTimers])
+
+  const handleLeave = useCallback(() => {
+    cancelTimers()
+    hideTimer.current = setTimeout(() => setOpen(false), 120)
+  }, [cancelTimers])
+
+  // Position the tooltip under the badge and clamp to the viewport, the same
+  // approach ContextMenu uses. Re-runs whenever the tooltip becomes visible.
+  useLayoutEffect(() => {
+    if (!open || !anchorRef.current) return
+    const rect = anchorRef.current.getBoundingClientRect()
+    const TOOLTIP_W = 320
+    const TOOLTIP_H_EST = 80
+    const winWidth = window.innerWidth
+    const winHeight = window.innerHeight
+    let x = rect.left
+    let y = rect.bottom + 6
+    if (x + TOOLTIP_W > winWidth) x = Math.max(8, winWidth - TOOLTIP_W - 8)
+    if (y + TOOLTIP_H_EST > winHeight) y = Math.max(8, rect.top - TOOLTIP_H_EST - 6)
+    setPos({ x, y })
+  }, [open])
+
+  useEffect(() => () => cancelTimers(), [cancelTimers])
+
+  return (
+    <span
+      ref={anchorRef}
+      onMouseEnter={handleEnter}
+      onMouseLeave={handleLeave}
+      onClick={(e) => e.stopPropagation()}
+      className="text-[10px] text-gray-400 dark:text-gray-500 bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded flex items-center gap-0.5 cursor-default"
+    >
+      <Folder className="w-2.5 h-2.5 flex-shrink-0" />
+      <span>{truncatePath(path)}</span>
+      {open && createPortal(
+        <div
+          role="tooltip"
+          onMouseEnter={handleEnter}
+          onMouseLeave={handleLeave}
+          style={{ left: pos.x, top: pos.y }}
+          className="fixed z-[1000] max-w-xs w-max break-words rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-800 dark:bg-gray-900 text-gray-100 dark:text-gray-100 shadow-2xl px-3 py-2 text-[11px] leading-relaxed"
+        >
+          {path}
+        </div>,
+        document.body
+      )}
+    </span>
+  )
+}
+
+/* =========================================================================
  * Library Item Row (document or folder)
  * ========================================================================= */
 function LibraryItem({ doc, idx, selectedDocId, isSelected, isSearchResult, searchMode, searchQuery,
@@ -1487,6 +1569,7 @@ function LibraryItem({ doc, idx, selectedDocId, isSelected, isSearchResult, sear
             {/* Keywords and meta */}
             {!doc.is_folder && (
               <div className="flex items-center gap-2 mt-1.5">
+                {isSearchResult && doc.folder_path && <PathBadge path={doc.folder_path} />}
                 <span className="text-[10px] text-gray-400 dark:text-gray-500 bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded">{doc.doc_type || 'text'}</span>
                 {(doc.keywords || []).slice(0, 3).map((kw, i) => (
                   <span key={i} onClick={(e) => { e.stopPropagation(); onKeywordSearch?.(kw) }} className="text-[10px] text-sigma-600 bg-sigma-50 dark:bg-sigma-600/20 px-1.5 py-0.5 rounded flex items-center gap-0.5 cursor-pointer hover:bg-sigma-100 transition-colors">

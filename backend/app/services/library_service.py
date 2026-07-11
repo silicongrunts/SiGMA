@@ -498,6 +498,9 @@ class LibraryService:
                 summary["search_matches"] = matches
                 summary["search_snippets"] = [match["text"] for match in matches]
                 enriched.append(summary)
+            folder_paths = await uow.library.get_folder_paths([s["id"] for s in enriched])
+            for summary in enriched:
+                summary["folder_path"] = folder_paths.get(summary["id"], "")
             return enriched
 
     async def search_documents_paged(
@@ -541,6 +544,9 @@ class LibraryService:
                 summary["search_matches"] = matches
                 summary["search_snippets"] = [match["text"] for match in matches]
                 enriched.append(summary)
+            folder_paths = await uow.library.get_folder_paths([s["id"] for s in enriched])
+            for summary in enriched:
+                summary["folder_path"] = folder_paths.get(summary["id"], "")
             return {"results": enriched, "total": total}
 
     async def rag_search(self, project_id: str, query: str, top_k: int | None = None, parent_id: str = None) -> List[Dict]:
@@ -565,6 +571,7 @@ class LibraryService:
             async with UnitOfWork(project_id) as uow:
                 docs = await uow.library.get_by_ids(doc_ids)
                 doc_map = {doc.id: doc for doc in docs}
+                folder_paths = await uow.library.get_folder_paths(doc_ids)
 
             enriched = []
             for chunk in chunks:
@@ -576,6 +583,7 @@ class LibraryService:
                 summary["search_snippets"] = [chunk.chunk_text]
                 summary["chunk_text"] = chunk.chunk_text
                 summary["chunk_line_start"] = chunk.line_start
+                summary["folder_path"] = folder_paths.get(doc.id, "")
                 enriched.append(summary)
             return enriched
         except RAGIndexModelMismatchError:

@@ -9,7 +9,7 @@ import json
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
-from sqlalchemy import select, or_, asc, desc, func, text
+from sqlalchemy import select, or_, asc, desc, func, text, bindparam
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import LibraryDocument, parse_keywords
@@ -472,6 +472,51 @@ class LibraryRepository:
             {"doc_id": doc_id},
         )
         return [{"id": row[0], "title": row[1]} for row in result.all()]
+
+    async def get_folder_paths(self, doc_ids: List[str]) -> Dict[str, str]:
+        """Build the virtual folder path for each document in one query.
+
+        Batch counterpart of :meth:`get_ancestor_chain`: walks the
+        ``parent_id`` chain upward for every ``doc_id`` via a single recursive
+        CTE, then joins each ancestor folder's ``title`` with ``" / "`` (root
+        to leaf). The library root itself is not part of the path.
+
+        Returns ``{doc_id: path}``; a document at the library root maps to
+        ``""``. One extra query per search result page — no N+1.
+        """
+        if not doc_ids:
+            return {}
+        result = await self._session.execute(
+            text("""
+                WITH RECURSIVE chain(doc_id, ancestor_id, title, depth) AS (
+                    SELECT id, parent_id, NULL, 0
+                    FROM library_documents
+                    WHERE id IN :doc_ids
+                    UNION ALL
+                    SELECT c.doc_id, parent.parent_id, parent.title, c.depth + 1
+                    FROM chain c
+                    JOIN library_documents parent ON parent.id = c.ancestor_id
+                    WHERE c.ancestor_id IS NOT NULL AND parent.is_folder = 1
+                )
+                SELECT doc_id, title FROM chain
+                WHERE title IS NOT NULL
+                ORDER BY doc_id, depth DESC
+            """).bindparams(bindparam("doc_ids", expanding=True)),
+            {"doc_ids": list(doc_ids)},
+        )
+        paths = {doc_id: "" for doc_id in doc_ids}
+        current: Optional[str] = None
+        parts: List[str] = []
+        for doc_id, title in result.all():
+            if doc_id != current:
+                if current is not None:
+                    paths[current] = " / ".join(parts)
+                current = doc_id
+                parts = []
+            parts.append(title)
+        if current is not None:
+            paths[current] = " / ".join(parts)
+        return paths
 
     async def move_items(
         self, ids: List[str], target_folder_id: Optional[str]
