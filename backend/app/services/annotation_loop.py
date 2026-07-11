@@ -54,7 +54,7 @@ class AnnotationLoop:
         """Run one annotation AI reply turn. Yields SSE event dicts."""
         try:
             async with UnitOfWork(self.project_id) as uow:
-                annotation, err = await uow.annotations.resolve_by_prefix(self.annotation_id)
+                annotation, err = await uow.annotations.resolve(self.annotation_id)
                 if err:
                     yield LLMLoopRunner.sse(SSE_ERROR, {
                         "error": err,
@@ -287,7 +287,7 @@ class AnnotationLoop:
         content = LLMLoopRunner._format_error_message(error)
         try:
             async with UnitOfWork(self.project_id) as uow:
-                annotation, err = await uow.annotations.resolve_by_prefix(self.annotation_id)
+                annotation, err = await uow.annotations.resolve(self.annotation_id)
                 if err or not annotation:
                     return content
                 await uow.messages.create_for_annotation(

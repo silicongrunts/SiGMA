@@ -61,13 +61,16 @@ class LibraryService:
 
         return {"documents": [doc.to_summary_dict() for doc in docs], "total": total}
 
-    async def resolve_by_prefix(self, project_id: str, short_id: str) -> tuple:
-        """Resolve a document by full or prefix ID.
+    async def resolve_document(self, project_id: str, doc_id: str) -> tuple:
+        """Resolve a document by exact ID.
 
         Returns (doc_orm, error_message). One of them is None.
         """
         async with UnitOfWork(project_id) as uow:
-            return await uow.library.resolve_by_prefix(short_id)
+            doc = await uow.library.get_by_id(doc_id)
+            if doc:
+                return doc, None
+            return None, f"No document found with ID '{doc_id}'"
 
     async def get_documents_by_ids(
         self, project_id: str, doc_ids: List[str]
@@ -94,6 +97,16 @@ class LibraryService:
                 return await uow.library.get_summary_by_id(doc_id)
             doc = await uow.library.get_by_id(doc_id)
             return doc.to_dict() if doc else None
+
+    async def get_ancestor_chain(self, project_id: str, doc_id: str) -> List[Dict]:
+        """Return the folder breadcrumb chain from root to ``doc_id``'s parent.
+
+        Each entry is ``{id, title}``, root first. Empty for a top-level doc
+        or a missing doc. Used by chat citations to rebuild Library breadcrumbs
+        before revealing a document.
+        """
+        async with UnitOfWork(project_id) as uow:
+            return await uow.library.get_ancestor_chain(doc_id)
 
     async def get_document_file_info(self, project_id: str, doc_id: str) -> Optional[Dict]:
         """Get only file_path and file_name for download -- no content loaded."""

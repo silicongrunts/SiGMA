@@ -280,14 +280,14 @@ class AnnotationService:
             return {"active": False, "task_id": None, "status": None}
 
     async def resolve_annotation(
-        self, project_id: str, short_id: str
+        self, project_id: str, annotation_id: str
     ) -> tuple:
-        """Resolve an annotation by full or prefix ID.
+        """Resolve an annotation by exact ID.
 
         Returns (annotation_orm, error_message). One of them is None.
         """
         async with UnitOfWork(project_id) as uow:
-            return await uow.annotations.resolve_by_prefix(short_id)
+            return await uow.annotations.resolve(annotation_id)
 
     async def list_annotations_by_file(
         self, project_id: str, file_path: str
@@ -296,15 +296,15 @@ class AnnotationService:
         async with UnitOfWork(project_id) as uow:
             return await uow.annotations.get_by_file(file_path)
 
-    async def delete_annotation_by_prefix(
-        self, project_id: str, short_id: str
+    async def delete_annotation(
+        self, project_id: str, annotation_id: str
     ) -> tuple:
-        """Delete an annotation by full or prefix ID.
+        """Delete an annotation by exact ID.
 
         Returns (success: bool, error_message: str|None).
         """
         async with UnitOfWork(project_id) as uow:
-            return await uow.annotations.delete_by_prefix(short_id)
+            return await uow.annotations.delete_by_id(annotation_id)
 
     async def start_ai_reply_stream(
         self,

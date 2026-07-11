@@ -12,7 +12,6 @@ paths only, keeping `read_notebook_json` side-effect-free.
 import asyncio
 from html import escape as _html_escape
 import re as _re
-import uuid as _uuid
 
 from app.agents.tools.read_state import (
     record_path_read,
@@ -39,6 +38,7 @@ from app.agents.tools.notebook_utils import (
     to_jupyter_path,
 )
 from app.agents.tools.registry import tool_registry
+from app.core.utils import generate_id
 from app.services.jupyter_service import get_jupyter
 
 
@@ -56,10 +56,10 @@ def _clean_traceback(lines: list | None) -> list[str]:
 
 def _new_cell_id(cells: list) -> str:
     existing = {str(cell.get("id", "")) for cell in cells}
-    while True:
-        candidate = _uuid.uuid4().hex[:8]
-        if candidate not in existing:
-            return candidate
+    candidate = generate_id()
+    while candidate in existing:
+        candidate = generate_id()
+    return candidate
 
 
 def _apply_cell_type(cell: dict, cell_type: str) -> None:
@@ -150,8 +150,6 @@ async def _notebook_read(
     output_limit = _CELL_LIST_OUTPUT_LIMIT
     if cell_id:
         idx = find_cell_index(cells, cell_id)
-        if idx == -2:
-            return f"Error: Cell ID '{cell_id}' matches multiple cells. Provide more characters for a unique match."
         if idx < 0:
             return f"Error: Cell not found: {cell_id}"
         indices = [idx]
@@ -243,8 +241,6 @@ async def _notebook_edit(
 
     if edit_mode == "delete":
         idx = find_cell_index(cells, cell_id)
-        if idx == -2:
-            return f"Error: Cell ID '{cell_id}' matches multiple cells. Provide more characters for a unique match."
         if idx < 0:
             return f"Error: Cell not found: {cell_id}"
         cells.pop(idx)
@@ -264,8 +260,6 @@ async def _notebook_edit(
 
         if cell_id:
             idx = find_cell_index(cells, cell_id)
-            if idx == -2:
-                return f"Error: Cell ID '{cell_id}' matches multiple cells. Provide more characters for a unique match."
             if idx < 0:
                 return f"Error: Cell not found: {cell_id}"
             cells.insert(idx + 1, new_cell)
@@ -277,8 +271,6 @@ async def _notebook_edit(
         if cell_type and cell_type not in ("code", "markdown"):
             return "Error: cell_type must be 'code' or 'markdown'."
         idx = find_cell_index(cells, cell_id)
-        if idx == -2:
-            return f"Error: Cell ID '{cell_id}' matches multiple cells. Provide more characters for a unique match."
         if idx < 0:
             return f"Error: Cell not found: {cell_id}"
 
@@ -362,8 +354,6 @@ async def _notebook_run_cell(
         return "Error: Notebook cells must be an array."
 
     idx = find_cell_index(cells, cell_id)
-    if idx == -2:
-        return f"Error: Cell ID '{cell_id}' matches multiple cells. Provide more characters for a unique match."
     if idx < 0:
         return f"Error: Cell not found: {cell_id}"
 

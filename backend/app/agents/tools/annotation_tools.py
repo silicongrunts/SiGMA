@@ -200,12 +200,12 @@ async def _annotation_rm(project_id: str, id) -> str:
         return "Error: no annotation IDs provided"
 
     parts = []
-    for short_id in ids:
-        success, err = await annotation_service.delete_annotation_by_prefix(project_id, short_id)
+    for anno_id in ids:
+        success, err = await annotation_service.delete_annotation(project_id, anno_id)
         if success:
-            parts.append(f"Annotation {short_id} deleted")
+            parts.append(f"Annotation {anno_id} deleted")
         else:
-            parts.append(f"Error for {short_id}: {err}")
+            parts.append(f"Error for {anno_id}: {err}")
 
     return "\n".join(parts)
 
@@ -217,10 +217,10 @@ async def _annotation_get(project_id: str, id) -> str:
         return "Error: no annotation IDs provided"
 
     parts = []
-    for short_id in ids:
-        annotation, err = await annotation_service.resolve_annotation(project_id, short_id)
+    for anno_id in ids:
+        annotation, err = await annotation_service.resolve_annotation(project_id, anno_id)
         if err:
-            parts.append(f"Error for {short_id}: {err}")
+            parts.append(f"Error for {anno_id}: {err}")
             continue
 
         data = serialize_annotation(annotation)
@@ -360,7 +360,7 @@ tool_registry.register(ToolDefinition(
                     {"type": "string"},
                     {"type": "array", "items": {"type": "string"}},
                 ],
-                "description": "Annotation ID(s) (provide at least first 8 chars for prefix match)",
+                "description": "Annotation ID(s)",
             },
         },
         "required": ["id"],
@@ -382,7 +382,7 @@ tool_registry.register(ToolDefinition(
                     {"type": "string"},
                     {"type": "array", "items": {"type": "string"}},
                 ],
-                "description": "Annotation ID(s) (provide at least first 8 chars for prefix match)",
+                "description": "Annotation ID(s)",
             },
         },
         "required": ["id"],
@@ -399,7 +399,7 @@ tool_registry.register(ToolDefinition(
     input_schema={
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "Annotation ID (provide at least first 8 chars for prefix match)"},
+            "id": {"type": "string", "description": "Annotation ID"},
             "reply_content": {
                 "type": "string",
                 "description": "Reply text, optionally containing <diff> blocks",

@@ -97,3 +97,46 @@ async def test_list_documents_can_skip_status_summary(monkeypatch):
     assert result["success"] is True
     assert result["data"] == {"documents": [{"id": "doc-1"}], "total": 1}
     assert calls["summary"] == 0
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_get_document_ancestors_returns_chain_and_parent(monkeypatch):
+    async def get_document(project_id, doc_id, include_content=True):
+        assert include_content is False
+        return {"id": doc_id, "parent_id": "folder-2"}
+
+    async def get_ancestor_chain(project_id, doc_id):
+        return [
+            {"id": "folder-1", "title": "Root Folder"},
+            {"id": "folder-2", "title": "Inner Folder"},
+        ]
+
+    monkeypatch.setattr(
+        library,
+        "library_service",
+        SimpleNamespace(get_document=get_document, get_ancestor_chain=get_ancestor_chain),
+    )
+
+    result = await library.get_document_ancestors("project-1", "doc-1")
+
+    assert result["success"] is True
+    data = result["data"]
+    assert data["parent_id"] == "folder-2"
+    assert [a["id"] for a in data["ancestors"]] == ["folder-1", "folder-2"]
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_get_document_ancestors_missing_doc_raises_not_found(monkeypatch):
+    async def get_document(project_id, doc_id, include_content=True):
+        return None
+
+    monkeypatch.setattr(
+        library,
+        "library_service",
+        SimpleNamespace(get_document=get_document),
+    )
+
+    with pytest.raises(DocumentNotFoundError):
+        await library.get_document_ancestors("project-1", "missing")

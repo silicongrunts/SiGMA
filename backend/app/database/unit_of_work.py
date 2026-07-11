@@ -23,7 +23,7 @@ Methods that self-commit (**every mutation except those listed below**):
 * ``SessionRepository``: ``create``, ``update``, ``delete``
 * ``MessageRepository``: ``create``,
   ``delete_by_session``, ``create_for_annotation``
-* ``AnnotationRepository``: ``create``, ``delete``, ``delete_by_prefix``,
+* ``AnnotationRepository``: ``create``, ``delete``, ``delete_by_id``,
   ``save_all``
 * ``LibraryRepository``: ``create``, ``update``, ``delete``, ``move_items``,
   ``update_processing_status``, ``update_processing_log``, ``update_content``,
@@ -92,7 +92,7 @@ class UnitOfWork:
 
     **Self-commit exception:** Most repository mutation methods commit
     internally (e.g. ``TaskRepository.create()``, ``MessageRepository.create()``,
-    ``AnnotationRepository.delete_by_prefix()``).  Seq-allocating methods use
+    ``AnnotationRepository.delete_by_id()``).  Seq-allocating methods use
     self-commit to make uniqueness conflicts visible across concurrent
     connections; other self-commit methods preserve the repository API's
     transaction boundary. Do NOT wrap them in a transaction that expects a

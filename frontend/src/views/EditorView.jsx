@@ -12,7 +12,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useStore } from '../store/useStore'
-import { projectsAPI, filesAPI } from '../api'
+import { projectsAPI, filesAPI, libraryAPI } from '../api'
 import { LogModal, ModalOverlay } from '../components/Modal'
 import { EditorHeader } from '../components/Header'
 import FileTree from '../components/FileTree'
@@ -35,6 +35,9 @@ import TerminalPanel from '../components/TerminalPanel'
 import { storage } from '../utils/storage'
 import { toastError } from '../components/Toast'
 import { RotateCw, AlertTriangle, Database, ArrowLeft, Loader } from 'lucide-react'
+
+// SiGMA IDs are 16-char lowercase hex (generate_id → uuid4().hex[:16]).
+const ID_FORMAT = /^[0-9a-f]{16}$/
 
 export default function EditorView() {
   const { t } = useTranslation()
@@ -93,6 +96,8 @@ export default function EditorView() {
     selectedDocTitle: null,
     currentFolderPath: null,
     indexingStatus: null,
+    revealFolderRequest: null,
+    revealDocumentRequest: null,
   })
 
   const updateLibraryActions = useCallback((updates) => {
@@ -205,6 +210,91 @@ export default function EditorView() {
       })
     })
   }, [setShowLogModal, currentFile, handleFileSelect, editorRef])
+
+  // ── Chat citation dispatcher: sigma:// links from LLM messages ──
+  // Three shapes:
+  //   sigma://library/folder/<id>
+  //   sigma://library/doc/<id>
+  //   sigma://synthesis/file?path=<relpath>&line=<n>
+  // Every shape is validated before navigation: unknown schemes, malformed
+  // IDs, missing items, folder/doc type confusion, project-escape paths,
+  // and out-of-range line numbers are all rejected with a toast.
+  const handleCitation = useCallback(async (href) => {
+    let url
+    try { url = new URL(href) } catch { toastError(t('chat.citation.badFormat')); return }
+    const kind = url.hostname // 'library' or 'synthesis'
+    if (kind === 'library') {
+      const segments = url.pathname.replace(/^\/+/, '').split('/').filter(Boolean)
+      const [sub, id] = segments
+      if ((sub !== 'folder' && sub !== 'doc') || !id || !ID_FORMAT.test(id)) {
+        toastError(t('chat.citation.badFormat')); return
+      }
+      // Verify the item exists and its type matches the URL's claim before
+      // navigating — a folder ID in a doc slot (or vice-versa) is a type
+      // error, not a navigation target.
+      let doc
+      try { doc = await libraryAPI.get(projectId, id, { include_content: false }) }
+      catch { toastError(t('chat.citation.notFound')); return }
+      if (!doc || doc.is_folder !== (sub === 'folder')) {
+        toastError(t('chat.citation.typeMismatch')); return
+      }
+      setActiveTab('library')
+      if (sub === 'folder') {
+        updateLibraryActions({ revealFolderRequest: { folderId: id, requestId: Date.now() } })
+      } else {
+        updateLibraryActions({ revealDocumentRequest: { docId: id, requestId: Date.now() } })
+      }
+      return
+    }
+    if (kind === 'synthesis') {
+      const rawPath = url.searchParams.get('path')
+      if (!rawPath) { toastError(t('chat.citation.badFormat')); return }
+      // Project-containment check: reject absolute paths and ".." traversal.
+      const normalized = rawPath.replace(/\\/g, '/').replace(/^\.\/+/, '')
+      if (/^(\/|[a-zA-Z]:[\\/]|\/\/)/.test(normalized)) {
+        toastError(t('chat.citation.outsideProject')); return
+      }
+      const stack = []
+      let escaped = false
+      for (const seg of normalized.split('/')) {
+        if (!seg || seg === '.') continue
+        if (seg === '..') { if (stack.length === 0) { escaped = true; break }; stack.pop(); continue }
+        stack.push(seg)
+      }
+      if (escaped || stack.length === 0) {
+        toastError(t('chat.citation.outsideProject')); return
+      }
+      // line must be a positive integer when present.
+      const line = url.searchParams.get('line')
+      const lineNum = line === null ? null : parseInt(line, 10)
+      if (line !== null && (!Number.isInteger(lineNum) || lineNum <= 0)) {
+        toastError(t('chat.citation.badFormat')); return
+      }
+      const safePath = stack.join('/')
+      setActiveTab('synthesis')
+      // Open the file first; handleFileSelect returns false when the file
+      // doesn't exist or is binary — abort and toast rather than jumping a
+      // stray line in whatever file was previously open.
+      const opened = await handleFileSelect({ path: safePath, name: safePath.split('/').pop() })
+      if (!opened) { toastError(t('chat.citation.notFound')); return }
+      if (lineNum !== null) {
+        // requestAnimationFrame lets SynthesisTab mount (when arriving from
+        // another tab) before we read editorRef and the editor's ready state.
+        requestAnimationFrame(() => {
+          editorRef.current?.whenReady()?.then(() => {
+            const total = editorRef.current?.getLineCount?.() || 0
+            if (lineNum > total) {
+              toastError(t('chat.citation.lineOutOfRange', { line: lineNum })); return
+            }
+            editorRef.current?.gotoLine(lineNum)
+          })
+        })
+      }
+      return
+    }
+    // Unknown host (e.g. sigma://garbage/...) — not a valid citation form.
+    toastError(t('chat.citation.badFormat'))
+  }, [t, projectId, setActiveTab, updateLibraryActions, handleFileSelect, editorRef])
 
   const pathMatchesCurrentFile = useCallback((changedPath, currentPath) => {
     if (!changedPath || !currentPath) return false
@@ -477,6 +567,7 @@ export default function EditorView() {
                 onAnnotationChanged={handleAnnotationChanged}
                 getUserState={getUserState}
                 onSaveBeforeChat={activeTab === 'synthesis' ? saveBeforeChat : null}
+                onCitation={handleCitation}
               />
             </div>
           </aside>

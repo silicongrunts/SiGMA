@@ -20,14 +20,14 @@ the suggested offset/limit to continue reading the remaining output lines.
 
 Example output:
 <notebook cells="3" offset="0" limit="5" kernel="idle">
-<cell id="a1b2c3d4" type="code" index="0">
+<cell id="a1b2c3d4e5f6a7b8" type="code" index="0">
   <source>import pandas as pd
 df = pd.read_csv('data.csv')</source>
 </cell>
-<cell id="e5f6a7b8" type="markdown" index="1">
+<cell id="c9d0e1f2a3b4c5d6" type="markdown" index="1">
   <source># Analysis</source>
 </cell>
-<cell id="c9d0e1f2" type="code" index="2">
+<cell id="e7f8a9b0c1d2e3f4" type="code" index="2">
   <source>result = 1 / 0</source>
   <outputs>
     <output type="error" name="ZeroDivisionError">division by zero</output>
@@ -40,7 +40,7 @@ Possible values include kernel="idle", kernel="busy", kernel="starting", kernel=
 or kernel="unknown". If no kernel session exists, the attribute is omitted.
 
 Cell IDs are shown in each <cell id="..."> attribute. Use exactly the IDs shown by \
-notebook_read. Prefixes are accepted for stable cell IDs, but the full shown ID is preferred.
+notebook_read.
 
 The tool reads from the Jupyter server's live state when available, so \
 outputs reflect the latest kernel execution results."""
@@ -56,8 +56,7 @@ before making edits. This is enforced by the tool: notebook_edit fails if this \
 notebook has not been read in the current session, or if it changed on disk \
 since the last notebook_read/notebook_edit/notebook_run_cell.
 
-Cell IDs come from the <cell id="..."> attribute shown by notebook_read. \
-Prefixes are accepted only for stable cell IDs, not numeric fallback IDs.
+Cell IDs come from the <cell id="..."> attribute shown by notebook_read.
 
 Edit modes:
 - replace (default): Replace text in the specified cell.

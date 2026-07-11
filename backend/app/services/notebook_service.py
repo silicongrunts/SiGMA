@@ -7,13 +7,12 @@ This module is responsible only for reading, writing, and creating .ipynb files.
 """
 
 import json
-import uuid
 from pathlib import Path
 
 from aiofiles import open as aiofiles_open
 
 from ..core.config import settings
-from ..core.utils import is_within
+from ..core.utils import generate_id, is_within
 from ..core.atomic_file import atomic_write_text
 
 
@@ -73,7 +72,7 @@ class NotebookService:
                 {
                     "cell_type": "code",
                     "execution_count": None,
-                    "id": uuid.uuid4().hex[:8],
+                    "id": generate_id(),
                     "metadata": {},
                     "outputs": [],
                     "source": [],

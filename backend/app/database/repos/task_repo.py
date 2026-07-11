@@ -88,38 +88,23 @@ class TaskRepository:
 
     # ── Read ──────────────────────────────────────────────────────────
 
-    async def resolve_by_prefix(
-        self, session_id: str, short_id: str,
+    async def resolve(
+        self, session_id: str, task_id: str,
     ) -> tuple[Optional[Task], Optional[str]]:
-        """Resolve a task by full or prefix ID (min 8 chars), scoped to a session.
+        """Resolve a task by exact ID, scoped to a session.
 
         Returns (task, error_message). One of them is None.
         """
-        # Exact match first (session-scoped)
         result = await self._session.execute(
             select(Task).where(
                 Task.session_id == session_id,
-                Task.id == short_id,
+                Task.id == task_id,
             )
         )
         task = result.scalar_one_or_none()
         if task:
             return task, None
-        # Prefix match (requires >= 8 chars)
-        if len(short_id) < 8:
-            return None, f"ID '{short_id}' is too short, please provide at least 8 characters"
-        result = await self._session.execute(
-            select(Task).where(
-                Task.session_id == session_id,
-                Task.id.startswith(short_id),
-            )
-        )
-        matches = list(result.scalars().all())
-        if len(matches) == 0:
-            return None, f"No task found with ID starting with '{short_id}'"
-        if len(matches) > 1:
-            return None, f"ID '{short_id}' matched {len(matches)} tasks, please provide more characters"
-        return matches[0], None
+        return None, f"No task found with ID '{task_id}'"
 
     async def get(self, task_id: str) -> Optional[Task]:
         result = await self._session.execute(

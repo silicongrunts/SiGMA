@@ -30,36 +30,22 @@ class AnnotationRepository:
         )
         return list(result.scalars().all())
 
-    async def resolve_by_prefix(self, short_id: str) -> tuple[Optional[Annotation], Optional[str]]:
-        """Resolve an annotation by full or prefix ID (min 8 chars).
+    async def resolve(self, annotation_id: str) -> tuple[Optional[Annotation], Optional[str]]:
+        """Resolve an annotation by exact ID.
 
         Returns (annotation, error_message). One of them is None.
         """
-        # Exact match first
-        anno = await self.get_by_id(short_id)
+        anno = await self.get_by_id(annotation_id)
         if anno:
             return anno, None
-        # Prefix match (requires >= 8 chars)
-        if len(short_id) < 8:
-            return None, f"ID '{short_id}' is too short, please provide at least 8 characters"
-        result = await self._session.execute(
-            select(Annotation)
-            .where(Annotation.id.startswith(short_id))
-            .options(selectinload(Annotation.messages))
-        )
-        matches = list(result.scalars().all())
-        if len(matches) == 0:
-            return None, f"No annotation found with ID starting with '{short_id}'"
-        if len(matches) > 1:
-            return None, f"ID '{short_id}' matched {len(matches)} annotations, please provide more characters"
-        return matches[0], None
+        return None, f"No annotation found with ID '{annotation_id}'"
 
-    async def delete_by_prefix(self, short_id: str) -> tuple[bool, Optional[str]]:
-        """Delete an annotation by full or prefix ID.
+    async def delete_by_id(self, annotation_id: str) -> tuple[bool, Optional[str]]:
+        """Delete an annotation by exact ID.
 
         Returns (success, error_message).
         """
-        anno, err = await self.resolve_by_prefix(short_id)
+        anno, err = await self.resolve(annotation_id)
         if err:
             return False, err
         await self._session.delete(anno)

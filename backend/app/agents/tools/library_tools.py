@@ -33,11 +33,6 @@ logger = get_logger(__name__)
 
 # ── Pure helpers (ID parsing, content formatting, search-result rendering) ──
 
-def short_id(doc_id: str) -> str:
-    """Truncate a UUID to 8 chars for display."""
-    return doc_id[:8]
-
-
 def parse_ids(value) -> list:
     """Normalize a string-or-array IDs parameter to a list.
 
@@ -131,7 +126,7 @@ def format_search_results(doc_entries: list, total: int,
     parts = [header, ""]
     for e in doc_entries:
         parts.append("<doc>")
-        parts.append(f"<id>{short_id(e['id'])}</id>")
+        parts.append(f"<id>{e['id']}</id>")
         if e["title"]:
             parts.append(f"<title>{xml_escape(e['title'])}</title>")
         if e["description"]:
@@ -164,15 +159,15 @@ def format_directory_listing(docs: list, label: str) -> str:
 
     lines = [f'Directory "{label}":']
     for d in docs:
-        sid = short_id(d["id"])
+        did = d["id"]
         if d.get("is_folder"):
-            lines.append(f"  [{sid}] {d['title']}/")
+            lines.append(f"  [{did}] {d['title']}/")
         else:
             title = d.get("title", "Untitled")
             kws = d.get("keywords", [])
             kw_str = ", ".join(kws) if isinstance(kws, list) and kws else ""
             suffix = f" — {kw_str}" if kw_str else ""
-            lines.append(f"  [{sid}] {title}{suffix}")
+            lines.append(f"  [{did}] {title}{suffix}")
 
     return "\n".join(lines)
 
@@ -218,9 +213,9 @@ def format_document_content(doc, fields: list,
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
-async def _resolve_id(project_id: str, short_id_val: str):
-    """Resolve a short/full ID via library_service. Returns (doc, error_str)."""
-    return await library_service.resolve_by_prefix(project_id, short_id_val)
+async def _resolve_id(project_id: str, doc_id: str):
+    """Resolve a document by exact ID. Returns (doc, error_str)."""
+    return await library_service.resolve_document(project_id, doc_id)
 
 
 def _copy_unique_file(source: Path, target: Path) -> Path:
@@ -526,17 +521,17 @@ async def _library_new(project_id: str, content_type: str, content: str,
         await background_task_service.enqueue_document_process(project_id, doc.id)
 
         parent_label = "root" if not resolved_parent else parent_doc.title
-        parent_sid = short_id(resolved_parent) if resolved_parent else "root"
+        parent_id_str = resolved_parent or "root"
         if doc_content:
             preview = content_preview(doc_content)
             return (
-                f"Successfully added {content_type} to {parent_label} (ID: {parent_sid}), "
-                f"document ID is {short_id(doc.id)}, content: {preview}"
+                f"Successfully added {content_type} to {parent_label} (ID: {parent_id_str}), "
+                f"document ID is {doc.id}, content: {preview}"
             )
         else:
             return (
-                f"Successfully added file to {parent_label} (ID: {parent_sid}), "
-                f"document ID is {short_id(doc.id)}, processing..."
+                f"Successfully added file to {parent_label} (ID: {parent_id_str}), "
+                f"document ID is {doc.id}, processing..."
             )
 
     except Exception as e:
@@ -586,8 +581,8 @@ async def _library_mkdir(project_id: str, title: str, parent_id: str = "") -> st
 
     try:
         folder = await library_service.create_folder(project_id, title, resolved_parent)
-        parent_label = "root" if not resolved_parent else f"{parent_doc.title} (ID: {short_id(resolved_parent)})"
-        return f"Successfully created folder \"{title}\" (ID: {short_id(folder['id'])}) in {parent_label}"
+        parent_label = "root" if not resolved_parent else f"{parent_doc.title} (ID: {resolved_parent})"
+        return f"Successfully created folder \"{title}\" (ID: {folder['id']}) in {parent_label}"
     except ValueError as e:
         return f"Failed to create folder: {e}"
 
@@ -675,7 +670,7 @@ async def _library_update(project_id: str, id: str, title: str = "",
         changed = ", ".join(k for k in updates.keys() if k != "old_string" and k != "new_string")
         if "old_string" in updates:
             changed = ("content" if not changed else f"{changed}, content")
-        return f"Successfully updated \"{result['title']}\" (ID: {short_id(result['id'])}), changed: {changed}"
+        return f"Successfully updated \"{result['title']}\" (ID: {result['id']}), changed: {changed}"
     except Exception as e:
         logger.exception("Failed to update library document")
         return f"Update failed: {e}"
@@ -703,10 +698,10 @@ async def _library_rm(project_id: str, id) -> str:
 
     resolved_ids = []
     skipped = []
-    for short_id_val in id_list:
-        doc, err = await _resolve_id(project_id, short_id_val)
+    for doc_id in id_list:
+        doc, err = await _resolve_id(project_id, doc_id)
         if err:
-            skipped.append(f"  {short_id_val}: {err}")
+            skipped.append(f"  {doc_id}: {err}")
         else:
             resolved_ids.append(doc.id)
 
@@ -759,7 +754,7 @@ tool_registry.register(ToolDefinition(
                     {"type": "string"},
                     {"type": "array", "items": {"type": "string"}},
                 ],
-                "description": "Folder ID(s) to list (provide at least first 8 chars for prefix matching). Omit this field to list the root directory.",
+                "description": "Folder ID(s) to list. Omit this field to list the root directory.",
                 "default": "",
             },
         },
@@ -820,7 +815,7 @@ tool_registry.register(ToolDefinition(
                     {"type": "string"},
                     {"type": "array", "items": {"type": "string"}},
                 ],
-                "description": "A single ID or array of IDs to move (provide at least first 8 chars each for prefix matching)",
+                "description": "A single ID or array of IDs to move",
             },
             "dst_id": {"type": "string", "description": "Target folder ID. Omit this field to move to root.", "default": ""},
         },
@@ -838,7 +833,7 @@ tool_registry.register(ToolDefinition(
     input_schema={
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "Document or folder ID (provide at least first 8 chars for prefix matching)"},
+            "id": {"type": "string", "description": "Document or folder ID"},
             "title": {"type": "string", "description": "New title (folders allow only this)", "default": ""},
             "description": {"type": "string", "description": "New description (documents only)", "default": ""},
             "old_string": {"type": "string", "description": "Text to find in the content. Must be unique in the document and must pair with new_string. Documents only.", "default": ""},
@@ -860,7 +855,7 @@ tool_registry.register(ToolDefinition(
     input_schema={
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "Document ID (provide at least first 8 chars for prefix matching). Must be a document, not a folder."},
+            "id": {"type": "string", "description": "Document ID. Must be a document, not a folder."},
             "field": {
                 "oneOf": [
                     {"type": "string"},
@@ -893,7 +888,7 @@ tool_registry.register(ToolDefinition(
                     {"type": "string"},
                     {"type": "array", "items": {"type": "string"}},
                 ],
-                "description": "Library item ID(s) (provide at least first 8 chars for prefix match)",
+                "description": "Library item ID(s)",
             },
         },
         "required": ["id"],

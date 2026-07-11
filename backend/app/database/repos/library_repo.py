@@ -193,28 +193,6 @@ class LibraryRepository:
             "parent_id": row["parent_id"],
         }
 
-    async def resolve_by_prefix(self, short_id: str) -> tuple[Optional[LibraryDocument], Optional[str]]:
-        """Resolve a document by full or prefix ID (min 8 chars).
-
-        Returns (document, error_message). One of them is None.
-        """
-        # Exact match
-        doc = await self.get_by_id(short_id)
-        if doc:
-            return doc, None
-        # Prefix match (requires >= 8 chars)
-        if len(short_id) < 8:
-            return None, f"ID '{short_id}' is too short, please provide at least 8 characters"
-        result = await self._session.execute(
-            select(LibraryDocument).where(LibraryDocument.id.startswith(short_id))
-        )
-        matches = list(result.scalars().all())
-        if len(matches) == 0:
-            return None, f"No document found with ID starting with '{short_id}'"
-        if len(matches) > 1:
-            return None, f"ID '{short_id}' matched {len(matches)} documents, please provide more characters"
-        return matches[0], None
-
     async def get_file_info(self, doc_id: str) -> Optional[Dict]:
         doc = await self.get_by_id(doc_id)
         if not doc:
@@ -465,6 +443,35 @@ class LibraryRepository:
             {"folder_id": folder_id},
         )
         return [row[0] for row in result.all()]
+
+    async def get_ancestor_chain(self, doc_id: str) -> List[Dict[str, Any]]:
+        """Return the folder chain from the library root down to ``doc_id``'s
+        parent folder, as ``[{id, title}, ...]`` (root first).
+
+        ``doc_id`` itself is excluded: the chain describes *where* the document
+        lives, so it can be used to rebuild breadcrumbs up to its container.
+        A top-level document has an empty chain. A missing ``doc_id`` also
+        yields an empty chain rather than raising, so callers can treat
+        "not found" uniformly with "no ancestors".
+        """
+        result = await self._session.execute(
+            text("""
+                WITH RECURSIVE chain(id, title, parent_id, depth) AS (
+                    SELECT id, title, parent_id, 0
+                    FROM library_documents
+                    WHERE id = :doc_id
+                    UNION ALL
+                    SELECT parent.id, parent.title, parent.parent_id, child.depth + 1
+                    FROM library_documents parent
+                    JOIN chain child ON parent.id = child.parent_id
+                )
+                SELECT id, title FROM chain
+                WHERE id != :doc_id
+                ORDER BY depth DESC
+            """),
+            {"doc_id": doc_id},
+        )
+        return [{"id": row[0], "title": row[1]} for row in result.all()]
 
     async def move_items(
         self, ids: List[str], target_folder_id: Optional[str]

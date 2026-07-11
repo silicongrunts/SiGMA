@@ -406,6 +406,7 @@ export const libraryAPI = {
     const qs = new URLSearchParams(params).toString()
     return request(`/library/${projectId}/documents/${docId}${qs ? '?' + qs : ''}`)
   },
+  getAncestors: (projectId, docId) => request(`/library/${projectId}/documents/${docId}/ancestors`),
   create: (projectId, data) => request(`/library/${projectId}/documents`, { method: 'POST', body: JSON.stringify(data) }),
   update: (projectId, docId, data) => request(`/library/${projectId}/documents/${docId}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (projectId, docId) => request(`/library/${projectId}/documents/${docId}`, { method: 'DELETE' }),

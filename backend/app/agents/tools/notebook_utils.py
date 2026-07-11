@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import json as _json
 import os
-import uuid as _uuid
 from dataclasses import dataclass
 from html import escape as _html_escape
 from pathlib import Path
 
 from app.core.atomic_file import atomic_write_text
 from app.core.config import settings
-from app.core.utils import is_within
+from app.core.utils import generate_id, is_within
 from app.services.jupyter_service import get_jupyter
 
 
@@ -87,9 +86,9 @@ def ensure_cell_ids(notebook: dict) -> bool:
     for cell in cells:
         if not isinstance(cell, dict) or cell.get("id"):
             continue
-        cell_id = _uuid.uuid4().hex[:8]
+        cell_id = generate_id()
         while cell_id in existing:
-            cell_id = _uuid.uuid4().hex[:8]
+            cell_id = generate_id()
         cell["id"] = cell_id
         existing.add(cell_id)
         changed = True
@@ -97,28 +96,13 @@ def ensure_cell_ids(notebook: dict) -> bool:
 
 
 def find_cell_index(cells: list, cell_id: str) -> int:
-    """Find a cell by displayed ID. Returns index, -1 if missing, -2 if ambiguous."""
+    """Find a cell by displayed ID. Returns index, or -1 if not found."""
     wanted = str(cell_id or "").strip()
     if not wanted:
         return -1
-
-    exact_matches = [
-        i for i, cell in enumerate(cells)
-        if _display_cell_id(cell, i) == wanted
-    ]
-    if len(exact_matches) == 1:
-        return exact_matches[0]
-    if len(exact_matches) > 1:
-        return -2
-
-    prefix_matches = [
-        i for i, cell in enumerate(cells)
-        if cell.get("id") and str(cell["id"]).startswith(wanted)
-    ]
-    if len(prefix_matches) == 1:
-        return prefix_matches[0]
-    if len(prefix_matches) > 1:
-        return -2
+    for i, cell in enumerate(cells):
+        if _display_cell_id(cell, i) == wanted:
+            return i
     return -1
 
 

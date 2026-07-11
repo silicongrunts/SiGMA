@@ -754,6 +754,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       if (!viewRef.current) return; const view = viewRef.current; const line = view.state.doc.line(Math.max(1, Math.min(n, view.state.doc.lines)))
       view.dispatch({ selection: { anchor: line.from, head: line.to }, scrollIntoView: true, effects: EditorView.scrollIntoView(line.from, { block: 'center' }) }); view.focus()
     },
+    getLineCount: () => viewRef.current ? viewRef.current.state.doc.lines : 0,
     setCursorPosition: (cursor) => {
       if (!viewRef.current || !cursor) return
       const view = viewRef.current

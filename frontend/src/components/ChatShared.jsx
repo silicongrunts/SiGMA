@@ -84,18 +84,46 @@ function sanitizeToolParams(paramsStr) {
     return out === '{}' ? '' : out
 }
 
-export const MarkdownContent = ({ content, projectId = null }) => {
+// Citation links use the sigma:// scheme. DOMPurify's default URI regex strips
+// unknown schemes, so we extend it (only when citations are active) to preserve
+// sigma: hrefs on anchors. Scoped to MarkdownContent's sanitize call; other
+// callers of DOMPurify keep the stricter default.
+const SIGMA_CITATION_SCHEME = 'sigma'
+const citationUriRegexp = /^(?:sigma:|(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
+
+export const MarkdownContent = ({ content, projectId = null, onCitation = null }) => {
     // Memoize parsing+sanitizing: in streaming chat the parent re-renders on
     // every token delta, and without this every prior message re-parses its
     // full markdown each frame.
     const html = useMemo(() => {
         const parsed = marked.parse(content || '')
-        return DOMPurify.sanitize(rewriteProjectImageSrc(parsed, projectId))
-    }, [content, projectId])
+        const rewritten = rewriteProjectImageSrc(parsed, projectId)
+        if (!onCitation) return DOMPurify.sanitize(rewritten)
+        return DOMPurify.sanitize(rewritten, {
+            ALLOWED_URI_REGEXP: citationUriRegexp,
+        })
+    }, [content, projectId, onCitation])
+
+    // Citation links are never real navigation. Intercept via a single delegated
+    // handler instead of per-anchor binding. Only active when onCitation is set,
+    // so other MarkdownContent callers are unaffected.
+    const handleClick = useMemo(() => {
+        if (!onCitation) return undefined
+        return (e) => {
+            const anchor = e.target.closest?.('a')
+            if (!anchor) return
+            const href = anchor.getAttribute('href') || ''
+            if (!href.startsWith(SIGMA_CITATION_SCHEME + ':')) return
+            e.preventDefault()
+            onCitation(href)
+        }
+    }, [onCitation])
+
     return (
         <div
             className="sigma-content text-sm leading-relaxed break-words overflow-hidden"
             dangerouslySetInnerHTML={{ __html: html }}
+            onClick={handleClick}
         />
     )
 }

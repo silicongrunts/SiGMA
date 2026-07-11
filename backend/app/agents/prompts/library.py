@@ -14,14 +14,14 @@ Results are returned as XML:
 
 Pagination (keyword mode only): use the page parameter (50 results per page, 1-indexed, must be >= 1). The header shows the matching document count and the current page window; advance page to see more. Requesting a page beyond the last one returns an out-of-range notice with the real count. Semantic mode ignores page — it always returns the top-k most relevant chunks.
 
-All document IDs in results are truncated to 8 characters. Use these short IDs in subsequent tool calls."""
+All document IDs in results are complete IDs. Use these IDs in subsequent tool calls."""
 
 PROMPT_LIBRARY_LS = """List contents of one or more library directories.
 
 Returns subdirectories and documents under each specified parent directory.
 The root directory is listed when parent_id is omitted.
 
-All document IDs are truncated to 8 characters. Use these in subsequent tool calls."""
+All document IDs are complete IDs. Use these in subsequent tool calls."""
 
 PROMPT_LIBRARY_NEW = """Add a new document to the project library.
 
@@ -32,7 +32,7 @@ Three content sources supported:
 
 After creation, the document is queued for AI field extraction (description and keywords only — title is never overwritten) and RAG indexing. Both run asynchronously.
 
-All document IDs in output are truncated to 8 characters. Use these short IDs in subsequent tool calls."""
+All document IDs in output are complete IDs. Use these in subsequent tool calls."""
 
 PROMPT_LIBRARY_MKDIR = """Create a new folder in the library."""
 
@@ -53,13 +53,13 @@ PROMPT_LIBRARY_GET = """Read a document's fields from the library.
 
 Similar to the read tool but for library documents. Supports paginated content reading with line numbers.
 
-All IDs are truncated to 8 characters. offset is 0-indexed and must be >=0. limit: omit or pass 0 for 200; negative returns the last abs(limit) lines.
+offset is 0-indexed and must be >=0. limit: omit or pass 0 for 200; negative returns the last abs(limit) lines.
 
 Documents still processing will include a status notice."""
 
 PROMPT_LIBRARY_RM = """Delete one or more documents or folders from the library.
 
-Accepts a single ID or an array of IDs. Provide at least the first 8 characters of each ID for prefix matching.
+Accepts a single ID or an array of IDs.
 
 Deleting a folder also deletes all its contents recursively (subfolders and documents). Non-existent IDs are skipped with a warning (not an error).
 

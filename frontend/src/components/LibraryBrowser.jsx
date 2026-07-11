@@ -428,6 +428,74 @@ export default function LibraryBrowser({ projectId }) {
     return () => { cancelled = true }
   }, [selectedDocId, projectId, selectDocument])
 
+  // ── Chat citation navigation: reveal a folder or document ──
+  // EditorView writes reveal requests into LibraryActionsContext; each carries
+  // a requestId so this effect re-fires even for a repeated target id. We
+  // rebuild breadcrumbs from the ancestor chain, set the folder, then (for a
+  // document) select it so its card opens in the detail panel.
+  const revealFolderRequest = useContext(LibraryActionsContext)?.revealFolderRequest
+  const revealDocumentRequest = useContext(LibraryActionsContext)?.revealDocumentRequest
+
+  useEffect(() => {
+    if (!revealFolderRequest?.folderId || !projectId) return
+    const { folderId } = revealFolderRequest
+    let cancelled = false
+    // The folder's title is needed for the last breadcrumb crumb; the ancestor
+    // chain (root→parent) comes from the ancestors endpoint. Two fetches, but
+    // folder reveal is an infrequent user-driven action.
+    Promise.all([
+      libraryAPI.get(projectId, folderId, { include_content: false }),
+      libraryAPI.getAncestors(projectId, folderId),
+    ]).then(([folder, res]) => {
+      if (cancelled || !folder) return
+      const ancestors = (res && res.ancestors) || []
+      const nextCrumbs = [
+        ...rootBreadcrumb(),
+        ...ancestors.map(a => ({ id: a.id, name: a.title })),
+        { id: folderId, name: folder.title },
+      ]
+      setCurrentFolderId(folderId)
+      setBreadcrumbs(nextCrumbs)
+      setSelectedDocId(null)
+      setSelectedDoc(null)
+      setSelectedIds(new Set())
+      persistLibraryState({ folderId, breadcrumbs: nextCrumbs, selectedDocId: null })
+    }).catch(() => {
+      // The item vanished between the citation's existence check and this
+      // reveal (e.g. deleted in another tab) — surface it rather than leave
+      // the click looking like a no-op.
+      if (!cancelled) toastError(t('chat.citation.notFound'))
+    })
+    return () => { cancelled = true }
+  }, [revealFolderRequest, projectId, rootBreadcrumb, persistLibraryState, t])
+
+  useEffect(() => {
+    if (!revealDocumentRequest?.docId || !projectId) return
+    const { docId } = revealDocumentRequest
+    let cancelled = false
+    libraryAPI.getAncestors(projectId, docId)
+      .then(res => {
+        if (cancelled) return
+        const ancestors = (res && res.ancestors) || []
+        const root = rootBreadcrumb()
+        const nextCrumbs = [
+          ...root,
+          ...ancestors.map(a => ({ id: a.id, name: a.title })),
+        ]
+        const parentId = ancestors.length > 0 ? ancestors[ancestors.length - 1].id : null
+        setCurrentFolderId(parentId)
+        setBreadcrumbs(nextCrumbs)
+        setSelectedIds(new Set())
+        persistLibraryState({ folderId: parentId, breadcrumbs: nextCrumbs, selectedDocId: docId })
+        // Selecting the doc triggers the detail-panel fetch effect above.
+        selectDocument(docId)
+      })
+      .catch(() => {
+        if (!cancelled) toastError(t('chat.citation.notFound'))
+      })
+    return () => { cancelled = true }
+  }, [revealDocumentRequest, projectId, rootBreadcrumb, persistLibraryState, selectDocument, t])
+
   // Status summary for global indicators (all docs in project)
   const [statusSummary, setStatusSummary] = useState({ summary: {}, documents: [] })
   const hasFailed = (statusSummary.summary.failed || 0) > 0

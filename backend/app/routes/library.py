@@ -69,6 +69,22 @@ async def get_document(
     return ok(doc)
 
 
+@router.get("/{project_id}/documents/{doc_id}/ancestors")
+async def get_document_ancestors(project_id: str, doc_id: str):
+    """Return the folder breadcrumb chain (root → parent) for a document.
+
+    Used by chat citations to rebuild Library navigation before revealing a
+    document. Missing documents raise 404 so the UI can surface the failure.
+    """
+    doc = await library_service.get_document(
+        project_id, doc_id, include_content=False
+    )
+    if not doc:
+        raise DocumentNotFoundError(doc_id)
+    ancestors = await library_service.get_ancestor_chain(project_id, doc_id)
+    return ok({"ancestors": ancestors, "parent_id": doc.get("parent_id")})
+
+
 @router.post("/{project_id}/documents")
 async def create_document(project_id: str, data: CreateDocumentRequest):
     """Create a new library document."""

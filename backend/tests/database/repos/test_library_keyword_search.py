@@ -128,3 +128,45 @@ async def test_count_search_keyword_short_query_uses_like_path(db_session_factor
 
         count = await repo.count_search_keyword("AI")
     assert count == 2
+
+
+@pytest.mark.database
+@pytest.mark.asyncio
+async def test_get_ancestor_chain_returns_root_to_parent_for_nested_doc(db_session_factory):
+    """The chain is root→parent of the doc, excluding the doc itself, root first."""
+    async with db_session_factory() as session:
+        repo = LibraryRepository(session)
+        root_folder = await repo.create(title="Root", content="", is_folder=True)
+        mid_folder = await repo.create(
+            title="Mid", content="", is_folder=True, parent_id=root_folder.id
+        )
+        doc = await repo.create(title="Doc", content="body", parent_id=mid_folder.id)
+
+        chain = await repo.get_ancestor_chain(doc.id)
+
+    assert [c["id"] for c in chain] == [root_folder.id, mid_folder.id]
+    assert [c["title"] for c in chain] == ["Root", "Mid"]
+
+
+@pytest.mark.database
+@pytest.mark.asyncio
+async def test_get_ancestor_chain_empty_for_top_level_doc(db_session_factory):
+    async with db_session_factory() as session:
+        repo = LibraryRepository(session)
+        doc = await repo.create(title="Top", content="body")
+
+        chain = await repo.get_ancestor_chain(doc.id)
+
+    assert chain == []
+
+
+@pytest.mark.database
+@pytest.mark.asyncio
+async def test_get_ancestor_chain_empty_for_missing_doc(db_session_factory):
+    """A non-existent id yields an empty chain rather than raising."""
+    async with db_session_factory() as session:
+        repo = LibraryRepository(session)
+
+        chain = await repo.get_ancestor_chain("does-not-exist")
+
+    assert chain == []

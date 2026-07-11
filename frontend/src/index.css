@@ -332,6 +332,46 @@
 }
 /* pre (code blocks) already use a dark background in light mode — keep as-is. */
 
+/* Citation links (sigma://) — distinct from ordinary links so users can tell
+   they navigate within SiGMA rather than to the web. A leading link icon is
+   rendered via ::before (no DOM mutation); color + dashed underline reinforce
+   that these are clickable, in-app references. */
+.sigma-content a[href^="sigma:"],
+.sigma-markdown a[href^="sigma:"] {
+  color: #2563eb;
+  font-weight: 500;
+  text-decoration: none;
+  border-bottom: 1px dashed #93c5fd;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.sigma-content a[href^="sigma:"]::before,
+.sigma-markdown a[href^="sigma:"]::before {
+  content: "";
+  display: inline-block;
+  width: 0.8em;
+  height: 0.8em;
+  margin-right: 0.15em;
+  vertical-align: -0.1em;
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71'/%3E%3Cpath d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71'/%3E%3C/svg%3E") center / contain no-repeat;
+          mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71'/%3E%3Cpath d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+.sigma-content a[href^="sigma:"]:hover,
+.sigma-markdown a[href^="sigma:"]:hover {
+  background-color: rgba(37, 99, 235, 0.08);
+  border-bottom-style: solid;
+}
+.dark .sigma-content a[href^="sigma:"],
+.dark .sigma-markdown a[href^="sigma:"] {
+  color: #93c5fd;
+  border-bottom-color: #60a5fa;
+}
+.dark .sigma-content a[href^="sigma:"]:hover,
+.dark .sigma-markdown a[href^="sigma:"]:hover {
+  background-color: rgba(147, 197, 253, 0.12);
+}
+
 /* CodeMirror gutter / active line — index.css !important rules above override
    the editor theme, so they need their own dark overrides. */
 .dark .cm-gutters {

@@ -166,7 +166,7 @@ function AttachmentStrip({ projectId, attachments, onRemove = null, compact = fa
 const sessionInitLocks = new Map() // projectId → Promise<sessionId>
 const HISTORY_PAGE_SIZE = 10
 
-export default function ChatPanel({ projectId, placeholder, citation = null, onClearCitation = null, onFileChanged = null, onAnnotationChanged = null, getUserState = null, onSaveBeforeChat = null }) {
+export default function ChatPanel({ projectId, placeholder, citation = null, onClearCitation = null, onFileChanged = null, onAnnotationChanged = null, getUserState = null, onSaveBeforeChat = null, onCitation = null }) {
   const { t } = useTranslation()
   const resolvedPlaceholder = placeholder || t('chat.askPlaceholder')
   const [chatInput, setChatInput] = useState('')
@@ -1852,7 +1852,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
               <div className={`max-w-[90%] px-4 py-3 rounded-2xl shadow-sm animate-in fade-in slide-in-from-bottom-1 duration-300 overflow-hidden break-words ${
                 m.role === 'user' ? 'bg-sigma-600 text-white rounded-tr-none' : 'bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 border border-gray-100 dark:border-gray-800 rounded-tl-none'
               }`}>
-                {m.role === 'SiGMA' ? <MarkdownContent content={m.content || ''} projectId={projectId} /> : (
+                {m.role === 'SiGMA' ? <MarkdownContent content={m.content || ''} projectId={projectId} onCitation={onCitation} /> : (
                   <div className={`text-sm leading-relaxed whitespace-pre-wrap ${editingMessageId === m.id ? 'opacity-50' : ''}`}>{m.content}</div>
                 )}
                 {m.role === 'user' && (

@@ -63,14 +63,14 @@ class TaskService:
             )
 
     async def resolve_task(
-        self, project_id: str, session_id: str, short_id: str,
+        self, project_id: str, session_id: str, task_id: str,
     ) -> tuple:
-        """Resolve a task by full or prefix ID, scoped to a session.
+        """Resolve a task by exact ID, scoped to a session.
 
         Returns (task, error_message). One of them is None.
         """
         async with UnitOfWork(project_id) as uow:
-            return await uow.tasks.resolve_by_prefix(session_id, short_id)
+            return await uow.tasks.resolve(session_id, task_id)
 
     async def get_task(self, project_id: str, task_id: str):
         """Get a task by exact ID. Returns ORM Task or None."""

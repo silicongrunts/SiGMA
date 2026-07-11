@@ -1,11 +1,12 @@
 import { createContext } from 'react'
 
 /**
- * Context for LibraryBrowser → EditorHeader / LibraryTab communication.
+ * Context for LibraryBrowser ↔ EditorHeader / EditorView communication.
  *
- * LibraryBrowser (inside LibraryTab) writes callbacks + status;
- * EditorHeader reads them to render action buttons and status indicators.
- * LibraryTab reads browsing state for LLM user_state context.
+ * LibraryBrowser writes callbacks + status; EditorHeader reads them to render
+ * action buttons and status indicators. LibraryTab reads browsing state for
+ * LLM user_state context. EditorView writes navigation requests (below) that
+ * LibraryBrowser consumes to drive folder/document reveal from chat citations.
  */
 export const LibraryActionsContext = createContext({
   onRefresh: null,
@@ -20,4 +21,9 @@ export const LibraryActionsContext = createContext({
   selectedDocTitle: null,
   currentFolderPath: null,
   indexingStatus: null,
+  // Imperative navigation requests from chat citations. Each carries a requestId
+  // so LibraryBrowser's effect re-fires even when the target id repeats. null
+  // means "no pending request".
+  revealFolderRequest: null,    // { folderId, requestId }
+  revealDocumentRequest: null,  // { docId, requestId }
 })

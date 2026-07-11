@@ -83,7 +83,7 @@ async def test_replace_tasks(db_session_factory):
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
 async def test_resolve_task(db_session_factory):
-    """resolve_task finds a task by prefix."""
+    """resolve_task finds a task by exact ID; returns error for unknown ID."""
     from unittest.mock import patch
     from app.services.task_service import task_service
 
@@ -103,11 +103,10 @@ async def test_resolve_task(db_session_factory):
         assert err is None
         assert task.subject == "Resolve me"
 
-        # Resolve by prefix (8+ chars)
-        prefix = created.id[:8]
-        task2, err2 = await task_service.resolve_task("p", session_id, prefix)
-        assert task2 is not None
-        assert err2 is None
+        # Unknown ID returns an error, not a match
+        task2, err2 = await task_service.resolve_task("p", session_id, "nonexistent00000000000000000")
+        assert task2 is None
+        assert err2 is not None
 
 
 @pytest.mark.asyncio

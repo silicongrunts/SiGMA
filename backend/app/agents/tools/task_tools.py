@@ -127,7 +127,7 @@ tool_registry.register(ToolDefinition(
     input_schema={
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "The ID of the task to update (8+ chars for prefix match)"},
+            "id": {"type": "string", "description": "The ID of the task to update"},
             "status": {"type": "string", "description": "New status: pending, in_progress, completed, deleted", "default": ""},
             "subject": {"type": "string", "description": "New subject for the task", "default": ""},
             "description": {"type": "string", "description": "New description", "default": ""},
@@ -164,7 +164,7 @@ tool_registry.register(ToolDefinition(
     input_schema={
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "The ID of the task to retrieve (8+ chars for prefix match)"},
+            "id": {"type": "string", "description": "The ID of the task to retrieve"},
         },
         "required": ["id"],
     },

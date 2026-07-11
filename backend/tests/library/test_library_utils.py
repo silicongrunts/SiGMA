@@ -6,7 +6,6 @@ and search result rendering.
 import pytest
 
 from app.agents.tools.library_tools import (
-    short_id,
     parse_ids,
     parse_fields,
     content_preview,
@@ -14,22 +13,6 @@ from app.agents.tools.library_tools import (
     format_directory_listing,
     format_document_content,
 )
-
-
-# ---------------------------------------------------------------------------
-# short_id
-# ---------------------------------------------------------------------------
-
-def test_short_id_truncates():
-    assert short_id("abcdef1234567890") == "abcdef12"
-
-
-def test_short_id_short_string():
-    assert short_id("abc") == "abc"
-
-
-def test_short_id_empty():
-    assert short_id("") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -135,14 +118,14 @@ def test_format_directory_listing_empty():
 
 def test_format_directory_listing_with_items():
     docs = [
-        {"id": "abcdef12-0000-0000-0000-000000000000", "title": "My Paper",
+        {"id": "abcdef12000000000000000000000000", "title": "My Paper",
          "keywords": ["ml", "nlp"]},
-        {"id": "12345678-0000-0000-0000-000000000000", "title": "Folder",
+        {"id": "12345678000000000000000000000000", "title": "Folder",
          "is_folder": True},
     ]
     result = format_directory_listing(docs, "papers")
-    assert "[abcdef12]" in result
-    assert "[12345678]" in result
+    assert "[abcdef12000000000000000000000000]" in result
+    assert "[12345678000000000000000000000000]" in result
     assert "My Paper" in result
     assert "Folder/" in result
     assert "ml, nlp" in result

@@ -15,13 +15,13 @@ These IDs are for subsequent tool calls only and not visible to the user."""
 
 PROMPT_ANNOTATION_RM = """Delete one or more annotations.
 
-Accepts a single ID or an array of IDs. Provide at least the first 8 characters of each ID for prefix matching.
+Accepts a single ID or an array of IDs.
 
 Tool result, one line per ID: "Annotation {id} deleted" or "Error for {id}: {reason}". These IDs are for subsequent tool calls only."""
 
 PROMPT_ANNOTATION_GET = """Retrieve the full thread of one or more annotations.
 
-Accepts a single ID or an array of IDs. Provide at least the first 8 characters of each ID for prefix matching.
+Accepts a single ID or an array of IDs.
 
 Tool result (XML):
 <annotation><id>full-id</id><file_content>original text snapshot</file_content><reply><role>SiGMA|user</role><text>message content</text></reply>...</annotation>
@@ -32,8 +32,6 @@ PROMPT_ANNOTATION_REPLY = """Reply to an existing annotation.
 reply_content may contain <diff> blocks:
 <diff><before>original text</before><after>new text</after></diff>
 Each <before> must appear exactly once in the annotation's file.
-
-Provide at least the first 8 characters of the ID for prefix matching.
 
 Tool result: "Reply added to annotation {id}" or "Error: {reason}"."""
 
