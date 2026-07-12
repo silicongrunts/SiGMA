@@ -68,7 +68,7 @@ class SearchRequest(BaseModel):
     """Request body for /library/{project_id}/search and rag-search."""
     query: str = Field(..., min_length=1, max_length=1000)
     parent_id: Optional[str] = None
-    limit: int = Field(100, ge=1, le=500)
+    limit: int = Field(50, ge=1, le=500)
     offset: int = Field(0, ge=0)
 
 

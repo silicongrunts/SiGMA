@@ -284,6 +284,10 @@ export default function LibraryBrowser({ projectId }) {
   // Pagination state
   const [page, setPage] = useState(0)
   const [totalCount, setTotalCount] = useState(0)
+  // Active query when paging through keyword-search results (null otherwise).
+  // Lets keyword search reuse the same page/totalCount/renderPagination path
+  // as folder browsing; semantic search is never paginated.
+  const [keywordSearchActive, setKeywordSearchActive] = useState(null)
   const [editingPage, setEditingPage] = useState(false)
   const [pageInput, setPageInput] = useState('')
   const pageInputRef = useRef(null)
@@ -365,11 +369,11 @@ export default function LibraryBrowser({ projectId }) {
   const loadDocuments = useCallback(async () => {
     if (!projectId) return
     setIsSearchResult(false)
+    setKeywordSearchActive(null)
     setLoading(true)
     try {
       const params = { sort: sortBy, order: sortOrder }
       if (currentFolderId) params.parent_id = currentFolderId
-      // Only apply pagination for non-search results
       const p = page * PAGE_SIZE
       params.limit = PAGE_SIZE
       params.offset = p
@@ -385,7 +389,12 @@ export default function LibraryBrowser({ projectId }) {
     }
   }, [projectId, sortBy, sortOrder, currentFolderId, page, resetToRoot])
 
-  useEffect(() => { loadDocuments() }, [loadDocuments])
+  // Browse view: reload when folder/sort/page changes. Skip while paging
+  // through keyword-search results — the search effect owns that path.
+  useEffect(() => {
+    if (keywordSearchActive != null) return
+    loadDocuments()
+  }, [loadDocuments, keywordSearchActive])
 
   // Clear selection when folder changes or documents reload
   useEffect(() => { setSelectedIds(new Set()); setPage(0) }, [currentFolderId, sortBy, sortOrder])
@@ -398,12 +407,13 @@ export default function LibraryBrowser({ projectId }) {
     }
   }, [isSearchResult, page, totalCount, totalPages])
 
-  // Auto-exit search mode when search box is cleared
+  // Auto-exit search mode when search box is cleared. The browse effect
+  // picks up the folder reload once keywordSearchActive is cleared.
   useEffect(() => {
     if (searchQuery.trim() === '' && isSearchResult) {
       const timer = setTimeout(() => {
         setIsSearchResult(false)
-        loadDocuments()
+        setKeywordSearchActive(null)
       }, 300)
       return () => clearTimeout(timer)
     }
@@ -562,45 +572,73 @@ export default function LibraryBrowser({ projectId }) {
   }, [projectId, selectedDocId, isSearchResult, sortBy, sortOrder, currentFolderId, page, resetToRoot])
 
   // Search handlers
-  const handleSearch = async () => {
-    if (!searchQuery.trim() || !projectId) return
+  // Keyword search is paginated: runKeywordSearch fetches a page, and the
+  // effect below re-fetches whenever the page changes. Semantic search returns
+  // a flat top-k list and is never paginated.
+
+  const runKeywordSearch = useCallback(async (query, pageToFetch) => {
     const myId = ++searchReqIdRef.current
     setLoading(true)
     try {
-      const api = searchMode === 'semantic' ? libraryAPI.ragSearch : libraryAPI.search
-      const options = { limit: 100 }
+      const options = { limit: PAGE_SIZE, offset: pageToFetch * PAGE_SIZE }
       if (currentFolderId) options.parent_id = currentFolderId
-      const data = await api(projectId, searchQuery, options)
+      const data = await libraryAPI.search(projectId, query, options)
       if (myId !== searchReqIdRef.current) return  // a newer search superseded this one
-      setIsSearchResult(true)
       setDocuments(data.documents || [])
-      setSelectedIds(new Set())
+      setTotalCount(data.total || 0)
     } catch (e) {
       if (myId !== searchReqIdRef.current) return
       toastError(getLibrarySearchErrorMessage(e, t))
     } finally {
       if (myId === searchReqIdRef.current) setLoading(false)
     }
+  }, [projectId, currentFolderId, PAGE_SIZE, t])
+
+  // Re-fetch when paging through keyword search results.
+  useEffect(() => {
+    if (keywordSearchActive == null) return
+    runKeywordSearch(keywordSearchActive, page)
+  }, [keywordSearchActive, page, runKeywordSearch])
+
+  const handleSearch = async () => {
+    if (!searchQuery.trim() || !projectId) return
+    if (searchMode === 'semantic') {
+      const myId = ++searchReqIdRef.current
+      setLoading(true)
+      try {
+        const options = {}
+        if (currentFolderId) options.parent_id = currentFolderId
+        const data = await libraryAPI.ragSearch(projectId, searchQuery, options)
+        if (myId !== searchReqIdRef.current) return
+        setIsSearchResult(true)
+        setKeywordSearchActive(null)
+        setDocuments(data.documents || [])
+        setTotalCount(0)
+        setSelectedIds(new Set())
+      } catch (e) {
+        if (myId !== searchReqIdRef.current) return
+        toastError(getLibrarySearchErrorMessage(e, t))
+      } finally {
+        if (myId === searchReqIdRef.current) setLoading(false)
+      }
+      return
+    }
+    // Keyword: set the active query + reset to page 0. If page was already 0
+    // the keywordSearchActive change drives the fetch; otherwise setPage(0)
+    // does. Both run in the same render cycle and the effect fires once.
+    setKeywordSearchActive(searchQuery)
+    setIsSearchResult(true)
+    setSelectedIds(new Set())
+    setPage(0)
   }
 
   const handleKeywordSearch = async (keyword) => {
     if (!keyword || !projectId) return
-    const myId = ++searchReqIdRef.current
     setSearchQuery(keyword)
-    setLoading(true)
-    try {
-      const options = { limit: 100 }
-      if (currentFolderId) options.parent_id = currentFolderId
-      const data = await libraryAPI.search(projectId, keyword, options)
-      if (myId !== searchReqIdRef.current) return  // a newer search superseded this one
-      setIsSearchResult(true)
-      setDocuments(data.documents || [])
-    } catch (e) {
-      if (myId !== searchReqIdRef.current) return
-      toastError(getLibrarySearchErrorMessage(e, t))
-    } finally {
-      if (myId === searchReqIdRef.current) setLoading(false)
-    }
+    setKeywordSearchActive(keyword)
+    setIsSearchResult(true)
+    setSelectedIds(new Set())
+    setPage(0)
   }
 
   const handleDelete = async (docId) => {
@@ -839,7 +877,10 @@ export default function LibraryBrowser({ projectId }) {
   }
 
   const renderPagination = () => {
-    if (isSearchResult || totalCount <= PAGE_SIZE) return null
+    // Semantic search returns a flat top-k list (no pagination). Keyword
+    // search reuses the same paging controls as folder browsing.
+    const isSemanticSearch = isSearchResult && keywordSearchActive == null
+    if (isSemanticSearch || totalCount <= PAGE_SIZE) return null
     const currentPage = page + 1
     return (
       <div className="flex items-center gap-0.5 bg-gray-50 dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 px-0.5 py-0">
@@ -1116,7 +1157,7 @@ export default function LibraryBrowser({ projectId }) {
             {loading && <Spinner size="xs" className="text-sigma-600" />}
             <button onClick={handleSearch} className="text-xs font-bold text-sigma-600 hover:text-sigma-700">{t('library.search')}</button>
             {isSearchResult && (
-              <button onClick={() => { setSearchQuery(''); loadDocuments(); }} className="p-0.5 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
+              <button onClick={() => { setSearchQuery(''); setKeywordSearchActive(null); }} className="p-0.5 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
                 <X className="w-3.5 h-3.5" />
               </button>
             )}

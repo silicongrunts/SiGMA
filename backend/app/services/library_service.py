@@ -473,7 +473,7 @@ class LibraryService:
         project_id: str,
         query: str,
         parent_id: str = None,
-        limit: int = 100,
+        limit: int = 50,
         offset: int = 0,
     ) -> List[Dict]:
         """Keyword search across title, description, and content with snippet extraction."""
@@ -508,7 +508,7 @@ class LibraryService:
         project_id: str,
         query: str,
         parent_id: str = None,
-        limit: int = 10,
+        limit: int = 50,
         offset: int = 0,
     ) -> Dict:
         """Keyword search with real pagination.

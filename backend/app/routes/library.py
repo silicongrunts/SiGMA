@@ -116,14 +116,14 @@ async def delete_document(project_id: str, doc_id: str):
 @router.post("/{project_id}/search")
 async def search_documents(project_id: str, data: SearchRequest):
     """Keyword search across library documents."""
-    docs = await library_service.search_documents(
+    result = await library_service.search_documents_paged(
         project_id,
         data.query,
         parent_id=data.parent_id,
         limit=data.limit,
         offset=data.offset,
     )
-    return ok({"documents": docs})
+    return ok({"documents": result["results"], "total": result["total"]})
 
 
 @router.post("/{project_id}/rag-search")
