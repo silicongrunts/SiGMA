@@ -95,6 +95,22 @@ def _is_binary(file_path: Path) -> bool:
         return True
 
 
+def _has_bundled_files(skill_dir: Path) -> bool:
+    """Return ``True`` if the skill directory holds any non-hidden file
+    besides ``SKILL.md`` (e.g. references, templates, scripts).
+
+    Hidden items (dot-prefix on any path segment) are ignored, matching the
+    listing convention of :meth:`SkillService.list_files`.
+    """
+    for item in skill_dir.rglob("*"):
+        rel = item.relative_to(skill_dir)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if item.is_file() and rel.name != _SKILL_MD:
+            return True
+    return False
+
+
 def _mtime_to_iso(mtime: float) -> str:
     """Convert a Unix timestamp to ISO 8601 string."""
     return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
@@ -184,9 +200,23 @@ class SkillService:
             raise SkillError(f"File too large ({size} bytes, max {_MAX_FILE_BYTES}): {target_name}")
 
         try:
-            return target.read_text(encoding="utf-8", errors="replace")
+            content = target.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             raise SkillError(f"Failed to read {target_name}: {exc}") from exc
+
+        # When the main SKILL.md is loaded and the skill bundles extra files,
+        # nudge the LLM to fetch them through skill_load rather than the read
+        # tool (whose path resolution cannot reach the skill directory).
+        if not file_path and _has_bundled_files(skill_dir):
+            content += (
+                "\n\n---\n"
+                "This skill bundles reference files, templates, or scripts. "
+                "To read any of them (paths mentioned above), use the "
+                "`skill_load` tool with this skill's `id` and the relative "
+                "`file_path` — do NOT use the `read` tool, which cannot "
+                "access skill files."
+            )
+        return content
 
     def toggle_skill(self, skill_id: str) -> dict:
         """Toggle a skill between enabled and disabled by renaming its folder.
