@@ -6,17 +6,38 @@ import { useEffect, useState, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
+import renderMathInElement from 'katex/dist/contrib/auto-render.mjs'
+import { extractMath, restoreMath } from '../utils/mathGuard'
 import { ChevronDown, MessageSquare, Cpu, CheckCircle2, Loader2, AlertCircle } from 'lucide-react'
 import TaskList from './TaskList'
 
 marked.setOptions({ gfm: true, breaks: true })
 
-function rewriteProjectImageSrc(html, projectId) {
+/**
+ * Rewrite relative <img src="..."> in rendered markdown HTML to project-scoped
+ * inline URLs so local images (e.g. `![](assets/fig.png)`) load from the
+ * backend. Absolute URLs (http(s):, data:, /, #) are left untouched.
+ *
+ * Shared by MarkdownContent (chat/annotation/diff) and Preview (editor
+ * preview) so the two paths render local images identically.
+ */
+export function rewriteProjectImageSrc(html, projectId) {
     if (!projectId || !html) return html
     const doc = new DOMParser().parseFromString(html, 'text/html')
     doc.querySelectorAll('img').forEach(img => {
         const src = img.getAttribute('src') || ''
-        if (!src || src.startsWith('http://') || src.startsWith('https://') || src.startsWith('data:') || src.startsWith('/') || src.startsWith('#')) {
+        // Skip absolute URLs (already resolvable) AND dangerous schemes that
+        // must never become a project path. javascript:/vbscript:/file: are
+        // listed explicitly as defense-in-depth even though DOMPurify (run
+        // after this) also strips them — this function may be called from a
+        // null-projectId early-return path, so we don't rely on downstream
+        // sanitization alone.
+        if (!src
+            || src.startsWith('http://') || src.startsWith('https://')
+            || src.startsWith('data:') || src.startsWith('/')
+            || src.startsWith('#')
+            || src.startsWith('javascript:') || src.startsWith('vbscript:')
+            || src.startsWith('file:')) {
             return
         }
         img.setAttribute('src', `/api/v1/files/${encodeURIComponent(projectId)}/inline?path=${encodeURIComponent(src)}`)
@@ -92,17 +113,42 @@ const SIGMA_CITATION_SCHEME = 'sigma'
 const citationUriRegexp = /^(?:sigma:|(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
 
 export const MarkdownContent = ({ content, projectId = null, onCitation = null }) => {
+    const containerRef = useRef(null)
+
     // Memoize parsing+sanitizing: in streaming chat the parent re-renders on
     // every token delta, and without this every prior message re-parses its
     // full markdown each frame.
     const html = useMemo(() => {
-        const parsed = marked.parse(content || '')
-        const rewritten = rewriteProjectImageSrc(parsed, projectId)
+        // Protect math from marked (breaks:true <br> insertion, emphasis eating,
+        // entity escaping) by lifting it out before parse and stitching it back
+        // after. See utils/mathGuard.js for the full rationale.
+        const { text, map } = extractMath(content || '')
+        const parsed = marked.parse(text)
+        const restored = restoreMath(parsed, map)
+        const rewritten = rewriteProjectImageSrc(restored, projectId)
         if (!onCitation) return DOMPurify.sanitize(rewritten)
         return DOMPurify.sanitize(rewritten, {
             ALLOWED_URI_REGEXP: citationUriRegexp,
         })
     }, [content, projectId, onCitation])
+
+    // Render math ($...$ inline, $$...$$ display) after React commits the HTML.
+    // Same delimiter set as Preview.jsx so chat and preview render math alike.
+    // Note: this runs on every `html` change, so during streaming it re-walks
+    // the whole subtree and re-typesets every formula each token (O(message
+    // length) per token). Acceptable for now; if long math-heavy messages lag,
+    // gate this on an isStreaming flag and run once on completion.
+    useEffect(() => {
+        if (containerRef.current) {
+            renderMathInElement(containerRef.current, {
+                delimiters: [
+                    { left: '$$', right: '$$', display: true },
+                    { left: '$', right: '$', display: false },
+                ],
+                throwOnError: false,
+            })
+        }
+    }, [html])
 
     // Citation links are never real navigation. Intercept via a single delegated
     // handler instead of per-anchor binding. Only active when onCitation is set,
@@ -121,6 +167,7 @@ export const MarkdownContent = ({ content, projectId = null, onCitation = null }
 
     return (
         <div
+            ref={containerRef}
             className="sigma-content text-sm leading-relaxed break-words overflow-hidden"
             dangerouslySetInnerHTML={{ __html: html }}
             onClick={handleClick}

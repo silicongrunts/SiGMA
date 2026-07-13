@@ -54,16 +54,17 @@ export function SideBySideDiffViewer({ before, after, onAccept, onReject }) {
         <div className="flex-1 text-xs font-bold text-green-700 dark:text-green-300 py-1 px-3 bg-green-50 dark:bg-green-900/30">{t('diff.suggested')}</div>
       </div>
 
-      {/* Content area - scrollable */}
-      <div className="flex-1 overflow-y-auto min-h-0">
-        <div className="flex">
+      {/* Content area - scrollable. break-all so long unbreakable tokens
+          (paths, URLs, base64) wrap instead of pushing the panel wider. */}
+      <div className="flex-1 overflow-auto min-h-0">
+        <div className="flex min-w-full">
           {/* Before (left side) - light red background */}
-          <div className="flex-1 p-3 font-mono text-xs leading-snug border-r border-gray-200 dark:border-gray-700 bg-red-50 dark:bg-red-900/20">
-            <div className="whitespace-pre-wrap text-gray-800 dark:text-red-300">{before}</div>
+          <div className="flex-1 min-w-0 p-3 font-mono text-xs leading-snug border-r border-gray-200 dark:border-gray-700 bg-red-50 dark:bg-red-900/20">
+            <div className="whitespace-pre-wrap break-all text-gray-800 dark:text-red-300">{before}</div>
           </div>
           {/* After (right side) - light green background */}
-          <div className="flex-1 p-3 font-mono text-xs leading-snug bg-green-50 dark:bg-green-900/20">
-            <div className="whitespace-pre-wrap text-gray-800 dark:text-green-300">{after}</div>
+          <div className="flex-1 min-w-0 p-3 font-mono text-xs leading-snug bg-green-50 dark:bg-green-900/20">
+            <div className="whitespace-pre-wrap break-all text-gray-800 dark:text-green-300">{after}</div>
           </div>
         </div>
       </div>

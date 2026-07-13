@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback, useImperativeHandle, forwardR
 import { useTranslation } from 'react-i18next'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.js?url'
-import { marked } from 'marked'
+import { Marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github-dark.css'
@@ -13,26 +13,34 @@ import { filesAPI, compileAPI } from '../api'
 import { storage } from '../utils/storage'
 import { getCompiledPdfName } from '../utils/constants'
 import { toastError } from './Toast'
+import { rewriteProjectImageSrc } from './ChatShared'
+import { extractMath, restoreMath } from '../utils/mathGuard'
 import { ZoomIn, ZoomOut, ArrowUp, Maximize2, FileSearch, FileText, Download, AlertTriangle, ChevronLeft, ChevronRight } from 'lucide-react'
 
 // Local worker (bundled, no CDN)
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
-// Extend the shared marked instance with syntax highlighting via highlight.js.
-// Applied as a marked extension (not setOptions) so it stays local to this file's
-// pipeline and does not alter token structure — ChatShared.jsx's own setOptions
-// (gfm/breaks) still govern block parsing.
-marked.use(markedHighlight({
-  langPrefix: 'hljs language-',
-  highlight(code, lang) {
-    const language = lang && hljs.getLanguage(lang) ? lang : 'plaintext'
-    try {
-      return hljs.highlight(code, { language }).value
-    } catch {
-      return code
-    }
-  },
-}))
+// Dedicated marked instance for the editor preview pipeline, fully isolated
+// from the shared global `marked` singleton that ChatShared.jsx configures.
+// Using `new Marked(...)` ensures the highlight.js renderer + gfm/breaks
+// options below do NOT leak into chat/annotation/diff rendering (which all go
+// through ChatShared's MarkdownContent). Lexer and parser share this instance
+// so the editor↔preview block map (which relies on marked.lexer token offsets)
+// stays consistent with the rendered HTML.
+const previewMarked = new Marked(
+  { gfm: true, breaks: true },
+  markedHighlight({
+    langPrefix: 'hljs language-',
+    highlight(code, lang) {
+      const language = lang && hljs.getLanguage(lang) ? lang : 'plaintext'
+      try {
+        return hljs.highlight(code, { language }).value
+      } catch {
+        return code
+      }
+    },
+  }),
+)
 
 const PDFJS_ASSET_BASE = `${import.meta.env.BASE_URL || '/'}pdfjs/`
 
@@ -423,7 +431,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
         return lo
       }
 
-      const tokens = marked.lexer(mdContent)
+      const tokens = previewMarked.lexer(mdContent)
       const domBlocks = containerRef.current.querySelectorAll('.prose > *')
       let searchOffset = 0
       const map = []
@@ -709,7 +717,12 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
                 <div
                     className="prose dark:prose-invert max-w-none prose-pre:font-mono prose-code:font-mono prose-code:before:hidden prose-code:after:hidden bg-white dark:bg-gray-800 p-12 mx-auto shadow-2xl border border-gray-200 dark:border-gray-700 mb-12"
                     style={{ maxWidth: '48rem', width: '100%', fontSize: `${zoomLevel}rem` }}
-                    dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(String(mdContent ?? ''))) }}
+                    dangerouslySetInnerHTML={{ __html: (() => {
+                        const md = String(mdContent ?? '')
+                        const { text, map } = extractMath(md)
+                        const restored = restoreMath(previewMarked.parse(text), map)
+                        return DOMPurify.sanitize(rewriteProjectImageSrc(restored, currentProjectId))
+                    })() }}
                 />
             </div>
         ) : binaryErrorPath ? (

@@ -24,23 +24,28 @@
 /* Markdown preview base is now provided by Tailwind Typography (`.prose`).
    Only project-specific overrides (highlight sync, KaTeX scroll) live here. */
 
-/* Sigma Markdown Chat Styles */
-.sigma-markdown {
-  font-size: 0.875rem;
-  line-height: 1.6;
+/* ───────────────── Markdown table tokens (shared by chat + preview) ─────────────────
+   Both .sigma-content (chat/annotation/diff) and .prose (editor preview) render
+   the same full-grid, shaded-header table look. Variables live on :root so the
+   two systems never drift; .dark overrides flip the palette. */
+:root {
+  --sigma-table-border: #e5e7eb;
+  --sigma-table-header-bg: #f9fafb;
+}
+.dark {
+  --sigma-table-border: #374151;
+  --sigma-table-header-bg: #1f2937;
 }
 
-/* Chat bubble markdown content */
+/* Chat bubble markdown content.
+   Overflow strategy mirrors .prose: the container never lets children cross
+   its boundary; each wide element (pre, table, katex) owns its own scrollbar.
+   No `* { max-width }` nuclear fallback — every rule is element-scoped. */
 .sigma-content {
   font-size: 0.875rem;
   line-height: 1.6;
+  overflow: hidden;
   overflow-wrap: break-word;
-  word-wrap: break-word;
-  word-break: break-word;
-  max-width: 100%;
-}
-
-.sigma-content * {
   max-width: 100%;
 }
 
@@ -62,7 +67,7 @@
   color: #f9fafb;
   padding: 1em;
   border-radius: 8px;
-  overflow: hidden;
+  overflow-x: auto;
   margin: 1em 0;
   max-width: 100%;
 }
@@ -80,43 +85,29 @@
 .sigma-content ol { list-style-type: decimal; }
 .sigma-content li { margin-bottom: 0.25em; }
 .sigma-content blockquote { border-left: 4px solid #e5e7eb; padding-left: 1em; color: #6b7280; font-style: italic; }
+.sigma-content img,
+.sigma-content svg {
+  max-width: 100%;
+}
 .sigma-content table {
   border-collapse: collapse;
   width: auto;
   max-width: 100%;
   margin-bottom: 1em;
-  overflow: auto;
   display: block;
+  overflow-x: auto;
 }
 .sigma-content th,
 .sigma-content td {
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--sigma-table-border);
   padding: 0.5em;
   min-width: 50px;
+  overflow-wrap: anywhere;
 }
 .sigma-content th {
-  background-color: #f9fafb;
+  background-color: var(--sigma-table-header-bg);
   font-weight: 600;
 }
-.sigma-markdown p { margin-bottom: 0.75em; }
-.sigma-markdown p:last-child { margin-bottom: 0; }
-.sigma-markdown h1, .sigma-markdown h2, .sigma-markdown h3 { 
-  font-weight: 700; margin-top: 1em; margin-bottom: 0.5em; 
-}
-.sigma-markdown h1 { font-size: 1.25em; }
-.sigma-markdown h2 { font-size: 1.15em; }
-.sigma-markdown h3 { font-size: 1.05em; }
-.sigma-markdown code { 
-  background-color: rgba(0,0,0,0.05); padding: 0.2em 0.4em; border-radius: 4px; font-size: 0.9em; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-}
-.sigma-markdown pre {
-  background-color: #1f2937; color: #f9fafb; padding: 1em; border-radius: 8px; overflow-x: auto; margin: 1em 0;
-}
-.sigma-markdown pre code { background-color: transparent; padding: 0; color: inherit; font-size: 0.85em; }
-.sigma-markdown ul, .sigma-markdown ol { margin-left: 1.5em; margin-bottom: 0.75em; list-style-type: disc; }
-.sigma-markdown ol { list-style-type: decimal; }
-.sigma-markdown li { margin-bottom: 0.25em; }
-.sigma-markdown blockquote { border-left: 4px solid #e5e7eb; padding-left: 1em; color: #6b7280; font-style: italic; }
 
 /* All markdown element typography (headings, lists, code, tables, etc.) is now
    handled by Tailwind Typography (`.prose`). The rules below are project-specific
@@ -151,6 +142,8 @@
    rule used in the chat area, so preview and chat behave consistently. */
 .prose table {
   display: block;
+  width: 100%;
+  border-collapse: collapse;
   max-width: 100%;
   overflow-x: auto;
 }
@@ -163,6 +156,30 @@
   overflow-wrap: anywhere;
 }
 
+/* Table borders + header shading — override Tailwind Typography's default
+   (borderless, header-bottom-rule-only) with the full-grid, shaded-header look
+   used by the chat area, so the two stay visually consistent. Colors come from
+   the shared --sigma-table-* variables (defined above .sigma-content), so the
+   dark-mode flip is automatic and the two systems can never drift. Width stays
+   100% so tables still fill the column. */
+.prose :where(thead, tbody, tr, th, td) {
+  border-color: var(--sigma-table-border);
+}
+.prose :where(th, td) {
+  border: 1px solid var(--sigma-table-border);
+  padding: 0.5em;
+}
+/* Override Typography's first/last cell edge-zero padding — looks cramped once
+   the full grid border is on. */
+.prose :where(th, td):first-child,
+.prose :where(th, td):last-child {
+  padding-inline: 0.5em;
+}
+.prose :where(thead th) {
+  background-color: var(--sigma-table-header-bg);
+  font-weight: 600;
+}
+
 /* Highlight sync — mirrors editor cursor line in the preview.
    Applied to direct children of .prose (the rendered block elements).
    `!important` ensures it overrides prose's element backgrounds. */
@@ -173,8 +190,11 @@
   transition: background-color 0.15s, border-color 0.15s;
 }
 
-/* Code blocks: keep the highlight.js (github-dark) background, highlight via border/outline only */
+/* Code blocks: the generic .md-highlight rule above forces a translucent blue
+   background onto <pre>, which washes out the hljs code text. Keep the interior
+   dark (hljs github-dark = #0d1117) and signal the highlight via border only. */
 .prose > pre.md-highlight {
+  background-color: #0d1117 !important;
   border-left: 3px solid rgba(96, 165, 250, 0.7) !important;
   outline: 1px solid rgba(96, 165, 250, 0.35);
 }
@@ -336,35 +356,43 @@
   background-color: rgba(59, 130, 246, 0.18) !important;
   border-left-color: rgba(96, 165, 250, 0.6);
 }
+/* Code blocks keep their dark interior in dark mode too (see light-mode rule above);
+   only the border brightens. */
+.dark .prose > pre.md-highlight {
+  background-color: #0d1117 !important;
+  border-left-color: rgba(96, 165, 250, 0.85);
+}
 
-/* Chat markdown (.sigma-content / .sigma-markdown) */
-.dark .sigma-content code,
-.dark .sigma-markdown code {
+/* Chat markdown (.sigma-content) — table border/header colors flip via the
+   --sigma-table-* variables defined above; only code/blockquote need overrides. */
+.dark .sigma-content code {
   background-color: rgba(255, 255, 255, 0.1);
 }
-.dark .sigma-content blockquote,
-.dark .sigma-markdown blockquote {
+.dark .sigma-content blockquote {
   border-left-color: #374151;
   color: #9ca3af;
 }
-.dark .sigma-content th,
-.dark .sigma-content td,
-.dark .sigma-markdown th,
-.dark .sigma-markdown td {
-  border-color: #374151;
-}
-.dark .sigma-content th,
-.dark .sigma-markdown th {
-  background-color: #1f2937;
-}
 /* pre (code blocks) already use a dark background in light mode — keep as-is. */
+
+/* Ordinary links — underline only (color inherits from the bubble text), so
+   they're distinguishable from body copy without competing with the blue,
+   icon-prefixed sigma:// citation links below. Hover tightens the underline. */
+.sigma-content a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.sigma-content a:hover {
+  color: #2563eb;
+}
+.dark .sigma-content a:hover {
+  color: #93c5fd;
+}
 
 /* Citation links (sigma://) — distinct from ordinary links so users can tell
    they navigate within SiGMA rather than to the web. A leading link icon is
    rendered via ::before (no DOM mutation); color + dashed underline reinforce
    that these are clickable, in-app references. */
-.sigma-content a[href^="sigma:"],
-.sigma-markdown a[href^="sigma:"] {
+.sigma-content a[href^="sigma:"] {
   color: #2563eb;
   font-weight: 500;
   text-decoration: none;
@@ -372,8 +400,7 @@
   border-radius: 2px;
   cursor: pointer;
 }
-.sigma-content a[href^="sigma:"]::before,
-.sigma-markdown a[href^="sigma:"]::before {
+.sigma-content a[href^="sigma:"]::before {
   content: "";
   display: inline-block;
   width: 0.8em;
@@ -384,18 +411,15 @@
   -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71'/%3E%3Cpath d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71'/%3E%3C/svg%3E") center / contain no-repeat;
           mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71'/%3E%3Cpath d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71'/%3E%3C/svg%3E") center / contain no-repeat;
 }
-.sigma-content a[href^="sigma:"]:hover,
-.sigma-markdown a[href^="sigma:"]:hover {
+.sigma-content a[href^="sigma:"]:hover {
   background-color: rgba(37, 99, 235, 0.08);
   border-bottom-style: solid;
 }
-.dark .sigma-content a[href^="sigma:"],
-.dark .sigma-markdown a[href^="sigma:"] {
+.dark .sigma-content a[href^="sigma:"] {
   color: #93c5fd;
   border-bottom-color: #60a5fa;
 }
-.dark .sigma-content a[href^="sigma:"]:hover,
-.dark .sigma-markdown a[href^="sigma:"]:hover {
+.dark .sigma-content a[href^="sigma:"]:hover {
   background-color: rgba(147, 197, 253, 0.12);
 }
 

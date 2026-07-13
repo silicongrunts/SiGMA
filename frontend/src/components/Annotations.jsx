@@ -100,6 +100,25 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   }, [setSiGMADOProcessingAnnotationId])
 
   // ── Positioning ──
+  // Clamp a desired {left,top} into the viewport using the wrapper's CURRENT
+  // size. Returns the same reference when nothing changes so setState is a
+  // no-op (avoids re-render loops). Shared by the anchor, resize, and
+  // diff-expand effects so all three can never let the popup overflow.
+  const clampToViewport = useCallback((desired) => {
+    if (!desired || !wrapperRef.current) return desired
+    const { offsetWidth, offsetHeight } = wrapperRef.current
+    const winWidth = window.innerWidth
+    const winHeight = window.innerHeight
+    const padding = 10
+    let { left, top } = desired
+    if (left + offsetWidth > winWidth - padding) left = winWidth - offsetWidth - padding
+    if (top + offsetHeight > winHeight - padding) top = winHeight - offsetHeight - padding
+    if (left < padding) left = padding
+    if (top < padding) top = padding
+    if (left === desired.left && top === desired.top) return desired
+    return { left, top }
+  }, [])
+
   useLayoutEffect(() => {
     if (!popupStyle || isDraggingRef.current) return
     if (!wrapperRef.current) {
@@ -107,50 +126,34 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       return
     }
 
-    const { offsetWidth, offsetHeight } = wrapperRef.current
-    const winWidth = window.innerWidth
-    const winHeight = window.innerHeight
-    const padding = 10
+    // Anchor-driven placement: center on the anchor, then keep the whole
+    // wrapper (which now includes the expanded diff panel) on screen.
     const anchorX = popupStyle.left
     const anchorY = popupStyle.top
-
+    // offsetWidth is read after render, so it already reflects the diff panel
+    // when one is open — no separate effect needed for width changes.
+    const { offsetWidth, offsetHeight } = wrapperRef.current
     let left = anchorX - offsetWidth / 2
-    if (left + offsetWidth > winWidth - padding) left = winWidth - offsetWidth - padding
-    if (left < padding) left = padding
-
     let top = anchorY - offsetHeight - 8
-    if (top < padding) top = anchorY + 20
-    if (top + offsetHeight > winHeight - padding) top = winHeight - offsetHeight - padding
-    if (top < padding) top = padding
+    if (top < 10) top = anchorY + 20
+    setPosition(clampToViewport({ left, top }))
+  }, [popupStyle, clampToViewport])
 
-    setPosition({ left, top })
-  }, [popupStyle])
+  // Re-clamp when the wrapper's width changes because the diff panel opens or
+  // closes — expanding a 600px panel near the right edge would otherwise push
+  // the popup off-screen. Runs after layout so wrapperRef has the new size.
+  useLayoutEffect(() => {
+    if (position == null) return
+    setPosition(prev => clampToViewport(prev))
+  }, [expandedDiff, clampToViewport])
 
   // Re-clamp on viewport resize
   useEffect(() => {
     if (!position) return
-    const handleResize = () => {
-      if (!wrapperRef.current) return
-      const { offsetWidth, offsetHeight } = wrapperRef.current
-      const winWidth = window.innerWidth
-      const winHeight = window.innerHeight
-      const padding = 10
-
-      setPosition(prev => {
-        if (!prev) return null
-        let left = prev.left
-        let top = prev.top
-        if (left + offsetWidth > winWidth - padding) left = winWidth - offsetWidth - padding
-        if (top + offsetHeight > winHeight - padding) top = winHeight - offsetHeight - padding
-        if (left < padding) left = padding
-        if (top < padding) top = padding
-        if (left === prev.left && top === prev.top) return prev
-        return { left, top }
-      })
-    }
+    const handleResize = () => setPosition(prev => clampToViewport(prev))
     window.addEventListener('resize', handleResize)
     return () => window.removeEventListener('resize', handleResize)
-  }, [position])
+  }, [position, clampToViewport])
 
   const isSiGMADOProcessing = siGMADOProcessingAnnotationId === annotation.id
 
