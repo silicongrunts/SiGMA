@@ -52,6 +52,11 @@ SESSION_COOKIE_NAME = "sigma_session"
 # sole brute-force mitigation.
 BCRYPT_COST = 12
 
+# Password length bounds — shared by the /auth/password route and the offline
+# reset_password script so both reject weak passwords identically.
+MIN_PASSWORD_LENGTH = 4
+MAX_PASSWORD_LENGTH = 256
+
 # Paths reachable without a valid session cookie when a password is set.
 # Keep this list narrow — every entry is an unauthenticated surface.
 AUTH_PUBLIC_PATHS: frozenset[str] = frozenset({

@@ -19,6 +19,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.core.auth import (
+    MAX_PASSWORD_LENGTH,
+    MIN_PASSWORD_LENGTH,
     clear_session_cookie,
     hash_password,
     is_authenticated,
@@ -34,10 +36,6 @@ from app.core.response import ok
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-# Keep passwords long enough to resist trivial guessing on the LAN.
-MIN_PASSWORD_LENGTH = 4
-MAX_PASSWORD_LENGTH = 256
 
 
 class LoginRequest(BaseModel):
