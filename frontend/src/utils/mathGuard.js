@@ -39,21 +39,51 @@ function randomHex(n) {
 }
 
 /**
- * Strip math fragments from raw markdown, returning the placeholder-filled
- * text plus a map to restore them later. Each math fragment is keyed by a
- * unique hex id so restoreMath is robust even if the order of matches shifts.
+ * Strip math fragments from raw markdown, returning:
+ *  - `text`:  placeholder-filled text (what marked should parse).
+ *  - `map`:   id → original math fragment, for restoreMath.
+ *  - `spans`: per placeholder, its offsets in BOTH the placeholder text and
+ *             the original markdown. Used by Preview's block-map lexer to map
+ *             placeholder-text offsets back to real source line numbers (a
+ *             multi-line `$$...$$` collapses to a single-line placeholder, so
+ *             placeholder offsets ≠ source offsets). `phStart/phEnd` are in
+ *             the placeholder text; `srcStart`/`srcEnd` are in `markdown`
+ *             (srcEnd exclusive, covering the whole `$$...$$` block).
+ *
+ * Callers that only need `{ text, map }` simply ignore `spans`.
  */
 export function extractMath(markdown) {
-  if (!markdown || typeof markdown !== 'string') return { text: markdown ?? '', map: null }
+  if (!markdown || typeof markdown !== 'string') return { text: markdown ?? '', map: null, spans: [] }
   const map = new Map()
+  const spans = []
+  const re = new RegExp(MATH_RE.source, 'g')
   let counter = 0
-  const text = markdown.replace(MATH_RE, (match) => {
+  let out = ''
+  let cursor = 0      // read cursor in original markdown
+  let phCursor = 0    // write cursor in placeholder text
+  let m
+  while ((m = re.exec(markdown)) !== null) {
+    const srcStart = m.index
+    const srcEnd = srcStart + m[0].length
+    // copy the verbatim gap before this math block
+    const gap = markdown.slice(cursor, srcStart)
+    out += gap
+    phCursor += gap.length
+    // emit placeholder
     const id = randomHex(6) + counter.toString(16)
-    map.set(id, match)
+    const ph = `${PH_PREFIX}${id}${PH_SUFFIX}`
+    map.set(id, m[0])
+    spans.push({ phStart: phCursor, phEnd: phCursor + ph.length, srcStart, srcEnd })
+    out += ph
+    phCursor += ph.length
+    cursor = srcEnd
     counter++
-    return `${PH_PREFIX}${id}${PH_SUFFIX}`
-  })
-  return { text, map: map.size > 0 ? map : null }
+    re.lastIndex = srcEnd
+  }
+  // trailing tail
+  if (counter === 0) return { text: markdown, map: null, spans: [] }
+  out += markdown.slice(cursor)
+  return { text: out, map, spans }
 }
 
 /**

@@ -44,6 +44,66 @@ const previewMarked = new Marked(
 
 const PDFJS_ASSET_BASE = `${import.meta.env.BASE_URL || '/'}pdfjs/`
 
+// Block-level HTML containers whose marked output NESTS inner blocks instead
+// of emitting them as siblings. E.g. `<details><summary>..</summary> <p>..</p>
+// <ul>..</ul> </details>` renders as a single <details> direct child of .prose
+// with <p>/<ul> as descendants — but marked.lexer still tokenizes the inner
+// <p>/<ul> as separate top-level tokens. That mismatch breaks the lexer↔DOM
+// 1:1 block alignment the highlight map relies on. `foldContainers` collapses
+// each container's open-tag … close-tag token range into ONE synthetic token
+// so it maps to the single DOM element it renders to.
+const HTML_CONTAINER_TAGS = ['details', 'figure', 'dialog', 'table']
+const HTML_CONTAINER_OPEN_RE = new RegExp(`^\\s*<(${HTML_CONTAINER_TAGS.join('|')})([\\s>])`, 'i')
+
+function tagRe(tag) { return new RegExp(`</${tag}\\s*>`, 'gi') }
+function openTagRe(tag) { return new RegExp(`<${tag}\\b`, 'gi') }
+
+function foldContainers(tokens) {
+  const out = []
+  let i = 0
+  while (i < tokens.length) {
+    const t = tokens[i]
+    const om = t.type === 'html' && typeof t.raw === 'string' ? HTML_CONTAINER_OPEN_RE.exec(t.raw) : null
+    if (!om) { out.push(t); i++; continue }
+    // Opening container found. Scan forward for the matching close tag,
+    // accounting for nested same-tag containers. Depth starts by counting the
+    // open tag in THIS token, plus any close tags already in it (covers the
+    // self-contained form `<details>x</details>` which marked emits as one
+    // html token, and same-line nesting `<details><details>..</details></details>`).
+    const tag = om[1].toLowerCase()
+    const openRe = openTagRe(tag)
+    const closeRe = tagRe(tag)
+    const selfOpens = (t.raw.match(openRe) || []).length
+    const selfCloses = (t.raw.match(closeRe) || []).length
+    let depth = selfOpens - selfCloses
+    let j = i
+    if (depth > 0) {
+      // Still open after this token — scan forward for the matching close.
+      j = i + 1
+      while (j < tokens.length) {
+        const tj = tokens[j]
+        if (tj.type === 'html' && typeof tj.raw === 'string') {
+          const opens = (tj.raw.match(openRe) || []).length
+          const closes = (tj.raw.match(closeRe) || []).length
+          depth += opens - closes
+          if (depth <= 0) break
+        }
+        j++
+      }
+    }
+    // Collapse tokens[i..j] into one synthetic token. Their raw fragments are
+    // contiguous in the source (spaces included), so concatenation yields a
+    // substring indexOf can locate in one shot. When depth never reaches 0
+    // (unclosed container), j stops at the last token — the whole tail folds
+    // into one block rather than misaligning everything after it.
+    let raw = ''
+    for (let k = i; k <= j && k < tokens.length; k++) raw += tokens[k].raw || ''
+    out.push({ type: 'html', raw })
+    i = j + 1
+  }
+  return out
+}
+
 const PDFPage = memo(({ pdf, pageNumber, scale, onDoubleClick, isActive }) => {
   const canvasRef = useRef(null)
   const textLayerRef = useRef(null)
@@ -403,9 +463,17 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
   }, [mdContent, type])
 
   // Build precise block map using marked.lexer() + indexOf character tracking.
-  // Each token's raw text is located in the source via indexOf, then converted
-  // to line numbers via a precomputed line-offset table. This avoids the drift
-  // that comes from counting lines via split('\n').
+  // Each token's raw text is located in the placeholder text via indexOf, then
+  // mapped back to real source line numbers, then converted via a precomputed
+  // line-offset table. This avoids the drift that comes from counting lines via
+  // split('\n').
+  //
+  // Why placeholder text, not raw mdContent: the render path (below) parses the
+  // math-guarded text, so the DOM it builds has a 1:1 block structure with the
+  // guarded lexer output. Lexing raw markdown instead diverges (marked doesn't
+  // know `$$`, so a multi-line math block tokenizes differently than the single
+  // `<p>` it renders to), which fails the count-validation below and silently
+  // disables precise highlight for any document containing math.
   useEffect(() => {
     // Clear previous highlight
     for (const el of highlightedElsRef.current) el.classList.remove('md-highlight')
@@ -416,7 +484,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
       return
     }
     try {
-      // Precompute: character offset where each source line starts
+      // Precompute: character offset where each source line starts (in RAW mdContent)
       const lineStarts = [0]
       for (let i = 0; i < mdContent.length; i++) {
         if (mdContent[i] === '\n') lineStarts.push(i + 1)
@@ -431,7 +499,43 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
         return lo
       }
 
-      const tokens = previewMarked.lexer(mdContent)
+      // Lex the SAME math-guarded text the render path parses, so token count
+      // matches DOM block count. `spans` maps placeholder offsets back to the
+      // original math block's source offsets (a multi-line `$$...$$` collapses
+      // to a single-line placeholder, so guarded offsets ≠ source offsets).
+      const { text: guarded, spans } = extractMath(mdContent)
+
+      // Translate a guarded-text offset to a source-text offset.
+      //  - `gOff` is a placeholder-text offset.
+      //  - Strictly inside a placeholder (phStart < gOff < phEnd) → that math
+      //    block's srcStart, so the placeholder maps to the math's first line.
+      //  - At the boundary gOff === phStart the `inclusive` flag decides:
+      //      true  → "inside"   (a token START at phStart is the placeholder)
+      //      false → "verbatim" (a token END at phStart is exclusive, i.e. before it)
+      //  - Otherwise verbatim: apply cumulative length delta across placeholders.
+      const guardOffsetToSrc = (gOff, inclusive) => {
+        let src = gOff
+        for (const s of spans) {
+          if (gOff < s.phStart) break              // before this placeholder
+          if (gOff === s.phStart && !inclusive) break // token end at placeholder start
+          if (gOff < s.phEnd) return s.srcStart     // strictly inside
+          // gOff >= s.phEnd: past this placeholder, accumulate the delta
+          src += (s.srcEnd - s.srcStart) - (s.phEnd - s.phStart)
+        }
+        return src
+      }
+      const guardToSrc = (gOff) => guardOffsetToSrc(gOff, true)
+      // If a token's end offset touches/overlaps a placeholder, return that
+      // math block's source end offset so endLine spans the whole formula.
+      const guardEndToSrc = (gEnd) => {
+        for (const s of spans) {
+          if (s.phStart >= gEnd) break           // placeholder starts at/after end
+          if (gEnd <= s.phEnd) return s.srcEnd   // end within placeholder
+        }
+        return guardOffsetToSrc(gEnd, false)
+      }
+
+      const tokens = foldContainers(previewMarked.lexer(guarded))
       const domBlocks = containerRef.current.querySelectorAll('.prose > *')
       let searchOffset = 0
       const map = []
@@ -439,10 +543,12 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
       for (const token of tokens) {
         const raw = token.raw
         if (!raw) continue
-        const idx = mdContent.indexOf(raw, searchOffset)
+        const idx = guarded.indexOf(raw, searchOffset)
         if (idx === -1) continue
-        const startLine = lineAtOffset(idx)
-        const endLine = lineAtOffset(idx + raw.length - (raw.endsWith('\n') ? 1 : 0))
+        const srcStart = guardToSrc(idx)
+        const srcEnd = guardEndToSrc(idx + raw.length)
+        const startLine = lineAtOffset(srcStart)
+        const endLine = lineAtOffset(srcEnd - 1)
         searchOffset = idx + raw.length
 
         if (token.type !== 'space') {
