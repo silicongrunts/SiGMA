@@ -136,6 +136,33 @@
   max-width: 100%;
 }
 
+/* Overflow containment — nothing rendered inside the preview may cross the
+   column boundary. Each wide element type owns its own scrollbar instead. */
+.prose {
+  overflow: hidden;
+  /* Break over-long words/URLs in paragraphs, headings, and list items so they
+     wrap rather than push the column wider. `break-word` only kicks in when a
+     word would otherwise overflow, so normal text is unaffected. */
+  overflow-wrap: break-word;
+}
+
+/* Tables: render as a block scoped to the column and scroll horizontally when
+   a row's content is wider than the column. Mirrors the .sigma-content table
+   rule used in the chat area, so preview and chat behave consistently. */
+.prose table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* Cell-level wrapping: let words break anywhere so most tables wrap instead of
+   scrolling. Truly unbreakable tokens (e.g. a long path with no break points)
+   fall back to the table-level scrollbar above. */
+.prose th,
+.prose td {
+  overflow-wrap: anywhere;
+}
+
 /* Highlight sync — mirrors editor cursor line in the preview.
    Applied to direct children of .prose (the rendered block elements).
    `!important` ensures it overrides prose's element backgrounds. */
