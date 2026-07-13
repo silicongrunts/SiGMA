@@ -310,6 +310,16 @@ class PermissionDeniedError(ServiceException):
 
 
 # ---------------------------------------------------------------------------
+# Authentication exception
+# ---------------------------------------------------------------------------
+
+class AuthenticationError(SiGMAException):
+    """Authentication is required or the provided credentials are invalid."""
+    def __init__(self, detail: str = "Authentication required"):
+        super().__init__(detail, "AUTHENTICATION_ERROR", status_code=401)
+
+
+# ---------------------------------------------------------------------------
 # Skill exceptions
 # ---------------------------------------------------------------------------
 

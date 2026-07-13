@@ -34,6 +34,14 @@ async function request(endpoint, options = {}, isText = false) {
     const contentType = response.headers.get('content-type')
 
     if (!response.ok) {
+      // A 401 on a non-auth endpoint means the session cookie is gone/expired
+      // — bounce to the login screen. Auth endpoints manage their own 401 UX.
+      if (response.status === 401 && !endpoint.startsWith('/auth/')) {
+        if (window.location.pathname !== '/login') {
+          window.location.href = '/login'
+        }
+        throw new Error(i18n.t('auth.loginRequired'))
+      }
       let data = {}
       try {
         data = await response.json()
@@ -151,6 +159,26 @@ export const systemAPI = {
     return r.body
   }),
   restart: () => request('/system/restart', { method: 'POST' }),
+}
+
+// ---------------------------------------------------------------------------
+// Auth API — access-password gate
+// ---------------------------------------------------------------------------
+export const authAPI = {
+  /** Whether an access password is currently configured. */
+  status: () => request('/auth/status'),
+  /** Verify the password; the backend sets the session cookie on success. */
+  login: (password) => request('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ password }),
+  }),
+  /** Clear the session cookie. */
+  logout: () => request('/auth/logout', { method: 'POST' }),
+  /** Set, change, or clear the access password (empty string clears it). */
+  setPassword: (newPassword) => request('/auth/password', {
+    method: 'POST',
+    body: JSON.stringify({ new_password: newPassword }),
+  }),
 }
 
 // ---------------------------------------------------------------------------

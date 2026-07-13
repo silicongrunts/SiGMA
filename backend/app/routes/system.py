@@ -63,22 +63,39 @@ async def _stream_tex_operation(stream: AsyncIterator[str]):
 
 @router.get("/settings")
 async def get_settings_yaml():
-    """Return the current settings in both structured and YAML form."""
+    """Return the current settings in both structured and YAML form.
+
+    The ``security.password_hash`` (bcrypt) is returned as-is. The frontend
+    derives ``password_enabled`` from whether the hash is non-empty. The hash
+    is changed exclusively via ``POST /auth/password``; this endpoint and
+    ``PUT /system/settings`` never persist a client-supplied hash.
+    """
+    raw_content = SETTINGS_FILE.read_text(encoding="utf-8")
     return ok({
         "path": str(SETTINGS_FILE),
-        "content": SETTINGS_FILE.read_text(encoding="utf-8"),
+        "content": raw_content,
         "config": settings_to_dict(settings),
     })
 
 
 @router.put("/settings")
 async def update_settings(data: SettingsUpdate):
-    """Validate, persist, and hot-reload settings.yaml."""
+    """Validate, persist, and hot-reload settings.yaml.
+
+    The access-password hash is server-managed: the client cannot set or clear
+    it through this endpoint (it goes through ``POST /auth/password`` instead).
+    Before saving, the currently persisted ``security.password_hash`` is
+    re-injected into whatever the client submitted, so a full-config rewrite
+    that omits or alters the ``security`` block can never wipe the password.
+    """
     try:
+        persisted_hash = settings.security.password_hash
         if data.content is not None:
-            save_settings_yaml(data.content)
+            content = _preserve_security_hash_in_yaml(data.content, persisted_hash)
+            save_settings_yaml(content)
         elif data.config is not None:
-            save_settings_data(data.config)
+            config = _preserve_security_hash_in_dict(data.config, persisted_hash)
+            save_settings_data(config)
         else:
             raise ValueError("Either content or config is required")
     except ValueError as exc:
@@ -89,11 +106,64 @@ async def update_settings(data: SettingsUpdate):
     })
 
 
+def _preserve_security_hash_in_dict(config: dict, persisted_hash: str) -> dict:
+    """Re-inject the persisted password hash into a structured config payload.
+
+    The client cannot change the password through PUT /system/settings (only
+    through POST /auth/password). Before persisting a full-config rewrite we
+    replace the ``security`` block with the server's persisted hash so the
+    password can never be wiped or altered here.
+    """
+    out = dict(config) if isinstance(config, dict) else {}
+    out["security"] = {"password_hash": persisted_hash}
+    return out
+
+
+def _sanitize_client_security(config: dict) -> dict:
+    """Normalize a client-supplied ``security`` block for validation.
+
+    ``SecuritySettings`` is ``extra='forbid'``. The frontend now sends the real
+    ``password_hash`` (a legitimate field), but a stray key from a hand-edited
+    YAML draft would still fail validation. For non-persisting operations
+    (render/validate/check) we keep only the ``password_hash`` the client sent.
+    """
+    if not isinstance(config, dict):
+        return config
+    out = dict(config)
+    security = out.get("security")
+    if isinstance(security, dict):
+        hash_value = security.get("password_hash", "")
+        out["security"] = {"password_hash": hash_value or ""}
+    return out
+
+
+def _preserve_security_hash_in_yaml(content: str, persisted_hash: str) -> str:
+    """Re-inject the persisted password hash into a YAML settings string.
+
+    Before validating a full-config YAML rewrite we replace the ``security``
+    block with the canonical form carrying the server's persisted hash, so the
+    client can never alter the password through PUT /system/settings (only
+    through POST /auth/password).
+    """
+    import yaml as _yaml
+
+    try:
+        raw = _yaml.safe_load(content) or {}
+    except _yaml.YAMLError as exc:
+        raise ValueError("Invalid YAML") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("settings.yaml must contain a YAML mapping")
+    # Replace whatever security block the client sent with the canonical form.
+    raw["security"] = {"password_hash": persisted_hash}
+    config = Settings.model_validate(raw)
+    return dump_settings_yaml(config)
+
+
 @router.post("/settings/yaml")
 async def render_settings_yaml(data: SettingsDataUpdate):
     """Render a structured settings draft as YAML without persisting it."""
     try:
-        config = Settings.model_validate(data.config)
+        config = Settings.model_validate(_sanitize_client_security(data.config))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return ok({"content": dump_settings_yaml(config)})
@@ -162,8 +232,12 @@ async def check_settings(data: SettingsUpdate):
     """Check settings config structure and model connectivity without saving."""
     from app.services.settings_check_service import SettingsCheckService
     service = SettingsCheckService()
+    # Normalize the client-supplied security block so a stray key (e.g. a
+    # forbidden password_enabled) does not trip SecuritySettings' extra='forbid'
+    # during the structure check.
+    config = _sanitize_client_security(data.config) if data.config is not None else None
     return StreamingResponse(
-        service.check(content=data.content, config=data.config),
+        service.check(content=data.content, config=config),
         media_type="text/event-stream",
     )
 

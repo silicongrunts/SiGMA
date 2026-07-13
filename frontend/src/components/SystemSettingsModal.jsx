@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { AlertTriangle, BookOpen, Check, CheckCircle2, ChevronDown, Circle, Code2, Eye, Globe2, Link2, Loader2, Minus, RotateCcw, Save, Sparkles, XCircle, X } from 'lucide-react'
-import { systemAPI } from '../api'
+import { AlertTriangle, BookOpen, Check, CheckCircle2, ChevronDown, Circle, Code2, Edit3, Eye, Globe2, Link2, Loader2, Lock, Minus, RotateCcw, Save, ShieldCheck, ShieldOff, Sparkles, XCircle, X } from 'lucide-react'
+import { systemAPI, authAPI } from '../api'
 import { createSSEStreamParser } from '../utils/sse'
 import { toastError } from './Toast'
 
@@ -729,10 +729,37 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
   const [restartCountdown, setRestartCountdown] = useState(10)
   const restartTimerRef = useRef(null)
 
+  // ── Access-password (security) state ─────────────────────────────────
+  // passwordEnabled mirrors the persisted hash (non-empty). newPassword holds
+  // the editable draft. passwordEditing only matters when a password is
+  // already set: the field is disabled until the user clicks "Modify", then
+  // becomes an empty editable box (blank = clear, value = change). Cancel
+  // restores the disabled state without changing anything.
+  const [newPassword, setNewPassword] = useState('')
+  const [passwordEnabled, setPasswordEnabled] = useState(false)
+  const [passwordEditing, setPasswordEditing] = useState(false)
+  const [showEmptyPwWarning, setShowEmptyPwWarning] = useState(false)
+  // Whether the password draft represents an intent to change (the user is in
+  // an editable state). Drives whether the save flow touches /auth/password.
+  const pendingSaveRef = useRef(null)
+
+  // The password field is editable when no password is set (always), or when a
+  // password is set and the user clicked "Modify".
+  const passwordFieldEditable = !passwordEnabled || passwordEditing
+
   const dirty = useMemo(() => {
+    // Password changes (form mode only):
+    //  - A non-empty draft sets/changes the password.
+    //  - Entering edit mode when a password is set means the user intends to
+    //    clear it (the draft is blank). That intent is itself a pending change,
+    //    so the Save button is enabled and the empty-password warning fires.
+    if (mode === 'form') {
+      if (passwordFieldEditable && newPassword.trim()) return true
+      if (passwordEnabled && passwordEditing) return true
+    }
     if (mode === 'yaml') return yamlContent !== originalYaml
     return JSON.stringify(config) !== JSON.stringify(originalConfig)
-  }, [config, mode, originalConfig, originalYaml, yamlContent])
+  }, [config, mode, originalConfig, originalYaml, yamlContent, newPassword, passwordFieldEditable, passwordEnabled, passwordEditing])
 
   const loadSettings = useCallback(async () => {
     if (!isOpen) return
@@ -749,6 +776,9 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
       setYamlContent(settingsData.content || '')
       setOriginalYaml(settingsData.content || '')
       setPath(settingsData.path || 'settings.yaml')
+      setPasswordEnabled(!!loadedConfig?.security?.password_hash)
+      setNewPassword('')
+      setPasswordEditing(false)
       setProviders(providerData.providers || [])
       setProviderRoles(providerData.provider_roles || {})
       setMode('form')
@@ -921,21 +951,32 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
     setSaving(true)
     setError('')
     try {
+      // Password change invalidates the caller's cookie, so it must run last —
+      // every request after it would 401.
+      const changingPassword = mode === 'form' && passwordFieldEditable
+
       await systemAPI.updateSettings(mode === 'yaml' ? { content: yamlContent } : { config })
+
       const reloaded = await systemAPI.getSettings()
       setConfig(cloneConfig(reloaded.config))
       setOriginalConfig(cloneConfig(reloaded.config))
       setYamlContent(reloaded.content || '')
       setOriginalYaml(reloaded.content || '')
       setPath(reloaded.path || path)
+      setPasswordEnabled(!!reloaded.config?.security?.password_hash)
+      setNewPassword('')
+      setPasswordEditing(false)
       setCheckPhase(null)
 
-      // Trigger service restart so model / config changes take effect.
-      // Fire-and-forget — if the restart API fails the overlay still counts
-      // down and the page will reload regardless.
       systemAPI.restart().catch(() => {})
       setRestarting(true)
       setRestartCountdown(10)
+
+      if (changingPassword) {
+        // Last step: rotates the signing secret, invalidating this browser's
+        // cookie. The restart reload below will then land on the login screen.
+        await authAPI.setPassword(newPassword)
+      }
     } catch (err) {
       const message = humanizeSettingsError(err.message || t('system.toast.saveFailed'), t)
       setError(message)
@@ -945,7 +986,19 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
     }
   }
 
-  const handleSave = () => setCheckPhase('confirming')
+  const handleSave = () => {
+    // The empty-password warning only applies when the password field is
+    // editable AND the draft is blank — i.e. the user is about to (keep) no
+    // password. When a password is set and the field is disabled (not editing),
+    // saving never touches the password, so no warning is needed. In YAML mode
+    // the password field isn't shown, so no warning applies either.
+    if (mode === 'form' && passwordFieldEditable && !newPassword.trim() && !showEmptyPwWarning) {
+      pendingSaveRef.current = () => setCheckPhase('confirming')
+      setShowEmptyPwWarning(true)
+      return
+    }
+    setCheckPhase('confirming')
+  }
 
   const handleCheckAndSave = async () => {
     setCheckPhase('checking')
@@ -1217,6 +1270,71 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
                   </div>
                 </SettingsGroup>
               </Section>
+
+              <Section title={t('system.securitySection')}>
+                <SettingsGroup title={t('system.securitySection')} icon={Lock}>
+                  <div className={`flex items-center gap-2 mb-3 px-3 py-2 rounded-lg text-sm font-bold ${passwordEnabled ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400' : 'bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400'}`}>
+                    {passwordEnabled ? (
+                      <ShieldCheck className="w-4 h-4 flex-shrink-0" />
+                    ) : (
+                      <ShieldOff className="w-4 h-4 flex-shrink-0" />
+                    )}
+                    <span>
+                      {passwordEnabled ? t('system.passwordProtectionOn') : t('system.passwordProtectionOff')}
+                    </span>
+                  </div>
+
+                  <label className="block">
+                    <span className="block text-xs font-bold text-gray-500 dark:text-gray-400 mb-1.5">
+                      {t('system.accessPassword')}
+                    </span>
+                    <div className="flex gap-2">
+                      <input
+                        type="password"
+                        value={passwordFieldEditable ? newPassword : ''}
+                        disabled={!passwordFieldEditable}
+                        onChange={e => setNewPassword(e.target.value)}
+                        placeholder={
+                          !passwordEnabled
+                            ? t('system.accessPasswordPlaceholder')
+                            : passwordEditing
+                              ? t('system.accessPasswordEditingPlaceholder')
+                              : '••••••••'
+                        }
+                        autoComplete="new-password"
+                        className="flex-1 px-3 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg outline-none focus:ring-4 focus:ring-sigma-600/10 focus:border-sigma-600 text-sm text-gray-900 dark:text-gray-100 disabled:bg-gray-100 dark:disabled:bg-gray-700/50 disabled:text-gray-400 dark:disabled:text-gray-500 disabled:cursor-not-allowed"
+                      />
+                      {passwordEnabled && !passwordEditing && (
+                        <button
+                          type="button"
+                          onClick={() => { setPasswordEditing(true); setNewPassword('') }}
+                          className="flex items-center gap-1.5 px-3 py-2 text-sm font-bold text-sigma-600 dark:text-sigma-400 hover:bg-sigma-50 dark:hover:bg-sigma-900/20 rounded-lg transition-colors whitespace-nowrap"
+                        >
+                          <Edit3 className="w-4 h-4" />
+                          {t('system.modifyPassword')}
+                        </button>
+                      )}
+                      {passwordEnabled && passwordEditing && (
+                        <button
+                          type="button"
+                          onClick={() => { setPasswordEditing(false); setNewPassword('') }}
+                          className="flex items-center gap-1.5 px-3 py-2 text-sm font-bold text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors whitespace-nowrap"
+                        >
+                          <X className="w-4 h-4" />
+                          {t('common.cancel')}
+                        </button>
+                      )}
+                    </div>
+                  </label>
+                  <p className="text-xs text-gray-400 dark:text-gray-500 mt-1.5 leading-5">
+                    {!passwordEnabled
+                      ? t('system.accessPasswordHint')
+                      : passwordEditing
+                        ? t('system.accessPasswordEditingHint')
+                        : t('system.accessPasswordSetHint')}
+                  </p>
+                </SettingsGroup>
+              </Section>
             </div>
           )}
         </div>
@@ -1246,6 +1364,43 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
                 </button>
                 <button onClick={() => { setShowCloseConfirm(false); onClose() }} className="px-4 py-2 text-sm font-bold text-white bg-red-600 hover:bg-red-700 rounded-lg">
                   {t('common.discard')}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showEmptyPwWarning && (
+          <div className="absolute inset-0 z-30 flex items-center justify-center bg-gray-900/40 p-4">
+            <div className="w-full max-w-md bg-white dark:bg-gray-800 rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-700 p-6 animate-in zoom-in duration-200">
+              <div className="flex items-start gap-4">
+                <div className="w-10 h-10 rounded-xl bg-amber-100 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 flex items-center justify-center flex-shrink-0">
+                  <AlertTriangle className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-gray-900 dark:text-gray-100">{t('system.emptyPasswordWarningTitle')}</h3>
+                  <p className="text-sm text-gray-600 dark:text-gray-400 mt-1 leading-6">
+                    {t('system.emptyPasswordWarningBody')}
+                  </p>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2 mt-6">
+                <button
+                  onClick={() => { setShowEmptyPwWarning(false); pendingSaveRef.current = null }}
+                  className="px-4 py-2 text-sm font-bold text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg"
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  onClick={() => {
+                    setShowEmptyPwWarning(false)
+                    const next = pendingSaveRef.current
+                    pendingSaveRef.current = null
+                    if (next) next()
+                  }}
+                  className="px-4 py-2 text-sm font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-lg"
+                >
+                  {t('system.emptyPasswordWarningConfirm')}
                 </button>
               </div>
             </div>

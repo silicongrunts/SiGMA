@@ -75,6 +75,34 @@ permission implementation together.
 - Secrets should live in `settings.yaml`, not hardcoded constants.
 - Logs must not include secrets.
 
+## Access Password And Session Cookies
+
+- The shared access password is stored in `settings.yaml` under
+  `security.password_hash` as a bcrypt hash only — the plaintext password is
+  never persisted or logged.
+- The hash is mutated exclusively through the `/auth/password` endpoint and is
+  re-injected server-side on every full-config `PUT /system/settings`, so the
+  client-rewritable settings.yaml editor can never clear it.
+- `GET /system/settings` returns the real bcrypt hash (it is not reversible to
+  the plaintext). The password is still only changeable via `/auth/password`;
+  a client-supplied `security.password_hash` on PUT/check/validate is always
+  discarded in favor of the server's persisted hash.
+- Session cookies are HMAC tokens keyed by a random signing secret in
+  `userdata/.SiGMA/auth_secret.key` (0600). The secret is rotated on every
+  password change, which immediately invalidates all outstanding cookies —
+  including the changer's own. No new cookie is issued after a password change,
+  so the user must log in again with the new password.
+- Enforcement is reject-by-default middleware (`AuthMiddleware`) that runs on
+  every request, including the SPA catch-all and WebSocket proxies. It is a
+  pure ASGI middleware (not `BaseHTTPMiddleware`, whose `dispatch` is never
+  invoked for `websocket` scopes) so that WebSocket connections to the
+  terminal, Jupyter, and VNC proxies are gated too. Unauthenticated WebSocket
+  connections are denied at the ASGI handshake (`websocket.close` code 4401)
+  before any handler runs. The public allow-list (`AUTH_PUBLIC_PATHS`) must
+  stay narrow; adding entries expands the unauthenticated surface.
+- Cookies are `HttpOnly` + `SameSite=Lax`; `Secure` is set when the request is
+  HTTPS.
+
 ## Security Review Checklist
 
 For security-sensitive changes, check:

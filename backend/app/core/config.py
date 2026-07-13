@@ -43,6 +43,22 @@ class AppSettings(BaseModel):
     api_prefix: str = "/api/v1"
 
 
+class SecuritySettings(BaseModel):
+    """Access-control settings.
+
+    ``password_hash`` holds a bcrypt hash of the shared access password. An
+    empty string means access protection is disabled (open mode). The plaintext
+    password is never stored; only the hash lives in settings.yaml. The hash is
+    mutated exclusively through the ``/auth/password`` endpoint and is preserved
+    server-side across client-driven full-config rewrites (see
+    ``routes/system.py``).
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    password_hash: str = ""
+
+
 class ModelSettings(BaseModel):
     model: str = ""
     provider: str = ""
@@ -244,6 +260,7 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     app: AppSettings = Field(default_factory=AppSettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
     models: ModelRoleSettings = Field(default_factory=ModelRoleSettings)
     retry: RetrySettings = Field(default_factory=RetrySettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
@@ -695,6 +712,46 @@ def reload_settings(config: Settings | None = None) -> Settings:
     for field_name in Settings.model_fields:
         setattr(settings, field_name, getattr(new_settings, field_name))
     return settings
+
+
+def update_password_hash(new_hash: str, path: Path = SETTINGS_FILE) -> Settings:
+    """Persist *new_hash* into ``settings.yaml``'s ``security.password_hash``.
+
+    The access password hash is the only settings field changed outside the
+    normal full-config save flow. Rather than rewriting the whole file from the
+    in-memory model (which would drop any keys the running process does not
+    know about), we read the file, mutate only the security block, and write it
+    back atomically. This keeps the hash change isolated and resilient to
+    concurrent edits by the settings UI.
+    """
+    raw: dict[str, Any]
+    if path.exists():
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{path} must contain a YAML mapping")
+        raw = loaded
+    else:
+        raw = {}
+    security = raw.get("security")
+    if not isinstance(security, dict):
+        security = {}
+        raw["security"] = security
+    security["password_hash"] = new_hash
+
+    content = yaml.safe_dump(raw, allow_unicode=False, sort_keys=False)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        tmp_path = Path(tmp_name)
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    return reload_settings()
 
 
 settings = load_settings_file()

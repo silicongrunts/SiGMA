@@ -12,6 +12,9 @@ aiofiles==24.1.0
 httpx==0.28.1
 websockets==14.1
 
+# Authentication — bcrypt password hashing for access control
+bcrypt==4.2.0
+
 # RAG / embeddings / reranking
 chromadb==1.5.9
 llama-index-core==0.14.21

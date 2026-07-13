@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.logging import RequestIDMiddleware, LoggingMiddleware, setup_logging
-from app.core.middleware import register_exception_handlers
+from app.core.middleware import AuthMiddleware, register_exception_handlers
 from app.core.lifecycle import startup_event, shutdown_event
 from app.core.proxies import jupyter_ws_proxy, jupyter_proxy, browser_vnc_ws_proxy
 from app.core.terminal_ws import terminal_ws_handler
@@ -26,6 +26,7 @@ from app.routes import (
     library as library_routes, browser as browser_routes,
     permissions as permissions_routes, terminal as terminal_routes,
     skills as skills_routes, system as system_routes,
+    auth as auth_routes,
 )
 
 # ---------------------------------------------------------------------------
@@ -37,7 +38,12 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Middleware
+# Middleware. Starlette runs middleware in reverse of add order: the LAST
+# added runs FIRST. Order below yields inbound execution:
+#   CORS (outermost, handles preflight) -> AuthMiddleware -> RequestID -> Logging
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(LoggingMiddleware)
+app.add_middleware(AuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,8 +51,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(RequestIDMiddleware)
-app.add_middleware(LoggingMiddleware)
 
 # Exception handlers
 register_exception_handlers(app)
@@ -65,6 +69,7 @@ app.include_router(permissions_routes.router, prefix=settings.API_PREFIX)
 app.include_router(terminal_routes.router, prefix=settings.API_PREFIX)
 app.include_router(skills_routes.router, prefix=settings.API_PREFIX)
 app.include_router(system_routes.router, prefix=settings.API_PREFIX)
+app.include_router(auth_routes.router, prefix=settings.API_PREFIX)
 
 # Proxy routes (WebSocket + HTTP)
 app.websocket("/api/v1/jupyter/{path:path}")(jupyter_ws_proxy)
