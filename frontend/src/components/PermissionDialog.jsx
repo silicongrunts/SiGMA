@@ -119,13 +119,6 @@ function PermissionPrompt({
     handleRespond(false, denyReason.trim())
   }
 
-  const handleDenyKeyDown = (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault()
-      handleRespond(false, denyReason.trim())
-    }
-  }
-
   const handleDisableAutoApprove = () => {
     if (countdownRef.current) {
       clearInterval(countdownRef.current)
@@ -142,6 +135,9 @@ function PermissionPrompt({
 
   const isCounting = autoMode === 'countdown'
   const showNormalDeny = autoMode === 'idle' || autoMode === 'disabled'
+  // When a deny reason is entered, the Allow action is disabled to avoid an
+  // ambiguous response — clear the reason to re-enable it.
+  const hasDenyReason = denyReason.trim() !== ''
 
   return (
     <div className="fixed inset-0 z-[5000] flex items-center justify-center">
@@ -233,13 +229,12 @@ function PermissionPrompt({
         {/* Deny reason input */}
         {showDenyInput && (
           <div className="px-6 py-3 border-t border-gray-100 dark:border-gray-800 flex-shrink-0">
-            <input
-              type="text"
+            <textarea
               value={denyReason}
               onChange={(e) => setDenyReason(e.target.value)}
-              onKeyDown={handleDenyKeyDown}
               placeholder={t('permission.denyReasonPlaceholder')}
-              className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-400 placeholder:text-gray-300 dark:placeholder:text-gray-600"
+              rows={3}
+              className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-400 placeholder:text-gray-300 dark:placeholder:text-gray-600 resize-none overflow-y-auto whitespace-pre-wrap break-words max-h-[200px]"
               autoFocus
             />
           </div>
@@ -278,8 +273,8 @@ function PermissionPrompt({
           )}
           <button
             onClick={() => handleRespond(true)}
-            disabled={responding}
-            className="flex-1 flex items-center justify-center gap-2 py-3.5 text-sm font-semibold text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 hover:text-amber-700 dark:hover:text-amber-300 transition-all disabled:opacity-40"
+            disabled={responding || hasDenyReason}
+              className="flex-1 flex items-center justify-center gap-2 py-3.5 text-sm font-semibold text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 hover:text-amber-700 dark:hover:text-amber-300 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
           >
             {responding ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
             {responding ? t('common.sending') : isCounting ? t('permission.allowCountdown', { count: countdown }) : t('permission.allow')}
