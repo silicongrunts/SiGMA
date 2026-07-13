@@ -104,6 +104,23 @@ function foldContainers(tokens) {
   return out
 }
 
+// Scroll `container` by the minimum amount needed to bring `el` fully into
+// view. If `el` is already visible, does nothing. This mirrors
+// element.scrollIntoView({ block: 'nearest' }) but operates within a single
+// scroll container (no ancestor scrolling, no horizontal change).
+function scrollIntoViewMinimal(container, el) {
+  const cRect = container.getBoundingClientRect()
+  const eRect = el.getBoundingClientRect()
+  const margin = 12  // breathing room so the highlight isn't flush against the edge
+  if (eRect.top < cRect.top + margin) {
+    // Above viewport — scroll up just enough
+    container.scrollTop -= cRect.top + margin - eRect.top
+  } else if (eRect.bottom > cRect.bottom - margin) {
+    // Below viewport — scroll down just enough
+    container.scrollTop += eRect.bottom - (cRect.bottom - margin)
+  }
+}
+
 const PDFPage = memo(({ pdf, pageNumber, scale, onDoubleClick, isActive }) => {
   const canvasRef = useRef(null)
   const textLayerRef = useRef(null)
@@ -674,6 +691,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
           if (n >= block.startLine && n <= block.endLine) {
             block.el.classList.add('md-highlight')
             highlightedElsRef.current = [block.el]
+            scrollIntoViewMinimal(container, block.el)
             return
           }
         }
@@ -717,6 +735,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
 
       target.classList.add('md-highlight')
       highlightedElsRef.current = [target]
+      scrollIntoViewMinimal(container, target)
     }
   }))
 
