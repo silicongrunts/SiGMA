@@ -57,9 +57,21 @@ async def _check_permission(
         return await _check_bash(tool_args, requester)
     if tool_name == "notebook_run_cell":
         return await _check_notebook_run(tool_args, project_id, requester)
+    if tool_name in _ANNOTATION_TOOLS:
+        return None
     if not tool_def.is_read_only:
         return await _check_write(tool_name, tool_args, project_id, requester)
     return None
+
+
+# Annotation tools never write the target file on disk — they read it (via
+# ``safe_join``) and store annotation rows in the per-project DB. They must
+# therefore never trigger the write-approval dialog. Path containment is the
+# tool layer's responsibility (``_ensure_inside_sandbox``), not the executor's.
+_ANNOTATION_TOOLS: frozenset[str] = frozenset({
+    "annotation_new", "annotation_rm", "annotation_get",
+    "annotation_reply", "annotation_list",
+})
 
 
 async def _check_bash(tool_args: dict, requester: Optional[Callable]) -> Optional[str]:
@@ -157,7 +169,6 @@ async def _check_write(
     operation = {
         "write": "write to", "edit": "edit",
         "notebook_edit": "edit", "notebook_run_cell": "execute code in",
-        "annotation_new": "annotate", "annotation_reply": "annotate",
     }.get(tool_name, "modify")
 
     content = tool_args.get("content", "")

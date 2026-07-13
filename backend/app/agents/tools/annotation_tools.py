@@ -14,7 +14,7 @@ from app.agents.prompts import (
     PROMPT_ANNOTATION_NEW, PROMPT_ANNOTATION_RM, PROMPT_ANNOTATION_GET,
     PROMPT_ANNOTATION_REPLY, PROMPT_ANNOTATION_LIST,
 )
-from app.core.exceptions import FileMissingError
+from app.core.exceptions import FileMissingError, FileSystemError
 from app.core.logging import get_logger
 from app.services.annotation_service import annotation_service, serialize_annotation
 from app.services.file_service import file_service
@@ -124,11 +124,35 @@ def validate_diffs(content: str, file_text: str) -> str | None:
     return None
 
 
+def _ensure_inside_sandbox(project_id: str, file_name: str) -> None:
+    """Reject paths that fall outside the project sandbox.
+
+    Annotations are scoped to the current project: the target file must live
+    inside it. ``read_file`` enforces this via ``safe_join``, but we check
+    upfront so the LLM gets a precise "outside the project" error rather than
+    a generic "file not found".
+    """
+    from app.services.file_service import PathAccessLevel
+    level = file_service.classify_path(project_id, file_name)
+    if level != PathAccessLevel.SANDBOX:
+        raise FileSystemError(
+            f"Annotations can only target files inside the current project; "
+            f"'{file_name}' is {level.value}"
+        )
+
+
 async def _read_project_file(project_id: str, file_name: str) -> str:
-    """Read a project file. Raises FileMissingError if not found."""
+    """Read a project file.
+
+    Raises ``FileSystemError`` if the path is outside the project sandbox,
+    or ``FileMissingError`` if the file does not exist.
+    """
+    _ensure_inside_sandbox(project_id, file_name)
     try:
         return await file_service.read_file(project_id, file_name)
     except FileMissingError:
+        raise
+    except FileSystemError:
         raise
     except Exception as e:
         raise FileMissingError(f"{file_name}: {e}")
@@ -150,8 +174,8 @@ async def _annotation_new(
     # 1. Read file (file_service.read_file enforces sandbox via safe_join)
     try:
         full_text = await _read_project_file(project_id, file_name)
-    except FileMissingError:
-        return f"Error: file not found: {file_name}"
+    except FileSystemError as e:
+        return f"Error: {e}"
 
     # 2. Locate file_content in file — must be unique
     if not file_content:
@@ -257,8 +281,8 @@ async def _annotation_reply(
     # Read file and validate diff blocks
     try:
         full_text = await _read_project_file(project_id, file_name)
-    except FileMissingError:
-        return f"Error: annotation's file not found: {file_name}"
+    except FileSystemError as e:
+        return f"Error: {e}"
 
     diff_err = validate_diffs(reply_content, full_text)
     if diff_err:
@@ -289,8 +313,8 @@ async def _annotation_list(project_id: str, file_name) -> str:
         # Verify file exists (enforces sandbox)
         try:
             await _read_project_file(project_id, name)
-        except FileMissingError:
-            all_parts.append(f"Error: file not found: {name}")
+        except FileSystemError as e:
+            all_parts.append(f"Error: {e}")
             continue
 
         annotations = await annotation_service.list_annotations_by_file(project_id, name)

@@ -296,3 +296,24 @@ async def test_write_user_denied_returns_reason():
         )
     assert "User denied permission to write to file: /etc/x" in result
     assert "protected path" in result
+
+
+# ── annotation tools never trigger the write-approval dialog ────────
+
+@pytest.mark.asyncio
+async def test_annotation_tool_bypasses_write_approval():
+    """Annotation tools never trigger the write-approval dialog, even when
+    marked ``is_read_only=False``. Path containment is the tool layer's
+    responsibility, so the executor unconditionally lets them through."""
+    tool_def = _make_tool_def(is_read_only=False)
+    requester = AsyncMock(return_value=_approved_resp())
+    with patch.object(permission_executor.LLMLoopRunner, "call_tool",
+                      new=AsyncMock(return_value="done")) as mock_call:
+        result = await permission_executor.execute_with_permission(
+            "annotation_new",
+            {"file_path": "notes.md", "file_content": "x", "annotation_content": "y"},
+            tool_def, project_id="p", permission_requester=requester,
+        )
+    assert result == "done"
+    mock_call.assert_awaited_once()
+    requester.assert_not_awaited()
