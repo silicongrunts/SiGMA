@@ -243,6 +243,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
   const headingMapRef = useRef([])  // [{srcLine, el?}] for scroll sync
   const blockMapRef = useRef([])    // [{startLine, endLine, el}] for precise highlight
   const highlightedElsRef = useRef([])
+  const currentHighlightLineRef = useRef(null) // last highlightLine() arg, re-applied after block-map rebuild
   const restoredScrollKeyRef = useRef('')
   const previewLoadTokenRef = useRef(0)
 
@@ -261,6 +262,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
     headingMapRef.current = []
     blockMapRef.current = []
     highlightedElsRef.current = []
+    currentHighlightLineRef.current = null
     restoredScrollKeyRef.current = ''
     if (currentPdfUrlRef.current) {
       URL.revokeObjectURL(currentPdfUrlRef.current)
@@ -564,6 +566,22 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
     } catch {
       blockMapRef.current = []
     }
+
+    // Re-apply the current highlight after the block map was rebuilt. Editing
+    // the document changes mdContent → this effect runs → line 479 clears the
+    // highlight. Without re-applying here, the highlight vanishes on every
+    // keystroke until the user moves the cursor again.
+    const hl = currentHighlightLineRef.current
+    if (hl != null) {
+      const n = hl - 1
+      for (const block of blockMapRef.current) {
+        if (n >= block.startLine && n <= block.endLine) {
+          block.el.classList.add('md-highlight')
+          highlightedElsRef.current = [block.el]
+          break
+        }
+      }
+    }
   }, [mdContent, type])
 
   useImperativeHandle(ref, () => ({
@@ -640,6 +658,7 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
       container.scrollTop = fromTop + ((n - from.srcLine) / lineRange) * (toTop - fromTop)
     },
     highlightLine: (line) => {
+      currentHighlightLineRef.current = line
       // Clear previous highlights
       for (const el of highlightedElsRef.current) el.classList.remove('md-highlight')
       highlightedElsRef.current = []
