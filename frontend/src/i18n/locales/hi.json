@@ -359,6 +359,7 @@
   "chat.toast.editFailed": "संपादन विफल: {{message}}",
   "chat.toast.stopStillRunning": "कार्य रुकने की पुष्टि नहीं हो सकी। कृपया फिर से रोकने का प्रयास करें।",
   "chat.toast.imageUploadFailed": "छवि अपलोड विफल",
+  "chat.toast.chatNotReady": "चैट अभी शुरू हो रहा है। कृपया कुछ क्षण बाद पुनः प्रयास करें।",
   "filetree.uploadFile": "फ़ाइल अपलोड करें",
   "filetree.refreshTree": "ट्री ताज़ा करें",
   "filetree.extractHere": "यहां निकालें",

@@ -359,6 +359,7 @@
   "chat.toast.editFailed": "编辑失败：{{message}}",
   "chat.toast.stopStillRunning": "无法确认任务已停止。请再次尝试停止。",
   "chat.toast.imageUploadFailed": "图片上传失败",
+  "chat.toast.chatNotReady": "对话正在启动中，请稍候重试。",
   "filetree.uploadFile": "上传文件",
   "filetree.refreshTree": "刷新文件树",
   "filetree.extractHere": "解压到此处",

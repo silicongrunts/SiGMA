@@ -106,10 +106,15 @@ async def clear_chat_history(project_id: str, session_id: str = Query(None)):
 
 
 @router.post("/attachments/{project_id}")
-async def upload_chat_attachment(project_id: str, file: UploadFile = File(...)):
+async def upload_chat_attachment(
+    project_id: str,
+    session_id: str = Query(...),
+    file: UploadFile = File(...),
+):
     content = await file.read()
     attachment = await save_chat_image(
         project_id=project_id,
+        session_id=session_id,
         filename=file.filename or "image",
         content=content,
         mime_type=file.content_type or "",

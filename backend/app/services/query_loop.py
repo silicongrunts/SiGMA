@@ -784,7 +784,7 @@ class QueryLoop:
         for attachment in attachments:
             try:
                 image_base64, media_type = await read_attachment_base64(
-                    self.project_id, attachment["path"]
+                    self.project_id, self.session_id, attachment["path"]
                 )
             except Exception as exc:
                 logger.debug(

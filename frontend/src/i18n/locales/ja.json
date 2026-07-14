@@ -360,6 +360,7 @@
   "chat.toast.editFailed": "編集に失敗しました：{{message}}",
   "chat.toast.stopStillRunning": "タスクが停止したことを確認できませんでした。もう一度停止してください。",
   "chat.toast.imageUploadFailed": "画像のアップロードに失敗しました",
+  "chat.toast.chatNotReady": "チャットを開始しています。しばらくしてからもう一度お試しください。",
   "filetree.uploadFile": "ファイルをアップロード",
   "filetree.refreshTree": "ツリーを更新",
   "filetree.extractHere": "ここに展開",

@@ -359,6 +359,7 @@
   "chat.toast.editFailed": "Échec de la modification : {{message}}",
   "chat.toast.stopStillRunning": "Impossible de confirmer l'arrêt de la tâche. Réessayez de l'arrêter.",
   "chat.toast.imageUploadFailed": "Échec du téléversement de l'image",
+  "chat.toast.chatNotReady": "La conversation démarre encore. Réessayez dans un instant.",
   "filetree.uploadFile": "Téléverser un fichier",
   "filetree.refreshTree": "Actualiser l'arborescence",
   "filetree.extractHere": "Extraire ici",

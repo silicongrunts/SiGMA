@@ -1543,9 +1543,14 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   async function uploadImageFiles(files) {
     const imageFiles = imageFilesFromList(files)
     if (imageFiles.length === 0 || !projectId) return
+    if (!sessionId) {
+      if (imageInputRef.current) imageInputRef.current.value = ''
+      toastError(t('chat.toast.chatNotReady'))
+      return
+    }
     setIsUploadingAttachment(true)
     try {
-      const uploaded = await Promise.all(imageFiles.map(file => chatAPI.uploadAttachment(projectId, file)))
+      const uploaded = await Promise.all(imageFiles.map(file => chatAPI.uploadAttachment(projectId, sessionId, file)))
       setPendingAttachments(prev => [...prev, ...uploaded])
     } catch (err) {
       toastError(err.message || t('chat.toast.imageUploadFailed'))

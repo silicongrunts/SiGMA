@@ -359,6 +359,7 @@
   "chat.toast.editFailed": "Edit Failed: {{message}}",
   "chat.toast.stopStillRunning": "Could not confirm the task stopped. Please try stopping again.",
   "chat.toast.imageUploadFailed": "Image upload failed",
+  "chat.toast.chatNotReady": "Chat is still starting up. Please try again in a moment.",
   "filetree.uploadFile": "Upload File",
   "filetree.refreshTree": "Refresh Tree",
   "filetree.extractHere": "Extract Here",

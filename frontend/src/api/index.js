@@ -271,10 +271,10 @@ export const compileAPI = {
 // Chat API — streaming + task management
 // ---------------------------------------------------------------------------
 export const chatAPI = {
-  uploadAttachment: (projectId, file) => {
+  uploadAttachment: (projectId, sessionId, file) => {
     const formData = new FormData()
     formData.append('file', file)
-    return fetch(`${API_BASE_URL}/chat/attachments/${projectId}`, {
+    return fetch(`${API_BASE_URL}/chat/attachments/${projectId}?session_id=${encodeURIComponent(sessionId)}`, {
       method: 'POST',
       body: formData,
     }).then(async r => {

@@ -19,15 +19,24 @@ from app.core.utils import (
 )
 from app.core.atomic_file import atomic_write_bytes, AtomicFileExistsError
 from app.core.chat_attachments import (
-    ATTACHMENTS_DIR,
     MAX_CHAT_IMAGE_BYTES,
     SUPPORTED_IMAGE_MIME_TYPES,
 )
 from app.services.file_service import file_service
+from app.services.session_temp_service import session_temp_service
+
+
+def _attachments_dir(project_id: str, session_id: str) -> Path:
+    """Resolve the per-session chat-attachments directory, creating it if needed."""
+    try:
+        return session_temp_service.ensure_child_dir(project_id, session_id, "chat_attachments")
+    except ValueError as exc:
+        raise FileSystemError(str(exc), code="INVALID_REQUEST", status_code=422) from exc
 
 
 async def save_chat_image(
     project_id: str,
+    session_id: str,
     filename: str,
     content: bytes,
     mime_type: str,
@@ -41,10 +50,7 @@ async def save_chat_image(
         raise FileSystemError("Image is too large", code="INVALID_REQUEST", status_code=413)
 
     root = settings.get_project_path(project_id)
-    directory = (root / ATTACHMENTS_DIR).resolve()
-    if not is_within(directory, root.resolve()):
-        raise FileSystemError("Invalid attachment directory", code="PERMISSION_DENIED", status_code=403)
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = _attachments_dir(project_id, session_id)
 
     safe_original = sanitize_filename(filename or f"image{SUPPORTED_IMAGE_MIME_TYPES[mime_type]}")
     suffix = Path(safe_original).suffix.lower() or SUPPORTED_IMAGE_MIME_TYPES[mime_type]
@@ -67,10 +73,13 @@ async def save_chat_image(
     }
 
 
-async def read_attachment_base64(project_id: str, path: str) -> tuple[str, str]:
+async def read_attachment_base64(project_id: str, session_id: str, path: str) -> tuple[str, str]:
     root = settings.get_project_path(project_id)
     full_path = (root / path).resolve()
-    attachments_root = (root / ATTACHMENTS_DIR).resolve()
+    try:
+        attachments_root = session_temp_service.session_dir(project_id, session_id) / "chat_attachments"
+    except ValueError as exc:
+        raise FileSystemError(str(exc), code="INVALID_REQUEST", status_code=422) from exc
     if not is_within(full_path, attachments_root):
         raise FileSystemError("Attachment path is outside chat attachments", code="PERMISSION_DENIED", status_code=403)
     if not full_path.is_file():

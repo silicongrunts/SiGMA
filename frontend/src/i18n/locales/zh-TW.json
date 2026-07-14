@@ -359,6 +359,7 @@
   "chat.toast.editFailed": "編輯失敗：{{message}}",
   "chat.toast.stopStillRunning": "無法確認任務已停止。請再次嘗試停止。",
   "chat.toast.imageUploadFailed": "圖片上傳失敗",
+  "chat.toast.chatNotReady": "對話正在啟動中，請稍候重試。",
   "filetree.uploadFile": "上傳檔案",
   "filetree.refreshTree": "重新整理樹狀目錄",
   "filetree.extractHere": "解壓縮至此",
