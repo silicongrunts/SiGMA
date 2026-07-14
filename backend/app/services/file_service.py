@@ -38,17 +38,6 @@ class PathAccessLevel(str, Enum):
     SANDBOX = "sandbox"       # Inside project directory → free R/W
     TMP = "tmp"               # Inside /tmp → free R/W
     EXTERNAL = "external"     # Outside sandbox & /tmp → read free, write needs approval
-    FORBIDDEN = "forbidden"   # System directory → always deny
-
-
-# Directories where writes are always denied (reads are unrestricted).
-_FORBIDDEN_WRITE_PREFIXES: tuple[Path, ...] = tuple(
-    (p.resolve() for p in (
-        Path("/etc"), Path("/root"), Path("/proc"), Path("/sys"),
-        Path("/dev"), Path("/boot"), Path("/lib"), Path("/lib64"),
-        Path("/usr"), Path("/sbin"), Path("/bin"),
-    ))
-)
 
 
 class FileService:
@@ -85,12 +74,8 @@ class FileService:
         try:
             resolved = self._resolve_for_check(project_id, path)
         except FileSystemError:
-            # Relative path escaped the sandbox via traversal — reject.
-            return PathAccessLevel.FORBIDDEN
-
-        for prefix in _FORBIDDEN_WRITE_PREFIXES:
-            if is_within(resolved, prefix):
-                return PathAccessLevel.FORBIDDEN
+            # Relative path escaped the sandbox via traversal — treat as external.
+            return PathAccessLevel.EXTERNAL
 
         try:
             sandbox = self.get_project_path(project_id)

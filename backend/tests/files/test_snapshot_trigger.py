@@ -58,6 +58,6 @@ async def test_classify_path_returns_sandbox_for_inner_path(tmp_path, monkeypatc
     assert level is PathAccessLevel.SANDBOX
 
 
-# Note: classify_path's EXTERNAL/TMP/FORBIDDEN branches are exercised by
-# other tests in the suite (permission_executor tests); we only need to
-# verify SANDBOX detection here since that's the trigger condition.
+# Note: classify_path's EXTERNAL/TMP branches are exercised by other tests
+# in the suite (permission_executor tests); we only need to verify SANDBOX
+# detection here since that's the trigger condition.

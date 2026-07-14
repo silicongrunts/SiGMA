@@ -234,8 +234,7 @@ async def _check_write(
     """Require approval for filesystem writes, classifying the target into the
     ``file_internal`` (sandbox /tmp) or ``file_external`` category.
 
-    Forbidden paths are always rejected regardless of auto-approve. For the
-    ``edit`` tool, the before/after strings are composed into the preview.
+    For the ``edit`` tool, the before/after strings are composed into the preview.
     """
     target_path = (
         tool_args.get("file_path") or tool_args.get("path")
@@ -245,10 +244,6 @@ async def _check_write(
         return None
 
     level = file_service.check_write_allowed(project_id, target_path)
-
-    # Forbidden system directories are never writable, even with auto-approve on.
-    if level is PathAccessLevel.FORBIDDEN:
-        return f"Permission denied: Writing to '{target_path}' is forbidden (protected system path)."
 
     is_internal = level in (PathAccessLevel.SANDBOX, PathAccessLevel.TMP)
     category = "file_internal" if is_internal else "file_external"

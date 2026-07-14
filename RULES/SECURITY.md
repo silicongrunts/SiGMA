@@ -20,17 +20,16 @@ not duplicate security decisions in components, tools, or routes.
 Agent file access follows the four-category model. Every non-exempt tool call
 passes through the shared permission executor before execution.
 
-- `file_external`: writes outside the project sandbox and `/tmp`.
-- `file_internal`: writes inside the project sandbox or `/tmp`.
+- `file_external`: writes outside the project sandbox.
+- `file_internal`: writes inside the project sandbox.
 - `bash`: non-read-only shell commands.
 - `notebook`: executing code in a notebook cell.
 
-Forbidden system paths are always rejected, even with auto-approve on. Each
-category has an auto-approve flag in `project_config` (`auto_approve.<category>`)
-read live per call — when on, the executor silently approves; when off, the
-frontend shows an approval dialog. Read-only tools and tools that mutate the
-project DB rather than the filesystem are exempt; see `permission_executor.py`
-for the authoritative list.
+Each category has an auto-approve flag in `project_config`
+(`auto_approve.<category>`) read live per call — when on, the executor silently
+approves; when off, the frontend shows an approval dialog. Read-only tools and
+tools that mutate the project DB rather than the filesystem are exempt; see
+`permission_executor.py` for the authoritative list.
 
 ## Uploads And Downloads
 

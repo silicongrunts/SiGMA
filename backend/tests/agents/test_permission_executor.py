@@ -330,22 +330,6 @@ async def test_write_outside_sandbox_no_requester_denies():
 
 
 @pytest.mark.asyncio
-async def test_write_forbidden_path_always_denied_even_with_auto_approve():
-    """FORBIDDEN paths are rejected before the auto-approve check — safety."""
-    tool_def = _make_tool_def(is_read_only=False)
-    requester = AsyncMock(return_value=_approved_resp())
-    with patch.object(permission_executor.file_service, "check_write_allowed",
-                      return_value=PathAccessLevel.FORBIDDEN), \
-         _auto_approve_patch("p", {"file_external": True}):
-        result = await permission_executor.execute_with_permission(
-            "write", {"file_path": "/etc/passwd"}, tool_def,
-            project_id="p", permission_requester=requester,
-        )
-    assert "forbidden" in result.lower()
-    requester.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_edit_composes_old_new_diff_as_content():
     tool_def = _make_tool_def(is_read_only=False)
     requester = AsyncMock(return_value=_approved_resp())
