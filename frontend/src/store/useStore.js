@@ -43,7 +43,7 @@ const initialState = {
   // Task & Interaction
   pendingInteraction: null,           // {type: 'ask_user_question'|'submit_plan_for_approval', data}
   interactionDismissed: false,        // user closed the interaction modal without resolving (input stays gated)
-  pendingPermission: null,            // {task_id, request_id, tool, path, operation, content, description}
+  pendingPermission: null,            // {session_id, tool, tool_name, path, operation, content, description}
   autoApproveSettings: {},            // { [toolType]: boolean } per-project, loaded on project switch
   taskList: [],                       // [{id, subject, status}]
   expandedTasks: false,               // auto-expand when tools modify tasks

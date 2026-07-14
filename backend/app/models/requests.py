@@ -239,13 +239,6 @@ class SyncTeXRequest(BaseModel):
 # Permission
 # ---------------------------------------------------------------------------
 
-class PermissionRespondRequest(BaseModel):
-    """Request body for POST /permissions/{project_id}/{task_id}/respond."""
-    request_id: str = Field(..., min_length=1)
-    approved: bool
-    reason: Optional[str] = Field(default="", max_length=2000)
-
-
 class AutoApproveUpdate(BaseModel):
     """Request body for PUT /permissions/{project_id}/auto-approve.
 

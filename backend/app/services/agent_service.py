@@ -79,7 +79,6 @@ class AgentService:
         inherited_messages: list[dict] | None = None,
         emit_event: Callable[[dict], Awaitable[None]] | None = None,
         cancel_event: asyncio.Event | None = None,
-        permission_requester: "callable | None" = None,
         token_budget_tracker=None,
         parent_model_role: str | None = None,
         parent_response_max_tokens: int | None = None,
@@ -103,7 +102,6 @@ class AgentService:
             return await self._resume(
                 resume_id=resume_id, prompt=prompt, project_id=project_id,
                 emit_event=emit_event, cancel_event=cancel_event,
-                permission_requester=permission_requester,
                 token_budget_tracker=token_budget_tracker,
             )
         elif agent_type == "general":
@@ -112,7 +110,6 @@ class AgentService:
                 parent_session_id=parent_session_id,
                 parent_tool_call_id=parent_tool_call_id,
                 emit_event=emit_event, cancel_event=cancel_event,
-                permission_requester=permission_requester,
                 token_budget_tracker=token_budget_tracker,
             )
         elif agent_type == "explore":
@@ -134,7 +131,6 @@ class AgentService:
                 prompt=prompt, project_id=project_id,
                 inherited_messages=inherited_messages or [],
                 emit_event=emit_event, cancel_event=cancel_event,
-                permission_requester=permission_requester,
                 token_budget_tracker=token_budget_tracker,
                 model_role=parent_model_role or "supervisor",
                 response_max_tokens=parent_response_max_tokens,
@@ -250,7 +246,6 @@ class AgentService:
         inner_tool_result: str,
         emit_event: Callable[[dict], Awaitable[None]] | None = None,
         cancel_event: asyncio.Event | None = None,
-        permission_requester: "callable | None" = None,
         token_budget_tracker=None,
     ) -> str:
         """Resume a general agent session after one of its interactive tools."""
@@ -299,7 +294,7 @@ class AgentService:
                 loop_ctx=ctx,
                 persisted_token_baseline=persisted_token_baseline,
             ),
-            execute_tool=self._make_permission_executor(permission_requester),
+            execute_tool=self._make_permission_executor(),
             token_budget_tracker=token_budget_tracker,
         )
 
@@ -320,13 +315,13 @@ class AgentService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _make_permission_executor(permission_requester):
+    def _make_permission_executor():
         """Create a permission-aware tool executor for subagents.
 
         Delegates to the shared permission executor (single source of truth
-        with QueryLoop). When ``permission_requester is None``, the shared
-        executor uniformly denies bash / notebook_run_cell / writes outside
-        sandbox — no special-case fallback.
+        with QueryLoop). When a write/bash/notebook tool needs approval,
+        ``execute_with_permission`` raises ``PermissionRequestPause``, which
+        propagates up to the parent loop for checkpointing.
         """
         from app.services.permission_executor import execute_with_permission
 
@@ -337,7 +332,6 @@ class AgentService:
             return await execute_with_permission(
                 tool_name, tool_args, tool_def,
                 project_id=tool_args.get("project_id", ""),
-                permission_requester=permission_requester,
             )
 
         return _execute
@@ -367,7 +361,6 @@ class AgentService:
     async def _spawn_general(
         self, *, prompt, project_id, parent_session_id, parent_tool_call_id,
         emit_event, cancel_event,
-        permission_requester=None,
         token_budget_tracker=None,
     ) -> str:
         """Spawn a general agent with independent context and persistent session."""
@@ -415,7 +408,7 @@ class AgentService:
                 token_budget_tracker=token_budget_tracker,
                 loop_ctx=ctx,
             ),
-            execute_tool=self._make_permission_executor(permission_requester),
+            execute_tool=self._make_permission_executor(),
             token_budget_tracker=token_budget_tracker,
         )
 
@@ -571,7 +564,6 @@ class AgentService:
     async def _fork(
         self, *, prompt, project_id, inherited_messages,
         emit_event, cancel_event,
-        permission_requester=None,
         token_budget_tracker=None,
         model_role: str = "supervisor",
         response_max_tokens: int | None = None,
@@ -612,7 +604,7 @@ class AgentService:
             forbidden_tools=FORK_FORBIDDEN_TOOLS,
             forbidden_tool_context="fork",
             cancel_event=cancel_event,
-            execute_tool=self._make_permission_executor(permission_requester),
+            execute_tool=self._make_permission_executor(),
             prepare_messages=lambda msgs: self._prepare_agent_messages(
                 project_id=project_id,
                 session_id=scope_id,
@@ -638,7 +630,6 @@ class AgentService:
     async def _resume(
         self, *, resume_id, prompt, project_id,
         emit_event, cancel_event,
-        permission_requester=None,
         token_budget_tracker=None,
     ) -> str:
         """Resume an existing general agent session."""
@@ -695,7 +686,7 @@ class AgentService:
                 loop_ctx=ctx,
                 persisted_token_baseline=persisted_token_baseline,
             ),
-            execute_tool=self._make_permission_executor(permission_requester),
+            execute_tool=self._make_permission_executor(),
             token_budget_tracker=token_budget_tracker,
         )
 

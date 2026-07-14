@@ -391,6 +391,33 @@ class TaskStateRepository:
         task = result.scalar_one_or_none()
         return self._to_dict(task) if task else None
 
+    async def reap_stale_tasks(self) -> int:
+        """Finalize chat tasks whose worker died without a clean exit.
+
+        Finds tasks still in ``running`` or ``cancelling`` whose heartbeat has
+        expired (per ``check_liveness``) and marks them failed. ``mark_failed``
+        is cancel-aware — a stale ``cancelling`` task finalizes as ``cancelled``.
+
+        This is the only stale-recovery path that runs independently of an
+        active SSE subscriber, so a task orphaned by a worker crash is cleaned
+        up even when the user has navigated away.
+        """
+        result = await self._session.execute(
+            select(TaskState).where(
+                TaskState.status.in_([STATUS_RUNNING, STATUS_CANCELLING])
+            )
+        )
+        reaped = 0
+        for task in result.scalars():
+            liveness = await self.check_liveness(task.task_id)
+            if liveness == "stale":
+                await self.mark_failed(
+                    task.task_id,
+                    "Worker stopped sending heartbeats and did not recover.",
+                )
+                reaped += 1
+        return reaped
+
     async def get_by_id(self, task_id: str) -> Optional[Dict]:
         """Return a task state dict by task_id, or None."""
         result = await self._session.execute(

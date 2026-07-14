@@ -1,44 +1,27 @@
 """
-Permission routes — user approval for agent write operations outside sandbox.
+Permission routes — auto-approve settings for agent write operations.
 
-When the LLM agent (via QueryLoop) tries to write a file outside the project
-directory or /tmp, the frontend shows a permission dialog.  The user's
-response is forwarded here, which relays it back to the worker via
-StreamServer.
+Permission approval no longer uses a dedicated HTTP endpoint. When the LLM
+agent needs user approval for a write/bash/notebook operation, the task is
+parked as ``awaiting_input`` (same mechanism as interactive tools like
+``ask_user_question``). The user's response flows back through the chat resume
+path (``POST /chat/stream`` with ``resume=true`` and
+``interaction_response``). This makes the permission flow crash-safe: a
+worker restart or page refresh does not lose the pending request.
 
-Also exposes the per-project auto-approve settings (one toggle per permission
-category) persisted in ``project_config``.
+This module exposes the per-project auto-approve settings (one toggle per
+permission category) persisted in ``project_config``.
 """
 
 from fastapi import APIRouter
 
-from app.models.requests import AutoApproveUpdate, PermissionRespondRequest
+from app.models.requests import AutoApproveUpdate
 from app.core.response import ok
 from app.core.exceptions import ServiceException
 from app.services.permission_executor import PERMISSION_CATEGORIES
 from app.services.project_service import project_service
-from app.workers.stream_server import stream_server
 
 router = APIRouter(prefix="/permissions", tags=["permissions"])
-
-
-@router.post("/{project_id}/{task_id}/respond")
-async def respond_permission(project_id: str, task_id: str, data: PermissionRespondRequest):
-    """Submit user approval/denial for a pending permission request."""
-    project_service.get_project_path(project_id)
-    sent = await stream_server.respond_permission(
-        task_id=task_id,
-        request_id=data.request_id,
-        approved=data.approved,
-        reason=data.reason or "",
-    )
-    if not sent:
-        raise ServiceException(
-            "No active task found for this permission request",
-            code="PERMISSION_TASK_NOT_FOUND",
-            status_code=404,
-        )
-    return ok({"request_id": data.request_id, "approved": data.approved})
 
 
 @router.get("/{project_id}/auto-approve")

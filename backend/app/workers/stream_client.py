@@ -14,14 +14,12 @@ import struct
 from typing import Optional
 
 from app.core.logging import get_logger
-from app.core.utils import generate_id
 
 logger = get_logger(__name__)
 
 HEADER = struct.Struct("!I")
 MAX_RECONNECT_ATTEMPTS = 5
 RECONNECT_DELAY = 2.0
-PERMISSION_TIMEOUT = 300  # 5 minutes to wait for user response
 
 
 class StreamClient:
@@ -44,7 +42,6 @@ class StreamClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.cancel_event: asyncio.Event = asyncio.Event()
         self._reader_task: Optional[asyncio.Task] = None
-        self._pending_permissions: dict[str, dict] = {}  # request_id → {event, approved}
 
     @property
     def connected(self) -> bool:
@@ -160,56 +157,6 @@ class StreamClient:
         await self.close()
 
     # ------------------------------------------------------------------
-    # Permission requests (worker → server → frontend → user → server → worker)
-    # ------------------------------------------------------------------
-    async def request_permission(self, tool: str, path: str, operation: str,
-                                content: str = "", description: str = "",
-                                tool_name: str = "") -> dict:
-        """Send a permission request to the frontend and wait for user response.
-
-        Returns ``{"approved": bool, "reason": str}``. ``description`` is an
-        optional intent label shown in the approval dialog. ``tool`` is the
-        permission category (drives auto-approve matching); ``tool_name`` is the
-        concrete tool the agent invoked (shown in the dialog for clarity).
-        """
-        request_id = generate_id()
-        event = asyncio.Event()
-        self._pending_permissions[request_id] = {"event": event, "approved": False}
-
-        payload = {
-            "type": "permission_request",
-            "task_id": self._task_id,
-            "request_id": request_id,
-            "tool": tool,
-            "path": path,
-            "operation": operation,
-        }
-        if tool_name:
-            payload["tool_name"] = tool_name
-        if content:
-            payload["content"] = content
-        if description:
-            payload["description"] = description
-
-        sent = await self._safe_send(payload)
-
-        if not sent:
-            self._pending_permissions.pop(request_id, None)
-            return {"approved": False, "reason": ""}
-
-        try:
-            await asyncio.wait_for(event.wait(), timeout=PERMISSION_TIMEOUT)
-        except asyncio.TimeoutError:
-            self._pending_permissions.pop(request_id, None)
-            logger.warning("Permission request %s timed out", request_id)
-            return {"approved": False, "reason": ""}
-
-        result = self._pending_permissions.pop(request_id, None)
-        if result:
-            return {"approved": result.get("approved", False), "reason": result.get("reason", "")}
-        return {"approved": False, "reason": ""}
-
-    # ------------------------------------------------------------------
     # Receiving (server → worker commands)
     # ------------------------------------------------------------------
     async def _read_loop(self) -> None:
@@ -224,16 +171,6 @@ class StreamClient:
                 if msg_type == "cancel":
                     logger.info("Received cancel signal from server")
                     self.cancel_event.set()
-
-                elif msg_type == "permission_response":
-                    request_id = msg.get("request_id", "")
-                    pending = self._pending_permissions.get(request_id)
-                    if pending:
-                        pending["approved"] = msg.get("approved", False)
-                        pending["reason"] = msg.get("reason", "")
-                        pending["event"].set()
-                    else:
-                        logger.warning("Received permission_response for unknown request %s", request_id)
 
         except (asyncio.IncompleteReadError, asyncio.CancelledError):
             pass  # normal disconnect / shutdown

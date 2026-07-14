@@ -531,14 +531,10 @@ export const skillsAPI = {
 }
 
 // ---------------------------------------------------------------------------
-// Permission API — worker write-approval relay
+// Permission API — auto-approve settings (approval itself goes through chat
+// resume: POST /chat/stream with resume=true and interaction_response)
 // ---------------------------------------------------------------------------
 export const permissionsAPI = {
-  respond: (projectId, taskId, body) =>
-    request(`/permissions/${projectId}/${taskId}/respond`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
   getAutoApprove: (projectId) =>
     request(`/permissions/${projectId}/auto-approve`),
   setAutoApprove: (projectId, body) =>

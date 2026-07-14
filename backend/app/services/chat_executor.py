@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, AsyncGenerator, Callable, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, Optional
 
 from app.database.unit_of_work import UnitOfWork
 from app.services.query_loop import QueryLoop
@@ -37,7 +37,6 @@ async def stream_chat_for_task(
     interaction_response: Optional[Dict[str, Any]] = None,
     task_id: str = "",
     cancel_event: "asyncio.Event | None" = None,
-    permission_requester: "Callable | None" = None,
 ) -> AsyncGenerator[str, None]:
     """Run one chat turn end-to-end and yield SSE-formatted event strings.
 
@@ -62,7 +61,6 @@ async def stream_chat_for_task(
         task_id=task_id,
         interaction_response=interaction_response,
         cancel_event=cancel_event,
-        permission_requester=permission_requester,
         token_budget_tracker=token_budget_tracker,
     )
 

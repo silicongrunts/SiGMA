@@ -54,7 +54,6 @@ async def _run_agent(
         inherited_messages=ctx.get("messages"),
         emit_event=ctx.get("emit_event"),
         cancel_event=ctx.get("cancel_event"),
-        permission_requester=ctx.get("permission_requester"),
         token_budget_tracker=ctx.get("token_budget_tracker"),
         parent_model_role=ctx.get("model_role"),
         parent_response_max_tokens=ctx.get("response_max_tokens"),

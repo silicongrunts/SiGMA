@@ -91,8 +91,13 @@ Persistent file writes should:
 - Stream state should tolerate client disconnect/reconnect.
 - Heartbeats and task status updates should be monotonic or explicitly
   transition-checked.
-- Permission requests should have a clear timeout, cancellation, and duplicate
-  response behavior.
+- Permission requests use the same DB-backed ``awaiting_input`` pause/resume
+  mechanism as interactive tools (``ask_user_question``, plan approval). The
+  worker does not block on an in-memory wait; it parks the task and exits. The
+  user's response arrives via the resume path (``POST /chat/stream`` with
+  ``resume=true``), which spawns a new worker task. This makes permission
+  pauses crash-safe: a worker restart or page refresh does not lose the pending
+  request because it is persisted in ``interaction_state``.
 
 ## Browser And Terminal State
 

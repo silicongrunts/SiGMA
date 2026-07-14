@@ -55,6 +55,10 @@ export default function EditorView() {
     if (s.currentProject?.id !== projectId) {
       s.clearCurrentFile()
       s.setHasUnsavedChanges(false)
+      // These are session-scoped modals; a stale value from a previous
+      // project's session must not bleed into the new project.
+      s.clearPendingPermission()
+      s.clearPendingInteraction()
     }
 
     return () => {

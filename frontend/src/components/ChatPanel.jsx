@@ -509,11 +509,24 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
 
       if (active?.active && active.session_id === sessionId) {
         if (active.status === 'awaiting_input' && active.interaction) {
-          useStore.getState().setPendingInteraction({
-            type: active.interaction.interaction_type || active.interaction.interaction_data?.interaction_type,
-            data: active.interaction.interaction_data || active.interaction,
-            sessionId,
-          })
+          const interactionType = active.interaction.interaction_type
+            || active.interaction.interaction_data?.interaction_type
+          if (interactionType === 'permission') {
+            // Permission approval checkpoint — restore the PermissionDialog.
+            // The payload fields (tool/path/operation/content/description) are
+            // nested under interaction_data; spreading the outer wrapper would
+            // lose them.
+            useStore.getState().setPendingPermission({
+              ...active.interaction.interaction_data,
+              session_id: sessionId,
+            })
+          } else {
+            useStore.getState().setPendingInteraction({
+              type: interactionType,
+              data: active.interaction.interaction_data || active.interaction,
+              sessionId,
+            })
+          }
         } else {
           // Task active but not awaiting input — drop any stale interaction state
           useStore.getState().clearPendingInteraction()
@@ -1024,11 +1037,6 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
           }
           return
         }
-        // Permission request — Zustand only
-        if (type === 'permission_request') {
-          useStore.getState().setPendingPermission(data)
-          return
-        }
         // Progressive usage update — refresh token stats after each LLM call
         if (type === 'turn_usage') {
           if (data.usage) {
@@ -1207,7 +1215,11 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
                 }
               } else if (innerType === 'awaiting_input') {
                 subSteps.push({ type: 'awaiting_input', interaction_type: innerData.interaction_type, data: innerData, transient: true })
-                pendingInteractionRef.current = { type: innerData.interaction_type, data: innerData, sessionId }
+                if (innerData.interaction_type === 'permission') {
+                  useStore.getState().setPendingPermission({ ...innerData, session_id: sessionId })
+                } else {
+                  pendingInteractionRef.current = { type: innerData.interaction_type, data: innerData, sessionId }
+                }
               }
 
               agentStep.subSteps = subSteps
@@ -1219,7 +1231,11 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
           } else if (type === 'awaiting_input') {
             currentProcess.push({ type: 'awaiting_input', interaction_type: data.interaction_type, data: data, transient: true })
             lastMsg.process = currentProcess
-            pendingInteractionRef.current = { type: data.interaction_type, data: data, sessionId }
+            if (data.interaction_type === 'permission') {
+              useStore.getState().setPendingPermission({ ...data, session_id: sessionId })
+            } else {
+              pendingInteractionRef.current = { type: data.interaction_type, data: data, sessionId }
+            }
           } else if (type === 'done') {
             const streamIdx = currentProcess.findLastIndex(s => s.type === 'streaming_text')
             if (streamIdx >= 0) {

@@ -416,7 +416,6 @@ def run_llm_chat(
                 interaction_response=interaction_response,
                 task_id=task_id,
                 cancel_event=runner.client.cancel_event,
-                permission_requester=runner.client.request_permission,
             ),
             on_delta=lambda data: data.get("content", ""),
             on_error=lambda data: data or {"error": "LLM task failed"},
@@ -494,6 +493,7 @@ def scan_and_queue_indexing():
     async def _scan():
         from app.services.background_task_service import background_task_service
         from app.database.manager import get_db_manager
+        from app.database.unit_of_work import UnitOfWork
 
         db_mgr = await get_db_manager()
         cleaned = await db_mgr.cleanup_inactive_projects()
@@ -501,7 +501,19 @@ def scan_and_queue_indexing():
             _get_logger().info("Cleaned worker DB state for inactive project(s): %s", cleaned)
 
         recovered = 0
+        reaped = 0
         for pid in _iter_library_scan_project_ids():
+            try:
+                # Reap chat tasks orphaned by a worker crash. Uses a separate
+                # UnitOfWork so the reaper's commits are isolated from the
+                # library scan. Safe to run unconditionally: reap_stale_tasks
+                # only touches tasks check_liveness already deems dead.
+                async with UnitOfWork(pid) as uow:
+                    reaped += await uow.task_state.reap_stale_tasks()
+            except Exception as exc:
+                _get_logger().warning(
+                    "Stale task reap failed for project %s: %s", pid, exc,
+                )
             try:
                 recovered += await asyncio.wait_for(
                     _scan_library_project(pid),
@@ -518,6 +530,8 @@ def scan_and_queue_indexing():
         background_task_service.wake()
         if recovered:
             _get_logger().info("Periodic scanner reconciled %d library task(s)", recovered)
+        if reaped:
+            _get_logger().info("Periodic scanner reaped %d stale task(s)", reaped)
 
     try:
         run_on_worker_loop(

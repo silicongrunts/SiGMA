@@ -23,9 +23,6 @@ from app.agents.tools.bash_security import (
     is_subshell,
 )
 from app.agents.tools.bash_readonly import is_command_read_only
-from app.core.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 class BashPermissionResult:
@@ -58,7 +55,7 @@ def check_bash_permission(
     """Check whether *command* may run without user approval.
 
     Pure-synchronous: classifies the command and returns a result. Does NOT
-    prompt the user — that's the caller's job (see ``check_bash_permission_async``).
+    prompt the user — that's the caller's job (see ``permission_executor``).
     """
     if not command or not command.strip():
         return BashPermissionResult(approved=True, reason="Empty command")
@@ -108,56 +105,6 @@ def check_bash_permission(
 
     # All checks passed — command is read-only
     return BashPermissionResult(approved=True, reason="Command is read-only")
-
-
-async def check_bash_permission_async(
-    command: str,
-    permission_requester=None,
-    description: str = "",
-) -> BashPermissionResult:
-    """Async version — requests user approval if needed.
-
-    If the command is read-only, returns immediately.
-    If approval is needed, calls permission_requester to ask the user.
-
-    `description` is the LLM-provided intent, surfaced in the permission dialog
-    so the user can compare "what the LLM said it would do" vs the actual command.
-    """
-    result = check_bash_permission(command)
-
-    if result.approved:
-        return result
-
-    # Command needs user approval
-    if permission_requester is None:
-        # No way to ask user — deny
-        logger.warning("Bash command blocked (no permission requester): %s", command[:200])
-        return BashPermissionResult(
-            approved=False,
-            reason="Command requires user approval but no permission channel is available",
-        )
-
-    # Ask the user
-    base_cmd = _base_command(command)
-    resp = await permission_requester(
-        tool="bash",
-        path=base_cmd,
-        operation="execute",
-        content=command[:800],
-        description=description,
-    )
-
-    if resp.get("approved"):
-        return BashPermissionResult(approved=True, reason="User approved")
-    else:
-        reason = resp.get("reason", "")
-        denial = "User rejected to execute this command"
-        if reason:
-            denial += f". User says: {reason}"
-        return BashPermissionResult(
-            approved=False,
-            reason=denial,
-        )
 
 
 # ---------------------------------------------------------------------------

@@ -4,9 +4,10 @@
  * file_internal, bash, notebook).
  *
  * Shows the category, target path, and content preview. The user's response is
- * sent to the backend which relays it to the worker. Auto-approve is configured
- * separately in the ChatPanel settings menu (persisted to the backend), so this
- * dialog only handles single-shot approval.
+ * sent via the chat resume path (POST /chat/stream with resume=true), which
+ * spawns a new worker task carrying the approval/denial. Auto-approve is
+ * configured separately in the ChatPanel settings menu (persisted to the
+ * backend), so this dialog only handles single-shot approval.
  */
 import { useState, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -24,15 +25,14 @@ export default function PermissionDialog() {
 
   if (!pendingPermission) return null
 
-  const { task_id, request_id, tool, tool_name, path, operation, content, description } = pendingPermission
+  const { session_id, tool, tool_name, path, operation, content, description } = pendingPermission
   const isAutoApproved = autoApproveSettings[tool] === true
 
   return (
     <PermissionPrompt
-      key={request_id}
+      key={session_id + (path || '') + (operation || '') + (tool_name || '')}
       projectId={currentProject?.id}
-      taskId={task_id}
-      requestId={request_id}
+      sessionId={session_id}
       tool={tool}
       toolName={tool_name || tool}
       path={path}
@@ -41,13 +41,13 @@ export default function PermissionDialog() {
       description={description || ''}
       onResolved={clearPendingPermission}
       isAutoApproved={isAutoApproved}
-      onToggleAutoApprove={(enabled) => currentProject && setAutoApproveType(tool, enabled)}
+      onToggleAutoApprove={(enabled) => setAutoApproveType(tool, enabled)}
     />
   )
 }
 
 function PermissionPrompt({
-  projectId, taskId, requestId, tool, toolName, path, operation, content, description,
+  projectId, sessionId, tool, toolName, path, operation, content, description,
   onResolved, isAutoApproved, onToggleAutoApprove,
 }) {
   const { t } = useTranslation()
@@ -72,15 +72,21 @@ function PermissionPrompt({
   const handleRespond = useCallback(async (approved, reason = '') => {
     setResponding(true)
     setSubmitError('')
-    try {
-      await permissionsAPI.respond(projectId, taskId, { request_id: requestId, approved, reason })
-    } catch (e) {
+    if (!sessionId) {
       setSubmitError(t('permission.respondFailed'))
       setResponding(false)
       return
     }
+    // Submit via the chat resume path — spawns a new worker task carrying
+    // the approval/denial, which resumes the paused loop.
+    useStore.getState().setStreamInteractionRequest({
+      message: '',
+      resume: true,
+      session_id: sessionId,
+      interaction_response: { approved, reason },
+    })
     onResolved()
-  }, [projectId, taskId, requestId, onResolved, t])
+  }, [sessionId, onResolved, t])
 
   const handleDenyClick = () => {
     if (!showDenyInput) {

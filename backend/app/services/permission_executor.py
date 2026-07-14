@@ -12,12 +12,21 @@ entirely (see ``_EXEMPT_TOOLS`` and the ``is_read_only`` flag).
 
 Auto-approve: each category's auto-approve flag is read live from the
 per-project ``project_config`` table (key ``auto_approve.<category>``). When the
-flag is on, the category is approved silently — no request is sent to the
-frontend. Reads are uncached (single-user local SQLite is cheap enough) so a
-settings change takes effect on the next tool call.
+flag is on, the category is approved silently — no pause is needed. Reads are
+uncached (single-user local SQLite is cheap enough) so a settings change takes
+effect on the next tool call.
+
+When approval is needed, ``execute_with_permission`` raises
+``PermissionRequestPause``. The LLM loop runner catches it, parks the task as
+``awaiting_input`` (same mechanism used by interactive tools like
+``ask_user_question``), and the user's response arrives via the resume path
+(``POST /chat/stream`` with ``resume=true``). This makes permission pauses
+crash-safe: a worker restart or page refresh does not lose the pending request,
+because it is persisted in ``interaction_state`` rather than held in process
+memory.
 """
 
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from app.agents.tools.bash_permissions import check_bash_permission
 from app.agents.tools.registry import tool_registry
@@ -26,6 +35,38 @@ from app.services.file_service import PathAccessLevel, file_service
 from app.services.llm_loop_runner import LLMLoopRunner
 
 logger = get_logger(__name__)
+
+
+class PermissionRequestPause(Exception):
+    """Raised when a tool needs user approval before it can execute.
+
+    Carries the full context needed to render the approval dialog and to resume
+    the task after the user responds. The LLM loop runner catches this, persists
+    a checkpoint via ``mark_awaiting_input``, and emits an ``awaiting_input``
+    SSE event. The user's response flows back through the resume path
+    (``QueryLoop._resume_from_permission``).
+    """
+
+    def __init__(
+        self,
+        *,
+        tool: str,
+        tool_name: str = "",
+        path: str = "",
+        operation: str = "",
+        content: str = "",
+        description: str = "",
+    ):
+        self.tool = tool              # category: file_external/file_internal/bash/notebook
+        self.tool_name = tool_name    # concrete tool invoked: write/edit/bash/...
+        self.path = path
+        self.operation = operation
+        self.content = content
+        self.description = description
+        # Set by the runner when the pause propagates out of a subagent, so
+        # the parent loop knows which agent tool_call to attach the result to.
+        self.parent_tool_call_id = ""
+        super().__init__(f"Permission required for {tool_name or tool}: {operation} {path}")
 
 
 # The four permission categories. Tools map onto one of these (see
@@ -44,13 +85,14 @@ async def execute_with_permission(
     tool_def: Any = None,
     *,
     project_id: str,
-    permission_requester: Optional[Callable] = None,
 ) -> str:
     """Dispatch ``tool_name`` after running the appropriate permission gate.
 
     Returns the tool's output string on success, or a denial / error message
     string if permission is denied (the caller treats both as the tool result
-    that goes back to the LLM).
+    that goes back to the LLM). Raises ``PermissionRequestPause`` when user
+    approval is needed — the caller (LLM loop runner) catches it and parks the
+    task as ``awaiting_input``.
     """
     if tool_def is None:
         tool_def = tool_registry.get(tool_name)
@@ -60,7 +102,7 @@ async def execute_with_permission(
         return f"Error: Tool '{tool_name}' has no call implementation"
 
     denied = await _check_permission(
-        tool_name, tool_args, tool_def, project_id, permission_requester,
+        tool_name, tool_args, tool_def, project_id,
     )
     if denied:
         return denied
@@ -72,17 +114,20 @@ async def _check_permission(
     tool_args: dict,
     tool_def: Any,
     project_id: str,
-    requester: Optional[Callable],
 ) -> Optional[str]:
-    """Returns denial string if denied, None to proceed with tool execution."""
+    """Returns denial string if denied, None to proceed with tool execution.
+
+    Raises ``PermissionRequestPause`` when user approval is needed and the
+    category is not auto-approved.
+    """
     if tool_name == "bash":
-        return await _check_bash(tool_args, project_id, requester)
+        return await _check_bash(tool_args, project_id)
     if tool_name == "notebook_run_cell":
-        return await _check_notebook_run(tool_args, project_id, requester)
+        return await _check_notebook_run(tool_args, project_id)
     if tool_name in _EXEMPT_TOOLS:
         return None
     if not tool_def.is_read_only:
-        return await _check_write(tool_name, tool_args, project_id, requester)
+        return await _check_write(tool_name, tool_args, project_id)
     return None
 
 
@@ -123,13 +168,13 @@ async def _is_auto_approved(project_id: str, category: str) -> bool:
 
 
 async def _check_bash(
-    tool_args: dict, project_id: str, requester: Optional[Callable],
+    tool_args: dict, project_id: str,
 ) -> Optional[str]:
     """Route bash through the read-only allowlist / approval flow.
 
     The synchronous classifier decides whether approval is needed. If it is,
     the ``bash`` auto-approve flag is consulted first; only when it is off (or
-    unreadable) does the request reach the frontend.
+    unreadable) does the method raise ``PermissionRequestPause``.
     """
     command = tool_args.get("command", "")
     if not command:
@@ -140,35 +185,22 @@ async def _check_bash(
     if result.approved:
         return None  # read-only command — no approval needed
 
-    # Non-read-only command. Check auto-approve before involving the requester.
+    # Non-read-only command. Check auto-approve before pausing.
     if await _is_auto_approved(project_id, "bash"):
         return None
 
-    if requester is None:
-        return (
-            "Permission denied: Cannot execute command — "
-            "user approval is required but the permission system is unavailable."
-        )
-
-    resp = await requester(
+    raise PermissionRequestPause(
         tool="bash",
+        tool_name="bash",
         path=result.path,
         operation=result.operation or "execute",
         content=result.content or command[:800],
         description=description,
-        tool_name="bash",
     )
-    if resp.get("approved"):
-        return None
-    denial = "User rejected to execute this command"
-    reason = resp.get("reason", "")
-    if reason:
-        denial += f". User says: {reason}"
-    return denial
 
 
 async def _check_notebook_run(
-    tool_args: dict, project_id: str, requester: Optional[Callable],
+    tool_args: dict, project_id: str,
 ) -> Optional[str]:
     """Require approval to execute a notebook cell. The cell's source code is
     shown in the approval dialog as preview content."""
@@ -199,37 +231,23 @@ async def _check_notebook_run(
                 exc_info=True,
             )
 
-    # Auto-approve short-circuits before any requester interaction.
+    # Auto-approve short-circuits before pausing.
     if await _is_auto_approved(project_id, "notebook"):
         return None
 
-    if requester is None:
-        return (
-            "Permission denied: Cannot execute notebook code — "
-            "user approval is required but the permission system is unavailable."
-        )
-
-    resp = await requester(
+    raise PermissionRequestPause(
         tool="notebook",
+        tool_name="notebook_run_cell",
         path=notebook_path,
         operation="execute code in",
         content=code[:2000] if code else f"(cell {cell_id})",
-        tool_name="notebook_run_cell",
     )
-    if not resp.get("approved"):
-        denial = f"User denied permission to execute code in notebook: {notebook_path}"
-        reason = resp.get("reason", "")
-        if reason:
-            denial += f". User says: {reason}"
-        return denial
-    return None
 
 
 async def _check_write(
     tool_name: str,
     tool_args: dict,
     project_id: str,
-    requester: Optional[Callable],
 ) -> Optional[str]:
     """Require approval for filesystem writes, classifying the target into the
     ``file_internal`` (sandbox /tmp) or ``file_external`` category.
@@ -248,15 +266,9 @@ async def _check_write(
     is_internal = level in (PathAccessLevel.SANDBOX, PathAccessLevel.TMP)
     category = "file_internal" if is_internal else "file_external"
 
-    # Auto-approve short-circuits before involving the requester.
+    # Auto-approve short-circuits before pausing.
     if await _is_auto_approved(project_id, category):
         return None
-
-    if requester is None:
-        return (
-            f"Permission denied: Cannot write to '{target_path}' — "
-            "user approval is required but the permission system is unavailable."
-        )
 
     operation = {
         "write": "write to", "edit": "edit",
@@ -273,17 +285,10 @@ async def _check_write(
                 if old != new else old
             )
 
-    resp = await requester(
+    raise PermissionRequestPause(
         tool=category,
+        tool_name=tool_name,
         path=target_path,
         operation=operation,
         content=content[:2000] if content else "",
-        tool_name=tool_name,
     )
-    if not resp.get("approved"):
-        denial = f"User denied permission to {operation} file: {target_path}"
-        reason = resp.get("reason", "")
-        if reason:
-            denial += f". User says: {reason}"
-        return denial
-    return None

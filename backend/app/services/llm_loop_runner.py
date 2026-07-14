@@ -127,12 +127,14 @@ class LoopContext:
     #   Signature: async (tool_name, tool_args, tool_call_id, interaction_data) -> None
     on_interactive_pause: Callable[..., Awaitable[None]] | None = None
 
+    # on_permission_pause: called when a write/bash/notebook tool needs user
+    #   approval. Same checkpoint semantics as on_interactive_pause. If not
+    #   provided, the runner raises PermissionRequestPause (used by subagents).
+    #   Signature: async (tool_name, tool_args, tool_call_id, interaction_data) -> None
+    on_permission_pause: Callable[..., Awaitable[None]] | None = None
+
     # Callbacks for fetching data after tool execution
     get_active_tasks: Callable[[str], Awaitable[list]] | None = None
-
-    # Permission requester passed through to subagents for write/exec gates.
-    # If None, subagents run without user-facing permission prompts (sandbox-only writes).
-    permission_requester: Any = None
 
     # Shared across a main loop and all nested agents for this user turn.
     token_budget_tracker: TokenBudgetTracker | None = None
@@ -494,6 +496,14 @@ class LLMLoopRunner:
                     except InteractiveToolPause:
                         raise
                     except Exception as exc:
+                        # PermissionRequestPause propagates up so the parent
+                        # loop (or QueryLoop) can checkpoint on behalf of the
+                        # subagent. All other exceptions take the error path.
+                        if (
+                            type(exc).__name__ == "PermissionRequestPause"
+                            and hasattr(exc, "tool")
+                        ):
+                            raise
                         exit_error = exc
                         aborted = True
                         break
@@ -520,6 +530,73 @@ class LLMLoopRunner:
                     else:
                         tool_result = await self.execute_tool_default(tool_name, tool_args)
                 except Exception as exc:
+                    # PermissionRequestPause is raised by execute_with_permission
+                    # when a write/bash/notebook tool needs user approval. Handle
+                    # it like an interactive pause: persist a checkpoint, emit
+                    # awaiting_input, and end this run. The user's response arrives
+                    # via the resume path.
+                    _is_perm_pause = (
+                        type(exc).__name__ == "PermissionRequestPause"
+                        and hasattr(exc, "tool")
+                    )
+                    if _is_perm_pause:
+                        pause = exc  # PermissionRequestPause instance
+                        turn_usage = self._build_turn_usage(
+                            ctx, accumulated_input, accumulated_output,
+                            accumulated_cached,
+                        )
+                        # If cancel landed before we could pause, record a
+                        # cancelled tool result and let the outer loop emit the
+                        # cancelled event instead of parking.
+                        if ctx.cancel_event and ctx.cancel_event.is_set():
+                            messages.append(self.msg(
+                                "tool", "Tool cancelled by user.",
+                                tool_call_id=tool_call_id,
+                            ))
+                            break
+                        if ctx.persist_messages:
+                            await ctx.persist_messages(messages)
+
+                        interaction_data = {
+                            "interaction_type": "permission",
+                            "tool": pause.tool,
+                            "tool_name": pause.tool_name,
+                            "path": pause.path,
+                            "operation": pause.operation,
+                            "content": pause.content,
+                            "description": pause.description,
+                        }
+                        if ctx.on_permission_pause:
+                            await ctx.on_permission_pause(
+                                tool_name=tool_name,
+                                tool_args=tool_args,
+                                tool_call_id=tool_call_id,
+                                interaction_data=interaction_data,
+                            )
+                        elif not ctx.task_id:
+                            # Subagent without on_permission_pause — propagate up
+                            # to the parent loop, which will checkpoint on behalf.
+                            raise
+                        else:
+                            # Fallback: persist checkpoint directly
+                            from app.database.unit_of_work import UnitOfWork
+                            async with UnitOfWork(ctx.project_id) as uow:
+                                await uow.task_state.mark_awaiting_input(
+                                    ctx.task_id, {
+                                        "tool_name": tool_name,
+                                        "tool_args": tool_args,
+                                        "tool_call_id": tool_call_id,
+                                        "interaction_data": interaction_data,
+                                    }
+                                )
+
+                        yield self.sse(SSE_AWAITING_INPUT, interaction_data)
+                        done_data = {}
+                        if turn_usage:
+                            done_data["usage"] = self._public_usage(turn_usage)
+                        yield self.sse(SSE_DONE, done_data)
+                        return  # loop pauses
+
                     tool_result = f"Tool '{tool_name}' error: {exc}"
                     yield self.sse(SSE_TOOL_END, {
                         "tool": tool_name,
@@ -712,7 +789,6 @@ class LLMLoopRunner:
             "emit_event": _emit_event,
             "cancel_event": ctx.cancel_event,
             "context_kind": context_kind,
-            "permission_requester": ctx.permission_requester,
             "token_budget_tracker": ctx.token_budget_tracker,
             "model_role": ctx.model_role,
             "response_max_tokens": ctx.response_max_tokens,
@@ -730,8 +806,11 @@ class LLMLoopRunner:
             except InteractiveToolPause as e:
                 await event_queue.put({"__interactive_pause__": e})
             except Exception as e:
-                logger.exception("agent tool execution failed for %s", tool_name)
-                await event_queue.put({"__agent_error__": str(e)})
+                if type(e).__name__ == "PermissionRequestPause" and hasattr(e, "tool"):
+                    await event_queue.put({"__interactive_pause__": e})
+                else:
+                    logger.exception("agent tool execution failed for %s", tool_name)
+                    await event_queue.put({"__agent_error__": str(e)})
 
         agent_task = asyncio.create_task(_execute())
 
@@ -791,7 +870,9 @@ class LLMLoopRunner:
                     break
 
                 elif "__interactive_pause__" in item:
-                    # Subagent hit an interactive tool — enrich and re-raise
+                    # Subagent hit an interactive tool or permission gate —
+                    # enrich with parent tool_call_id and re-raise so the
+                    # parent loop can checkpoint on behalf of the subagent.
                     e = item["__interactive_pause__"]
                     e.parent_tool_call_id = tool_call_id
                     await agent_task

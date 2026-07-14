@@ -511,7 +511,6 @@ class AIService:
         interaction_response: Dict[str, Any] = None,
         task_id: str = "",
         cancel_event: "asyncio.Event | None" = None,
-        permission_requester: "callable | None" = None,
     ) -> AsyncGenerator[str, None]:
         """Stream chat via QueryLoop. Yields SSE-formatted strings.
 
@@ -529,7 +528,6 @@ class AIService:
             interaction_response=interaction_response,
             task_id=task_id,
             cancel_event=cancel_event,
-            permission_requester=permission_requester,
         ):
             yield chunk
 
@@ -632,6 +630,13 @@ class AIService:
         # Subagent interactions are resumed and persisted by QueryLoop's
         # _resume_subagent_interaction path — never via this direct persist.
         if state.get("is_subagent_interaction"):
+            return
+
+        # Permission approvals are handled by QueryLoop._resume_from_permission,
+        # which executes the approved tool (or injects a denial string) inside
+        # the worker. The user's response is not a tool-call argument.
+        interaction_data = state.get("interaction_data", {})
+        if interaction_data.get("interaction_type") == "permission":
             return
 
         tool_name = state.get("tool_name", "")

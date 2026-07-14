@@ -19,6 +19,7 @@ best-effort.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +30,18 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 PROJECT_STATUS_ACTIVE = "active"
+
+# In-process cache for the project registry. ``_read_registry`` is on the hot
+# path of both the web event loop (``GET /projects``) and the worker heartbeat
+# loop (``is_project_active``). ``ProjectFileLock`` uses a blocking
+# ``fcntl.flock(LOCK_EX)``; when the web and worker processes contend on it,
+# the synchronous syscall freezes the async event loop and stalls every HTTP
+# request. Caching keyed on the file's mtime lets the common case (registry
+# unchanged) return instantly without touching the lock. Writes go through
+# ``project_service._update_projects`` which uses ``os.replace`` — that always
+# bumps the mtime, so the cache invalidates automatically on the next read.
+_registry_cache: dict | None = None
+_registry_mtime: float = 0.0
 
 
 def _projects_file() -> Path:
@@ -44,15 +57,34 @@ def _read_registry() -> dict:
     "no projects eligible" rather than crashing; the service layer owns
     any backup-and-rebuild recovery policy.
     """
+    global _registry_cache, _registry_mtime
+
     path = _projects_file()
+
+    # Fast path — ``os.stat`` is non-blocking and never contends on the flock.
+    # If the registry has not changed since the last locked read, reuse the
+    # cached value and skip the lock entirely.
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        _registry_cache = None
+        _registry_mtime = 0.0
+        return {}
+    if _registry_cache is not None and mtime == _registry_mtime:
+        return _registry_cache
+
     try:
         with ProjectFileLock(path):
-            return safe_read_json(path)
+            data = safe_read_json(path)
     except FileNotFoundError:
         return {}
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         logger.warning("Project registry at %s is unreadable: %s", path, exc)
         return {}
+
+    _registry_cache = data
+    _registry_mtime = mtime
+    return data
 
 
 def get_project_status(project_id: str) -> Optional[str]:

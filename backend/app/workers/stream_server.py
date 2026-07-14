@@ -9,13 +9,9 @@ Protocol (JSON-over-TCP, length-prefixed):
     {"type": "heartbeat", "task_id": "..."}
     {"type": "done",    "task_id": "..."}
     {"type": "error",   "task_id": "...", "message": "..."}
-    {"type": "permission_request", "task_id": "...", "request_id": "...",
-     "tool": "file_external", "tool_name": "write", "path": "/path/to/file",
-     "operation": "write"}
 
   Server → Worker:
     {"type": "cancel"}
-    {"type": "permission_response", "request_id": "...", "approved": true/false}
 """
 
 import asyncio
@@ -141,23 +137,6 @@ class StreamSession:
             except Exception as exc:
                 logger.warning("Failed to send cancel to worker: %s", exc, exc_info=True)
 
-    async def send_permission_response(self, request_id: str, approved: bool, reason: str = "") -> None:
-        """Send a permission response to the worker over its TCP connection."""
-        if self._writer and not self._writer.is_closing():
-            try:
-                msg = {
-                    "type": "permission_response",
-                    "request_id": request_id,
-                    "approved": approved,
-                }
-                if reason:
-                    msg["reason"] = reason
-                await _write_one(self._writer, msg)
-                logger.info("Sent permission response (%s) for request %s",
-                            "approved" if approved else "denied", request_id)
-            except Exception as exc:
-                logger.warning("Failed to send permission response: %s", exc, exc_info=True)
-
 
 # ---------------------------------------------------------------------------
 # Stream Server
@@ -219,19 +198,6 @@ class StreamServer:
             await session.send_cancel()
             await session.shutdown()
         return len(task_ids)
-
-    # -- permission response (web → worker) ---------------------------------
-    async def respond_permission(self, task_id: str, request_id: str, approved: bool, reason: str = "") -> bool:
-        """Send a permission approval/denial to the worker.
-
-        Returns True if the signal was sent, False if the session was not
-        found.
-        """
-        session = self.sessions.get(task_id)
-        if not session:
-            return False
-        await session.send_permission_response(request_id, approved, reason)
-        return True
 
     # -- SSE subscriber -----------------------------------------------------
     async def subscribe(
@@ -488,30 +454,6 @@ class StreamServer:
                     if project_id:
                         async with UnitOfWork(project_id) as uow:
                             await uow.task_state.heartbeat(task_id)
-
-                elif msg_type == "permission_request":
-                    # Forward to SSE clients (frontend) as a permission_request event
-                    request_id = msg.get("request_id", "")
-                    perm_payload = {
-                        "task_id": task_id,
-                        "request_id": request_id,
-                        "tool": msg.get("tool", ""),
-                        "path": msg.get("path", ""),
-                        "operation": msg.get("operation", "write"),
-                    }
-                    if msg.get("tool_name"):
-                        perm_payload["tool_name"] = msg["tool_name"]
-                    if msg.get("content"):
-                        perm_payload["content"] = msg["content"]
-                    if msg.get("description"):
-                        perm_payload["description"] = msg["description"]
-                    session.push(
-                        "event: permission_request\ndata: "
-                        + json.dumps(perm_payload, ensure_ascii=False)
-                        + "\n\n"
-                    )
-                    logger.info("Permission request %s from task %s: %s %s",
-                                request_id, task_id, msg.get("tool"), msg.get("path"))
 
         except asyncio.IncompleteReadError:
             pass  # handled in finally if the task did not send done/error

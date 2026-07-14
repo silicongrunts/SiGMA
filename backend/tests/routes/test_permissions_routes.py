@@ -1,73 +1,58 @@
+"""Tests for the permission routes (auto-approve settings only).
+
+Permission approval no longer uses a dedicated HTTP endpoint. When the LLM
+agent needs user approval, the task is parked as ``awaiting_input`` and the
+user's response flows back through the chat resume path
+(``POST /chat/stream`` with ``resume=true``). This module only tests the
+auto-approve GET/PUT endpoints.
+"""
+
 from types import SimpleNamespace
 
 import pytest
 
 from app.core.exceptions import ServiceException
-from app.models.requests import PermissionRespondRequest
 from app.routes import permissions
 
 
 @pytest.mark.route
 @pytest.mark.asyncio
-async def test_respond_permission_returns_approval_when_worker_receives(monkeypatch):
-    calls = []
-
-    async def respond_permission(**kwargs):
-        calls.append(kwargs)
-        return True
-
-    monkeypatch.setattr(
-        permissions,
-        "project_service",
-        SimpleNamespace(get_project_path=lambda project_id: calls.append({"project_id": project_id})),
-    )
-    monkeypatch.setattr(
-        permissions,
-        "stream_server",
-        SimpleNamespace(respond_permission=respond_permission),
-    )
-
-    result = await permissions.respond_permission(
-        "project-1",
-        "task-1",
-        PermissionRespondRequest(request_id="req-1", approved=False, reason=None),
-    )
-
-    assert result["data"] == {"request_id": "req-1", "approved": False}
-    assert calls == [
-        {"project_id": "project-1"},
-        {
-            "task_id": "task-1",
-            "request_id": "req-1",
-            "approved": False,
-            "reason": "",
-        },
-    ]
-
-
-@pytest.mark.route
-@pytest.mark.asyncio
-async def test_respond_permission_maps_missing_task(monkeypatch):
-    async def respond_permission(**kwargs):
-        return False
-
+async def test_set_auto_approve_rejects_invalid_category(monkeypatch):
+    """An invalid category raises ServiceException with a 400 status."""
     monkeypatch.setattr(
         permissions,
         "project_service",
         SimpleNamespace(get_project_path=lambda project_id: "/project"),
     )
+    with pytest.raises(ServiceException) as exc_info:
+        await permissions.set_auto_approve(
+            "project-1",
+            type("Req", (), {"category": "invalid_cat", "enabled": True})(),
+        )
+    assert exc_info.value.code == "PERMISSION_INVALID_CATEGORY"
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_set_auto_approve_passes_valid_category(monkeypatch):
+    """A valid category is forwarded to project_service.set_auto_approve."""
+    calls = []
+
+    async def fake_set_auto_approve(pid, cat, enabled):
+        calls.append({"project_id": pid, "category": cat, "enabled": enabled})
+
     monkeypatch.setattr(
         permissions,
-        "stream_server",
-        SimpleNamespace(respond_permission=respond_permission),
+        "project_service",
+        SimpleNamespace(
+            get_project_path=lambda project_id: "/project",
+            set_auto_approve=fake_set_auto_approve,
+        ),
     )
-
-    with pytest.raises(ServiceException) as exc_info:
-        await permissions.respond_permission(
-            "project-1",
-            "task-1",
-            PermissionRespondRequest(request_id="req-1", approved=True),
-        )
-
-    assert exc_info.value.code == "PERMISSION_TASK_NOT_FOUND"
-    assert exc_info.value.status_code == 404
+    result = await permissions.set_auto_approve(
+        "project-1",
+        type("Req", (), {"category": "bash", "enabled": True})(),
+    )
+    assert result["data"] == {"category": "bash", "enabled": True}
+    assert calls == [{"project_id": "project-1", "category": "bash", "enabled": True}]
