@@ -10,7 +10,8 @@ Protocol (JSON-over-TCP, length-prefixed):
     {"type": "done",    "task_id": "..."}
     {"type": "error",   "task_id": "...", "message": "..."}
     {"type": "permission_request", "task_id": "...", "request_id": "...",
-     "tool": "write", "path": "/path/to/file", "operation": "write"}
+     "tool": "file_external", "tool_name": "write", "path": "/path/to/file",
+     "operation": "write"}
 
   Server → Worker:
     {"type": "cancel"}
@@ -498,6 +499,8 @@ class StreamServer:
                         "path": msg.get("path", ""),
                         "operation": msg.get("operation", "write"),
                     }
+                    if msg.get("tool_name"):
+                        perm_payload["tool_name"] = msg["tool_name"]
                     if msg.get("content"):
                         perm_payload["content"] = msg["content"]
                     if msg.get("description"):

@@ -17,15 +17,20 @@ not duplicate security decisions in components, tools, or routes.
 
 ## Filesystem Permission Model
 
-Agent file access follows the project permission model:
+Agent file access follows the four-category model. Every non-exempt tool call
+passes through the shared permission executor before execution.
 
-- Project sandbox and approved temporary areas may be writable.
-- Writes outside allowed areas require user approval or must be rejected.
-- Permission checks happen before tool execution.
-- Individual tools should not invent their own write permission rules.
+- `file_external`: writes outside the project sandbox and `/tmp`.
+- `file_internal`: writes inside the project sandbox or `/tmp`.
+- `bash`: non-read-only shell commands.
+- `notebook`: executing code in a notebook cell.
 
-If the intended permission model changes, update this file and the central
-permission implementation together.
+Forbidden system paths are always rejected, even with auto-approve on. Each
+category has an auto-approve flag in `project_config` (`auto_approve.<category>`)
+read live per call — when on, the executor silently approves; when off, the
+frontend shows an approval dialog. Read-only tools and tools that mutate the
+project DB rather than the filesystem are exempt; see `permission_executor.py`
+for the authoritative list.
 
 ## Uploads And Downloads
 

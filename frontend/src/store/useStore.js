@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { devtools } from 'zustand/middleware'
 import { storage } from '../utils/storage'
+import { permissionsAPI } from '../api'
 
 const initialState = {
   projects: [],
@@ -79,8 +80,8 @@ const actions = (set, get) => ({
   setProjects: (projects) => set({ projects }),
   setCurrentProject: (project) => set((state) => {
     if (state.currentProject?.id === project?.id) return { currentProject: project }
-    const autoApproveSettings = project ? (storage.getAutoApprove(project.id) || {}) : {}
-    return { currentProject: project, autoApproveSettings }
+    // auto-approve settings are loaded from the backend by loadAutoApproveSettings()
+    return { currentProject: project, autoApproveSettings: {} }
   }),
   addProject: (p) => set((s) => ({ projects: [...s.projects, p] })),
   removeProject: (id) => set((s) => {
@@ -174,11 +175,21 @@ const actions = (set, get) => ({
   setInteractionDismissed: (v) => set({ interactionDismissed: v }),
   setPendingPermission: (val) => set({ pendingPermission: val }),
   clearPendingPermission: () => set({ pendingPermission: null }),
-  setAutoApproveType: (projectId, toolType, enabled) => set((s) => {
+  setAutoApproveType: (toolType, enabled) => set((s) => {
+    // Local state update only. Callers must persist to the backend first and
+    // call this only after the PUT succeeds (see ChatPanel's approvingCategory).
     const settings = { ...s.autoApproveSettings, [toolType]: enabled }
-    storage.setAutoApprove(projectId, settings)
     return { autoApproveSettings: settings }
   }),
+  loadAutoApproveSettings: async (projectId) => {
+    // Fetch the four-category flags from the backend. Called after project switch.
+    try {
+      const data = await permissionsAPI.getAutoApprove(projectId)
+      set({ autoApproveSettings: data || {} })
+    } catch (e) {
+      // Keep the empty default on failure — toggles show all-off, safest.
+    }
+  },
   setTaskList: (tasks) => set({ taskList: tasks }),
   setExpandedTasks: (val) => set({ expandedTasks: val }),
   setStreamInteractionRequest: (req) => set({ streamInteractionRequest: req }),

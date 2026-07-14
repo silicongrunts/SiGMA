@@ -278,6 +278,34 @@ class ProjectService:
                 await uow.config.set("tips", data.tips)
 
     # ------------------------------------------------------------------
+    # Permission auto-approve (project_config keys: auto_approve.<category>)
+    # ------------------------------------------------------------------
+
+    async def get_auto_approve(self, project_id: str) -> Dict[str, bool]:
+        """Return the four-category auto-approve flags for a project."""
+        from app.database.unit_of_work import UnitOfWork
+        from app.services.permission_executor import PERMISSION_CATEGORIES
+        result = {cat: False for cat in PERMISSION_CATEGORIES}
+        try:
+            async with UnitOfWork(project_id) as uow:
+                for cat in PERMISSION_CATEGORIES:
+                    val = await uow.config.get(f"auto_approve.{cat}", "false")
+                    result[cat] = val == "true"
+        except Exception:
+            # Project DB not ready — return all-off defaults (safest).
+            logger.debug("Auto-approve read failed for %s", project_id, exc_info=True)
+        return result
+
+    async def set_auto_approve(self, project_id: str, category: str, enabled: bool) -> None:
+        """Toggle one auto-approve category. ``category`` validity is the
+        caller's responsibility (the route validates against the schema)."""
+        from app.database.unit_of_work import UnitOfWork
+        async with UnitOfWork(project_id) as uow:
+            await uow.config.set(
+                f"auto_approve.{category}", "true" if enabled else "false",
+            )
+
+    # ------------------------------------------------------------------
     # Template discovery
     # ------------------------------------------------------------------
 

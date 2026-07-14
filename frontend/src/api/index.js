@@ -539,6 +539,13 @@ export const permissionsAPI = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+  getAutoApprove: (projectId) =>
+    request(`/permissions/${projectId}/auto-approve`),
+  setAutoApprove: (projectId, body) =>
+    request(`/permissions/${projectId}/auto-approve`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
 }
 
 // ---------------------------------------------------------------------------

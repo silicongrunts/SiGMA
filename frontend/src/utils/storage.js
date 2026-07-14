@@ -13,7 +13,6 @@ export const STORAGE_KEYS = {
 
 const LEGACY_KEYS = {
   lastFile: (projectId) => `sigma_last_file_${projectId}`,
-  autoApprove: (projectId) => `sigma_auto_approve_${projectId}`,
   session: (projectId) => `sigma_session_${projectId}`,
   budgetPrefix: (projectId) => `sigma_budget_${projectId}_`,
   theme: 'sigma_theme',
@@ -38,7 +37,6 @@ const DEFAULT_PROJECT_STATE = Object.freeze({
   version: STORAGE_VERSION,
   updatedAt: 0,
   lastAccessedAt: 0,
-  autoApprove: {},
   chat: {
     sessionId: null,
     budgetsBySession: {},
@@ -178,15 +176,6 @@ function sanitizeCursorMap(value) {
   return trimObjectMap(out, MAX_FILE_STATE_ENTRIES)
 }
 
-function sanitizeStringMap(value) {
-  if (!isPlainObject(value)) return {}
-  const out = {}
-  for (const [key, val] of Object.entries(value)) {
-    if (isNonEmptyString(key)) out[key] = Boolean(val)
-  }
-  return out
-}
-
 function sanitizeBudgetMap(value) {
   if (!isPlainObject(value)) return {}
   const out = {}
@@ -234,7 +223,6 @@ function sanitizeProjectState(value) {
     version: STORAGE_VERSION,
     updatedAt: Number.isFinite(source.updatedAt) ? source.updatedAt : 0,
     lastAccessedAt: Number.isFinite(source.lastAccessedAt) ? source.lastAccessedAt : 0,
-    autoApprove: sanitizeStringMap(source.autoApprove),
     chat: {
       sessionId: isNonEmptyString(chat.sessionId) ? chat.sessionId : null,
       budgetsBySession: sanitizeBudgetMap(chat.budgetsBySession),
@@ -294,7 +282,6 @@ function migrateProject(projectId) {
   if (!projectId || safeGetItem(STORAGE_KEYS.project(projectId))) return
   const projectState = readProjectState(projectId)
   const lastFile = safeGetItem(LEGACY_KEYS.lastFile(projectId))
-  const autoApprove = safeJsonParse(safeGetItem(LEGACY_KEYS.autoApprove(projectId)))
   const sessionId = safeGetItem(LEGACY_KEYS.session(projectId))
   const budgetPrefix = LEGACY_KEYS.budgetPrefix(projectId)
   const budgetsBySession = {}
@@ -315,7 +302,6 @@ function migrateProject(projectId) {
 
   writeProjectState(projectId, {
     ...projectState,
-    autoApprove: sanitizeStringMap(autoApprove),
     chat: {
       sessionId: isNonEmptyString(sessionId) ? sessionId : null,
       budgetsBySession,
@@ -330,7 +316,6 @@ function migrateProject(projectId) {
 
 function removeLegacyProjectKeys(projectId) {
   safeRemoveItem(LEGACY_KEYS.lastFile(projectId))
-  safeRemoveItem(LEGACY_KEYS.autoApprove(projectId))
   safeRemoveItem(LEGACY_KEYS.session(projectId))
   const prefix = LEGACY_KEYS.budgetPrefix(projectId)
   removeKeysMatching(key => key.startsWith(prefix))
@@ -551,14 +536,6 @@ export const storage = {
         previewScrollRatioByFile: pruneMapToExistingPaths(current.synthesis.previewScrollRatioByFile, existing),
       },
     }))
-  },
-
-  getAutoApprove(projectId) {
-    return this.getProject(projectId).autoApprove
-  },
-
-  setAutoApprove(projectId, settings) {
-    this.setProject(projectId, { autoApprove: sanitizeStringMap(settings) })
   },
 
   getSession(projectId) {

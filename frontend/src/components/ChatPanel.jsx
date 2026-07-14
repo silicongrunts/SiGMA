@@ -8,10 +8,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { MarkdownContent, ThinkingProcess } from './ChatShared'
-import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronDown, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu } from 'lucide-react'
+import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronDown, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2 } from 'lucide-react'
 import { toastError, toastSuccess } from './Toast'
 import { ModalOverlay, ConfirmModal } from './Modal'
-import { chatAPI, skillsAPI } from '../api'
+import Toggle from './Toggle'
+import { chatAPI, skillsAPI, permissionsAPI } from '../api'
 import { createSSEStreamParser } from '../utils/sse'
 import { storage, STORAGE_KEYS } from '../utils/storage'
 import { copyToClipboard } from '../utils/clipboard'
@@ -234,6 +235,9 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   const [contextStats, setContextStats] = useState(null)
   const [budgetDraft, setBudgetDraft] = useState('')
   const [budgetError, setBudgetError] = useState('')
+
+  // Per-category loading flag while an auto-approve toggle is being persisted.
+  const [approvingCategory, setApprovingCategory] = useState(null)
 
   // Message editing
   const [editingMessageId, setEditingMessageId] = useState(null)
@@ -2147,11 +2151,10 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
       {/* ── Auto-approve settings menu ── */}
       {showAutoApproveMenu && (() => {
         const toolTypes = [
-          { key: 'edit', label: t('chat.tool.edit'), desc: t('chat.tool.editDesc') },
-          { key: 'write', label: t('chat.tool.write'), desc: t('chat.tool.writeDesc') },
-          { key: 'bash', label: t('chat.tool.bash'), desc: t('chat.tool.bashDesc') },
-          { key: 'notebook_run_cell', label: t('chat.tool.notebookRun'), desc: t('chat.tool.notebookRunDesc') },
-          { key: 'notebook_edit', label: t('chat.tool.notebookEdit'), desc: t('chat.tool.notebookEditDesc') },
+          { key: 'file_external', label: t('permission.cat.fileExternal'), desc: t('permission.cat.fileExternalDesc') },
+          { key: 'file_internal', label: t('permission.cat.fileInternal'), desc: t('permission.cat.fileInternalDesc') },
+          { key: 'bash', label: t('permission.cat.bash'), desc: t('permission.cat.bashDesc') },
+          { key: 'notebook', label: t('permission.cat.notebook'), desc: t('permission.cat.notebookDesc') },
         ]
         return (
           <div
@@ -2201,25 +2204,37 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
               </div>
             )}
             {settingsPanel === 'approve' && (
-              <div className="py-1">
+              <div className="px-3 py-2 space-y-2">
               {toolTypes.map(({ key, label, desc }) => {
                 const enabled = autoApproveSettings[key] === true
+                const isLoading = approvingCategory === key
                 return (
-                  <div key={key} className="flex items-center gap-3 px-4 py-2.5 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
-                    <button
-                      onClick={() => {
-                        if (currentProject) {
-                          setAutoApproveType(currentProject.id, key, !enabled)
+                  <div key={key} className="flex items-center justify-between px-3 py-2.5 bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-700 rounded-xl">
+                    <div className="min-w-0 flex items-center gap-2">
+                      {isLoading && <Loader2 className="w-3 h-3 text-gray-400 dark:text-gray-500 animate-spin flex-shrink-0" />}
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-gray-700 dark:text-gray-300">{label}</div>
+                        <div className="text-[10px] text-gray-400 dark:text-gray-500 truncate">{desc}</div>
+                      </div>
+                    </div>
+                    <Toggle
+                      checked={enabled}
+                      disabled={isLoading || !currentProject}
+                      onChange={async () => {
+                        if (!currentProject || isLoading) return
+                        const next = !enabled
+                        setApprovingCategory(key)
+                        try {
+                          await permissionsAPI.setAutoApprove(currentProject.id, { category: key, enabled: next })
+                          setAutoApproveType(key, next)
+                        } catch (e) {
+                          toastError(t('permission.toggleFailed'))
+                        } finally {
+                          setApprovingCategory(null)
                         }
                       }}
-                      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors flex-shrink-0 ${enabled ? 'bg-sigma-600' : 'bg-gray-200 dark:bg-gray-700'}`}
-                    >
-                      <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${enabled ? 'translate-x-[18px]' : 'translate-x-1'}`} />
-                    </button>
-                    <div className="min-w-0">
-                      <div className="text-xs font-semibold text-gray-700 dark:text-gray-300">{label}</div>
-                      <div className="text-[10px] text-gray-400 dark:text-gray-500 truncate">{desc}</div>
-                    </div>
+                      label={label}
+                    />
                   </div>
                 )
               })}

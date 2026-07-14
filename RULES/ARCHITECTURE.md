@@ -169,7 +169,8 @@ explicitly model error objects.
 - Process-local state in workers may be acceptable for the documented local
   single-user deployment, but the failure mode must be recoverable. Persistent
   project data, task checkpoints, and permission decisions should not depend
-  solely on process memory.
+  solely on process memory (permission auto-approve flags, for example, are
+  persisted in `project_config` and read live per call).
 
 ## Browser Automation Rules
 

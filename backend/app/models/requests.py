@@ -246,6 +246,16 @@ class PermissionRespondRequest(BaseModel):
     reason: Optional[str] = Field(default="", max_length=2000)
 
 
+class AutoApproveUpdate(BaseModel):
+    """Request body for PUT /permissions/{project_id}/auto-approve.
+
+    Toggles one of the four permission categories. ``category`` must be one of
+    ``file_external``, ``file_internal``, ``bash``, ``notebook``.
+    """
+    category: str = Field(..., min_length=1)
+    enabled: bool
+
+
 # ---------------------------------------------------------------------------
 # Notebooks
 # ---------------------------------------------------------------------------

@@ -163,11 +163,14 @@ class StreamClient:
     # Permission requests (worker → server → frontend → user → server → worker)
     # ------------------------------------------------------------------
     async def request_permission(self, tool: str, path: str, operation: str,
-                                content: str = "", description: str = "") -> dict:
+                                content: str = "", description: str = "",
+                                tool_name: str = "") -> dict:
         """Send a permission request to the frontend and wait for user response.
 
         Returns ``{"approved": bool, "reason": str}``. ``description`` is an
-        optional intent label shown in the approval dialog.
+        optional intent label shown in the approval dialog. ``tool`` is the
+        permission category (drives auto-approve matching); ``tool_name`` is the
+        concrete tool the agent invoked (shown in the dialog for clarity).
         """
         request_id = generate_id()
         event = asyncio.Event()
@@ -181,6 +184,8 @@ class StreamClient:
             "path": path,
             "operation": operation,
         }
+        if tool_name:
+            payload["tool_name"] = tool_name
         if content:
             payload["content"] = content
         if description:

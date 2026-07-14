@@ -419,6 +419,12 @@ export default function EditorView() {
     return () => { cancelled = true }
   }, [projectId])
 
+  // ── Load auto-approve settings from backend on project change ──
+  const loadAutoApproveSettings = useStore(s => s.loadAutoApproveSettings)
+  useEffect(() => {
+    if (projectId) loadAutoApproveSettings(projectId)
+  }, [projectId, loadAutoApproveSettings])
+
   // ── Load annotations when Editor finishes loading a file ──
   // Called directly from Editor's onFileReady callback — guarantees the
   // document content is in CodeMirror and decorations can be placed.
