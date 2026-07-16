@@ -595,6 +595,18 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   // Thread area height = total height - header(~48) - input(~52) - resize handle(~12)
   const threadMaxH = Math.max(100, size.height - 112)
 
+  // Auto-resize reply textarea, capped at 3 visible lines (~72px at text-sm + py-1.5)
+  function autoResizeReply() {
+    const el = replyInputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 72) + 'px'
+  }
+  // Re-measure after content changes (typing/paste/send-clear) and after popup
+  // width changes (drag-resize). Runs synchronously after DOM commit, so the
+  // textarea's value/width are already up to date when we read scrollHeight.
+  useLayoutEffect(() => { autoResizeReply() }, [reply, size.width])
+
   return (
     <div
       ref={wrapperRef}
@@ -697,12 +709,16 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
 
         {/* Input */}
         <div className="p-3 border-t border-gray-100 dark:border-gray-800 bg-gray-50/30 dark:bg-gray-800/30">
-          <div className="flex items-center gap-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-3 py-1.5 focus-within:ring-2 focus-within:ring-sigma-600/20 transition-all shadow-sm">
-            <input
+          <div className="flex items-end gap-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-3 py-1.5 focus-within:ring-2 focus-within:ring-sigma-600/20 transition-all shadow-sm">
+            <textarea
               ref={replyInputRef}
               value={reply} onChange={e => setReply(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && handleSend()}
-              placeholder={t('annotations.replyPlaceholder')} className="flex-1 bg-transparent text-sm outline-none py-1"
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
+              }}
+              placeholder={t('annotations.replyPlaceholder')}
+              rows={1}
+              className="flex-1 bg-transparent text-sm outline-none py-1 resize-none max-h-[72px] overflow-y-auto text-gray-800 dark:text-gray-200 placeholder:text-gray-400 dark:placeholder:text-gray-500"
               disabled={isSiGMADOProcessing || isStreaming}
             />
             {isStreaming ? (
