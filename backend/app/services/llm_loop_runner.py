@@ -541,6 +541,10 @@ class LLMLoopRunner:
                     )
                     if _is_perm_pause:
                         pause = exc  # PermissionRequestPause instance
+                        # Stamp the full tool args / call id so the checkpoint
+                        # can re-execute the tool on resume.
+                        pause.tool_args = tool_args
+                        pause.inner_tool_call_id = tool_call_id
                         turn_usage = self._build_turn_usage(
                             ctx, accumulated_input, accumulated_output,
                             accumulated_cached,
@@ -989,7 +993,8 @@ class LLMLoopRunner:
     # Side-effect event helpers
     # ------------------------------------------------------------------
 
-    def _emit_file_changed(self, tool_name: str, tool_args: dict, tool_result: str = "") -> dict | None:
+    @staticmethod
+    def _emit_file_changed(tool_name: str, tool_args: dict, tool_result: str = "") -> dict | None:
         """Return file_changed SSE event if applicable."""
         if tool_result.startswith("Error:"):
             return None
@@ -1005,7 +1010,7 @@ class LLMLoopRunner:
                 p = tool_args.get("notebook_path") or ""
                 if p:
                     paths.append(p)
-            return self.sse(SSE_FILE_CHANGED, {"paths": paths})
+            return LLMLoopRunner.sse(SSE_FILE_CHANGED, {"paths": paths})
         return None
 
     def _emit_annotation_changed(self, tool_name: str, tool_args: dict) -> dict | None:

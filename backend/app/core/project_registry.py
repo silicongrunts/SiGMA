@@ -32,14 +32,19 @@ logger = get_logger(__name__)
 PROJECT_STATUS_ACTIVE = "active"
 
 # In-process cache for the project registry. ``_read_registry`` is on the hot
-# path of both the web event loop (``GET /projects``) and the worker heartbeat
-# loop (``is_project_active``). ``ProjectFileLock`` uses a blocking
+# path of ``is_project_active`` / ``get_project_status`` (worker heartbeat,
+# DB init, library scan). ``ProjectFileLock`` uses a blocking
 # ``fcntl.flock(LOCK_EX)``; when the web and worker processes contend on it,
 # the synchronous syscall freezes the async event loop and stalls every HTTP
 # request. Caching keyed on the file's mtime lets the common case (registry
 # unchanged) return instantly without touching the lock. Writes go through
 # ``project_service._update_projects`` which uses ``os.replace`` — that always
 # bumps the mtime, so the cache invalidates automatically on the next read.
+#
+# This is a non-correctness cache (no local lock). Concurrent cache misses are
+# harmless: readers are serialized by the ``flock`` and store identical data.
+# Note: ``GET /projects`` (``list_projects``) does NOT use this cache — it
+# reads fresh via ``_load_projects_readonly`` under the lock directly.
 _registry_cache: dict | None = None
 _registry_mtime: float = 0.0
 

@@ -28,6 +28,7 @@ from app.services.llm_loop_runner import (
     LLMLoopRunner, LoopContext, InteractiveToolPause,
     SSE_CONTEXT_STATS, SSE_COMPACT_START, SSE_COMPACT_DONE, SSE_ERROR,
 )
+from app.services.permission_executor import PermissionRequestPause
 from app.services.compaction_service import compaction_service
 from app.services.message_persist import stage_new_messages
 from app.services.project_service import project_service
@@ -226,12 +227,13 @@ class AgentService:
                 if event.get("type") == SSE_ERROR:
                     data = event.get("data") or {}
                     raise RuntimeError(str(data.get("error") or "Agent LLM failed"))
-        except InteractiveToolPause as e:
-            e.agent_session_id = agent_session_id
-            e.agent_type = "plan"
+        except (InteractiveToolPause, PermissionRequestPause) as e:
+            self._enrich_pause(
+                e, agent_session_id=agent_session_id,
+                agent_type="plan",
+                agent_usage_baseline=agent_usage_baseline,
+            )
             e.parent_tool_call_id = parent_tool_call_id
-            if e.agent_usage_baseline is None:
-                e.agent_usage_baseline = agent_usage_baseline
             raise
 
         return self._extract_final_text(messages)
@@ -300,12 +302,13 @@ class AgentService:
 
         try:
             await self._run_and_forward(ctx, messages, emit_event)
-        except InteractiveToolPause as e:
-            e.agent_session_id = agent_session_id
-            e.agent_type = "general"
+        except (InteractiveToolPause, PermissionRequestPause) as e:
+            self._enrich_pause(
+                e, agent_session_id=agent_session_id,
+                agent_type="general",
+                agent_usage_baseline=agent_usage_baseline,
+            )
             e.parent_tool_call_id = parent_tool_call_id
-            if e.agent_usage_baseline is None:
-                e.agent_usage_baseline = agent_usage_baseline
             raise
 
         return self._extract_final_text(messages)
@@ -353,6 +356,21 @@ class AgentService:
             if event.get("type") == SSE_ERROR:
                 data = event.get("data") or {}
                 raise RuntimeError(str(data.get("error") or "Agent LLM failed"))
+
+    @staticmethod
+    def _enrich_pause(pause, *, agent_session_id, agent_type, agent_usage_baseline):
+        """Stamp subagent identity onto an InteractiveToolPause or
+        PermissionRequestPause before re-raising it to the parent loop.
+
+        The parent loop (QueryLoop) uses these fields to save a subagent
+        checkpoint and resume the subagent mid-loop after the user responds.
+        """
+        if not pause.agent_session_id:
+            pause.agent_session_id = agent_session_id
+        if not pause.agent_type:
+            pause.agent_type = agent_type
+        if pause.agent_usage_baseline is None:
+            pause.agent_usage_baseline = agent_usage_baseline
 
     # ------------------------------------------------------------------
     # Spawn General
@@ -414,11 +432,12 @@ class AgentService:
 
         try:
             await self._run_and_forward(ctx, messages, emit_event)
-        except InteractiveToolPause as e:
-            e.agent_session_id = agent_session_id
-            e.agent_type = "general"
-            if e.agent_usage_baseline is None:
-                e.agent_usage_baseline = agent_usage_baseline
+        except (InteractiveToolPause, PermissionRequestPause) as e:
+            self._enrich_pause(
+                e, agent_session_id=agent_session_id,
+                agent_type="general",
+                agent_usage_baseline=agent_usage_baseline,
+            )
             raise
         final_text = self._extract_final_text(messages)
         return f"<resume_id>{agent_session_id}</resume_id>\n{final_text}"
@@ -547,12 +566,12 @@ class AgentService:
 
         try:
             await self._run_and_forward(ctx, messages, emit_event)
-        except InteractiveToolPause as e:
-            # Enrich with plan agent context before propagating
-            e.agent_session_id = plan_session_id
-            e.agent_type = "plan"
-            if e.agent_usage_baseline is None:
-                e.agent_usage_baseline = agent_usage_baseline
+        except (InteractiveToolPause, PermissionRequestPause) as e:
+            self._enrich_pause(
+                e, agent_session_id=plan_session_id,
+                agent_type="plan",
+                agent_usage_baseline=agent_usage_baseline,
+            )
             raise
 
         return self._extract_final_text(messages)
@@ -618,7 +637,18 @@ class AgentService:
             token_budget_tracker=token_budget_tracker,
         )
 
-        await self._run_and_forward(ctx, messages, emit_event)
+        try:
+            await self._run_and_forward(ctx, messages, emit_event)
+        except (InteractiveToolPause, PermissionRequestPause) as e:
+            # Fork agents have no persistent session — stamp agent_type so
+            # the parent loop knows it's a subagent pause, but leave
+            # agent_session_id empty. QueryLoop routes empty-session pauses
+            # to the direct checkpoint path (execute tool, re-run main loop).
+            self._enrich_pause(
+                e, agent_session_id="", agent_type="fork",
+                agent_usage_baseline=None,
+            )
+            raise
         final_start_index = min(start_index, max(0, len(messages) - 1))
         final_text = self._extract_final_text(messages, start_index=final_start_index)
         return final_text or "Error: Fork agent produced no final assistant response."
@@ -692,11 +722,12 @@ class AgentService:
 
         try:
             await self._run_and_forward(ctx, messages, emit_event)
-        except InteractiveToolPause as e:
-            e.agent_session_id = agent_session_id
-            e.agent_type = "general"
-            if e.agent_usage_baseline is None:
-                e.agent_usage_baseline = agent_usage_baseline
+        except (InteractiveToolPause, PermissionRequestPause) as e:
+            self._enrich_pause(
+                e, agent_session_id=agent_session_id,
+                agent_type="general",
+                agent_usage_baseline=agent_usage_baseline,
+            )
             raise
         final_text = self._extract_final_text(messages)
         return f"<resume_id>{agent_session_id}</resume_id>\n{final_text}"

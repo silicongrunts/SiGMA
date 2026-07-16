@@ -270,6 +270,16 @@ class AIService:
                     liveness = await uow.task_state.check_liveness(existing["task_id"])
                     if liveness in (STATUS_QUEUED, STATUS_RUNNING, STATUS_CANCELLING):
                         raise TaskActiveError(task_id=existing["task_id"])
+        else:
+            # Guard against concurrent resumes: if a task for this session is
+            # already running/queued/cancelling, the resume would race with it.
+            # Only awaiting_input tasks are eligible for resume.
+            async with UnitOfWork(project_id) as uow:
+                existing = await uow.task_state.get_active_by_session(session_id)
+                if existing:
+                    liveness = await uow.task_state.check_liveness(existing["task_id"])
+                    if liveness in (STATUS_QUEUED, STATUS_RUNNING, STATUS_CANCELLING):
+                        raise TaskActiveError(task_id=existing["task_id"])
 
         # Resolve or create session before persisting messages
         if session_id:

@@ -9,7 +9,6 @@ Delegates the LLM ↔ tool loop to LLMLoopRunner and handles:
 """
 
 import asyncio
-import json
 from functools import partial
 from typing import AsyncIterator, Any
 
@@ -250,11 +249,20 @@ class QueryLoop:
 
     async def _save_subagent_checkpoint(self, pause: InteractiveToolPause) -> None:
         """Save a rich checkpoint for subagent interaction resume."""
+        # Mirror interaction_type/interaction_data to the top level so the
+        # frontend restore path (getActive → active.interaction.interaction_type)
+        # works uniformly for subagent checkpoints. The resume dispatch in
+        # _resume_from_interaction checks is_subagent_interaction first, so the
+        # redundant top-level interaction_data never causes a wrong branch.
+        interaction = pause.interaction_data or {}
         async with UnitOfWork(self.project_id) as uow:
             await uow.task_state.mark_awaiting_input(
                 self._task_id, {
                     # Sentinel for resume dispatch
                     "is_subagent_interaction": True,
+                    # Top-level interaction fields (for frontend restore only)
+                    "interaction_type": interaction.get("interaction_type"),
+                    "interaction_data": interaction,
                     # Outer agent tool context
                     "parent_tool_call_id": pause.parent_tool_call_id,
                     # Subagent session
@@ -290,11 +298,16 @@ class QueryLoop:
     async def _emit_subagent_permission_pause(self, pause) -> AsyncIterator[dict]:
         """Persist a subagent permission pause and emit matching UI events.
 
-        A subagent's tool hit a permission gate. We cannot resume the subagent
-        mid-loop, so the checkpoint stores the permission interaction data
-        directly (not as a subagent interaction). On resume, the user's
-        approval/denial is applied as the ``agent`` tool's result and the main
-        loop re-runs — the LLM will re-invoke the agent tool if needed.
+        A subagent's tool hit a permission gate. If the subagent has a
+        persistent session (general/resume agents), the checkpoint is saved as
+        a subagent interaction — preserving the agent_session_id so the
+        subagent can be resumed mid-loop after the user responds. The approved
+        operation is executed on resume and its result injected into the
+        subagent's message history, then the subagent loop continues.
+
+        Fork agents have no persistent session; they fall back to the direct
+        checkpoint path (the tool is executed on resume and the main loop
+        re-runs).
         """
         interaction_data = {
             "interaction_type": "permission",
@@ -305,15 +318,57 @@ class QueryLoop:
             "content": pause.content,
             "description": pause.description,
         }
-        async with UnitOfWork(self.project_id) as uow:
-            await uow.task_state.mark_awaiting_input(
-                self._task_id, {
-                    "tool_name": "agent",
-                    "tool_args": {},
-                    "tool_call_id": pause.parent_tool_call_id,
-                    "interaction_data": interaction_data,
-                }
-            )
+
+        has_session = bool(getattr(pause, "agent_session_id", ""))
+
+        if has_session:
+            # Subagent with a persistent session — checkpoint as a subagent
+            # interaction so _resume_subagent_interaction resumes it mid-loop.
+            # interaction_type/interaction_data are mirrored to the top level so
+            # the frontend restore path (getActive) can rebuild the modal
+            # uniformly. Resume dispatch checks is_subagent_interaction first,
+            # so the redundant fields never cause a wrong branch.
+            async with UnitOfWork(self.project_id) as uow:
+                await uow.task_state.mark_awaiting_input(
+                    self._task_id, {
+                        "is_subagent_interaction": True,
+                        # Top-level interaction fields (for frontend restore only)
+                        "interaction_type": interaction_data.get("interaction_type"),
+                        "interaction_data": interaction_data,
+                        "parent_tool_call_id": pause.parent_tool_call_id,
+                        "agent_session_id": pause.agent_session_id,
+                        "agent_type": pause.agent_type,
+                        "agent_usage_baseline": pause.agent_usage_baseline or {
+                            "input": 0, "output": 0, "cached": 0,
+                        },
+                        "inner_tool_name": pause.tool_name,
+                        "inner_tool_args": getattr(pause, "tool_args", {}),
+                        "inner_tool_call_id": getattr(pause, "inner_tool_call_id", ""),
+                        "inner_interaction_data": interaction_data,
+                    }
+                )
+        else:
+            # Fork agent (no persistent session) — save the inner tool details
+            # so _resume_from_permission can execute it directly on approval
+            # and inject the result as the agent tool's result.
+            async with UnitOfWork(self.project_id) as uow:
+                await uow.task_state.mark_awaiting_input(
+                    self._task_id, {
+                        "tool_name": "agent",
+                        "tool_args": {},
+                        "tool_call_id": pause.parent_tool_call_id,
+                        "interaction_data": interaction_data,
+                        "inner_tool_name": pause.tool_name,
+                        "inner_tool_args": getattr(pause, "tool_args", {}),
+                    }
+                )
+
+        yield LLMLoopRunner.sse(SSE_AGENT_EVENT, {
+            "parent_tool_call_id": pause.parent_tool_call_id,
+            "agent_type": getattr(pause, "agent_type", ""),
+            "inner_type": "awaiting_input",
+            "inner_data": interaction_data,
+        })
         yield LLMLoopRunner.sse("awaiting_input", interaction_data)
         done_data = {}
         usage = self._current_turn_usage()
@@ -529,12 +584,16 @@ class QueryLoop:
         directly (bypassing the permission gate — the user just approved it);
         if denied, a rejection string is injected as the tool result.
 
-        Subagent pause (``tool_name == "agent"``): the approval/denial is
-        injected as the ``agent`` tool's result. The subagent cannot be resumed
-        mid-loop, so the main loop re-runs and the LLM decides whether to
-        re-invoke the agent tool.
+        Fork-agent pause (``tool_name == "agent"`` with ``inner_tool_name``):
+        the fork subagent has no persistent session, so it cannot be resumed.
+        If approved, the inner tool (write/edit/bash/...) is executed directly
+        and its result is injected as the ``agent`` tool's result — the main
+        loop re-runs with the operation already done. If denied, a rejection
+        string is injected instead.
 
-        In both cases the main LLM loop re-runs with the tool result in place.
+        Subagent pauses from persistent agents (general/resume) never reach
+        here — they are saved as ``is_subagent_interaction`` checkpoints and
+        resumed via ``_resume_subagent_interaction``.
         """
         try:
             interaction_data = state.get("interaction_data", {})
@@ -556,13 +615,33 @@ class QueryLoop:
 
             if approved:
                 if is_subagent:
-                    # The subagent's inner tool was approved, but we cannot
-                    # resume the subagent mid-loop. Tell the LLM the operation
-                    # was approved and let it re-invoke the agent tool.
-                    tool_result = (
-                        "User approved the requested operation. "
-                        "Please retry the agent task to proceed."
-                    )
+                    # Fork agent — execute the approved inner tool directly
+                    # and inject the result as the agent tool's result.
+                    inner_tool_name = state.get("inner_tool_name", "")
+                    inner_tool_args = state.get("inner_tool_args", {})
+                    inner_tool_def = tool_registry.get(inner_tool_name)
+                    if inner_tool_def and inner_tool_def.call:
+                        call_args = dict(inner_tool_args)
+                        if inner_tool_def.requires_project_id:
+                            call_args.setdefault("project_id", self.project_id)
+                        if inner_tool_def.requires_session_id and self.session_id:
+                            call_args.setdefault("session_id", self.session_id)
+                        if inner_tool_def.requires_model_role:
+                            call_args.setdefault("model_role", self.model_role)
+                        try:
+                            tool_result = str(await LLMLoopRunner.call_tool(
+                                inner_tool_def, call_args,
+                            ))
+                        except Exception as exc:
+                            logger.exception(
+                                "Permission-approved fork tool '%s' failed",
+                                inner_tool_name,
+                            )
+                            tool_result = f"Tool '{inner_tool_name}' error: {exc}"
+                    else:
+                        tool_result = (
+                            f"Error: Tool '{inner_tool_name}' is not available"
+                        )
                 else:
                     # Execute the tool directly, bypassing the permission gate
                     # — the user just explicitly approved this exact operation.
@@ -611,14 +690,19 @@ class QueryLoop:
                 "tool_call_id": tool_call_id,
             })
 
-            # A direct file-mutating tool was just executed on approval — emit
+            # A file-mutating tool was just executed on approval — emit
             # file_changed so the frontend refreshes the file tree, matching the
             # main loop's side-effect (llm_loop_runner emits it after call_tool).
-            # Subagent pauses and denials inject synthetic strings, not file ops.
-            if approved and not is_subagent:
-                fc_evt = LLMLoopRunner()._emit_file_changed(
-                    tool_name, tool_args, tool_result,
-                )
+            # Denials inject synthetic strings, not file ops, so skip those.
+            if approved:
+                if is_subagent:
+                    fc_evt = LLMLoopRunner._emit_file_changed(
+                        inner_tool_name, inner_tool_args, tool_result,
+                    )
+                else:
+                    fc_evt = LLMLoopRunner._emit_file_changed(
+                        tool_name, tool_args, tool_result,
+                    )
                 if fc_evt:
                     yield fc_evt
 
@@ -627,8 +711,16 @@ class QueryLoop:
                 yield event
 
         except Exception as e:
-            logger.error("Resume from permission error: %s", e, exc_info=True)
-            yield LLMLoopRunner.sse(SSE_ERROR, {"error": str(e)})
+            # A fork-agent sub-task hit another permission gate during the
+            # re-run. Re-checkpoint it (don't lose the pause) instead of
+            # treating it as an unrecoverable error.
+            if type(e).__name__ == "PermissionRequestPause" and hasattr(e, "tool"):
+                await self._save_messages(messages)
+                async for event in self._emit_subagent_permission_pause(e):
+                    yield event
+            else:
+                logger.error("Resume from permission error: %s", e, exc_info=True)
+                yield LLMLoopRunner.sse(SSE_ERROR, {"error": str(e)})
 
     @staticmethod
     def _permission_denial_message(interaction_data: dict, reason: str) -> str:
@@ -671,9 +763,49 @@ class QueryLoop:
             return
 
         # ── Phase 2: process the inner tool with the user's response ──
+        inner_interaction_data = state.get("inner_interaction_data", {})
+        is_permission = (
+            inner_interaction_data.get("interaction_type") == "permission"
+        )
         inner_tool_def = tool_registry.get(inner_tool_name)
         inner_result = ""
-        if inner_tool_def and inner_tool_def.requires_user_interaction:
+
+        if is_permission:
+            # Permission approval/denial for a subagent's write/bash/notebook
+            # tool. If approved, execute the tool directly (the user just
+            # approved this exact operation — re-checking the permission gate
+            # would pause again). If denied, inject a rejection string.
+            response = self._interaction_response or {}
+            approved = response.get("approved", False)
+            reason = response.get("reason", "")
+            if approved:
+                if inner_tool_def and inner_tool_def.call:
+                    call_args = dict(inner_tool_args or {})
+                    if inner_tool_def.requires_project_id:
+                        call_args.setdefault("project_id", self.project_id)
+                    if inner_tool_def.requires_session_id:
+                        call_args.setdefault("session_id", agent_session_id)
+                    if inner_tool_def.requires_model_role:
+                        call_args.setdefault("model_role", "supervisor")
+                    try:
+                        inner_result = str(
+                            await LLMLoopRunner.call_tool(inner_tool_def, call_args)
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "Permission-approved subagent tool '%s' failed",
+                            inner_tool_name,
+                        )
+                        inner_result = f"Tool '{inner_tool_name}' error: {exc}"
+                else:
+                    inner_result = (
+                        f"Error: Tool '{inner_tool_name}' is not available"
+                    )
+            else:
+                inner_result = self._permission_denial_message(
+                    inner_interaction_data, reason,
+                )
+        elif inner_tool_def and inner_tool_def.requires_user_interaction:
             merged = {**inner_tool_args, **(self._interaction_response or {})}
             if inner_tool_def.requires_project_id:
                 merged["project_id"] = self.project_id
@@ -703,6 +835,16 @@ class QueryLoop:
                 "tool_call_id": inner_tool_call_id,
             },
         })
+
+        # A permission-approved file-mutating tool was just executed directly —
+        # emit file_changed so the frontend refreshes the file tree, matching the
+        # main loop's side-effect. Denials inject synthetic strings, not file ops.
+        if is_permission and approved:
+            fc_evt = LLMLoopRunner._emit_file_changed(
+                inner_tool_name, inner_tool_args, inner_result,
+            )
+            if fc_evt:
+                yield fc_evt
 
         # The user's response has been consumed. Clear the old awaiting_input
         # checkpoint before continuing; a rejected plan may create a new one.
@@ -791,9 +933,9 @@ class QueryLoop:
                             type(pause).__name__ == "PermissionRequestPause"
                             and hasattr(pause, "tool")
                         ):
-                            # Subagent's tool hit a permission gate during
-                            # resume. Use the permission-pause checkpoint — we
-                            # cannot resume the subagent mid-loop.
+                            # Subagent's tool hit another permission gate during
+                            # resume. Re-checkpoint as a subagent interaction so
+                            # the subagent resumes mid-loop again on next approval.
                             if not pause.parent_tool_call_id:
                                 pause.parent_tool_call_id = parent_tool_call_id
                             async for event in self._emit_subagent_permission_pause(pause):

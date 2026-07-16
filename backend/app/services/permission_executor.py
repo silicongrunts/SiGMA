@@ -66,6 +66,18 @@ class PermissionRequestPause(Exception):
         # Set by the runner when the pause propagates out of a subagent, so
         # the parent loop knows which agent tool_call to attach the result to.
         self.parent_tool_call_id = ""
+        # Enriched by agent_service when the pause escapes a subagent, so the
+        # checkpoint can be saved as a subagent interaction and the subagent
+        # resumed mid-loop after the user responds (same pattern as
+        # InteractiveToolPause). Empty for direct (main-loop) tool pauses.
+        self.agent_session_id = ""
+        self.agent_type = ""
+        self.agent_usage_baseline: dict | None = None
+        self.inner_tool_call_id = ""
+        # The full tool_args of the paused tool call. Set by the runner when it
+        # catches the pause (the runner has the LLM-produced args). Needed to
+        # re-execute the tool on resume after user approval.
+        self.tool_args: dict = {}
         super().__init__(f"Permission required for {tool_name or tool}: {operation} {path}")
 
 

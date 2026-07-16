@@ -530,6 +530,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         } else {
           // Task active but not awaiting input — drop any stale interaction state
           useStore.getState().clearPendingInteraction()
+          useStore.getState().clearPendingPermission()
         }
 
         if (active.status === 'running' || active.status === 'queued' || active.status === 'cancelling') {
@@ -563,6 +564,11 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         }
         const cleanProcess = preserved.filter(s => !s.transient)
         history.push({ role: 'SiGMA', content: '', process: cleanProcess })
+      } else {
+        // No active task for this session — clear stale interaction state so
+        // modals from a previous session don't bleed across.
+        useStore.getState().clearPendingInteraction()
+        useStore.getState().clearPendingPermission()
       }
 
       // Commit the final message array in a single setState.
@@ -593,7 +599,16 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         } finally {
           // Only update if this effect is still current
           if (genRef.current === gen) {
-            if (!abortController.signal.aborted && projectId && sessionId) {
+            // Skip history reload when pausing for input — the live process
+            // array (including subagent subSteps) is the source of truth for
+            // the pending interaction, and refreshLatestHistory({ dropLocal })
+            // would discard the anonymous streaming bubble.
+            const pausing = !!(
+              useStore.getState().pendingPermission
+              || useStore.getState().pendingInteraction
+              || pendingInteractionRef.current
+            )
+            if (!pausing && !abortController.signal.aborted && projectId && sessionId) {
               try {
                 if (genRef.current === gen) await refreshLatestHistory()
               } catch { /* best-effort */ }
@@ -742,11 +757,14 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
       toastError(e.message || t('chat.toast.resumeFailed'))
     } finally {
       if (genRef.current === gen) {
-        if (!controller.signal.aborted && projectId && sessionId) {
-          try {
-            if (genRef.current === gen) await refreshLatestHistory()
-          } catch { /* best-effort */ }
-        }
+        // Do NOT call refreshLatestHistory here. The resume stream appends to
+        // the existing (anonymous) streaming bubble, which carries the live
+        // process array — including subagent subSteps — that has no server-side
+        // counterpart. refreshLatestHistory({ dropLocal: true }) would discard
+        // it, erasing all subagent content from the UI. The pendingPermission/
+        // pendingInteraction guards added elsewhere are ineffective here because
+        // the dialog's onResolved() clears them before this function starts.
+        // Server history syncs on the next natural message-send completion.
         setIsStreaming(false)
       }
     }
@@ -799,7 +817,13 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         // Reload history to get real message IDs and can_edit flags from server.
         // Must happen before setIsStreaming(false) so the edit buttons only
         // appear on messages with real server IDs.
-        if (!controller.signal.aborted && projectId && sessionId) {
+        // Skip when pausing for input — see handleSendMessage for rationale.
+        const pausing = !!(
+          useStore.getState().pendingPermission
+          || useStore.getState().pendingInteraction
+          || pendingInteractionRef.current
+        )
+        if (!pausing && !controller.signal.aborted && projectId && sessionId) {
           try {
             if (genRef.current === gen) await refreshLatestHistory()
           } catch { /* best-effort */ }
@@ -1661,7 +1685,17 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         // Reload history to get real message IDs and can_edit flags.
         // Skip for compact commands — their bubbles are local-only (not persisted)
         // and would be lost if we replaced messages with server data.
-        if (!isCompactCommand && !controller.signal.aborted && projectId && sessionId) {
+        // Skip when pausing for input (awaiting_input / permission) — the live
+        // process array (including subagent subSteps) is the source of truth for
+        // the pending interaction, and refreshLatestHistory({ dropLocal: true })
+        // would discard the anonymous streaming bubble, erasing all subagent
+        // progress from the UI. Server history syncs on the next natural end.
+        const pausing = !!(
+          useStore.getState().pendingPermission
+          || useStore.getState().pendingInteraction
+          || pendingInteractionRef.current
+        )
+        if (!isCompactCommand && !pausing && !controller.signal.aborted && projectId && sessionId) {
           try {
             if (genRef.current === gen) await refreshLatestHistory()
           } catch { /* best-effort */ }
