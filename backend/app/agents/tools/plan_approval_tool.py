@@ -88,10 +88,13 @@ async def _submit_plan_for_approval_phase2(
         return "Error: Could not determine session temporary storage for saving plan."
 
     try:
-        await _save_plan(project_id, session_id, plan_content)
+        relative_path = await _save_plan(project_id, session_id, plan_content)
         return (
             "The plan was approved and saved to internal session temporary "
-            "storage. Here's the content of this plan:"
+            f"storage at `{relative_path}`. Here's the content of this plan:"
+            "\n\nIMPORTANT: If this session is compacted before the plan is fully "
+            f"executed, the compaction summary MUST include both the full path "
+            f"(`{relative_path}`) and the current execution progress of the plan."
         )
     except Exception as e:
         logger.exception("Failed to save approved plan")
