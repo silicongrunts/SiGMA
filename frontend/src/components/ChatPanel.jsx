@@ -2183,7 +2183,6 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage() }
             }}
             onFocus={autoResizeTextarea}
-            onBlur={() => { if (textareaRef.current) { textareaRef.current.style.height = 'auto' } }}
             placeholder={resolvedPlaceholder}
             rows={1}
             className="flex-1 bg-transparent text-sm outline-none py-1.5 resize-none max-h-[200px] overflow-y-auto text-gray-800 dark:text-gray-200 placeholder:text-gray-400 dark:placeholder:text-gray-500"
