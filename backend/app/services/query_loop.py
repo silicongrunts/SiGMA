@@ -1052,9 +1052,9 @@ class QueryLoop:
             skills_summary=skills_summary,
         )
 
-        agents_desc = self._describe_agents()
-        if agents_desc:
-            sys_prompt += f"\n\n# Available Agents\n{agents_desc}"
+        # agents_desc = self._describe_agents()
+        # if agents_desc:
+        #     sys_prompt += f"\n\n# Available Agents\n{agents_desc}"
 
         messages.append(LLMLoopRunner.msg("system", sys_prompt))
 
