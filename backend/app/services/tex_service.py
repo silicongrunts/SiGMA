@@ -36,6 +36,11 @@ PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}$")
 SEARCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+*?\\^-]{0,127}$")
 YEAR_RE = re.compile(r"^(20[0-9]{2})$")
 
+# Month by which a TeX Live year historically freezes into the historic
+# archive (when the following year is released). Historically late March /
+# early April; 4 is a conservative cutoff. See _is_live_year.
+TEXLIVE_FREEZE_MONTH = 4
+
 TEX_BASE_PACKAGES = (
     "latexmk",
     "texcount",
@@ -131,8 +136,9 @@ class TeXService:
         yield self._event("start", {"operation": "install_package", "package": package})
         year = self._current_year()
         args = [self._tlmgr_bin(year)]
-        if repository:
-            args.extend(["--repository", self._repository_url(repository, year=year)])
+        # Frontend may omit repository; default to official so the
+        # _repository_url "current year → live" fallback applies consistently.
+        args.extend(["--repository", self._repository_url(repository or "official", year=year)])
         args.extend(["install", package])
         async for event in self._run(args):
             yield event
@@ -144,8 +150,9 @@ class TeXService:
         yield self._event("start", {"operation": "search", "query": query})
         year = self._current_year()
         args = [self._tlmgr_bin(year)]
-        if repository:
-            args.extend(["--repository", self._repository_url(repository, year=year)])
+        # Frontend omits repository for search; default to official so the
+        # _repository_url "current year → live" fallback applies consistently.
+        args.extend(["--repository", self._repository_url(repository or "official", year=year)])
         args.extend(["search", "--global", query])
         async for event in self._run(args):
             yield event
@@ -397,6 +404,18 @@ class TeXService:
         return {key: value.format(year=year) for key, value in REPOSITORIES.items()}
 
     def _repository_url(self, repository: str, *, year: str, use_current: bool = False) -> str:
+        # TeX Live's historic archive (REPOSITORIES) only holds *frozen* years.
+        # A given year Y freezes into the historic archive only when year Y+1
+        # is released — historically late March / early April. Before that,
+        # year Y still lives exclusively on the rolling live tlnet repos.
+        #
+        # Naively comparing `year >= utcnow().year` breaks for a ~3 month
+        # window each new year (Jan 1 until the new release): a user running
+        # last year's TeX Live would be sent to a historic URL that does not
+        # exist yet. Account for the pre-release window so the previous year
+        # is also treated as live until ~April of the following year.
+        if not use_current and self._is_live_year(year):
+            use_current = True
         repositories = CURRENT_REPOSITORIES if use_current else self._repository_labels(year)
         if repository in repositories:
             return repositories[repository]
@@ -405,8 +424,7 @@ class TeXService:
         raise ValueError("Unsupported TeX Live repository")
 
     def _install_year_repository_url(self, repository: str, *, year: str) -> str:
-        use_current_tlnet = int(year) >= utcnow().year
-        return self._repository_url(repository, year=year, use_current=use_current_tlnet)
+        return self._repository_url(repository, year=year, use_current=self._is_live_year(year))
 
     @staticmethod
     def _validate_package(package: str) -> None:
@@ -418,6 +436,22 @@ class TeXService:
         if not YEAR_RE.fullmatch(year):
             raise ValueError("Invalid TeX Live target year")
         return year
+
+    @staticmethod
+    def _is_live_year(year: str) -> bool:
+        # Whether a TeX Live year still lives on the rolling live tlnet repos
+        # vs. the frozen historic archive. See _repository_url for the full
+        # rationale. A year Y freezes into historic only when Y+1 is released
+        # (historically late March / early April); before that Y is live only.
+        now = utcnow()
+        y = int(year)
+        if y > now.year:
+            return True                       # future/current year — always live
+        if y == now.year:
+            return True                       # this year — not frozen yet
+        if y == now.year - 1 and now.month < TEXLIVE_FREEZE_MONTH:
+            return True                       # last year, before the freeze window
+        return False
 
     @staticmethod
     def _event(event: str, data: dict) -> str:
