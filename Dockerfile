@@ -157,7 +157,13 @@ WORKDIR /app
 # writes to a project. ripgrep IS needed at runtime: the grep tool shells
 # out to `rg` for content search. chromium pulls its own X11 / NSSS / ATK
 # runtime libs as deps.
-RUN apt-get update \
+# chromium 147.x is no longer in the live bookworm repos (superseded by 150.x).
+# Pin the apt source to a snapshot.debian.org frozen timestamp so the exact
+# 147.0.7727.137-1~deb12u1 version is installable. snapshot archives are
+# historical, hence check-valid-until=no and trusted=yes.
+RUN echo "deb [check-valid-until=no trusted=yes] https://snapshot.debian.org/archive/debian-security/20260503T000000Z/ bookworm-security main" > /etc/apt/sources.list \
+    && echo "deb [check-valid-until=no trusted=yes] https://snapshot.debian.org/archive/debian/20260503T000000Z/ bookworm main" >> /etc/apt/sources.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
         ca-certificates \

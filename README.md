@@ -83,7 +83,7 @@ mkdir -p ~/SiGMA-userdata && docker run -d \
   -e SIGMA_USERDATA_DIR=/app/userdata \
   -v "$HOME/SiGMA-userdata:/app/userdata" \
   -v sigma-texlive:/usr/local/texlive \
-  ghcr.io/silicongrunts/sigma:0.1.0-cpu
+  ghcr.io/silicongrunts/sigma:latest-cpu
 ```
 
 ### Run the GPU image
@@ -96,7 +96,7 @@ mkdir -p ~/SiGMA-userdata && docker run -d \
   -e SIGMA_USERDATA_DIR=/app/userdata \
   -v "$HOME/SiGMA-userdata:/app/userdata" \
   -v sigma-texlive:/usr/local/texlive \
-  ghcr.io/silicongrunts/sigma:0.1.0-gpu
+  ghcr.io/silicongrunts/sigma:latest-gpu
 ```
 
 Then open:
