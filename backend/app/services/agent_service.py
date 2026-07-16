@@ -839,6 +839,7 @@ class AgentService:
         )
         events = [LLMLoopRunner.sse(SSE_CONTEXT_STATS, stats.to_dict())]
         if stats.current_tokens <= stats.compact_threshold:
+            LLMLoopRunner.apply_cache_control(messages, target_offset=0)
             return messages, events
 
         events.append(LLMLoopRunner.sse(SSE_COMPACT_START, {
@@ -852,6 +853,7 @@ class AgentService:
                 mode="passive",
                 tools=tools,
                 token_budget_tracker=token_budget_tracker,
+                session_id=session_id,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -877,6 +879,7 @@ class AgentService:
 
         events.append(LLMLoopRunner.sse(SSE_COMPACT_DONE, result.stats.to_dict()))
         events.append(LLMLoopRunner.sse(SSE_CONTEXT_STATS, result.stats.to_dict()))
+        LLMLoopRunner.apply_cache_control(result.messages, target_offset=0)
         return result.messages, events
 
 

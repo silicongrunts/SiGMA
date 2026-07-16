@@ -259,15 +259,27 @@ class CompactionService:
         mode: str,
         tools: list[dict] | None = None,
         token_budget_tracker=None,
+        session_id: str | None = None,
     ) -> CompactionResult:
         """Generate a compacted context view.
 
         `mode` is "passive" or "active" and only affects the boundary preface.
+
+        ``session_id`` enables sticky routing for the compaction call so it can
+        read the already-cached conversation prefix for free (no cache_control
+        is created here — compaction only reads, never creates a cache entry).
         """
         if not messages:
             raise ValueError("Cannot compact an empty message list")
 
-        compact_request = list(messages)
+        # Strip any stale cache_control carried over from a prior turn so the
+        # compaction call never creates a cache entry (it only reads). The
+        # message dicts are shared with the caller's live list, so build new
+        # dicts instead of mutating in place.
+        compact_request = [
+            {k: v for k, v in m.items() if k != "cache_control"}
+            for m in messages
+        ]
         compact_request.append({"role": "user", "content": COMPACT_PROMPT})
 
         summary, compact_usage = await llm_service.call_chat_text(
@@ -276,6 +288,7 @@ class CompactionService:
             timeout=300.0,
             max_tokens=self.budget_for_role(model_role).compact_response_max_tokens,
             tools=tools,
+            session_id=session_id,
         )
 
         if token_budget_tracker and compact_usage:

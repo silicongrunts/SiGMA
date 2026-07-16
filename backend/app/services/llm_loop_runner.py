@@ -1049,6 +1049,7 @@ class LLMLoopRunner:
             tools=ctx.tool_schemas,
             delta_queue=delta_queue,
             max_tokens=ctx.response_max_tokens,
+            session_id=ctx.session_id,
         )
 
     # ------------------------------------------------------------------
@@ -1158,6 +1159,40 @@ class LLMLoopRunner:
         if getattr(msg, 'reasoning_content', None):
             entry["reasoning_content"] = msg.reasoning_content
         return entry
+
+    @staticmethod
+    def apply_cache_control(messages: list[dict], *, target_offset: int) -> None:
+        """Idempotently mark exactly one user message with a cache breakpoint.
+
+        Prompt caching only caches content *before* the ``cache_control`` marker.
+        To grow the cache incrementally across turns, the marker must move with
+        the latest stable user message each turn. This helper:
+
+        1. Clears ``cache_control`` from every user message (so the previous
+           turn's marker never lingers — ``messages`` is reused in place across
+           turns).
+        2. Selects the target user message by scanning backwards. ``tool`` and
+           ``_ephemeral`` (in-memory image) messages are skipped because they are
+           not real user turns.
+        3. Sets a single ``cache_control: {"type": "ephemeral"}`` at message
+           level. LiteLLM's OpenRouter handler moves it into the content block
+           automatically; the ZAI/GLM handler passes it through as-is. Either
+           way no more than one breakpoint exists per request.
+
+        ``target_offset``: 0 = newest user message (main loop), 1 = second-to-newest
+        (annotation loop, where the annotated span migrates into the newest user
+        message each turn, so the second-to-newest is the stable cacheable prefix).
+        No-op when there are not enough user messages (e.g. the first turn).
+        """
+        user_indices = [
+            i for i, m in enumerate(messages)
+            if m.get("role") == "user" and not m.get("_ephemeral")
+        ]
+        for i in user_indices:
+            messages[i].pop("cache_control", None)
+        if len(user_indices) > target_offset:
+            target = user_indices[-(target_offset + 1)]
+            messages[target]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
 
     @staticmethod
     def sse(event_type: str, data: dict) -> dict:

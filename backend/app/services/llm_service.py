@@ -28,6 +28,21 @@ STREAM_IDLE_TIMEOUT_SECONDS = 300.0
 STREAM_ABSOLUTE_TIMEOUT_SECONDS = 3600.0
 
 
+def _session_headers(session_id: str | None) -> dict:
+    """Return LiteLLM ``extra_headers`` kwargs for sticky routing, or empty.
+
+    LiteLLM merges ``extra_headers`` into the outgoing HTTP request for every
+    provider (verified through to the httpx call). An ``x-session-id`` header
+    lets multi-instance providers (OpenRouter in particular) pin a conversation
+    to one backend instance so prompt/KV cache prefixes stay hot. Returns an
+    empty dict when there is no session (background jobs, connectivity checks),
+    leaving those requests untagged.
+    """
+    if not session_id:
+        return {}
+    return {"extra_headers": {"x-session-id": session_id}}
+
+
 @dataclass(frozen=True)
 class GeneratedImage:
     """Provider-neutral image generation result."""
@@ -104,6 +119,7 @@ class LLMService:
         max_tokens: int | None = None,
         tools: list[dict] | None = None,
         tool_choice: str | None = None,
+        session_id: str | None = None,
     ) -> tuple[str, dict | None]:
         """Call a chat model with caller-supplied messages.
 
@@ -119,6 +135,7 @@ class LLMService:
             max_tokens=max_tokens,
             tools=tools,
             tool_choice=tool_choice,
+            session_id=session_id,
         )
         message = self._first_message(response)
         text = str(message.get("content") or "").strip()
@@ -197,11 +214,17 @@ class LLMService:
         timeout: float = 300.0,
         delta_queue: "asyncio.Queue | None" = None,
         max_tokens: int | None = None,
+        session_id: str | None = None,
     ) -> tuple[str, str, list[dict], dict | None]:
         """Stream chat while preserving the existing SiGMA return contract.
 
         Returns:
             (text_content, reasoning_content, parsed_tool_calls, usage_dict_or_None)
+
+        ``session_id``, when provided, is sent as an ``x-session-id`` HTTP header
+        so the provider can pin sticky routing. This is required for prompt/KV
+        cache hits on multi-instance providers (e.g. OpenRouter): without it the
+        cache only activates after a hit, which never happens under round-robin.
         """
         endpoint = self._require_endpoint(model_role)
         litellm = self._litellm()
@@ -215,6 +238,7 @@ class LLMService:
             "stream_options": {"include_usage": True},
             "drop_params": True,
             **endpoint.litellm_kwargs(),
+            **_session_headers(session_id),
         }
         if max_tokens:
             payload["max_tokens"] = max_tokens
@@ -347,6 +371,7 @@ class LLMService:
         max_tokens: int | None = None,
         tools: list[dict] | None = None,
         tool_choice: str | None = None,
+        session_id: str | None = None,
     ) -> dict:
         endpoint = self._require_endpoint(role)
 
@@ -358,6 +383,7 @@ class LLMService:
                 "stream": stream,
                 "drop_params": True,
                 **endpoint.litellm_kwargs(),
+                **_session_headers(session_id),
             }
             if max_tokens:
                 payload["max_tokens"] = max_tokens

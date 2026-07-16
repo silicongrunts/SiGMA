@@ -143,6 +143,7 @@ class QueryLoop:
                 mode="active",
                 tools=tools,
                 token_budget_tracker=self._token_budget_tracker,
+                session_id=self.session_id,
             )
             async def _operation(uow):
                 await compaction_service.stage_session_boundary(
@@ -407,6 +408,7 @@ class QueryLoop:
                     warning_message,
                     _ephemeral=True,
                 ))
+            LLMLoopRunner.apply_cache_control(messages, target_offset=0)
             return messages, events
 
         events.append(LLMLoopRunner.sse(SSE_COMPACT_START, {
@@ -420,6 +422,7 @@ class QueryLoop:
                 mode="passive",
                 tools=tool_schemas_for_model_role(self.model_role),
                 token_budget_tracker=self._token_budget_tracker,
+                session_id=self.session_id,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -447,6 +450,7 @@ class QueryLoop:
 
         events.append(LLMLoopRunner.sse(SSE_COMPACT_DONE, result.stats.to_dict()))
         events.append(LLMLoopRunner.sse(SSE_CONTEXT_STATS, result.stats.to_dict()))
+        LLMLoopRunner.apply_cache_control(result.messages, target_offset=0)
         return result.messages, events
 
     async def _get_active_tasks(self, session_id: str) -> list:
