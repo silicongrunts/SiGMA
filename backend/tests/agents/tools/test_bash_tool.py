@@ -3,8 +3,9 @@ Unit tests for the bash tool.
 
 Covers:
 - ``_format_output`` produces the unified three-section format in all cases
-- ``_run_bash`` validates timeout, kills timed-out subprocesses, returns
-  partial output on timeout, and uses the unified format on success/failure.
+- ``_run_bash`` validates timeout, kills timed-out subprocesses, returns the
+  timeout note promptly (without blocking for the command's full duration),
+  and uses the unified format on success/failure/timeout.
 """
 
 import asyncio
@@ -20,6 +21,23 @@ async def _raise_timeout(awaitable, timeout):
     if inspect.iscoroutine(awaitable):
         awaitable.close()
     raise asyncio.TimeoutError
+
+
+def _raise_timeout_first_call():
+    """A wait_for fake that raises TimeoutError on the first call (the
+    communicate() guard) and runs the real awaitable on subsequent calls
+    (the post-kill reap), so the reap path can be exercised."""
+    call_count = {"n": 0}
+
+    async def _fake(awaitable, timeout):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            raise asyncio.TimeoutError
+        return await awaitable
+
+    return _fake
 
 
 # ── _format_output ──────────────────────────────────────────────────
@@ -130,12 +148,15 @@ async def test_run_bash_failure_returns_nonzero_exit_code():
     assert "stderr: fail" in result
 
 
-# ── _run_bash: timeout kills subprocess and captures partial output ──
+# ── _run_bash: timeout kills subprocess ─────────────────────────────
 
 @pytest.mark.asyncio
-async def test_run_bash_timeout_kills_and_returns_partial():
-    """On timeout: proc.kill() must be called, partial output drained from
-    pipes, and the unified format returned with the timeout note."""
+async def test_run_bash_timeout_kills_and_returns_timeout_note():
+    """On timeout: proc.kill() must be called and the unified format must be
+    returned with the timeout note. The post-kill path no longer drains
+    pipes (it uses proc.wait()), so partial output is intentionally not
+    captured — see test_run_bash_timeout_returns_within_timeout_not_command_duration
+    for the wall-clock regression test."""
 
     captured_signals = {"killed": False}
 
@@ -144,18 +165,12 @@ async def test_run_bash_timeout_kills_and_returns_partial():
         await asyncio.sleep(10)
         return b"", b""
 
-    async def drain_communicate():
-        # Subsequent communicate() after kill returns the partial output
-        return b"partial stdout line\n", b""
-
     def kill_side_effect():
         captured_signals["killed"] = True
-        # Switch communicate to the drain version
-        mock_proc.communicate = drain_communicate
 
     mock_proc = MagicMock()
     mock_proc.communicate = slow_communicate
-    mock_proc.returncode = -15
+    mock_proc.returncode = -9
     mock_proc.kill = MagicMock(side_effect=kill_side_effect)
 
     with patch("app.agents.tools.bash.asyncio.create_subprocess_shell",
@@ -165,25 +180,63 @@ async def test_run_bash_timeout_kills_and_returns_partial():
         result = await _run_bash("proj", "ping x", timeout=2)
 
     assert captured_signals["killed"] is True
-    assert "exit code: -15  (Command timed out after 2s)" in result
-    assert "stdout: partial stdout line" in result
+    assert "exit code: -9  (Command timed out after 2s)" in result
+    assert "stdout: " in result  # empty stdout section present
 
 
 @pytest.mark.asyncio
-async def test_run_bash_timeout_drain_failure_falls_back_to_empty():
-    """If post-kill drain itself raises, we still return the timeout format
-    with empty output rather than propagating the exception."""
+async def test_run_bash_timeout_returns_even_if_wait_raises():
+    """If post-kill proc.wait() itself raises, we still return the timeout
+    format rather than propagating the exception (best-effort reap)."""
 
     mock_proc = MagicMock()
     mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
-    mock_proc.returncode = -15
+    # wait() raises when the reap is attempted after SIGKILL
+    mock_proc.wait = AsyncMock(side_effect=RuntimeError("reap failed"))
+    mock_proc.returncode = None
     mock_proc.kill = MagicMock()
 
+    # First wait_for (communicate) raises TimeoutError; second (proc.wait())
+    # actually runs and surfaces the RuntimeError from the reap.
     with patch("app.agents.tools.bash.asyncio.create_subprocess_shell",
                return_value=mock_proc), \
          patch("app.agents.tools.bash.asyncio.wait_for",
-               new=_raise_timeout):
+               new=_raise_timeout_first_call()):
         result = await _run_bash("proj", "ping x", timeout=1)
 
     assert "Command timed out after 1s" in result
+    assert "exit code:" in result
     assert "stdout: " in result  # empty stdout section present
+
+
+# ── _run_bash: real-subprocess timeout regression ───────────────────
+
+@pytest.mark.asyncio
+async def test_run_bash_timeout_returns_within_timeout_not_command_duration(
+    tmp_path, monkeypatch
+):
+    """Regression: a timed-out command must return within ~timeout seconds,
+    not wait for the command's own full duration.
+
+    Previously the post-kill ``proc.communicate()`` blocked until the
+    command's own timer expired (pipe EOF), so ``sleep 60`` with
+    ``timeout=3`` took ~60s. This spawns a real subprocess (no mocks) and
+    asserts the wall-clock elapsed time is bounded well below the command
+    duration.
+    """
+    from types import SimpleNamespace
+    from app.agents.tools import bash as bash_mod
+    monkeypatch.setattr(
+        bash_mod, "settings",
+        SimpleNamespace(get_project_path=lambda pid: tmp_path),
+    )
+
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    result = await _run_bash("proj", "sleep 30", timeout=2)
+    elapsed = loop.time() - t0
+
+    assert "Command timed out after 2s" in result
+    # Normal case: ~2s. If the bug regresses, elapsed ≈ 30s. The 15s bound
+    # allows generous slack for CI load without masking a real regression.
+    assert elapsed < 15, f"timeout did not bound elapsed time: {elapsed:.1f}s"
