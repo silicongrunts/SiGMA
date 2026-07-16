@@ -116,9 +116,25 @@
 /* Display math ($$...$$): horizontal scroll for long equations.
    KaTeX already sets display:block; we only add overflow control.
    overflow-y:hidden avoids a stray vertical scrollbar from baseline alignment. */
-.prose .katex-display {
+.prose .katex-display,
+.sigma-content .katex-display {
   overflow-x: auto;
   overflow-y: hidden;
+}
+
+/* Inline math ($...$): long expressions (e.g. a single very wide equation
+   written inline) must not overflow the column. `overflow` only takes effect
+   on block/inline-block, so promote .katex to inline-block while keeping it
+   baseline-aligned for normal short formulas. `overflow-x:auto` then lets the
+   wide case scroll within the column instead of crossing the boundary. The
+   display-mode case above is unaffected since it wraps a separate wrapper. */
+.prose .katex,
+.sigma-content .katex {
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  vertical-align: baseline;
 }
 
 /* Images and inline SVGs must not exceed the column width. */
