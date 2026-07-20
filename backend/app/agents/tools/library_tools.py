@@ -14,6 +14,7 @@ from pathlib import Path
 from collections import OrderedDict
 
 from app.agents.tools.base import ToolDefinition
+from app.agents.tools.formatting import format_range_footer
 from app.agents.tools.registry import tool_registry
 from app.agents.prompts import (
     PROMPT_LIBRARY_SEARCH, PROMPT_LIBRARY_LS, PROMPT_LIBRARY_NEW,
@@ -202,10 +203,9 @@ def format_document_content(doc, fields: list,
                 end_idx = min(len(lines), start_idx + line_limit)
             numbered = [f"{i + 1}\t{lines[i]}" for i in range(start_idx, end_idx)]
             content_str = "\n".join(numbered)
-            if start_idx > 0:
-                content_str = f"... (skipped first {start_idx} lines)\n" + content_str
-            if end_idx < len(lines):
-                content_str += f"\n\n... ({len(lines) - end_idx} more lines not shown)"
+            content_str += format_range_footer(
+                start_idx + 1, end_idx, len(lines), unit="lines",
+            )
             result_parts.append(content_str)
 
     return "\n\n".join(result_parts)

@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 from app.agents.tools.base import ToolDefinition
+from app.agents.tools.formatting import format_range_footer
 from app.agents.tools.registry import tool_registry
 from app.agents.tools.read_state import (
     path_mtime,
@@ -158,10 +159,15 @@ def _slice_and_record(
 ) -> str:
     """Apply offset/limit slicing and record the read in the cache.
 
+    Output uses ``cat -n``-style line numbers (``N\\t<content>``) where ``N``
+    is the file's real 1-indexed line number — so paginated reads still expose
+    absolute line numbers usable for ``sigma://`` citations and edit context.
+
     ``offset`` is 0-indexed: ``offset=0`` (or ``None``) starts at line 1.
-    ``limit=None`` or ``limit=0`` triggers the default 200-line cap with a
-    "more lines not shown" suffix when applicable. ``limit<0`` returns the
-    last ``abs(limit)`` lines and ignores ``offset``.
+    ``limit=None`` or ``limit=0`` triggers the default 200-line cap. ``limit<0``
+    returns the last ``abs(limit)`` lines and ignores ``offset``. Anytime the
+    returned window stops short of EOF, a ``Showing lines X-Y of Z`` footer is
+    appended (including when an explicit ``limit`` truncates).
     """
     if (limit is None or limit >= 0) and offset is not None and offset < 0:
         return f"Error: offset must be >= 0, got {offset}"
@@ -170,29 +176,26 @@ def _slice_and_record(
     _record_read(project_id, session_id, file_path, content, is_partial=is_partial)
 
     lines = content.split("\n")
+    # Empty content: return "" so the LLM does not see a misleading "1\t"
+    # prefix implying the file has a line.
+    if not content:
+        return ""
     if limit is not None and limit < 0:
         start_idx = max(0, len(lines) + limit)
         end_idx = len(lines)
-        defaulted = False
     else:
         start_idx = max(0, offset) if offset else 0
         if limit is None or limit == 0:
             end_idx = min(len(lines), start_idx + _DEFAULT_READ_LIMIT)
-            defaulted = True
         else:
             end_idx = min(len(lines), start_idx + limit)
-            defaulted = False
 
-    result = "\n".join(lines[start_idx:end_idx])
-    if defaulted and end_idx < len(lines):
-        # 1-indexed range: lines are start_idx..end_idx-1 in 0-indexed terms.
-        shown_start = start_idx + 1
-        shown_end = end_idx
-        hidden = len(lines) - end_idx
-        result += (
-            f"\n\nShowing lines {shown_start}-{shown_end} of {len(lines)} "
-            f"({hidden} more not shown)"
-        )
+    # 1-indexed line numbers (i+1) so paginated output stays absolutely located.
+    numbered = [f"{i + 1}\t{lines[i]}" for i in range(start_idx, end_idx)]
+    result = "\n".join(numbered)
+    result += format_range_footer(
+        start_idx + 1, end_idx, len(lines), unit="lines",
+    )
     return result
 
 
@@ -630,7 +633,6 @@ def _build_rg_command(
 def _format_grep_output(
     raw: str,
     *,
-    output_mode: str,
     head_limit: int,
     offset: int,
 ) -> str:
@@ -643,13 +645,6 @@ def _format_grep_output(
     all_lines = raw.split("\n")
     total = len(all_lines)
 
-    # files_with_matches mode: also sort by mtime (newest first), then alpha
-    if output_mode == "files_with_matches":
-        try:
-            base = Path(".")  # placeholder; sort key computed by caller
-        except Exception:
-            pass
-
     if head_limit and head_limit > 0:
         end = min(total, offset + head_limit)
     else:
@@ -658,10 +653,8 @@ def _format_grep_output(
 
     result = "\n".join(shown)
     if head_limit and head_limit > 0 and end < total:
-        result += (
-            f"\n\n[Showing results with pagination = "
-            f"limit: {head_limit}, offset: {offset}]"
-        )
+        # 1-indexed result window: offset..end-1 in 0-indexed terms.
+        result += format_range_footer(offset + 1, end, total, unit="results")
     return result
 
 
@@ -718,7 +711,7 @@ async def _grep_search(
         if not output:
             return f"No matches for '{pattern}'"
         return _format_grep_output(
-            output, output_mode=output_mode,
+            output,
             head_limit=head_limit, offset=offset,
         ) or f"No matches for '{pattern}'"
     except FileNotFoundError:
@@ -810,7 +803,7 @@ async def _grep_fallback(
         body = "\n".join(files)
     else:
         body = _format_grep_output(
-            output, output_mode="content",
+            output,
             head_limit=head_limit, offset=offset,
         )
 

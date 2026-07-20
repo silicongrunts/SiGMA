@@ -247,7 +247,11 @@ async def test_read_file_image_rejected_when_model_no_vision(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_read_file_text_unchanged(tmp_path, monkeypatch):
-    """Text files are unaffected by image support."""
+    """Text files are unaffected by image support.
+
+    Note: read now prepends `cat -n` line numbers, so a single-line file
+    becomes `1\\t<content>`. The assertion checks the text payload is intact.
+    """
     p = tmp_path / "hello.txt"
     p.write_text("hello world")
 
@@ -255,7 +259,7 @@ async def test_read_file_text_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
 
     result = await _read_file("proj", "sess","hello.txt")
-    assert result == "hello world"
+    assert result == "1\thello world"
 
 
 @pytest.mark.asyncio

@@ -53,7 +53,7 @@ PROMPT_LIBRARY_GET = """Read a document's fields from the library.
 
 Similar to the read tool but for library documents. Supports paginated content reading with line numbers.
 
-offset is 0-indexed and must be >=0. limit: omit or pass 0 for 200; negative returns the last abs(limit) lines.
+offset is 0-indexed and must be >=0. limit: omit or pass 0 for 200; negative returns the last abs(limit) lines. Output uses `cat -n`-style line numbers (`N\\t<content>`) with the document's real 1-indexed line; whenever the window stops short of the end, a "Showing lines X-Y of Z (N more not shown)" footer is appended, matching the read tool.
 
 Documents still processing will include a status notice."""
 

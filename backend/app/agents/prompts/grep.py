@@ -16,7 +16,7 @@ Usage:
 - `multiline: true` enables cross-line matching (rg `-U --multiline-dotall`).
 - Case-insensitive search: `-i: true`. Line numbers in content mode: `-n: true` (default).
 - `head_limit` caps output (default 250); 0 or negative means unlimited. `offset` skips result entries and must be >=0.
-- When truncation occurs, a "[Showing results with pagination = limit: N, offset: M]" suffix is appended so you know to paginate with `offset`.
+- When truncation occurs, a "Showing results X-Y of Z (N more not shown)" suffix is appended so you know to paginate with `offset`.
 - Pattern syntax: ripgrep regex. Literal braces need escaping (e.g. `interface\\{\\}` to find `interface{}`).
 - If ripgrep is not installed, the tool falls back to GNU grep with a reduced feature set; unsupported parameters are reported in the output rather than silently dropped.
 

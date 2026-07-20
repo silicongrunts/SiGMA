@@ -211,8 +211,9 @@ async def test_grep_truncation_marker(tmp_path, monkeypatch):
         "proj", "match", ".",
         output_mode="content", flags={"-n": True}, head_limit=10, offset=0,
     )
-    assert "Showing results with pagination" in result
-    assert "limit: 10" in result
+    assert "Showing results" in result
+    assert "1-10 of 300" in result
+    assert "290 more not shown" in result
 
 
 @pytest.mark.asyncio
@@ -225,6 +226,6 @@ async def test_grep_head_limit_zero_means_unlimited(tmp_path, monkeypatch):
         output_mode="content", flags={"-n": True}, head_limit=0, offset=0,
     )
     # 50 matching lines + 1 file:line prefix — no truncation marker
-    assert "Showing results with pagination" not in result
+    assert "Showing results" not in result
     # All 50 matches returned
     assert result.count("\n") >= 49

@@ -169,7 +169,8 @@ def test_format_document_content_with_offset():
     result = format_document_content(doc, ["content"], offset=2, limit=2)
     assert "3\tline3" in result
     assert "4\tline4" in result
-    assert "skipped first 2 lines" in result
+    assert "Showing lines 3-4 of 5" in result
+    assert "1 more not shown" in result
 
 
 def test_format_document_content_with_limit():
@@ -177,7 +178,8 @@ def test_format_document_content_with_limit():
     result = format_document_content(doc, ["content"], offset=0, limit=2)
     assert "1\ta" in result
     assert "2\tb" in result
-    assert "more lines not shown" in result
+    assert "Showing lines 1-2 of 5" in result
+    assert "3 more not shown" in result
 
 
 def test_format_document_content_keywords():
