@@ -206,6 +206,16 @@
   transition: background-color 0.15s, border-color 0.15s;
 }
 
+/* List items: the editor↔preview block map targets individual <li> elements,
+   which are descendants of .prose rather than direct children, so the
+   highlight rule must reach them separately from .prose > .md-highlight. */
+.prose li.md-highlight {
+  background-color: rgba(219, 234, 254, 0.45) !important;
+  border-left: 3px solid rgba(59, 130, 246, 0.35);
+  border-radius: 2px;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+
 /* Code blocks: the generic .md-highlight rule above forces a translucent blue
    background onto <pre>, which washes out the hljs code text. Keep the interior
    dark (hljs github-dark = #0d1117) and signal the highlight via border only. */
@@ -369,6 +379,10 @@
 /* Markdown preview dark-mode typography is handled by `dark:prose-invert`.
    Only the cursor-sync highlight needs an explicit override here. */
 .dark .prose > .md-highlight {
+  background-color: rgba(59, 130, 246, 0.18) !important;
+  border-left-color: rgba(96, 165, 250, 0.6);
+}
+.dark .prose li.md-highlight {
   background-color: rgba(59, 130, 246, 0.18) !important;
   border-left-color: rgba(96, 165, 250, 0.6);
 }

@@ -105,19 +105,29 @@ function foldContainers(tokens) {
 }
 
 // Scroll `container` by the minimum amount needed to bring `el` fully into
-// view. If `el` is already visible, does nothing. This mirrors
+// view. If `el` is already visible, does nothing. Similar in intent to
 // element.scrollIntoView({ block: 'nearest' }) but operates within a single
 // scroll container (no ancestor scrolling, no horizontal change).
+//
+// The three branches are mutually exclusive and exhaustive, so a given
+// (container, el) state always yields the same delta. Callers re-invoke this
+// on every cursor move, so the branches MUST be idempotent — a structure that
+// flips between two positions across calls would oscillate forever.
 function scrollIntoViewMinimal(container, el) {
   const cRect = container.getBoundingClientRect()
   const eRect = el.getBoundingClientRect()
   const margin = 12  // breathing room so the highlight isn't flush against the edge
-  if (eRect.top < cRect.top + margin) {
-    // Above viewport — scroll up just enough
-    container.scrollTop -= cRect.top + margin - eRect.top
-  } else if (eRect.bottom > cRect.bottom - margin) {
-    // Below viewport — scroll down just enough
-    container.scrollTop += eRect.bottom - (cRect.bottom - margin)
+  const targetTop = cRect.top + margin
+  const targetBottom = cRect.bottom - margin
+  if (eRect.top >= targetTop && eRect.bottom <= targetBottom) return  // already visible
+  if (eRect.height >= cRect.height - 2 * margin) {
+    // Taller than the viewport — the bottom constraint is unsatisfiable, so
+    // align the top; any other choice would oscillate on the next call.
+    container.scrollTop += eRect.top - targetTop
+  } else if (eRect.top < targetTop) {
+    container.scrollTop -= targetTop - eRect.top
+  } else {
+    container.scrollTop += eRect.bottom - targetBottom
   }
 }
 
@@ -557,7 +567,15 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
       const tokens = foldContainers(previewMarked.lexer(guarded))
       const domBlocks = containerRef.current.querySelectorAll('.prose > *')
       let searchOffset = 0
+      // `map` holds one entry per highlightable unit. Most top-level tokens
+      // contribute one record; a `list` token contributes one record per <li>
+      // so map.length can exceed the top-level block count.
       const map = []
+      // topIdx tracks the next slot in domBlocks (.prose > *), advancing once
+      // per non-space top-level token. This keeps the lexer↔DOM 1:1 alignment
+      // used by the validation below intact even though the map itself is
+      // finer-grained than the DOM top level.
+      let topIdx = 0
 
       for (const token of tokens) {
         const raw = token.raw
@@ -570,16 +588,43 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
         const endLine = lineAtOffset(srcEnd - 1)
         searchOffset = idx + raw.length
 
-        if (token.type !== 'space') {
-          const domIdx = map.length  // maps 1:1 with non-space tokens
-          if (domIdx < domBlocks.length) {
-            map.push({ startLine, endLine, el: domBlocks[domIdx] })
+        if (token.type === 'space') continue
+
+        const domEl = topIdx < domBlocks.length ? domBlocks[topIdx] : null
+        topIdx += 1
+
+        if (domEl && token.type === 'list' && Array.isArray(token.items) && token.items.length > 0) {
+          // Expand the <ul>/<ol> into one record per top-level <li>. marked's
+          // list.items[i].raw aligns 1:1 with the <li> direct children of the
+          // rendered list element: nested items fold into their parent item's
+          // raw, and the rendered nested <ul> sits inside the parent <li>, so
+          // listEl.children stays the outer <li>s.
+          const lis = Array.from(domEl.children).filter(c => c.tagName === 'LI')
+          const liCount = Math.min(token.items.length, lis.length)
+          let itemSearch = idx
+          for (let k = 0; k < liCount; k++) {
+            const itemRaw = token.items[k].raw
+            if (!itemRaw) continue
+            const j = guarded.indexOf(itemRaw, itemSearch)
+            if (j === -1) continue
+            const iStart = lineAtOffset(guardToSrc(j))
+            const iEnd = lineAtOffset(guardEndToSrc(j + itemRaw.length) - 1)
+            map.push({ startLine: iStart, endLine: iEnd, el: lis[k] })
+            itemSearch = j + itemRaw.length
           }
+          // Item count can mismatch <li> count on malformed markdown or when
+          // DOMPurify rewrites the list; fall back to the whole-list block so
+          // the section stays reachable.
+          if (liCount === 0) map.push({ startLine, endLine, el: domEl })
+          continue
         }
+
+        if (domEl) map.push({ startLine, endLine, el: domEl })
       }
 
-      // Validation: non-space token count must match DOM block count
-      blockMapRef.current = (map.length === domBlocks.length) ? map : []
+      // Validation: top-level non-space token count must match DOM block count.
+      // Per-<li> expansion is internal to a single block and does not affect it.
+      blockMapRef.current = (topIdx === domBlocks.length) ? map : []
     } catch {
       blockMapRef.current = []
     }
@@ -644,6 +689,30 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
       const container = containerRef.current
       if (!container) return
       const n = line - 1  // CodeMirror lines are 1-indexed, source array is 0-indexed
+
+      // Primary: precise block map. Resolves to the exact <li> for list lines,
+      // avoiding the drift the heading-interpolation fallback suffers when one
+      // source line maps to uneven DOM heights (long/wrapping list items).
+      // Within a block we interpolate by source-line ratio, so multi-line
+      // paragraphs scroll continuously while list items snap to their bounds.
+      const blocks = blockMapRef.current
+      if (blocks.length > 0) {
+        for (const block of blocks) {
+          if (n >= block.startLine && n <= block.endLine) {
+            const cRect = container.getBoundingClientRect()
+            const eRect = block.el.getBoundingClientRect()
+            const elTop = eRect.top - cRect.top + container.scrollTop
+            const elH = eRect.height
+            const span = block.endLine - block.startLine
+            const within = span > 0 ? (n - block.startLine) / span : 0
+            const targetTop = elTop + within * elH
+            const anchor = cRect.height / 3  // rest the target near the upper third
+            container.scrollTop = Math.max(0, targetTop - anchor)
+            return
+          }
+        }
+      }
+
       const map = headingMapRef.current
       // Fewer than 3 entries means no real headings — fall back to percentage
       if (map.length < 3) {
