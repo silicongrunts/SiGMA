@@ -155,7 +155,7 @@ export default function SynthesisTab({
                   </span>
                   <button
                     onClick={prevAnnotation}
-                    disabled={topAnnoIndex === 1}
+                    disabled={annoCount > 1 && topAnnoIndex === 1}
                     title={t('annotations.prevAnnotation')}
                     className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent transition-colors"
                   >
@@ -163,7 +163,7 @@ export default function SynthesisTab({
                   </button>
                   <button
                     onClick={nextAnnotation}
-                    disabled={topAnnoIndex === annoCount}
+                    disabled={annoCount > 1 && topAnnoIndex === annoCount}
                     title={t('annotations.nextAnnotation')}
                     className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent transition-colors"
                   >

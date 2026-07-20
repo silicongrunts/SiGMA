@@ -194,6 +194,19 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   const lastNavScrollAt = useRef(0)
   const NAV_SUPPRESS_MS = 350
 
+  // Clamp both nav index refs to the live decoration count. Called after any
+  // mutation that can shrink the count (delete, sync, reload, bulk replace);
+  // without it the counter can read e.g. "2 / 1" until the next free-scroll
+  // re-derivation in the scroll listener.
+  const clampNavIndices = useCallback(() => {
+    const view = viewRef.current
+    if (!view) return
+    const total = readAnnoPositions(view).length
+    if (total === 0) return // refreshAnnoNav hides the panel via annoCount=0
+    if (currentIndexRef.current > total) currentIndexRef.current = total
+    if (displayIndexRef.current > total) displayIndexRef.current = total
+  }, [])
+
   // Pending annotations: created locally, not yet persisted to backend (no replies sent).
   // Live in a ref (not zustand) — they don't survive file switches.
   const pendingAnnosRef = useRef([])
@@ -303,6 +316,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     // Update store + decorations
     setAnnotations(resolved)
     view.dispatch({ effects: setAnnosEffect.of(resolved) })
+    clampNavIndices()
 
     // Save to backend. The backend preserves stored anchors for orphan
     // annotations, so placeholder render positions are not written back.
@@ -310,7 +324,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     if (toSave.length > 0 || toRemove.length > 0) {
       try { await filesAPI.saveAnnotations(pid, file, toSave) } catch { /* non-critical */ }
     }
-  }, [getDecorationPosition, setAnnotations])
+  }, [clampNavIndices, getDecorationPosition, setAnnotations])
 
   // ── Annotation CRUD ─────────────────────────────────────────────────
 
@@ -462,13 +476,14 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     deleteAnnotation(id)
     setActiveAnnotationId(null)
     popupAnnoFromRef.current = null
+    clampNavIndices()
 
     try {
       await filesAPI.saveAnnotations(currentProject.id, currentFile, updatedAnnotations)
     } catch (e) {
       console.error('Failed to save annotations after delete', e)
     }
-  }, [currentProject?.id, currentFile, deleteAnnotation, handleCancelPending])
+  }, [clampNavIndices, currentProject?.id, currentFile, deleteAnnotation, handleCancelPending])
 
   /** Apply a diff suggestion from an annotation reply. */
   const handleApplyDiff = useCallback(async (annotationId, diff) => {
@@ -595,8 +610,9 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     const validated = revalidateBackendAnnotations(loaded)
     setAnnotations(validated)
     view.dispatch({ effects: setAnnosEffect.of(validated) })
+    clampNavIndices()
     return annotationId ? validated.find(a => a.id === annotationId) || null : null
-  }, [revalidateBackendAnnotations, setAnnotations])
+  }, [clampNavIndices, revalidateBackendAnnotations, setAnnotations])
 
   // ── Editor click & popup ────────────────────────────────────────────
 
@@ -879,6 +895,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
         a.from != null && a.to != null && a.from >= 0 && a.from < a.to && a.to <= docLen
       )
       view.dispatch({ effects: setAnnosEffect.of(placed) })
+      clampNavIndices()
       // Keep the annotation nav panel in sync after decorations change.
       requestAnimationFrame(() => callbacks.current.onAnnoNavScroll?.())
     },
@@ -915,9 +932,10 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     /** Navigate to the previous or next annotation. Pure arithmetic on
      *  currentIndexRef (cur±1, clamp) — never reads geometry. Writes both
      *  currentIndexRef (navigation source of truth) and displayIndexRef (so
-     *  the counter updates instantly). Skips the scroll dispatch when the
-     *  index is already clamped at the boundary, which would otherwise cause
-     *  the editor to drift on repeated clicks at the boundary. */
+     *  the counter updates instantly). Skips the scroll dispatch only when
+     *  truly stuck at a multi-annotation boundary (avoids drift on repeated
+     *  clicks at first/last); with a single annotation the scroll always
+     *  fires so the user can jump to it even when the index is already 1. */
     navToAnnotation: (dir) => {
       const view = viewRef.current
       if (!view) return null
@@ -935,10 +953,8 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       // Stamp the suppression window so free-scroll geometry re-derivation
       // is skipped while this scrollIntoView is settling.
       lastNavScrollAt.current = Date.now()
-      // Skip the scroll dispatch if the index didn't change (boundary clamp).
-      // Re-scrolling to the same position would cause the editor to drift on
-      // repeated clicks at the boundary.
-      if (next !== cur) {
+      const stuckAtBoundary = total > 1 && next === cur
+      if (!stuckAtBoundary) {
         view.dispatch({
           effects: EditorView.scrollIntoView(positions[next - 1].from, { y: 'start' }),
         })
