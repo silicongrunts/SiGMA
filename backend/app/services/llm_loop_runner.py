@@ -569,6 +569,8 @@ class LLMLoopRunner:
                             "operation": pause.operation,
                             "content": pause.content,
                             "description": pause.description,
+                            "diff_lines": pause.diff_lines,
+                            "diff_truncated": pause.diff_truncated,
                         }
                         if ctx.on_permission_pause:
                             await ctx.on_permission_pause(

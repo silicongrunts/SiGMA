@@ -318,6 +318,8 @@ class QueryLoop:
             "operation": pause.operation,
             "content": pause.content,
             "description": pause.description,
+            "diff_lines": pause.diff_lines,
+            "diff_truncated": pause.diff_truncated,
         }
 
         has_session = bool(getattr(pause, "agent_session_id", ""))

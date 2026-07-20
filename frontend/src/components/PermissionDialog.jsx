@@ -15,6 +15,7 @@ import { ShieldAlert, FileText, Check, X, Loader2, AlertTriangle } from 'lucide-
 import { useStore } from '../store/useStore'
 import { permissionsAPI } from '../api'
 import { toastError } from './Toast'
+import DiffView from './DiffView'
 
 export default function PermissionDialog() {
   const pendingPermission = useStore(s => s.pendingPermission)
@@ -25,12 +26,12 @@ export default function PermissionDialog() {
 
   if (!pendingPermission) return null
 
-  const { session_id, tool, tool_name, path, operation, content, description } = pendingPermission
+  const { session_id, tool, tool_name, path, operation, content, description, diff_lines, diff_truncated } = pendingPermission
   const isAutoApproved = autoApproveSettings[tool] === true
 
   return (
     <PermissionPrompt
-      key={session_id + (path || '') + (operation || '') + (tool_name || '')}
+      key={session_id + (path || '') + (operation || '') + (tool_name || '') + (diff_lines?.length ?? 0)}
       projectId={currentProject?.id}
       sessionId={session_id}
       tool={tool}
@@ -39,6 +40,8 @@ export default function PermissionDialog() {
       operation={operation}
       content={content || ''}
       description={description || ''}
+      diffLines={diff_lines}
+      diffTruncated={!!diff_truncated}
       onResolved={clearPendingPermission}
       isAutoApproved={isAutoApproved}
       onToggleAutoApprove={(enabled) => setAutoApproveType(tool, enabled)}
@@ -48,6 +51,7 @@ export default function PermissionDialog() {
 
 function PermissionPrompt({
   projectId, sessionId, tool, toolName, path, operation, content, description,
+  diffLines, diffTruncated,
   onResolved, isAutoApproved, onToggleAutoApprove,
 }) {
   const { t } = useTranslation()
@@ -56,6 +60,9 @@ function PermissionPrompt({
   const [showDenyInput, setShowDenyInput] = useState(false)
   const [denyReason, setDenyReason] = useState('')
   const [autoApproveSaving, setAutoApproveSaving] = useState(false)
+
+  const hasDiff = Array.isArray(diffLines) && diffLines.length > 0
+  const modalMaxW = hasDiff ? 'max-w-4xl' : 'max-w-xl'
 
   const handleToggleAutoApprove = async (checked) => {
     setAutoApproveSaving(true)
@@ -96,11 +103,6 @@ function PermissionPrompt({
     handleRespond(false, denyReason.trim())
   }
 
-  const MAX_PREVIEW = 800
-  const previewContent = content.length > MAX_PREVIEW
-    ? content.slice(0, MAX_PREVIEW) + '\n...'
-    : content
-
   // When a deny reason is entered, the Allow action is disabled to avoid an
   // ambiguous response — clear the reason to re-enable it.
   const hasDenyReason = denyReason.trim() !== ''
@@ -120,7 +122,7 @@ function PermissionPrompt({
   return (
     <div className="fixed inset-0 z-[5000] flex items-center justify-center">
       <div className="absolute inset-0 bg-gray-900/40 backdrop-blur-sm animate-in fade-in duration-300" />
-      <div className="relative bg-white dark:bg-gray-900 rounded-3xl shadow-2xl max-w-xl w-full mx-4 max-h-[85vh] overflow-hidden flex flex-col animate-in zoom-in duration-300">
+      <div className={`relative bg-white dark:bg-gray-900 rounded-3xl shadow-2xl ${modalMaxW} w-full mx-4 max-h-[85vh] overflow-hidden flex flex-col animate-in zoom-in duration-300`}>
         {/* Header */}
         <div className="bg-amber-50 dark:bg-amber-900/20 border-b border-amber-100 dark:border-amber-800/50 px-6 py-4 flex items-center gap-3 flex-shrink-0">
           <div className="w-10 h-10 rounded-full bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center flex-shrink-0">
@@ -176,11 +178,29 @@ function PermissionPrompt({
           )}
 
           {/* Content */}
-          {previewContent && (
+          {hasDiff ? (
+            <div>
+              <div className="text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1.5">{t('permission.content')}</div>
+              <div className="border border-gray-200 dark:border-gray-700 rounded-xl overflow-hidden">
+                <DiffView
+                  lines={diffLines}
+                  leftLabel={t('permission.diffBefore')}
+                  rightLabel={t('permission.diffAfter')}
+                  maxH="max-h-[50vh]"
+                />
+              </div>
+              {diffTruncated && (
+                <div className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                  <AlertTriangle className="w-3 h-3 flex-shrink-0" />
+                  <span>{t('permission.diffTruncated')}</span>
+                </div>
+              )}
+            </div>
+          ) : content && (
             <div>
               <div className="text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1.5">{isNotebook ? t('permission.code') : t('permission.content')}</div>
               <pre className="bg-gray-900 text-gray-100 rounded-xl px-4 py-3 text-xs font-mono leading-relaxed whitespace-pre-wrap break-all max-h-64 overflow-y-auto">
-                {previewContent}
+                {content}
               </pre>
             </div>
           )}

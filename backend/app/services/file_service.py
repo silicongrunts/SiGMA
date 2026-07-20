@@ -29,6 +29,34 @@ MAX_TREE_DEPTH = 64
 MAX_TREE_NODES = 10000
 
 
+def compute_diff_lines(old_text: str, new_text: str) -> list:
+    """Compute a line-level diff between two texts using difflib.
+
+    Returns ``{type, content}`` dicts where ``type`` is ``'context'``,
+    ``'remove'``, or ``'add'``.
+    """
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    sm = difflib.SequenceMatcher(None, old_lines, new_lines)
+    lines = []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == 'equal':
+            for line in old_lines[i1:i2]:
+                lines.append({'type': 'context', 'content': line.rstrip('\r\n')})
+        elif op == 'replace':
+            for line in old_lines[i1:i2]:
+                lines.append({'type': 'remove', 'content': line.rstrip('\r\n')})
+            for line in new_lines[j1:j2]:
+                lines.append({'type': 'add', 'content': line.rstrip('\r\n')})
+        elif op == 'delete':
+            for line in old_lines[i1:i2]:
+                lines.append({'type': 'remove', 'content': line.rstrip('\r\n')})
+        elif op == 'insert':
+            for line in new_lines[j1:j2]:
+                lines.append({'type': 'add', 'content': line.rstrip('\r\n')})
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Path access classification
 # ---------------------------------------------------------------------------
@@ -293,7 +321,7 @@ class FileService:
             if not force and require_expected_hash and full_path.exists() and not expected_hash:
                 try:
                     disk_content = full_path.read_text(encoding='utf-8', errors='replace')
-                    diff_lines = self._compute_diff_lines(disk_content, content)
+                    diff_lines = compute_diff_lines(disk_content, content)
                     return {"conflict": True, "diff_lines": diff_lines}
                 except OSError:
                     logger.warning("Conflict check failed for %s; refusing unguarded write", path, exc_info=True)
@@ -304,7 +332,7 @@ class FileService:
                     disk_content = full_path.read_text(encoding='utf-8', errors='replace')
                     disk_hash = self.compute_hash(disk_content)
                     if disk_hash != expected_hash:
-                        diff_lines = self._compute_diff_lines(disk_content, content)
+                        diff_lines = compute_diff_lines(disk_content, content)
                         return {"conflict": True, "diff_lines": diff_lines}
                 except OSError:
                     logger.warning("Conflict check failed for %s; refusing guarded write", path, exc_info=True)
@@ -320,30 +348,6 @@ class FileService:
     def compute_hash(text: str) -> str:
         """Compute MD5 hex digest of text content (UTF-8 encoded)."""
         return hashlib.md5(text.encode('utf-8')).hexdigest()
-
-    @staticmethod
-    def _compute_diff_lines(old_text: str, new_text: str) -> list:
-        """Compute a line-level diff using difflib."""
-        old_lines = old_text.splitlines(keepends=True)
-        new_lines = new_text.splitlines(keepends=True)
-        sm = difflib.SequenceMatcher(None, old_lines, new_lines)
-        lines = []
-        for op, i1, i2, j1, j2 in sm.get_opcodes():
-            if op == 'equal':
-                for line in old_lines[i1:i2]:
-                    lines.append({'type': 'context', 'content': line.rstrip('\r\n')})
-            elif op == 'replace':
-                for line in old_lines[i1:i2]:
-                    lines.append({'type': 'remove', 'content': line.rstrip('\r\n')})
-                for line in new_lines[j1:j2]:
-                    lines.append({'type': 'add', 'content': line.rstrip('\r\n')})
-            elif op == 'delete':
-                for line in old_lines[i1:i2]:
-                    lines.append({'type': 'remove', 'content': line.rstrip('\r\n')})
-            elif op == 'insert':
-                for line in new_lines[j1:j2]:
-                    lines.append({'type': 'add', 'content': line.rstrip('\r\n')})
-        return lines
 
     # ------------------------------------------------------------------
     # File create / delete / move / rename

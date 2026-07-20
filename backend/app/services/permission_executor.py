@@ -31,7 +31,7 @@ from typing import Any, Optional
 from app.agents.tools.bash_permissions import check_bash_permission
 from app.agents.tools.registry import tool_registry
 from app.core.logging import get_logger
-from app.services.file_service import PathAccessLevel, file_service
+from app.services.file_service import PathAccessLevel, compute_diff_lines, file_service
 from app.services.llm_loop_runner import LLMLoopRunner
 
 logger = get_logger(__name__)
@@ -56,6 +56,8 @@ class PermissionRequestPause(Exception):
         operation: str = "",
         content: str = "",
         description: str = "",
+        diff_lines: list | None = None,
+        diff_truncated: bool = False,
     ):
         self.tool = tool              # category: file_external/file_internal/bash/notebook
         self.tool_name = tool_name    # concrete tool invoked: write/edit/bash/...
@@ -63,6 +65,11 @@ class PermissionRequestPause(Exception):
         self.operation = operation
         self.content = content
         self.description = description
+        # Structured diff for the ``edit`` tool (old_string -> new_string);
+        # ``None`` for other tools, which fall back to the flat ``content``.
+        # ``diff_truncated`` is set when the diff exceeded DIFF_LINE_SOFT_LIMIT.
+        self.diff_lines = diff_lines
+        self.diff_truncated = diff_truncated
         # Set by the runner when the pause propagates out of a subagent, so
         # the parent loop knows which agent tool_call to attach the result to.
         self.parent_tool_call_id = ""
@@ -89,6 +96,11 @@ class PermissionRequestPause(Exception):
 PERMISSION_CATEGORIES: tuple[str, ...] = (
     "file_external", "file_internal", "bash", "notebook",
 )
+
+# Soft cap on the typed diff lines carried in an edit permission request.
+# Beyond this the diff is truncated and ``diff_truncated`` is set, keeping
+# SSE/checkpoint payloads modest while covering all but whole-file rewrites.
+DIFF_LINE_SOFT_LIMIT = 5000
 
 
 async def execute_with_permission(
@@ -288,6 +300,8 @@ async def _check_write(
     }.get(tool_name, "modify")
 
     content = tool_args.get("content", "")
+    diff_lines = None
+    diff_truncated = False
     if not content and tool_name == "edit":
         old = tool_args.get("old_string", "")
         new = tool_args.get("new_string", "")
@@ -296,6 +310,13 @@ async def _check_write(
                 f"--- before ---\n{old}\n--- after ---\n{new}"
                 if old != new else old
             )
+            # Diff the replacement fragment itself (old_string -> new_string),
+            # not the whole file — that is what the user is approving. Truncate
+            # at the soft limit to bound payload size.
+            diff_lines = compute_diff_lines(old, new)
+            if len(diff_lines) > DIFF_LINE_SOFT_LIMIT:
+                diff_lines = diff_lines[:DIFF_LINE_SOFT_LIMIT]
+                diff_truncated = True
 
     raise PermissionRequestPause(
         tool=category,
@@ -303,4 +324,6 @@ async def _check_write(
         path=target_path,
         operation=operation,
         content=content[:2000] if content else "",
+        diff_lines=diff_lines,
+        diff_truncated=diff_truncated,
     )
