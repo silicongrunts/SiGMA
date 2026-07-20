@@ -10,6 +10,12 @@ const initialState = {
   isTexFile: false,
   activeTab: 'synthesis',
   isRebuildingIndex: false,
+  // Monotonic counter bumped every time the user clears browser data via the
+  // Explore settings menu. BrowserVNC subscribes to it so the noVNC iframe is
+  // remounted (and its WebSocket reconnected) after the backend restarts the
+  // browser stack — otherwise the iframe keeps a stale WS to the dead
+  // websockify and shows a black screen until the user refreshes the page.
+  browserDataClearedAt: 0,
   leftTab: 'files',
   // Single source of truth for the preview panel. Title and rendered content
   // both derive from this descriptor — see Preview.jsx. Never mutate partial
@@ -108,6 +114,7 @@ const actions = (set, get) => ({
     return { activeTab: tab }
   }),
   setIsRebuildingIndex: (flag) => set({ isRebuildingIndex: flag }),
+  bumpBrowserDataCleared: () => set((s) => ({ browserDataClearedAt: s.browserDataClearedAt + 1 })),
   setLeftTab: (tab) => set((state) => {
     if (state.currentProject?.id) storage.setSynthesis(state.currentProject.id, { leftTab: tab })
     return { leftTab: tab }

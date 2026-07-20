@@ -6,12 +6,20 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Monitor, Loader2, AlertTriangle, RefreshCw } from 'lucide-react'
 import { browserAPI } from '../api'
+import { useStore } from '../store/useStore'
 
 const POLL_INTERVAL_MS = 500
 const POLL_MAX_ATTEMPTS = 20
 
 export default function BrowserVNC({ projectId }) {
   const { t } = useTranslation()
+  // Monotonic counter bumped after the user clears browser data. Each bump
+  // re-runs startBrowser() below, which cycles status through 'starting'
+  // (no iframe rendered) and back to 'connected' (iframe re-rendered) so the
+  // embedded noVNC client opens a fresh WebSocket to the restarted
+  // websockify. Without this, the iframe keeps a stale WS to the dead
+  // websockify and shows a black screen until the user manually refreshes.
+  const browserDataClearedAt = useStore(state => state.browserDataClearedAt)
   const [status, setStatus] = useState('starting') // starting | connected | error
   const [error, setError] = useState(null)
   // Bumped on every start attempt; stale async chains bail out so they cannot
@@ -66,7 +74,7 @@ export default function BrowserVNC({ projectId }) {
     if (!projectId) return
     startBrowser()
     return () => { activeTokenRef.current++ }  // invalidate the in-flight chain on unmount/projectId change
-  }, [projectId, startBrowser])
+  }, [projectId, startBrowser, browserDataClearedAt])
 
   if (status === 'error') {
     return (
@@ -100,6 +108,7 @@ export default function BrowserVNC({ projectId }) {
         <div className="w-2 h-2 rounded-full bg-green-400" />
       </div>
       <iframe
+        key={browserDataClearedAt}
         src={iframeSrc}
         className="flex-1 border-0"
         style={{ minHeight: 0 }}

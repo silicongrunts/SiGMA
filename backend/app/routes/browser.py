@@ -30,3 +30,16 @@ async def stop_browser(project_id: str):
     service = get_browser_service()
     await service.stop()
     return ok({"status": "stopped"})
+
+
+@router.post("/{project_id}/clear-data")
+async def clear_browser_data(project_id: str):
+    """Stop the browser, wipe its profile dir, and restart it cleanly.
+
+    Recovers from a corrupted or version-incompatible profile without a
+    full container restart.
+    """
+    project_service.get_project_path(project_id)
+    service = get_browser_service()
+    result = await service.clear_data()
+    return ok(result)

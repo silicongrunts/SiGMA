@@ -28,11 +28,24 @@ class BrowserService:
     PORT_VNC = 6180       # x11vnc (RFB)
     DISPLAY = ":99"
 
+    # Chrome crash-loop protection. If Chrome exits, the daemon relaunches it
+    # up to _CHROME_MAX_RELAUNCH times, waiting _CHROME_RELAUNCH_INTERVAL
+    # seconds between attempts. After the limit is hit the daemon gives up
+    # (sets _chrome_failed) and the user must explicitly clear browser data
+    # or restart the container. This prevents a malformed profile from
+    # causing unbounded relaunches that fill the disk with crash artifacts.
+    _CHROME_MAX_RELAUNCH = 10
+    _CHROME_RELAUNCH_INTERVAL = 5.0
+
     def __init__(self, base_dir: str):
         self.base_dir = Path(base_dir).resolve()
         self._procs = None          # dict name -> asyncio subprocess
         self._started = False
         self._running = False       # controls daemon loop
+        self._chrome_task: Optional[asyncio.Task] = None
+        self._chrome_relaunch_count = 0   # consecutive relaunch attempts
+        self._chrome_failed = False       # relaunch limit exhausted
+        self._op_lock = asyncio.Lock()    # serializes start/stop/clear_data
 
     # ------------------------------------------------------------------
     # helpers
@@ -163,15 +176,19 @@ class BrowserService:
     # Public API for the shared browser instance.
     # ------------------------------------------------------------------
     async def start(self) -> Dict:
-        if await self._is_running():
-            return {"status": "running", "url": self._url_str()}
-        return await self._do_start()
+        async with self._op_lock:
+            if await self._is_running():
+                return {"status": "running", "url": self._url_str()}
+            return await self._do_start()
 
     async def stop(self) -> Dict:
-        await self.stop_all()
+        async with self._op_lock:
+            await self.stop_all()
         return {"status": "stopped"}
 
     async def get_status(self) -> Dict:
+        if self._chrome_failed:
+            return {"status": "failed"}
         if await self._is_running():
             return {"status": "running", "url": self._url_str()}
         return {"status": "stopped"}
@@ -193,6 +210,52 @@ class BrowserService:
         elif self._started:
             self._kill_stale()
         self._started = False
+
+    async def clear_data(self) -> Dict:
+        """Atomically wipe the shared browser profile and restart the stack.
+
+        Sequence: stop daemon → stop all subprocesses → remove browser_data
+        → reset failure counters → restart stack + daemon.
+
+        Holds _op_lock for the whole operation so a racing ``/start`` or
+        ``_chrome_daemon`` relaunch cannot recreate files mid-delete.
+
+        Used to recover from a corrupted/incompatible Chrome profile (the
+        most common cause of ``_chrome_failed``) without a full container
+        restart.
+        """
+        async with self._op_lock:
+            # 1. Stop the daemon first so it cannot relaunch Chrome while
+            #    we are tearing down the profile directory.
+            self._running = False
+            if self._chrome_task is not None and not self._chrome_task.done():
+                self._chrome_task.cancel()
+                try:
+                    await self._chrome_task
+                except asyncio.CancelledError:
+                    pass
+                self._chrome_task = None
+
+            # 2. Terminate websockify/x11vnc/chrome/xvfb and clear _procs.
+            await self.stop_all()
+
+            # 3. Wipe the entire browser_data directory.
+            data_dir = settings.SIGMA_DIR / "browser_data"
+            if data_dir.exists():
+                shutil.rmtree(data_dir)
+                logger.info("Cleared browser_data at %s", data_dir)
+            data_dir.mkdir(parents=True, exist_ok=True)
+
+            # 4. Reset failure state so the new daemon is willing to start.
+            self._chrome_relaunch_count = 0
+            self._chrome_failed = False
+
+            # 5. Restart the stack and daemon.
+            self._running = True
+            result = await self._do_start()
+            if result.get("status") == "running":
+                self._chrome_task = asyncio.create_task(self._chrome_daemon())
+            return result
 
     # ------------------------------------------------------------------
     # Daemon: automatically relaunch Chrome when it dies
@@ -218,7 +281,13 @@ class BrowserService:
         return proc
 
     async def _chrome_daemon(self):
-        """Background loop that watches for Chrome's demise and relaunches it."""
+        """Background loop that watches for Chrome's demise and relaunches it.
+
+        Bounded by _CHROME_MAX_RELAUNCH: after that many consecutive
+        relaunch attempts the daemon gives up, sets _chrome_failed, and
+        exits. Recovery requires explicit clear_data() or a container
+        restart.
+        """
         logger.info("Chrome daemon started.")
         # Wait for websockify to be ready before monitoring Chrome
         for _ in range(30):  # up to 15 seconds
@@ -229,13 +298,38 @@ class BrowserService:
         while self._running:
             chrome_proc = self._procs.get("chrome") if self._procs else None
             if chrome_proc is None or chrome_proc.returncode is None:
+                # Chrome is alive (or not yet launched) at this poll, so the
+                # previous launch succeeded — clear the consecutive-failure
+                # counter. A Chrome that crashes every few seconds will not
+                # reach this branch often enough to defeat the limit.
+                if self._chrome_relaunch_count > 0:
+                    self._chrome_relaunch_count = 0
+                    logger.info("Chrome relaunch counter reset (process stable).")
                 await asyncio.sleep(2)
                 continue
 
             # Chrome has exited — check _running before relaunching
             if not self._running:
                 break
-            logger.warning(f"Chrome exited with code {chrome_proc.returncode}, relaunching...")
+
+            self._chrome_relaunch_count += 1
+            if self._chrome_relaunch_count > self._CHROME_MAX_RELAUNCH:
+                logger.error(
+                    "Chrome exited %d times — relaunch limit (%d) reached, "
+                    "giving up. Clear browser data or restart to recover.",
+                    self._chrome_relaunch_count - 1, self._CHROME_MAX_RELAUNCH,
+                )
+                self._chrome_failed = True
+                break
+
+            logger.warning(
+                "Chrome exited with code %s, relaunching (attempt %d/%d) in %.0fs...",
+                chrome_proc.returncode, self._chrome_relaunch_count,
+                self._CHROME_MAX_RELAUNCH, self._CHROME_RELAUNCH_INTERVAL,
+            )
+            await asyncio.sleep(self._CHROME_RELAUNCH_INTERVAL)
+            if not self._running:
+                break
             new_chrome = await self._relaunch_chrome()
             if new_chrome and self._procs:
                 self._procs["chrome"] = new_chrome
@@ -256,7 +350,7 @@ class BrowserService:
         self._running = True
         result = await self._do_start()
         if result.get("status") == "running":
-            asyncio.create_task(self._chrome_daemon())
+            self._chrome_task = asyncio.create_task(self._chrome_daemon())
         return result
 
     async def on_shutdown(self):
@@ -266,8 +360,14 @@ class BrowserService:
         even if ``on_startup`` never ran or the stack already exited.
         """
         self._running = False
-        # Give daemon a moment to notice
-        await asyncio.sleep(0.2)
+        # Cancel the daemon task promptly instead of relying on the next poll.
+        if self._chrome_task is not None and not self._chrome_task.done():
+            self._chrome_task.cancel()
+            try:
+                await self._chrome_task
+            except asyncio.CancelledError:
+                pass
+        self._chrome_task = None
         # Stop all
         if self._procs is not None:
             for name in ("websockify", "x11vnc", "chrome", "xvfb"):

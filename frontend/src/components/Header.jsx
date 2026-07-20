@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef, useCallback, useContext } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useStore } from '../store/useStore'
-import { ArrowLeft, Pencil, Play, RefreshCw, CheckCircle2, Settings, ChevronDown, FileCode, Cpu, Book, X, Loader2, AlertTriangle, Check, RotateCw, Redo2, Plus, Upload, FolderPlus, FileText, Loader, AlertCircle, Camera, Clock, ArrowUpDown, TerminalSquare, Lightbulb, Sun, Moon } from 'lucide-react'
-import { projectsAPI, filesAPI, notebooksAPI, libraryAPI } from '../api'
+import { ArrowLeft, Pencil, Play, RefreshCw, CheckCircle2, Settings, ChevronDown, FileCode, Cpu, Book, X, Loader2, AlertTriangle, Check, RotateCw, Redo2, Plus, Upload, FolderPlus, FileText, Loader, AlertCircle, Camera, Clock, ArrowUpDown, TerminalSquare, Lightbulb, Sun, Moon, Monitor, Trash2 } from 'lucide-react'
+import { projectsAPI, filesAPI, notebooksAPI, libraryAPI, browserAPI } from '../api'
 import { computeIsTexFile, getCompiledPreviewSource } from '../utils/constants'
 import { toastError, toastSuccess } from './Toast'
-import { ModalOverlay } from './Modal'
+import { ModalOverlay, ConfirmModal } from './Modal'
 import { LibraryActionsContext } from './LibraryActionsContext'
 import { Spinner } from './ui'
 import Toggle from './Toggle'
@@ -227,6 +227,7 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
   const setActiveTab = useStore(state => state.setActiveTab)
   const isRebuildingIndex = useStore(state => state.isRebuildingIndex)
   const setIsRebuildingIndex = useStore(state => state.setIsRebuildingIndex)
+  const bumpBrowserDataCleared = useStore(state => state.bumpBrowserDataCleared)
   const compiling = useStore(state => state.compiling)
   const compileFailed = useStore(state => state.compileFailed)
   const hasUnsavedChanges = useStore(state => state.hasUnsavedChanges)
@@ -263,6 +264,8 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
   // Rebuild index state
   const [showRebuildConfirm, setShowRebuildConfirm] = useState(false)
   const [rebuilding, setRebuilding] = useState(false)
+
+  const [showClearBrowserConfirm, setShowClearBrowserConfirm] = useState(false)
 
   // Snapshot settings
   const [snapshotInterval, setSnapshotInterval] = useState(5)
@@ -514,8 +517,25 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
     setShowRebuildConfirm(false)
   }
 
+  const handleClearBrowserConfirm = async () => {
+    if (!currentProject?.id) return
+    try {
+      await browserAPI.clearData(currentProject.id)
+      // The backend restarted the whole browser stack (websockify
+      // included); bump the counter so BrowserVNC remounts its iframe and
+      // opens a fresh WebSocket instead of staying stuck on the dead one.
+      bumpBrowserDataCleared()
+      toastSuccess(t('browser.dataCleared'))
+    } catch (e) {
+      toastError(e.message || t('browser.clearFailed'))
+      throw e
+    }
+  }
+
   // Show rebuild button only on Library tab (activeTab === 'library')
   const showRebuildButton = activeTab === 'library'
+
+  const showClearBrowserButton = activeTab === 'explore'
 
   // Determine what to show in the "Run" section of the dropdown
   const renderDropdown = () => (
@@ -649,6 +669,24 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
                   {t('editor.settings.rebuildIndex')}
                 </>
               )}
+            </button>
+          </div>
+        )}
+
+        {/* Clear Browser Data button — only on Explore tab */}
+        {showClearBrowserButton && (
+          <div>
+            <label className="flex items-center gap-2 text-[10px] font-black text-gray-400 uppercase tracking-widest mb-3"><Monitor className="w-3.5 h-3.5" /> {t('editor.settings.browser')}</label>
+            <button
+              type="button"
+              onClick={() => {
+                setShowClearBrowserConfirm(true)
+                setShowSettings(false)
+              }}
+              className="w-full bg-red-600 hover:bg-red-700 text-white px-4 py-2.5 rounded-xl flex items-center justify-center gap-2 text-xs font-bold transition-all"
+            >
+              <Trash2 className="w-4 h-4" />
+              {t('editor.settings.clearBrowserData')}
             </button>
           </div>
         )}
@@ -976,6 +1014,16 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
       onClose={() => setShowRebuildConfirm(false)}
       onConfirm={handleRebuildConfirm}
       rebuilding={rebuilding}
+    />
+
+    {/* Clear Browser Data confirmation */}
+    <ConfirmModal
+      isOpen={showClearBrowserConfirm}
+      onClose={() => setShowClearBrowserConfirm(false)}
+      onConfirm={handleClearBrowserConfirm}
+      title={t('browser.clearDataTitle')}
+      message={t('browser.clearDataConfirm')}
+      danger
     />
 
     {/* Snapshot Disable Warning Modal */}

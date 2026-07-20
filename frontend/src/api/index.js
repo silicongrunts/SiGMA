@@ -473,6 +473,7 @@ export const browserAPI = {
   getStatus: (projectId) => request(`/browser/${projectId}/status`),
   start: (projectId) => request(`/browser/${projectId}/start`, { method: 'POST' }),
   stop: (projectId) => request(`/browser/${projectId}/stop`, { method: 'POST' }),
+  clearData: (projectId) => request(`/browser/${projectId}/clear-data`, { method: 'POST' }),
 }
 
 // ---------------------------------------------------------------------------
