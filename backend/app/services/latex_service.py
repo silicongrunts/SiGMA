@@ -91,6 +91,11 @@ class LaTeXService:
         try:
             backups = self._backup_existing_temp_outputs(compile_dir)
             keep_outputs = self._snapshot_keep_outputs(compile_dir)
+            # Snapshot the PDF's mtime BEFORE running latexmk so the finalizer
+            # can tell a freshly written PDF apart from one left over from a
+            # previous successful compile (latexmk -f preserves the old file
+            # when the current run fails outright).
+            prior_pdf_mtime = self._pdf_mtime(compile_dir)
             success, stdout, stderr = await self._run_latexmk(
                 compile_dir, main_name, engine
             )
@@ -105,8 +110,9 @@ class LaTeXService:
                 self._relative_output_pdf(main_file),
                 log_content,
                 main_file,
+                prior_pdf_mtime,
             )
-            if not result.get("success"):
+            if not result.get("success") and not result.get("pdf_path"):
                 self._cleanup_failed_keep_outputs(compile_dir, keep_outputs)
             return result
         finally:
@@ -122,34 +128,76 @@ class LaTeXService:
         output_path: str,
         log_content: str,
         main_file: str,
+        prior_pdf_mtime: Optional[int],
     ) -> Dict[str, Any]:
         synctex_file = compile_dir / f"{LATEX_OUTPUT_BASE}.synctex.gz"
         pdf_file = compile_dir / f"{LATEX_OUTPUT_BASE}.pdf"
 
-        if compilation_successful and pdf_file.exists():
-            if pdf_file.stat().st_size < 1000:
-                return {"success": False, "log": log_content, "error": "Generated PDF is too small (likely corrupted)"}
+        # Classify the PDF in one pass: ``produced_this_run`` rejects a file
+        # left over from a previous successful compile when the current run
+        # failed outright (latexmk -f preserves the old file). ``valid`` adds
+        # the size and magic-header checks that mark a file as actually usable.
+        try:
+            st = pdf_file.stat()
+            produced_this_run = st.st_mtime_ns != prior_pdf_mtime
+            size = st.st_size
+        except OSError:
+            produced_this_run = False
+            size = 0
+        valid = (
+            produced_this_run
+            and size >= 1000
+            and self._has_pdf_magic_header(pdf_file)
+        )
 
-            with open(pdf_file, "rb") as f:
-                header = f.read(4)
-                if header != b"%PDF":
-                    return {"success": False, "log": log_content, "error": "Invalid PDF generated"}
+        # Sanitize synctex whenever a usable PDF is exposed, so source↔PDF
+        # jumps work in both the clean and the compiled-with-errors cases.
+        if valid and synctex_file.exists():
+            self._sanitize_synctex(synctex_file, str(compile_dir))
 
-            if synctex_file.exists():
-                self._sanitize_synctex(synctex_file, str(compile_dir))
-
+        if compilation_successful and valid:
             return {
                 "success": True, "log": log_content,
                 "pdf_path": output_path,
                 "diagnostics": [],
             }
 
-        # Compilation ran but failed — return the log so the user can
-        # see what went wrong.  This is a normal business outcome, NOT
-        # an HTTP error.
-        error_msg = "PDF not generated" if not pdf_file.exists() else "Compilation failed"
         diagnostics = self._parse_diagnostics(log_content, main_file)
+
+        # Errors present but a usable PDF was still produced (latexmk -f keeps
+        # going past non-fatal errors). Surface diagnostics AND the pdf_path so
+        # the frontend can refresh the preview while still flagging the log.
+        if valid:
+            return {
+                "success": False, "log": log_content,
+                "error": "Compilation completed with errors",
+                "pdf_path": output_path,
+                "diagnostics": diagnostics,
+            }
+
+        # No usable PDF this run. ``produced_this_run`` distinguishes a corrupt
+        # output written this run from a file that latexmk never touched.
+        if not produced_this_run:
+            error_msg = "PDF not generated"
+        elif size < 1000:
+            error_msg = "Generated PDF is too small (likely corrupted)"
+        else:
+            error_msg = "Invalid PDF generated"
         return {"success": False, "log": log_content, "error": error_msg, "diagnostics": diagnostics}
+
+    @staticmethod
+    def _pdf_mtime(compile_dir: Path) -> Optional[int]:
+        """Return the PDF's mtime in nanoseconds, or None if it does not exist."""
+        pdf_file = compile_dir / f"{LATEX_OUTPUT_BASE}.pdf"
+        try:
+            return pdf_file.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    @staticmethod
+    def _has_pdf_magic_header(pdf_file: Path) -> bool:
+        with open(pdf_file, "rb") as f:
+            return f.read(4) == b"%PDF"
 
     # ------------------------------------------------------------------
     # Log parsing

@@ -1,9 +1,12 @@
 /**
  * useCompile — unified LaTeX compilation hook.
  *
- * Guards compilation behind isTexFile (set by useFileActions). On success,
- * bumps previewSource.compileVersion; the Preview component's load effect
- * re-fetches the freshly compiled PDF. On failure, opens the log modal.
+ * Guards compilation behind isTexFile (set by useFileActions). When the
+ * response carries a pdf_path (clean compile, or errors-but-PDF-still-made),
+ * bumps previewSource.compileVersion so the Preview component's load effect
+ * re-fetches the freshly compiled PDF. When success is false, flashes the
+ * log button yellow; only when there is no usable PDF does it open the log
+ * modal / toast.
  *
  * Pre-compile save delegates to handleSave() so conflict detection is
  * handled uniformly.
@@ -55,8 +58,13 @@ export function useCompile({ projectId, editorRef, previewRef, handleSave }) {
       state.setCompileLogs(res.log)
       state.setCompileDiagnostics(res.diagnostics || [])
 
-      if (res.success) {
-        state.setCompileFailed(false)
+      // Decide preview refresh, log-button flash, and error modal from two
+      // independent signals: pdf_path (a usable PDF exists) and success
+      // (the compile was clean). Three outcomes:
+      //   - clean + PDF        → refresh preview
+      //   - errors + PDF       → refresh preview AND flash log yellow
+      //   - errors + no PDF    → flash log yellow AND open error modal
+      if (res.pdf_path) {
         const current = useStore.getState()
         const ps = current.previewSource
         const currentOutputName = ps.outputName || getCompiledPdfName(ps.mainFile || ps.path)
@@ -66,9 +74,13 @@ export function useCompile({ projectId, editorRef, previewRef, handleSave }) {
           // function of the store (no hidden blob-passing side channel).
           current.bumpCompileVersion()
         }
-      } else {
+      }
+
+      if (!res.success) {
         state.setCompileFailed(true)
-        if (!isSilent) {
+        // No PDF to show → surface the error log. When a PDF exists, the
+        // flashing log button alone is enough (see the truth table above).
+        if (!res.pdf_path && !isSilent) {
           toastError(t('compile.failed'))
           state.setShowLogModal(true)
         }

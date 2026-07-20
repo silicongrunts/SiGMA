@@ -131,6 +131,183 @@ async def test_compile_engines_use_latexmk_flags(tmp_path, monkeypatch, engine, 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
+async def test_compile_returns_pdf_path_when_errors_but_pdf_usable(tmp_path, monkeypatch):
+    """Errors present but a usable PDF was produced → success=False with pdf_path."""
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    (project_path / "main.tex").write_text(
+        "\\documentclass{article}\\begin{document}Hello\\end{document}",
+        encoding="utf-8",
+    )
+    # A log containing an Undefined control sequence error so _parse_diagnostics
+    # yields at least one diagnostic entry.
+    error_log = (
+        "! Undefined control sequence.\n"
+        "l.5 \\fakemacro\n"
+    )
+
+    async def fake_run_latexmk(compile_dir_arg, main_name, engine_arg):
+        (compile_dir_arg / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
+        return False, error_log, ""
+
+    class FakeSettings:
+        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
+        DEFAULT_LATEX_ENGINE = "pdflatex"
+
+        def get_project_path(self, project_id):
+            return project_path
+
+    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    service = LaTeXService()
+    monkeypatch.setattr(service, "_run_latexmk", fake_run_latexmk)
+
+    with patch.object(
+        project_service_module.project_service,
+        "get_project",
+        new_callable=AsyncMock,
+        return_value={"id": "x", "main_file": "main.tex", "engine": "pdflatex"},
+    ):
+        result = await service.compile("x")
+
+    assert result["success"] is False
+    assert result["pdf_path"] == "output.pdf"
+    assert result["error"] == "Compilation completed with errors"
+    assert any(d["severity"] == "error" for d in result["diagnostics"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+async def test_compile_no_pdf_path_when_errors_and_no_pdf(tmp_path, monkeypatch):
+    """Errors present and no PDF produced → success=False without pdf_path."""
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    (project_path / "main.tex").write_text(
+        "\\documentclass{article}\\begin{document}Hello\\end{document}",
+        encoding="utf-8",
+    )
+    error_log = "! Undefined control sequence.\nl.5 \\fakemacro\n"
+
+    async def fake_run_latexmk(compile_dir_arg, main_name, engine_arg):
+        return False, error_log, ""
+
+    class FakeSettings:
+        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
+        DEFAULT_LATEX_ENGINE = "pdflatex"
+
+        def get_project_path(self, project_id):
+            return project_path
+
+    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    service = LaTeXService()
+    monkeypatch.setattr(service, "_run_latexmk", fake_run_latexmk)
+
+    with patch.object(
+        project_service_module.project_service,
+        "get_project",
+        new_callable=AsyncMock,
+        return_value={"id": "x", "main_file": "main.tex", "engine": "pdflatex"},
+    ):
+        result = await service.compile("x")
+
+    assert result["success"] is False
+    assert "pdf_path" not in result
+    assert result["error"] == "PDF not generated"
+    assert any(d["severity"] == "error" for d in result["diagnostics"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+async def test_failed_compile_with_usable_pdf_keeps_pdf(tmp_path, monkeypatch):
+    """A failed compile that still produced a usable PDF must NOT delete it."""
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    (project_path / "main.tex").write_text(
+        "\\documentclass{article}\\begin{document}Hello\\end{document}",
+        encoding="utf-8",
+    )
+    error_log = "! Undefined control sequence.\nl.5 \\fakemacro\n"
+
+    async def fake_run_latexmk(compile_dir_arg, main_name, engine_arg):
+        (compile_dir_arg / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
+        return False, error_log, ""
+
+    class FakeSettings:
+        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
+        DEFAULT_LATEX_ENGINE = "pdflatex"
+
+        def get_project_path(self, project_id):
+            return project_path
+
+    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    service = LaTeXService()
+    monkeypatch.setattr(service, "_run_latexmk", fake_run_latexmk)
+
+    with patch.object(
+        project_service_module.project_service,
+        "get_project",
+        new_callable=AsyncMock,
+        return_value={"id": "x", "main_file": "main.tex", "engine": "pdflatex"},
+    ):
+        result = await service.compile("x")
+
+    assert result["success"] is False
+    assert result.get("pdf_path") == "output.pdf"
+    # The freshly produced PDF survives the post-compile cleanup so the
+    # frontend can actually fetch it.
+    assert (project_path / "output.pdf").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+async def test_compile_no_pdf_path_when_previous_pdf_left_untouched(tmp_path, monkeypatch):
+    """A failed run that leaves a previous successful PDF on disk must NOT
+    report pdf_path — otherwise the frontend would refresh the preview with a
+    stale PDF and skip the error modal. Regression for the case where the user
+    clears a working document and recompiles something that fails outright.
+    """
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    (project_path / "main.tex").write_text(
+        "\\documentclass{article}\\begin{document}Hello\\end{document}",
+        encoding="utf-8",
+    )
+    # Simulate a PDF left over from a PRIOR successful compile. fake_run_latexmk
+    # below does NOT touch it, so its mtime stays equal to the pre-compile
+    # snapshot and the finalizer must classify it as "not produced this run".
+    stale_pdf = project_path / "output.pdf"
+    stale_pdf.write_bytes(b"%PDF" + b"x" * 1200)
+    error_log = "! Undefined control sequence.\nl.5 \\fakemacro\n"
+
+    async def fake_run_latexmk(compile_dir_arg, main_name, engine_arg):
+        # Failed run — no PDF written.
+        return False, error_log, ""
+
+    class FakeSettings:
+        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
+        DEFAULT_LATEX_ENGINE = "pdflatex"
+
+        def get_project_path(self, project_id):
+            return project_path
+
+    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    service = LaTeXService()
+    monkeypatch.setattr(service, "_run_latexmk", fake_run_latexmk)
+
+    with patch.object(
+        project_service_module.project_service,
+        "get_project",
+        new_callable=AsyncMock,
+        return_value={"id": "x", "main_file": "main.tex", "engine": "pdflatex"},
+    ):
+        result = await service.compile("x")
+
+    assert result["success"] is False
+    assert "pdf_path" not in result
+    assert result["error"] == "PDF not generated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
 async def test_compile_runs_in_nested_main_file_directory(tmp_path, monkeypatch):
     project_path = tmp_path / "project"
     source_dir = project_path / "chapters"
