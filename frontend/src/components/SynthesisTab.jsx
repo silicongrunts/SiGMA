@@ -27,6 +27,7 @@ export default function SynthesisTab({
   handleExitNotebook,
   onFileReady,
   onSaveBeforeAnnotationChat,
+  onApplyDiffSave,
 }) {
   const { t } = useTranslation()
   const currentFile = useStore(s => s.currentFile)
@@ -177,6 +178,7 @@ export default function SynthesisTab({
                 ref={editorRef}
                 onFileReady={onFileReady}
                 onSaveBeforeAnnotationChat={onSaveBeforeAnnotationChat}
+                onApplyDiffSave={onApplyDiffSave}
                 onContentChange={(c) => {
                   setHasUnsavedChanges(true)
                   if (currentFile?.endsWith('.md')) {

@@ -188,6 +188,19 @@ export default function EditorView() {
     }
   }, [handleSave])
 
+  // ── Save editor content after applying an annotation diff ──
+  // Save without compiling: applying a diff is an edit, not a build trigger.
+  // handleSave also runs `syncAnnotationsNow`, which is the real reason we
+  // save here — it realigns annotation positions with the decorations so the
+  // next click doesn't hit the fuzzy matcher with stale state.
+  const saveAfterApplyDiff = useCallback(async () => {
+    try {
+      return await handleSave(false, false)
+    } catch {
+      return false
+    }
+  }, [handleSave])
+
   // ── Ask SiGMA from LogModal ──
   const handleAskSiGMA = useCallback((logs) => {
     setShowLogModal(false)
@@ -592,6 +605,7 @@ export default function EditorView() {
                 handleExitNotebook={handleExitNotebook}
                 onFileReady={handleFileReady}
                 onSaveBeforeAnnotationChat={saveBeforeChat}
+                onApplyDiffSave={saveAfterApplyDiff}
               />
             ) : activeTab === 'explore' ? (
               <BrowserVNC projectId={projectId} />

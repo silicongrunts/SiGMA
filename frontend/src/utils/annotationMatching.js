@@ -8,37 +8,11 @@
  *   1. Exact match at stored position          → status='exact'  (solid underline)
  *   2. Exact match elsewhere, unique            → status='exact'  (solid)
  *   3. Exact match elsewhere, multiple          → status='fuzzy'  (dashed), closest pos
- *   4. Fuzzy match via Levenshtein sliding window → status='fuzzy' (dashed), >=40% similarity
+ *   4. Fuzzy match (LCS or Myers, best wins)    → status='fuzzy'  (dashed), >=40% similarity
  *   5. No match                                 → status='orphan' (dashed, pinned at doc end)
  */
 
-/**
- * Compute Levenshtein edit distance between two strings.
- * O(n*m) DP with 2-row optimization.
- */
-function levenshtein(a, b) {
-  if (a.length === 0) return b.length
-  if (b.length === 0) return a.length
-
-  let prev = Array.from({ length: b.length + 1 }, (_, i) => i)
-  let curr = new Array(b.length + 1).fill(0)
-
-  for (let i = 0; i < a.length; i++) {
-    curr[0] = i + 1
-    for (let j = 0; j < b.length; j++) {
-      const cost = a[i] === b[j] ? 0 : 1
-      curr[j + 1] = Math.min(
-        curr[j] + 1,       // insertion
-        prev[j + 1] + 1,   // deletion
-        prev[j] + cost     // substitution
-      )
-    }
-    const tmp = prev; prev = curr; curr = tmp
-    curr.fill(0)
-  }
-
-  return prev[b.length]
-}
+import search from 'approx-string-match'
 
 /**
  * Find the longest common substring (contiguous) between two strings.
@@ -100,42 +74,45 @@ export function findAllOccurrences(doc, needle) {
 }
 
 /**
- * Fuzzy match: find the best-matching substring in the search region
- * using Levenshtein-distance ratio on a sliding window.
+ * Fuzzy match: find the best-matching substring of `doc` for `originalText`,
+ * constrained to the stored anchor neighborhood.
  *
- * Returns { from, to, originalText, score } or null if no match >= threshold.
+ * Uses Myers' bit-vector approximate string matching (O((k/w)·n) where k is
+ * the error budget and w is the 32-bit word size), with Ukkonen-style cutoff
+ * that stops expanding any region whose error count exceeds `maxDistance`.
+ *
+ * Returns { from, to, originalText, score } or null if no match within
+ * `maxDistance` (≈ 15% of original length, clamped to [20, 200]).
  */
 function fuzzyFind(originalText, doc, storedFrom, storedTo) {
   const len = originalText.length
+  // Restrict the search to a neighborhood around the stored anchor so we
+  // don't match similar text elsewhere in the document.
   const searchStart = Math.max(0, storedFrom - len)
   const searchEnd = Math.min(doc.length, storedTo + len)
+  const region = doc.slice(searchStart, searchEnd)
 
-  // Minimum window length: at least 1 char or 30% of original length
-  const minWin = Math.max(1, Math.floor(len * 0.3))
-  // Maximum window length: original length + 50%
-  const maxWin = Math.min(doc.length - searchStart, Math.ceil(len * 1.5))
+  // Allow ~15% of characters to differ, bounded so short annotations stay
+  // matchable and long ones don't blow up the band width.
+  const maxDistance = Math.min(200, Math.max(20, Math.floor(len * 0.15)))
 
-  let bestScore = 0
-  let bestMatch = null
+  // `search` returns only the lowest-error matches. Among equal-error
+  // matches, pick the highest score (shortest span relative to original).
+  const matches = search(region, originalText, maxDistance)
+  if (matches.length === 0) return null
 
-  // Slide variable-length windows across the search region
-  for (let i = searchStart; i < searchEnd; i++) {
-    for (let w = minWin; w <= maxWin && i + w <= doc.length; w++) {
-      const candidate = doc.slice(i, i + w)
-      const dist = levenshtein(originalText, candidate)
-      const score = 1 - dist / Math.max(len, w)
-
-      if (score >= 0.4 && score > bestScore + 0.001) {
-        bestScore = score
-        bestMatch = { from: i, to: i + w, originalText: candidate, score }
-      } else if (score >= 0.4 && Math.abs(score - bestScore) < 0.001 && w < (bestMatch?.to - bestMatch?.from)) {
-        // Tiebreaker: prefer shorter windows with equal scores (cleaner match)
-        bestMatch = { from: i, to: i + w, originalText: candidate, score }
-      }
-    }
+  const best = matches.reduce((p, m) => {
+    const s = 1 - m.errors / Math.max(len, m.end - m.start)
+    return s > p.score ? { score: s, start: m.start, end: m.end, errors: m.errors } : p
+  }, { score: -1 })
+  const from = searchStart + best.start
+  const to = searchStart + best.end
+  return {
+    from,
+    to,
+    originalText: doc.slice(from, to),
+    score: best.score,
   }
-
-  return bestMatch
 }
 
 /**
@@ -186,9 +163,12 @@ export function matchAnnotation(doc, annotation) {
   }
 
   // ── Tier 4: Fuzzy match ──
-  // Compute both LCS (clean contiguous) and Levenshtein (handles substitutions).
-  // Pick the one with the higher similarity score.
-  // On tie, prefer LCS (cleaner, fewer extraneous characters).
+  // Two independent matchers, both must score >= 0.4 to be accepted:
+  //   4a: longest common substring — clean contiguous overlap, good when
+  //       the text was moved but barely edited
+  //   4b: Myers bit-vector search — tolerates substitutions/indels, good
+  //       when the text was lightly edited in place
+  // Keep the higher score; on tie prefer LCS (cleaner span).
 
   const searchStart = Math.max(0, storedFrom - len)
   const searchEnd = Math.min(doc.length, storedTo + len)
@@ -215,7 +195,7 @@ export function matchAnnotation(doc, annotation) {
     }
   }
 
-  // 4b: Find best Levenshtein sliding-window match
+  // 4b: Myers bit-vector search
   const fuzzy = fuzzyFind(originalText, doc, storedFrom ?? 0, storedTo ?? 0)
 
   // Pick the better match

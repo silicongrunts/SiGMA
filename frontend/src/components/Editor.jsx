@@ -157,7 +157,7 @@ const getLanguage = (path) => {
 let _pendingCounter = 0
 function _genPendingId() { return `pending_${Date.now()}_${++_pendingCounter}` }
 
-const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll }, ref) => {
+const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll, onApplyDiffSave }, ref) => {
   const { t } = useTranslation()
   const containerRef = useRef(null); const viewRef = useRef(null); const cursorRef = useRef({ line: 1, column: 0 })
   const autoSaveTimerRef = useRef(null)
@@ -228,8 +228,8 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   const compileDiagnostics = useStore(s => s.compileDiagnostics)
   const { isDark } = useTheme()
 
-  const callbacks = useRef({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll })
-  useEffect(() => { callbacks.current = { onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll } })
+  const callbacks = useRef({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll, onApplyDiffSave })
+  useEffect(() => { callbacks.current = { onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll, onApplyDiffSave } })
 
   // ── Annotation helpers ──────────────────────────────────────────────
 
@@ -542,11 +542,16 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       }
     }).filter(Boolean)
 
+    // Seed the store so the save path's `syncAnnotationsNow` sees these
+    // annotations (it no-ops on an empty store). `syncAnnotationsNow` then
+    // re-derives positions straight from the CodeMirror decorations, which
+    // is more accurate than the delta arithmetic above, so the revalidated
+    // array is intentionally overwritten shortly after.
     setAnnotations(revalidated)
 
-    try { await filesAPI.saveAnnotations(currentProject.id, currentFile, revalidated) } catch { /* non-critical */ }
     if (callbacks.current.onContentChange) callbacks.current.onContentChange(view.state.doc.toString())
-  }, [currentProject?.id, currentFile, setAnnotations, getDecorationPosition])
+    try { await callbacks.current.onApplyDiffSave?.() } catch { /* non-critical: save failure surfaces elsewhere */ }
+  }, [setAnnotations, getDecorationPosition])
 
   const revalidateBackendAnnotations = useCallback((annos) => {
     const view = viewRef.current
