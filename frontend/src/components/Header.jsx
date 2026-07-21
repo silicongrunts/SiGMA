@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useContext } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useStore } from '../store/useStore'
-import { ArrowLeft, Pencil, Play, RefreshCw, CheckCircle2, Settings, ChevronDown, FileCode, Cpu, Book, X, Loader2, AlertTriangle, Check, RotateCw, Redo2, Plus, Upload, FolderPlus, FileText, Loader, AlertCircle, Camera, Clock, ArrowUpDown, TerminalSquare, Lightbulb, Sun, Moon, Monitor, Trash2 } from 'lucide-react'
+import { ArrowLeft, Pencil, Play, RefreshCw, CheckCircle2, Settings, ChevronDown, FileCode, Cpu, Book, X, Loader2, AlertTriangle, Check, RotateCw, Redo2, Plus, Upload, FolderPlus, FileText, Loader, AlertCircle, Camera, Clock, ArrowUpDown, TerminalSquare, Lightbulb, Sun, Moon, Monitor, Trash2, Palette, Minus } from 'lucide-react'
 import { projectsAPI, filesAPI, notebooksAPI, libraryAPI, browserAPI } from '../api'
 import { computeIsTexFile, getCompiledPreviewSource } from '../utils/constants'
 import { toastError, toastSuccess } from './Toast'
@@ -11,6 +11,9 @@ import { Spinner } from './ui'
 import Toggle from './Toggle'
 import LanguageSelector from './LanguageSelector'
 import { useTheme } from '../hooks/useTheme'
+import { useEditorAppearance } from '../hooks/useEditorAppearance'
+import { FONT_OPTIONS } from '../utils/editorFonts'
+import { HIGHLIGHT_SCHEMES, getSchemePreviewColors } from '../utils/highlightSchemes'
 
 /**
  * Confirmation modal for rebuilding RAG index.
@@ -237,6 +240,7 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
   const isTexFile = useStore(state => state.isTexFile)
 
   const { isDark, toggleTheme } = useTheme()
+  const { appearance, setEditorAppearance } = useEditorAppearance()
   const { t } = useTranslation()
 
   const currentFile = useStore(state => state.currentFile)
@@ -255,6 +259,7 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
 
   const [showSettings, setShowSettings] = useState(false)
   const [showKernelModal, setShowKernelModal] = useState(false)
+  const [showEditorThemeModal, setShowEditorThemeModal] = useState(false)
   const [showLibraryAddMenu, setShowLibraryAddMenu] = useState(false)
   const [libraryStatusPopup, setLibraryStatusPopup] = useState(null) // key of open status popup
   const libraryAddMenuRef = useRef(null)
@@ -382,6 +387,19 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
   }, [showKernelModal])
+
+  // Click outside to close editor theme modal
+  const editorThemeModalRef = useRef(null)
+  useEffect(() => {
+    if (!showEditorThemeModal) return
+    const handler = (e) => {
+      if (editorThemeModalRef.current && !editorThemeModalRef.current.contains(e.target)) {
+        setShowEditorThemeModal(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showEditorThemeModal])
 
   // Load TeX files when settings open
   useEffect(() => {
@@ -691,10 +709,10 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
           </div>
         )}
 
-        {/* Appearance — dark mode toggle */}
+        {/* Appearance — dark mode, language, and editor theme (synthesis only) */}
         <div>
           <label className="flex items-center gap-2 text-[10px] font-black text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-3">
-            {isDark ? <Moon className="w-3.5 h-3.5" /> : <Sun className="w-3.5 h-3.5" />} {t('settings.darkMode')}
+            {isDark ? <Moon className="w-3.5 h-3.5" /> : <Sun className="w-3.5 h-3.5" />} {t('settings.appearance')}
           </label>
           <div className="flex items-center justify-between px-3 py-2.5 bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-700 rounded-xl">
             <span className="text-xs font-bold text-gray-700 dark:text-gray-300">{t('editor.settings.darkMode')}</span>
@@ -704,6 +722,16 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
             <span className="text-xs font-bold text-gray-700 dark:text-gray-300">{t('settings.language')}</span>
             <LanguageSelector />
           </div>
+          {activeTab === 'synthesis' && (
+            <button
+              type="button"
+              onClick={() => { setShowEditorThemeModal(true); setShowSettings(false) }}
+              className="w-full mt-2 bg-sigma-600 hover:bg-sigma-700 text-white px-4 py-2.5 rounded-xl flex items-center justify-center gap-2 text-xs font-bold transition-all"
+            >
+              <Palette className="w-4 h-4" />
+              {t('editor.settings.editorTheme')}
+            </button>
+          )}
         </div>
 
       </div>
@@ -765,6 +793,127 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
               </div>
             ))
           )}
+        </div>
+      </div>
+    )
+  }
+
+  // Editor theme modal — anchored popover (mirrors renderKernelModal structure).
+  // This is a documented exception to CLAUDE.md rule 8: the kernels popover is
+  // the established pattern for settings-anchored panels in this dropdown, so
+  // we mirror it rather than using the centered ModalOverlay primitive.
+  const renderEditorThemeModal = () => {
+    if (!showEditorThemeModal) return null
+    return (
+      <div
+        ref={editorThemeModalRef}
+        className="absolute top-full right-0 mt-2 w-96 bg-white/95 dark:bg-gray-800/95 backdrop-blur-xl border border-gray-200 dark:border-gray-700 shadow-[0_20px_50px_rgba(0,0,0,0.15)] rounded-2xl p-5 z-[100] animate-in fade-in zoom-in duration-200"
+      >
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-bold text-gray-800 dark:text-gray-200 flex items-center gap-2">
+            <Palette className="w-4 h-4" />
+            {t('editor.settings.editorTheme')}
+          </h3>
+          <button
+            type="button"
+            onClick={() => setShowEditorThemeModal(false)}
+            className="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-md transition-colors"
+          >
+            <X className="w-4 h-4 text-gray-400 dark:text-gray-500" />
+          </button>
+        </div>
+
+        {/* Font family */}
+        <div className="mb-4">
+          <label className="block text-[10px] font-black text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-2">
+            {t('editor.appearance.fontFamily')}
+          </label>
+          <div className="grid grid-cols-2 gap-1.5">
+            {FONT_OPTIONS.map(font => (
+              <button
+                key={font.id}
+                type="button"
+                onClick={() => setEditorAppearance({ fontFamily: font.id })}
+                className={`px-3 py-2 rounded-lg text-xs border transition-all text-left ${appearance.fontFamily === font.id ? 'bg-sigma-50 dark:bg-sigma-600/30 border-sigma-600 text-sigma-700 dark:text-sigma-200 font-bold' : 'bg-gray-50 dark:bg-gray-900 border-gray-100 dark:border-gray-800 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-700'}`}
+                style={{ fontFamily: font.css }}
+              >
+                {font.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Font size */}
+        <div className="mb-4">
+          <label className="block text-[10px] font-black text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-2">
+            {t('editor.appearance.fontSize')}
+          </label>
+          <div className="flex items-center justify-between bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-lg px-3 py-2">
+            <button
+              type="button"
+              onClick={() => setEditorAppearance({ fontSize: appearance.fontSize - 1 })}
+              disabled={appearance.fontSize <= 12}
+              className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+            >
+              <Minus className="w-3.5 h-3.5" />
+            </button>
+            <span className="text-xs font-bold text-gray-700 dark:text-gray-300">{appearance.fontSize}px</span>
+            <button
+              type="button"
+              onClick={() => setEditorAppearance({ fontSize: appearance.fontSize + 1 })}
+              disabled={appearance.fontSize >= 20}
+              className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Line height */}
+        <div className="mb-4">
+          <label className="flex items-center justify-between text-[10px] font-black text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-2">
+            <span>{t('editor.appearance.lineHeight')}</span>
+            <span className="text-gray-600 dark:text-gray-400 normal-case font-bold tracking-normal">{appearance.lineHeight.toFixed(1)}</span>
+          </label>
+          <input
+            type="range"
+            min={1.2}
+            max={2.0}
+            step={0.1}
+            value={appearance.lineHeight}
+            onChange={(e) => setEditorAppearance({ lineHeight: parseFloat(e.target.value) })}
+            className="w-full h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full appearance-none cursor-pointer accent-sigma-600"
+          />
+        </div>
+
+        {/* Syntax scheme */}
+        <div>
+          <label className="block text-[10px] font-black text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-2">
+            {t('editor.appearance.syntaxScheme')}
+          </label>
+          <div className="space-y-1.5">
+            {HIGHLIGHT_SCHEMES.map(scheme => {
+              const colors = getSchemePreviewColors(scheme.id, isDark)
+              const selected = appearance.syntaxScheme === scheme.id
+              return (
+                <button
+                  key={scheme.id}
+                  type="button"
+                  onClick={() => setEditorAppearance({ syntaxScheme: scheme.id })}
+                  className={`w-full px-3 py-2 rounded-lg text-xs border transition-all flex items-center justify-between ${selected ? 'bg-sigma-50 dark:bg-sigma-600/30 border-sigma-600' : 'bg-gray-50 dark:bg-gray-900 border-gray-100 dark:border-gray-800 hover:border-gray-300 dark:hover:border-gray-700'}`}
+                >
+                  <span className={`font-bold ${selected ? 'text-sigma-700 dark:text-sigma-200' : 'text-gray-700 dark:text-gray-300'}`}>{scheme.label}</span>
+                  {/* Token color preview swatches */}
+                  <span className="flex items-center gap-1 font-mono text-[10px]">
+                    <span style={{ color: colors.keyword }}>kw</span>
+                    <span style={{ color: colors.string }}>str</span>
+                    <span style={{ color: colors.comment }}>//</span>
+                    <span style={{ color: colors.name }}>fn</span>
+                  </span>
+                </button>
+              )
+            })}
+          </div>
         </div>
       </div>
     )
@@ -1005,6 +1154,8 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
 
         {/* Kernel modal — rendered as a sibling, with its own ref for click-outside */}
         {renderKernelModal()}
+        {/* Editor theme modal — same anchored-popover pattern */}
+        {renderEditorThemeModal()}
       </div>
     </header>
 

@@ -26,10 +26,31 @@ const MAX_FILE_STATE_ENTRIES = 20
 /** Language codes supported by the UI. Order is the selector display order. */
 const SUPPORTED_LANGUAGE_CODES = ['en', 'zh-CN', 'zh-TW', 'ja', 'ko', 'hi', 'es', 'fr']
 
+/**
+ * Editor appearance option whitelists. Kept here (rather than imported from the
+ * registry in utils/) so the storage layer never depends on a higher layer.
+ * If the registry in utils/editorFonts.js or utils/highlightSchemes.js adds or
+ * removes an option, update the matching array here too.
+ */
+const EDITOR_FONT_IDS = ['jetbrains-mono', 'fira-code', 'cascadia-code', 'source-code-pro', 'roboto-mono', 'system']
+const EDITOR_SCHEME_IDS = ['default', 'github', 'solarized', 'dracula', 'monokai']
+const EDITOR_FONT_SIZE_MIN = 12
+const EDITOR_FONT_SIZE_MAX = 20
+const EDITOR_LINE_HEIGHT_MIN = 1.2
+const EDITOR_LINE_HEIGHT_MAX = 2.0
+
+const DEFAULT_EDITOR_APPEARANCE = Object.freeze({
+  fontFamily: 'jetbrains-mono',
+  fontSize: 14,
+  lineHeight: 1.5,
+  syntaxScheme: 'default',
+})
+
 const DEFAULT_GLOBAL_STATE = Object.freeze({
   version: STORAGE_VERSION,
   theme: 'light',
   language: null,
+  editorAppearance: { ...DEFAULT_EDITOR_APPEARANCE },
   updatedAt: 0,
 })
 
@@ -136,6 +157,22 @@ function sanitizeLanguage(value) {
   return SUPPORTED_LANGUAGE_CODES.includes(value) ? value : null
 }
 
+function sanitizeEditorAppearance(value) {
+  const source = isPlainObject(value) ? value : {}
+  const fontSize = Math.round(Number(source.fontSize))
+  const lineHeight = Math.round(Number(source.lineHeight) * 10) / 10
+  return {
+    fontFamily: EDITOR_FONT_IDS.includes(source.fontFamily) ? source.fontFamily : DEFAULT_EDITOR_APPEARANCE.fontFamily,
+    fontSize: Number.isSafeInteger(fontSize) && fontSize >= EDITOR_FONT_SIZE_MIN && fontSize <= EDITOR_FONT_SIZE_MAX
+      ? fontSize
+      : DEFAULT_EDITOR_APPEARANCE.fontSize,
+    lineHeight: Number.isFinite(lineHeight) && lineHeight >= EDITOR_LINE_HEIGHT_MIN && lineHeight <= EDITOR_LINE_HEIGHT_MAX
+      ? lineHeight
+      : DEFAULT_EDITOR_APPEARANCE.lineHeight,
+    syntaxScheme: EDITOR_SCHEME_IDS.includes(source.syntaxScheme) ? source.syntaxScheme : DEFAULT_EDITOR_APPEARANCE.syntaxScheme,
+  }
+}
+
 function sanitizeBudget(value) {
   const n = Number(value)
   return Number.isSafeInteger(n) && n > 0 ? n : null
@@ -192,6 +229,7 @@ function sanitizeGlobalState(value) {
     version: STORAGE_VERSION,
     theme: sanitizeTheme(source.theme),
     language: sanitizeLanguage(source.language),
+    editorAppearance: sanitizeEditorAppearance(source.editorAppearance),
     updatedAt: Number.isFinite(source.updatedAt) ? source.updatedAt : 0,
   }
 }
@@ -621,6 +659,17 @@ export const storage = {
   setLanguage(value) {
     const language = sanitizeLanguage(value)
     if (language) this.setGlobal({ language })
+  },
+
+  getEditorAppearance() {
+    return this.getGlobal().editorAppearance
+  },
+
+  setEditorAppearance(patch) {
+    if (!isPlainObject(patch)) return
+    this.setGlobal((current) => ({
+      editorAppearance: sanitizeEditorAppearance({ ...current.editorAppearance, ...patch }),
+    }))
   },
 
   getWorkspace(projectId) {

@@ -8,8 +8,7 @@ import { bracketMatching } from '@codemirror/language'
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { searchKeymap, highlightSelectionMatches } from '@codemirror/search'
 import { lintKeymap, setDiagnostics } from '@codemirror/lint'
-import { indentOnInput, syntaxHighlighting, defaultHighlightStyle, foldGutter } from '@codemirror/language'
-import { oneDarkHighlightStyle } from '@codemirror/theme-one-dark'
+import { indentOnInput, foldGutter } from '@codemirror/language'
 import { lineNumbers, highlightActiveLine, highlightActiveLineGutter, dropCursor } from '@codemirror/view'
 
 import { StreamLanguage } from '@codemirror/language'
@@ -20,9 +19,13 @@ import { javascript } from '@codemirror/lang-javascript'
 import { python } from '@codemirror/lang-python'
 import { useStore } from '../store/useStore'
 import { useTheme } from '../hooks/useTheme'
+import { useEditorAppearance } from '../hooks/useEditorAppearance'
 import { useTranslation } from 'react-i18next'
 import { filesAPI } from '../api'
 import { TEX_EXTS } from '../utils/constants'
+import { getFontCss } from '../utils/editorFonts'
+import { getSchemeExtension } from '../utils/highlightSchemes'
+import { storage } from '../utils/storage'
 import { matchAnnotation } from '../utils/annotationMatching'
 import { AnnotationPopup } from './Annotations'
 import ContextMenu from './ContextMenu'
@@ -96,9 +99,9 @@ function readAnnoPositions(view) {
 }
 
 const lightEditorTheme = EditorView.theme({
-  '&': { height: '100%', fontSize: '14px', backgroundColor: '#ffffff' },
+  '&': { height: '100%', backgroundColor: '#ffffff' },
   '&.cm-focused': { outline: 'none' },
-  '.cm-scroller': { overflow: 'auto !important', fontFamily: "'JetBrains Mono', monospace" },
+  '.cm-scroller': { overflow: 'auto !important' },
   '.cm-activeLine': { backgroundColor: '#f0f7ff' },
   '.cm-annotation': {
     backgroundColor: '#fef3c7',
@@ -117,9 +120,9 @@ const lightEditorTheme = EditorView.theme({
 })
 
 const darkEditorTheme = EditorView.theme({
-  '&': { height: '100%', fontSize: '14px', backgroundColor: '#111827', color: '#e5e7eb' },
+  '&': { height: '100%', backgroundColor: '#111827', color: '#e5e7eb' },
   '&.cm-focused': { outline: 'none' },
-  '.cm-scroller': { overflow: 'auto !important', fontFamily: "'JetBrains Mono', monospace" },
+  '.cm-scroller': { overflow: 'auto !important' },
   '.cm-activeLine': { backgroundColor: '#1e293b' },
   '.cm-activeLineGutter': { backgroundColor: '#1e293b' },
   '.cm-gutters': { backgroundColor: '#0f172a', color: '#4b5563', borderRight: '1px solid #1f2937' },
@@ -145,6 +148,21 @@ const darkEditorTheme = EditorView.theme({
 
 const themeCompartment = new Compartment()
 const syntaxCompartment = new Compartment()
+const fontCompartment = new Compartment()
+
+/**
+ * Build a CodeMirror extension that applies the user-selected editor font
+ * family, size, and line height. Lives in its own compartment so it can be
+ * reconfigured at runtime via `setEditorAppearance` without rebuilding the
+ * editor state. Background is intentionally NOT set here — only dark mode
+ * controls it.
+ */
+function buildFontExtension(fontFamily, fontSize, lineHeight) {
+  return EditorView.theme({
+    '&': { fontSize: `${fontSize}px` },
+    '.cm-scroller': { fontFamily: getFontCss(fontFamily), lineHeight },
+  })
+}
 
 const getLanguage = (path) => {
   const ext = path?.split('.').pop()?.toLowerCase()
@@ -227,6 +245,16 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   const setAnnotations = useStore(s => s.setAnnotations)
   const compileDiagnostics = useStore(s => s.compileDiagnostics)
   const { isDark } = useTheme()
+  const { appearance, setEditorAppearance } = useEditorAppearance()
+
+  /**
+   * Bump editor font size by `delta` px, clamped to the storage whitelist.
+   * Uses the updater form so the keymap closure (captured once at mount) always
+   * reads the current font size instead of a stale render-time snapshot.
+   */
+  const adjustFontSize = useCallback((delta) => {
+    setEditorAppearance((prev) => ({ fontSize: prev.fontSize + delta }))
+  }, [setEditorAppearance])
 
   const callbacks = useRef({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll, onApplyDiffSave })
   useEffect(() => { callbacks.current = { onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll, onApplyDiffSave } })
@@ -679,15 +707,25 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
 
   useEffect(() => {
     if (!containerRef.current) return
+    // Initial values are read synchronously at mount (same pattern as the
+    // existing isDark DOM read below) so the first paint already reflects the
+    // saved editor appearance without waiting for the hook to notify.
+    const initialIsDark = document.documentElement.classList.contains('dark')
+    const initialAppearance = storage.getEditorAppearance()
     const extensions = [
       lineNumbers(), highlightActiveLineGutter(), highlightActiveLine(),
       history(), dropCursor(), EditorState.allowMultipleSelections.of(false),
-      indentOnInput(), syntaxCompartment.of(syntaxHighlighting(document.documentElement.classList.contains('dark') ? oneDarkHighlightStyle : defaultHighlightStyle, { fallback: true })),
+      indentOnInput(), syntaxCompartment.of(getSchemeExtension(initialAppearance.syntaxScheme, initialIsDark)),
       bracketMatching(), closeBrackets(), autocompletion(), highlightSelectionMatches(),
-      EditorView.lineWrapping, foldGutter(), themeCompartment.of(document.documentElement.classList.contains('dark') ? darkEditorTheme : lightEditorTheme), annotationField,
+      EditorView.lineWrapping, foldGutter(),
+      themeCompartment.of(initialIsDark ? darkEditorTheme : lightEditorTheme),
+      fontCompartment.of(buildFontExtension(initialAppearance.fontFamily, initialAppearance.fontSize, initialAppearance.lineHeight)),
+      annotationField,
       languageConf.of([]),
       keymap.of([
         { key: 'Mod-s', run: (view) => { if(autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current); callbacks.current.onSave?.(); return true; }, preventDefault: true },
+        { key: 'Mod-=', run: () => { adjustFontSize(1); return true }, preventDefault: true },
+        { key: 'Mod--', run: () => { adjustFontSize(-1); return true }, preventDefault: true },
         ...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap,
         ...completionKeymap, ...lintKeymap, indentWithTab,
       ]),
@@ -735,16 +773,17 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     viewRef.current = view; return () => { if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current); view.destroy() }
   }, [])
 
-  // ── Reconfigure editor theme when dark mode toggles ──
+  // ── Reconfigure editor theme/syntax/font when dark mode or appearance changes ──
   useEffect(() => {
     if (!viewRef.current) return
     viewRef.current.dispatch({
       effects: [
         themeCompartment.reconfigure(isDark ? darkEditorTheme : lightEditorTheme),
-        syntaxCompartment.reconfigure(syntaxHighlighting(isDark ? oneDarkHighlightStyle : defaultHighlightStyle, { fallback: true })),
+        syntaxCompartment.reconfigure(getSchemeExtension(appearance.syntaxScheme, isDark)),
+        fontCompartment.reconfigure(buildFontExtension(appearance.fontFamily, appearance.fontSize, appearance.lineHeight)),
       ],
     })
-  }, [isDark])
+  }, [isDark, appearance])
 
   // ── File loading ────────────────────────────────────────────────────
 
