@@ -66,7 +66,7 @@ class AIService:
     async def list_sessions(self, project_id: str, include_archived: bool = False) -> list[Dict]:
         """List sessions for a project."""
         async with UnitOfWork(project_id) as uow:
-            sessions = await uow.sessions.list_by_project(project_id, include_archived=include_archived)
+            sessions = await uow.sessions.list_all(include_archived=include_archived)
             return [s.to_dict() for s in sessions]
 
     async def create_session(self, project_id: str) -> Dict:
@@ -220,7 +220,7 @@ class AIService:
 
         async with UnitOfWork(project_id) as uow:
             if session_id is None:
-                sessions = await uow.sessions.list_by_project(project_id)
+                sessions = await uow.sessions.list_all()
                 if sessions:
                     session_id = sessions[0].id
                 else:
@@ -236,7 +236,7 @@ class AIService:
         """Clear chat history for a session. Falls back to most recent session if session_id is None."""
         async with UnitOfWork(project_id) as uow:
             if session_id is None:
-                sessions = await uow.sessions.list_by_project(project_id)
+                sessions = await uow.sessions.list_all()
                 if sessions:
                     session_id = sessions[0].id
                 else:

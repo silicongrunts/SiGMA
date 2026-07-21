@@ -61,6 +61,10 @@ class Session(Base):
     __tablename__ = "sessions"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_id)
+    # Retained for NOT NULL only. This DB file is already project-scoped
+    # (one file per project under ``userdata/<id>/.SiGMA/``), so the column
+    # is not used for filtering or identity. Writers still populate it with
+    # the current project id to satisfy the constraint.
     project_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
     title: Mapped[str] = mapped_column(String(500), default="", nullable=False)
 
@@ -92,7 +96,6 @@ class Session(Base):
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
-            "project_id": self.project_id,
             "title": self.title,
             "created_at": to_iso(self.created_at),
             "updated_at": to_iso(self.updated_at),
@@ -314,6 +317,9 @@ class BackgroundTask(Base):
     __tablename__ = "background_tasks"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # Retained for NOT NULL only. See Session.project_id for the rationale:
+    # this DB is already project-scoped, and the worker passes the project_id
+    # explicitly through its claim/run pipeline rather than reading this column.
     project_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
     kind: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
     queue: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
@@ -337,7 +343,6 @@ class BackgroundTask(Base):
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
-            "project_id": self.project_id,
             "kind": self.kind,
             "queue": self.queue,
             "status": self.status,

@@ -195,10 +195,11 @@ class LibraryTaskRunner:
             processed = 0
             while True:
                 while len(active) < limit and processed + len(active) < batch_size:
-                    task = await self._claim_next()
-                    if task is None:
+                    claimed = await self._claim_next()
+                    if claimed is None:
                         break
-                    active.add(asyncio.create_task(self._run_one(task)))
+                    project_id, task = claimed
+                    active.add(asyncio.create_task(self._run_one(project_id, task)))
 
                 if not active:
                     break
@@ -223,6 +224,13 @@ class LibraryTaskRunner:
             _RUN_LOCK.release()
 
     async def _claim_next(self):
+        """Claim the next runnable task across all projects.
+
+        Returns ``(project_id, task)`` or ``None``. The project_id is the
+        directory slot the task was claimed from — the source of truth for
+        which DB to write results back to, since the task row's own
+        ``project_id`` column is retained only for NOT NULL and is not read.
+        """
         global _PROJECT_CURSOR
         project_ids = _iter_project_ids()
         if not project_ids:
@@ -242,12 +250,13 @@ class LibraryTaskRunner:
                         break
                     if task.status == "failed":
                         await self._apply_final_failure(
+                            project_id,
                             task,
                             task.error or "Task failed after lease expiry",
                         )
                         continue
                     _PROJECT_CURSOR = (start + offset + 1) % len(project_ids)
-                    return task
+                    return project_id, task
                 except Exception as exc:
                     logger.warning(
                         "Failed to claim library background task for %s: %s",
@@ -258,9 +267,9 @@ class LibraryTaskRunner:
                     break
         return None
 
-    async def _run_one(self, task) -> None:
+    async def _run_one(self, project_id: str, task) -> None:
         ctx = RunningTaskContext(
-            project_id=task.project_id,
+            project_id=project_id,
             task_id=task.id,
             owner=self.owner,
             lease_seconds=settings.BACKGROUND_TASK_LEASE_SECONDS,
@@ -273,20 +282,20 @@ class LibraryTaskRunner:
                 raise RuntimeError(f"Unknown background task kind: {task.kind}")
             heartbeat_task = asyncio.create_task(self._heartbeat_while_running(ctx))
             await handler(ctx, payload)
-            async with UnitOfWork(task.project_id) as uow:
+            async with UnitOfWork(project_id) as uow:
                 if await uow.background_tasks.is_cancelling(task.id):
                     await uow.background_tasks.mark_cancelled(task.id, self.owner)
                 else:
                     await uow.background_tasks.mark_completed(task.id, self.owner)
         except asyncio.CancelledError:
-            async with UnitOfWork(task.project_id) as uow:
+            async with UnitOfWork(project_id) as uow:
                 await uow.background_tasks.mark_failed_or_retry(
                     task.id, self.owner, "Worker task cancelled"
                 )
             raise
         except Exception as exc:
             logger.exception("Background task %s failed", task.id)
-            async with UnitOfWork(task.project_id) as uow:
+            async with UnitOfWork(project_id) as uow:
                 status = await uow.background_tasks.mark_failed_or_retry(
                     task.id, self.owner, str(exc)
                 )
@@ -299,9 +308,9 @@ class LibraryTaskRunner:
                 heartbeat_task.cancel()
                 await asyncio.gather(heartbeat_task, return_exceptions=True)
 
-    async def _apply_final_failure(self, task, error: str) -> None:
+    async def _apply_final_failure(self, project_id: str, task, error: str) -> None:
         """Apply document-side effects for a task already marked failed."""
-        async with UnitOfWork(task.project_id) as uow:
+        async with UnitOfWork(project_id) as uow:
             await _mark_task_document_failed_if_current(uow, task, error)
 
     async def _heartbeat_while_running(self, ctx: RunningTaskContext) -> None:

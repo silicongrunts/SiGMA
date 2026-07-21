@@ -21,11 +21,14 @@ class SessionRepository:
 
     async def create(self, project_id: str, title: str = "",
                      session_kind: str = "chat") -> Session:
-        """Create a new session. Auto-generates 'Untitled-n' title if none provided."""
+        """Create a new session. Auto-generates 'Untitled-n' title if none provided.
+
+        ``project_id`` is written to the row to satisfy the NOT NULL column;
+        it is not used for filtering since this DB is already project-scoped.
+        """
         if not title:
             result = await self._session.execute(
                 select(func.count()).select_from(Session)
-                .where(Session.project_id == project_id)
                 .where(Session.session_kind == session_kind)
             )
             count = result.scalar_one()
@@ -43,16 +46,19 @@ class SessionRepository:
         )
         return result.scalar_one_or_none()
 
-    async def list_by_project(
-        self, project_id: str, include_archived: bool = False,
+    async def list_all(
+        self, include_archived: bool = False,
         session_kind: str = "chat",
     ) -> List[Session]:
-        """List sessions for a project, ordered by most recently updated.
+        """List sessions in this project DB, ordered by most recently updated.
+
+        No project filter is needed: this DB file is already project-scoped
+        (one SQLite file per project under ``userdata/<id>/.SiGMA/``).
 
         By default only returns sessions matching session_kind (defaults to "chat",
         hiding agent sessions from the user-facing session list).
         """
-        query = select(Session).where(Session.project_id == project_id)
+        query = select(Session)
         if session_kind:
             query = query.where(Session.session_kind == session_kind)
         if not include_archived:

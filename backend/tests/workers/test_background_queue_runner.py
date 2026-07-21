@@ -10,7 +10,7 @@ from app.services import background_task_service as bts
 async def test_queue_runner_respects_configured_concurrency(monkeypatch):
     runner = bts.LibraryTaskRunner()
     tasks = [
-        SimpleNamespace(id=f"task-{idx}", project_id="p1", kind="test", queue=bts.QUEUE_LIBRARY)
+        SimpleNamespace(id=f"task-{idx}", kind="test", queue=bts.QUEUE_LIBRARY)
         for idx in range(5)
     ]
     running = 0
@@ -20,9 +20,9 @@ async def test_queue_runner_respects_configured_concurrency(monkeypatch):
 
     async def fake_claim_next():
         await asyncio.sleep(0)
-        return tasks.pop(0) if tasks else None
+        return ("p1", tasks.pop(0)) if tasks else None
 
-    async def fake_run_one(task):
+    async def fake_run_one(_project_id, _task):
         nonlocal running, max_running
         running += 1
         max_running = max(max_running, running)
@@ -42,7 +42,7 @@ async def test_queue_runner_respects_configured_concurrency(monkeypatch):
 async def test_queue_runner_yields_after_batch_limit(monkeypatch):
     runner = bts.LibraryTaskRunner()
     tasks = [
-        SimpleNamespace(id=f"task-{idx}", project_id="p1", kind="test", queue=bts.QUEUE_LIBRARY)
+        SimpleNamespace(id=f"task-{idx}", kind="test", queue=bts.QUEUE_LIBRARY)
         for idx in range(5)
     ]
     wake_calls = []
@@ -53,9 +53,9 @@ async def test_queue_runner_yields_after_batch_limit(monkeypatch):
 
     async def fake_claim_next():
         await asyncio.sleep(0)
-        return tasks.pop(0) if tasks else None
+        return ("p1", tasks.pop(0)) if tasks else None
 
-    async def fake_run_one(task):
+    async def fake_run_one(_project_id, _task):
         await asyncio.sleep(0)
 
     monkeypatch.setattr(runner, "_claim_next", fake_claim_next)
@@ -73,7 +73,6 @@ async def test_document_process_final_failure_marks_current_document_failed(monk
     runner = bts.LibraryTaskRunner()
     task = SimpleNamespace(
         id="task-1",
-        project_id="p1",
         kind=bts.KIND_DOCUMENT_PROCESS,
         payload_json='{"doc_id": "doc-1", "doc_revision": 7}',
     )
@@ -93,7 +92,7 @@ async def test_document_process_final_failure_marks_current_document_failed(monk
         ),
     )
 
-    await runner._run_one(task)
+    await runner._run_one("p1", task)
 
     assert failed_docs == [
         ("doc-1", "Document processing failed after task retries: boom")
@@ -105,7 +104,6 @@ async def test_document_process_final_failure_does_not_mark_newer_revision(monke
     runner = bts.LibraryTaskRunner()
     task = SimpleNamespace(
         id="task-1",
-        project_id="p1",
         kind=bts.KIND_DOCUMENT_PROCESS,
         payload_json='{"doc_id": "doc-1", "doc_revision": 7}',
     )
@@ -125,7 +123,7 @@ async def test_document_process_final_failure_does_not_mark_newer_revision(monke
         ),
     )
 
-    await runner._run_one(task)
+    await runner._run_one("p1", task)
 
     assert failed_docs == []
 
@@ -135,7 +133,6 @@ async def test_lease_expired_final_failure_marks_current_document_failed(monkeyp
     runner = bts.LibraryTaskRunner()
     task = SimpleNamespace(
         id="task-1",
-        project_id="p1",
         kind=bts.KIND_DOCUMENT_PROCESS,
         payload_json='{"doc_id": "doc-1", "doc_revision": 7}',
     )
@@ -152,6 +149,7 @@ async def test_lease_expired_final_failure_marks_current_document_failed(monkeyp
     )
 
     await runner._apply_final_failure(
+        "p1",
         task,
         "Task lease expired too many times; marking failed",
     )
