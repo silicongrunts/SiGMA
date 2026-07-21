@@ -603,26 +603,28 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
           </div>
         )}
 
-        {/* Jupyter Kernels \u2013 always shown */}
-        <div>
-          <div className="flex items-center justify-between mb-2">
-            <label className="flex items-center gap-2 text-[10px] font-black text-gray-400 uppercase tracking-widest"><Cpu className="w-3.5 h-3.5" /> {t('editor.settings.jupyterKernels')}</label>
+        {/* Jupyter Kernels \u2013 only shown when there are active kernels */}
+        {activeKernels.length > 0 && (
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="flex items-center gap-2 text-[10px] font-black text-gray-400 uppercase tracking-widest"><Cpu className="w-3.5 h-3.5" /> {t('editor.settings.jupyterKernels')}</label>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setShowKernelModal(true)
+                setShowSettings(false)
+              }}
+              className="w-full bg-sigma-600 hover:bg-sigma-700 text-white px-4 py-2.5 rounded-xl flex items-center justify-center gap-2 text-xs font-bold transition-all"
+            >
+              <Cpu className="w-4 h-4" />
+              {t('editor.settings.viewActiveKernels')}
+              {activeKernels.length > 0 && (
+                <span className="ml-1 bg-white/20 rounded-full px-2 py-0.5 text-[10px]">{activeKernels.length}</span>
+              )}
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => {
-              setShowKernelModal(true)
-              setShowSettings(false)
-            }}
-            className="w-full bg-sigma-600 hover:bg-sigma-700 text-white px-4 py-2.5 rounded-xl flex items-center justify-center gap-2 text-xs font-bold transition-all"
-          >
-            <Cpu className="w-4 h-4" />
-            {t('editor.settings.viewActiveKernels')}
-            {activeKernels.length > 0 && (
-              <span className="ml-1 bg-white/20 rounded-full px-2 py-0.5 text-[10px]">{activeKernels.length}</span>
-            )}
-          </button>
-        </div>
+        )}
 
         {/* Auto-Snapshot Section */}
         <div>
