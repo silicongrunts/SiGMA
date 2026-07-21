@@ -187,6 +187,10 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   const awaitingRef = useRef(false)
   const [viewingCitation, setViewingCitation] = useState(null)
   const chatScrollRef = useRef(null)
+  // Inner content wrapper — ResizeObserver watches it so we can re-pin to the
+  // bottom whenever async layout (KaTeX typesetting, image decode, entrance
+  // animations) grows the content height after the initial render.
+  const chatContentRef = useRef(null)
   const currentHintRef = useRef('')
   const abortRef = useRef(null)
   const textareaRef = useRef(null)
@@ -667,11 +671,25 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
     }
   }
 
+  // Pin to the bottom whenever the content grows while the user is at the
+  // bottom. Cold load and streaming both settle asynchronously — KaTeX
+  // typesetting, image decode, and entrance animations keep growing
+  // scrollHeight for ~1s after the first paint — so a one-shot scroll on
+  // [messages] change lands at a stale height. A ResizeObserver on the inner
+  // content re-pins on every real height change instead. Pagination is
+  // unaffected: the user is at the top then, so isUserAtBottom is false.
+  // scrollTop is set directly (not via scrollTo): the container has no smooth
+  // scrolling, so each correction is instantaneous and never animates.
   useEffect(() => {
-    if (chatScrollRef.current && isUserAtBottom.current) {
-      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight
-    }
-  }, [messages])
+    const el = chatScrollRef.current
+    const content = chatContentRef.current
+    if (!el || !content) return
+    const ro = new ResizeObserver(() => {
+      if (isUserAtBottom.current) el.scrollTop = el.scrollHeight
+    })
+    ro.observe(content)
+    return () => ro.disconnect()
+  }, [])
 
   // ---- Close dropdown on outside click ----
   useClickOutside(dropdownRef, () => setShowDropdown(false), showDropdown)
@@ -1883,7 +1901,8 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         </div>
       </div>
 
-      <div ref={chatScrollRef} onScroll={handleChatScroll} className="flex-1 overflow-y-auto p-4 space-y-6 scroll-smooth">
+      <div ref={chatScrollRef} onScroll={handleChatScroll} className="flex-1 overflow-y-auto p-4">
+        <div ref={chatContentRef} className="space-y-6">
         {isLoadingHistory && (
           <div className="text-center text-[10px] text-gray-400 dark:text-gray-500 font-medium">{t('chat.loadingHistory')}</div>
         )}
@@ -1987,6 +2006,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
             </div>
           )
         })}
+        </div>
       </div>
 
       <div className="p-4 bg-white dark:bg-gray-900 border-t border-gray-100 dark:border-gray-800 space-y-3 shadow-[0_-10px_20px_rgba(0,0,0,0.02)]">
