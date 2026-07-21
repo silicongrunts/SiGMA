@@ -193,18 +193,15 @@ class MessageRepository:
     # Compaction
     # ------------------------------------------------------------------
 
-    async def insert_boundary(self, session_id: str, summary: str) -> Message:
-        """Insert a compaction boundary message containing the summary."""
-        return await self.create(
-            session_id=session_id,
-            role="system",
-            content=summary,
-            is_boundary=True,
-        )
+    async def stage_boundary_for_annotation(
+        self, annotation_id: str, summary: str,
+    ) -> Message:
+        """Stage a compaction boundary message for an annotation thread.
 
-    async def insert_boundary_for_annotation(self, annotation_id: str, summary: str) -> Message:
-        """Insert a compaction boundary message for an annotation thread."""
-        return await self.create_for_annotation(
+        Use inside ``UnitOfWork.execute_atomic()`` so the boundary commits
+        together with the surrounding mutation.
+        """
+        return await self.stage_create_for_annotation(
             annotation_id=annotation_id,
             role="system",
             content=summary,
@@ -249,6 +246,33 @@ class MessageRepository:
         """Create a message linked to an annotation. seq is auto-assigned with retry."""
         return await self._do_create_message(
             group_field="annotation_id", group_value=annotation_id, staged=False,
+            role=role, content=content, tool_calls=tool_calls,
+            tool_call_id=tool_call_id, reasoning_content=reasoning_content,
+            token_count=token_count, cached_tokens=cached_tokens,
+            input_tokens=input_tokens, is_boundary=is_boundary,
+        )
+
+    async def stage_create_for_annotation(
+        self,
+        annotation_id: str,
+        role: str,
+        content: str = "",
+        tool_calls: str | None = None,
+        tool_call_id: str | None = None,
+        reasoning_content: str | None = None,
+        token_count: int = 0,
+        cached_tokens: int = 0,
+        input_tokens: int = 0,
+        is_boundary: bool = False,
+    ) -> Message:
+        """Stage a message linked to an annotation without committing.
+
+        Use inside ``UnitOfWork.execute_atomic()`` when the message must commit
+        together with other repository mutations (e.g. AnnotationLoop saving a
+        batch of new messages atomically, mirroring QueryLoop's pattern).
+        """
+        return await self._do_create_message(
+            group_field="annotation_id", group_value=annotation_id, staged=True,
             role=role, content=content, tool_calls=tool_calls,
             tool_call_id=tool_call_id, reasoning_content=reasoning_content,
             token_count=token_count, cached_tokens=cached_tokens,

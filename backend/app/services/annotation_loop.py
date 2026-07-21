@@ -138,10 +138,12 @@ class AnnotationLoop:
                 f"Unable to compact this annotation thread: {exc}. "
                 "Please create a new session and continue from there."
             ) from exc
-        async with UnitOfWork(self.project_id) as uow:
+        async def _operation(uow):
             await compaction_service.insert_annotation_boundary(
                 uow, self.annotation_id, result.boundary_content,
             )
+
+        await UnitOfWork.execute_atomic(self.project_id, _operation)
 
         # Mirror query_loop: compaction collapses the visible context, so the
         # must-read-first cache must reset — the LLM must re-read a file before
@@ -203,10 +205,6 @@ class AnnotationLoop:
 
         if tips and tips.strip():
             content += f"\n\n{prompt_service._format_tips(tips)}"
-
-        tool_desc = self._describe_tools()
-        if tool_desc:
-            content += f"\n\n# Available Tools\n{tool_desc}"
 
         from app.services.skill_service import skill_service
         skills_summary = skill_service.build_skills_prompt()
@@ -275,46 +273,54 @@ class AnnotationLoop:
     # ------------------------------------------------------------------
 
     async def _save_messages(self, messages: list[dict]) -> None:
-        """Save new messages to the database (annotation variant)."""
-        async with UnitOfWork(self.project_id) as uow:
-            history_count = len(await uow.messages.get_messages_for_annotation_llm(self.annotation_id))
-            new_messages = messages[1 + history_count:]
+        """Save new messages to the database (annotation variant).
+
+        Atomic: all new messages for this turn are staged and committed in one
+        transaction (mirrors QueryLoop), so a mid-batch failure cannot leave a
+        partial message list with broken tool_call/tool_call_id pairings.
+        """
+        async def _operation(uow):
+            history = await uow.messages.get_messages_for_annotation_llm(self.annotation_id)
+            history_count = sum(
+                1 for msg in history if getattr(msg, "role", "") != "system"
+            )
+            candidates = [
+                msg for msg in messages[1:]
+                if not msg.get("_ephemeral") and msg.get("role") != "system"
+            ]
+            new_messages = candidates[history_count:]
 
             await stage_new_messages(
                 new_messages,
-                partial(uow.messages.create_for_annotation, annotation_id=self.annotation_id),
+                partial(uow.messages.stage_create_for_annotation, annotation_id=self.annotation_id),
             )
 
+        await UnitOfWork.execute_atomic(self.project_id, _operation)
+
     async def _persist_error_message(self, error: Exception) -> str:
-        """Persist a visible annotation-thread error when possible."""
+        """Persist a visible annotation-thread error when possible.
+
+        Best-effort: failures are logged but never mask the original error that
+        triggered this call. Atomic via execute_atomic for consistency with
+        QueryLoop._persist_error_message.
+        """
         content = LLMLoopRunner._format_error_message(error)
+
+        async def _operation(uow):
+            annotation, err = await uow.annotations.resolve(self.annotation_id)
+            if err or not annotation:
+                return
+            await uow.messages.stage_create_for_annotation(
+                annotation_id=annotation.id,
+                role="assistant",
+                content=content,
+            )
+
         try:
-            async with UnitOfWork(self.project_id) as uow:
-                annotation, err = await uow.annotations.resolve(self.annotation_id)
-                if err or not annotation:
-                    return content
-                await uow.messages.create_for_annotation(
-                    annotation_id=annotation.id,
-                    role="assistant",
-                    content=content,
-                )
+            await UnitOfWork.execute_atomic(self.project_id, _operation)
         except Exception:
             logger.debug("Failed to persist AnnotationLoop error message", exc_info=True)
         return content
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _describe_tools(self) -> str:
-        """Build a text description of available tools for the system prompt."""
-        lines = []
-        for t in self._tool_schemas:
-            fn = t.get("function", {})
-            name = fn.get("name", "")
-            desc = fn.get("description", "")
-            lines.append(f"- **{name}**: {desc}")
-        return "\n".join(lines)
 
 
 def _escape_xml(text: str) -> str:

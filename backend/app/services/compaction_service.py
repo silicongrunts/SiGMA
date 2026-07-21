@@ -339,7 +339,7 @@ class CompactionService:
         annotation_id: str,
         boundary_content: str,
     ) -> None:
-        await uow.messages.insert_boundary_for_annotation(annotation_id, boundary_content)
+        await uow.messages.stage_boundary_for_annotation(annotation_id, boundary_content)
 
 
 compaction_service = CompactionService()

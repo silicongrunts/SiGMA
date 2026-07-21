@@ -39,7 +39,8 @@ Methods that self-commit (**every mutation except those listed below**):
 Methods that do **NOT** self-commit (caller must ``uow.commit()``):
 
 * ``SessionRepository``: ``stage_touch``
-* ``MessageRepository``: ``stage_create``, ``stage_truncate_from``
+* ``MessageRepository``: ``stage_create``, ``stage_truncate_from``,
+  ``stage_create_for_annotation``, ``stage_boundary_for_annotation``
 * ``TaskRepository.update`` — modifies ORM attributes only
 
 Atomic bulk methods (self-commit as a single transaction):
