@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, useCallback, useImperativeHandle, forwardRef, memo } from 'react'
 import { useTranslation } from 'react-i18next'
 import * as pdfjsLib from 'pdfjs-dist'
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.js?url'
 import { Marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
 import hljs from 'highlight.js'
@@ -15,10 +14,8 @@ import { getCompiledPdfName } from '../utils/constants'
 import { toastError } from './Toast'
 import { rewriteProjectImageSrc } from './ChatShared'
 import { extractMath, restoreMath } from '../utils/mathGuard'
+import PdfPreview from './preview/PdfPreview'
 import { ZoomIn, ZoomOut, ArrowUp, Maximize2, FileSearch, FileText, Download, AlertTriangle, ChevronLeft, ChevronRight } from 'lucide-react'
-
-// Local worker (bundled, no CDN)
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
 // Dedicated marked instance for the editor preview pipeline, fully isolated
 // from the shared global `marked` singleton that ChatShared.jsx configures.
@@ -41,8 +38,6 @@ const previewMarked = new Marked(
     },
   }),
 )
-
-const PDFJS_ASSET_BASE = `${import.meta.env.BASE_URL || '/'}pdfjs/`
 
 // Block-level HTML containers whose marked output NESTS inner blocks instead
 // of emitting them as siblings. E.g. `<details><summary>..</summary> <p>..</p>
@@ -131,97 +126,6 @@ function scrollIntoViewMinimal(container, el) {
   }
 }
 
-const PDFPage = memo(({ pdf, pageNumber, scale, onDoubleClick, isActive }) => {
-  const canvasRef = useRef(null)
-  const textLayerRef = useRef(null)
-  const renderTaskRef = useRef(null)
-
-  useEffect(() => {
-    let isCancelled = false
-    
-    const renderPage = async () => {
-      try {
-        const page = await pdf.getPage(pageNumber)
-        if (isCancelled) return
-        
-        const viewport = page.getViewport({ scale, rotation: page.rotate })
-        const canvas = canvasRef.current
-        if (!canvas) return
-        
-        // Use standard context for maximum stability across browsers
-        const context = canvas.getContext('2d', { alpha: false })
-        const dpr = window.devicePixelRatio || 1
-        
-        canvas.width = viewport.width * dpr
-        canvas.height = viewport.height * dpr
-        canvas.style.width = `${viewport.width}px`
-        canvas.style.height = `${viewport.height}px`
-        context.scale(dpr, dpr)
-        
-        // Cancel existing task if any
-        if (renderTaskRef.current) {
-            renderTaskRef.current.cancel()
-        }
-        
-        renderTaskRef.current = page.render({ canvasContext: context, viewport })
-        await renderTaskRef.current.promise
-        
-        if (isCancelled) return
-
-        // Render Text Layer for selection
-        if (textLayerRef.current) {
-            const textLayer = textLayerRef.current
-            textLayer.innerHTML = ''
-            textLayer.style.width = `${viewport.width}px`
-            textLayer.style.height = `${viewport.height}px`
-            // Required by PDF.js 3+ CSS
-            textLayer.style.setProperty('--scale-factor', scale)
-            
-            const textContent = await page.getTextContent()
-            if (isCancelled) return
-            
-            await pdfjsLib.renderTextLayer({
-                textContentSource: textContent,
-                container: textLayer,
-                viewport: viewport,
-                textDivs: []
-            }).promise
-        }
-      } catch (e) {
-        if (e.name !== 'RenderingCancelledException') {
-            console.error(`PDF Render Error [Page ${pageNumber}]:`, e)
-        }
-      }
-    }
-
-    renderPage()
-    
-    return () => { 
-        isCancelled = true
-        if (renderTaskRef.current) renderTaskRef.current.cancel()
-    }
-  }, [pdf, pageNumber, scale])
-
-  return (
-    <div 
-      data-page-wrapper={pageNumber}
-      className={`relative bg-white shadow-2xl mb-10 transition-all duration-300 select-text ${isActive ? 'ring-4 ring-blue-500/40' : ''}`}
-      style={{ width: 'fit-content' }}
-      onDoubleClick={(e) => {
-          // Double-click for SyncTeX
-          const rect = canvasRef.current.getBoundingClientRect()
-          const x = (e.clientX - rect.left)
-          const y = (e.clientY - rect.top)
-          onDoubleClick(pageNumber, x / scale, y / scale)
-      }}
-    >
-      <canvas ref={canvasRef} className="block shadow-inner pointer-events-none bg-white" />
-      {/* The textLayer MUST be after canvas and NOT have pointer-events-none to allow selection */}
-      <div ref={textLayerRef} className="textLayer absolute inset-0 overflow-hidden" dir="ltr" />
-    </div>
-  )
-})
-
 const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
   const { t } = useTranslation()
   const currentProjectId = useStore(state => state.currentProject?.id)
@@ -236,14 +140,16 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
   // currently open source file.
   const [pdf, setPdf] = useState(null)
   const [numPages, setNumPages] = useState(0)
+  // Mirror of `pdf` for reading inside callbacks (e.g. loadPDF) that must not
+  // depend on the pdf state to avoid stale closures.
+  const pdfRef = useRef(null)
+  useEffect(() => { pdfRef.current = pdf }, [pdf])
   const [mdContent, setMdContent] = useState('')
-  const [activePage, setActivePage] = useState(null)
   const [visiblePage, setVisiblePage] = useState(1)
   const [pageInput, setPageInput] = useState('')
   const [editingPage, setEditingPage] = useState(false)
   const pageInputRef = useRef(null)
   const [containerWidth, setContainerWidth] = useState(0)
-  const [baseScale, setBaseScale] = useState(0)
 
   // Derived view model — title and render branch both flow from previewSource.
   const previewKind = previewSource.kind
@@ -265,7 +171,6 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
     : previewKind === 'markdown' ? 'markdown' : 'none'
 
   const containerRef = useRef(null)
-  const pdfInstanceRef = useRef(null)
   const currentPdfUrlRef = useRef(null)
   const headingMapRef = useRef([])  // [{srcLine, el?}] for scroll sync
   const blockMapRef = useRef([])    // [{startLine, endLine, el}] for precise highlight
@@ -273,119 +178,100 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
   const currentHighlightLineRef = useRef(null) // last highlightLine() arg, re-applied after block-map rebuild
   const restoredScrollKeyRef = useRef('')
   const previewLoadTokenRef = useRef(0)
+  // Imperative handle exposed by <PdfPreview> (scrollToPage / goToPage / etc).
+  const pdfApiRef = useRef(null)
 
-  // Clear every piece of render state. Called at the start of every load
-  // effect run so identity changes always start from a clean slate.
+  // Revoke any held object URL. Used when switching away from a PDF or on
+  // unmount. Returns the URL it revoked (or null) so callers can clear the ref.
+  const revokePdfUrl = useCallback(() => {
+    if (!currentPdfUrlRef.current) return null
+    const url = currentPdfUrlRef.current
+    URL.revokeObjectURL(url)
+    currentPdfUrlRef.current = null
+    return url
+  }, [])
+
+  // Reset non-PDF render state. Called at the start of every load effect run
+  // so identity changes always start from a clean slate. PDF state is handled
+  // separately: the load effect parses the new document BEFORE swapping it in,
+  // so recompiles do not blank the preview (the previous PDF stays on screen
+  // until the new one is ready, eliminating the black flash).
   const resetRenderingState = useCallback(() => {
     previewLoadTokenRef.current += 1
-    setPdf(null)
-    setNumPages(0)
     setMdContent('')
-    setActivePage(null)
-    setVisiblePage(1)
     setPageInput('')
     setEditingPage(false)
-    setBaseScale(0)
+    setVisiblePage(1)
     headingMapRef.current = []
     blockMapRef.current = []
     highlightedElsRef.current = []
     currentHighlightLineRef.current = null
     restoredScrollKeyRef.current = ''
-    if (currentPdfUrlRef.current) {
-      URL.revokeObjectURL(currentPdfUrlRef.current)
-      currentPdfUrlRef.current = null
-    }
   }, [])
 
-  // Track container width for "Fit Width" calculation
+  // Track container width for the PdfPreview fit-to-width calculation.
   useEffect(() => {
     if (!containerRef.current) return
-    const observer = new ResizeObserver(entries => { 
-        if(entries[0]) setContainerWidth(entries[0].contentRect.width) 
+    const observer = new ResizeObserver(entries => {
+        if(entries[0]) setContainerWidth(entries[0].contentRect.width)
     })
     observer.observe(containerRef.current)
     return () => observer.disconnect()
   }, [])
 
-  // Track which PDF page is currently visible
-  useEffect(() => {
-    if (type !== 'pdf' || !containerRef.current) return
-    const container = containerRef.current
-
-    const update = () => {
-      const scrollTop = container.scrollTop
-      const pages = container.querySelectorAll('[data-page-wrapper]')
-      for (const page of pages) {
-        // Page whose top is at or just past the scroll position
-        if (page.offsetTop + page.offsetHeight > scrollTop + 10) {
-          const n = parseInt(page.getAttribute('data-page-wrapper'), 10)
-          if (n > 0) setVisiblePage(n)
-          return
-        }
-      }
-    }
-
-    container.addEventListener('scroll', update, { passive: true })
-    // Set initial page
-    update()
-    return () => container.removeEventListener('scroll', update)
-  }, [type, pdf, numPages])
-
-  // Navigate to a specific page by number
+  // Navigate to a specific page by number. Delegates to the PdfPreview API.
   const goToPage = useCallback((n) => {
-    const clamped = Math.max(1, Math.min(numPages, n))
-    const pageWrapper = containerRef.current?.querySelector(`[data-page-wrapper="${clamped}"]`)
-    if (pageWrapper) {
-      containerRef.current.scrollTo({ top: pageWrapper.offsetTop - 10, behavior: 'smooth' })
-    }
-  }, [numPages])
+    pdfApiRef.current?.goToPage?.(n)
+  }, [])
 
-  // Calculate scaling factor
-  useEffect(() => {
-    const calcBase = async () => {
-        if (!pdf || containerWidth <= 0) return
-        try {
-            const page = await pdf.getPage(1)
-            const viewport = page.getViewport({ scale: 1.0, rotation: page.rotate })
-            const padding = 80 // 40px each side
-            setBaseScale((containerWidth - padding) / viewport.width)
-        } catch (e) {
-            console.error('PDF base scale failed:', e)
-            toastError(t('preview.loadFailed'))
-        }
-    }
-    if (type === 'pdf') calcBase()
-    else if (type === 'markdown') setBaseScale(1.0)
-  }, [pdf, containerWidth, type])
-
+  // Parse a fetched PDF into a PDFDocumentProxy. The previous document and its
+  // object URL stay alive until the new one is ready, so recompiles never
+  // blank the preview. Callers revoke the URL on failure; on success the URL
+  // is retained (it backs the document's font/cmap requests) and the previous
+  // one is released here.
   const loadPDF = useCallback(async (url) => {
     const token = previewLoadTokenRef.current + 1
     previewLoadTokenRef.current = token
+    const assetBase = `${import.meta.env.BASE_URL || '/'}pdfjs/`
     try {
-      // Background loading to prevent white/black flash
       const loadingTask = pdfjsLib.getDocument({
         url,
-        cMapUrl: `${PDFJS_ASSET_BASE}cmaps/`,
+        cMapUrl: `${assetBase}cmaps/`,
         cMapPacked: true,
-        standardFontDataUrl: `${PDFJS_ASSET_BASE}standard_fonts/`,
+        standardFontDataUrl: `${assetBase}standard_fonts/`,
         useSystemFonts: true,
       })
       const pdfDoc = await loadingTask.promise
       if (token !== previewLoadTokenRef.current) {
+        // A newer load superseded this one — discard quietly.
         URL.revokeObjectURL(url)
+        pdfDoc.destroy?.()
         return
       }
 
-      if (currentPdfUrlRef.current) URL.revokeObjectURL(currentPdfUrlRef.current)
+      // Swap: release the PREVIOUS url only now that the new doc is ready.
+      revokePdfUrl()
       currentPdfUrlRef.current = url
 
+      // Defer destroying the previous document until the next frame so the
+      // PdfPreview has a chance to start rendering the new one first — the
+      // min-height pin in PdfViewerHost.loadDocument keeps the viewport steady
+      // during this overlap. Read from the ref (not the state) so loadPDF does
+      // not need pdf in its dependency array.
+      const previous = pdfRef.current
+      requestAnimationFrame(() => { previous?.destroy?.() })
+
       setPdf(pdfDoc)
+      pdfRef.current = pdfDoc
       setNumPages(pdfDoc.numPages)
     } catch (e) {
-      console.error("PDF Load Error:", e)
-      if (e.name !== 'AbortException') { URL.revokeObjectURL(url); toastError(t('preview.loadFailed')) }
+      console.error('PDF Load Error:', e)
+      if (e?.name !== 'AbortException') {
+        URL.revokeObjectURL(url)
+        toastError(t('preview.loadFailed'))
+      }
     }
-  }, [])
+  }, [revokePdfUrl, t])
 
   // ── Single load effect — the ONLY place that fetches preview content. ──
   // Source-file switches inside one compiled TeX project must not reload the
@@ -395,6 +281,22 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
     const kind = previewKind
     const path = previewLoadPath
     resetRenderingState()
+
+    // When moving away from a PDF preview, drop the PDF state so the render
+    // branch switches to the new (markdown/binary/none) view. The PDF branch
+    // itself never nulls pdf here — loadPDF swaps in the new doc only once it
+    // has finished parsing, which is what keeps recompiles flash-free.
+    if (kind !== 'pdf-compiled' && kind !== 'pdf-standalone') {
+      if (currentPdfUrlRef.current) revokePdfUrl()
+      if (pdfRef.current) {
+        const old = pdfRef.current
+        requestAnimationFrame(() => { old.destroy?.() })
+        pdfRef.current = null
+      }
+      setPdf(null)
+      setNumPages(0)
+    }
+
     if (kind === 'none' || !path) return
 
     let cancelled = false
@@ -429,18 +331,14 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
     previewLoadVersion,
     currentProjectId,
     resetRenderingState,
+    revokePdfUrl,
     loadPDF,
   ])
 
   // Revoke any held object URL on unmount.
   useEffect(() => {
-    return () => {
-      if (currentPdfUrlRef.current) {
-        URL.revokeObjectURL(currentPdfUrlRef.current)
-        currentPdfUrlRef.current = null
-      }
-    }
-  }, [])
+    return () => revokePdfUrl()
+  }, [revokePdfUrl])
 
   useEffect(() => {
     if (type === 'markdown' && containerRef.current) {
@@ -449,6 +347,10 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
     }
   }, [mdContent, type, zoomLevel])
 
+  // Restore the saved scroll ratio once the freshly-loaded content is ready.
+  // PDF and markdown scroll inside different containers (PdfPreview owns the
+  // PDF scroll element; markdown scrolls in containerRef), so route through
+  // the pdfApiRef for PDFs.
   useEffect(() => {
     if (!currentProjectId || !previewStorageKey || type === 'none') return
     if (type === 'pdf' && (!pdf || numPages === 0)) return
@@ -459,10 +361,14 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
     const ratio = storage.getSynthesis(currentProjectId).previewScrollRatioByFile[previewStorageKey]
     if (!Number.isFinite(ratio)) return
     requestAnimationFrame(() => {
-      const container = containerRef.current
-      if (!container) return
-      const maxScroll = container.scrollHeight - container.clientHeight
-      if (maxScroll > 0) container.scrollTop = Math.max(0, Math.min(1, ratio)) * maxScroll
+      if (type === 'pdf') {
+        pdfApiRef.current?.scrollToRatio?.(ratio)
+      } else {
+        const container = containerRef.current
+        if (!container) return
+        const maxScroll = container.scrollHeight - container.clientHeight
+        if (maxScroll > 0) container.scrollTop = Math.max(0, Math.min(1, ratio)) * maxScroll
+      }
     })
   }, [currentProjectId, previewStorageKey, type, pdf, numPages, mdContent])
 
@@ -663,24 +569,15 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
       setMdContent(content ?? '')
     },
     scrollToPage: (n, x, y) => {
-      const pageWrapper = containerRef.current?.querySelector(`[data-page-wrapper="${n}"]`)
-      if (pageWrapper) {
-        const finalScale = baseScale * zoomLevel
-        const top = pageWrapper.offsetTop + (y * finalScale) - 100
-        containerRef.current.scrollTo({ top, behavior: 'smooth' })
-        setActivePage(n)
-
-        const indicator = document.createElement('div')
-        indicator.className = 'synctex-indicator'
-        indicator.style.left = `${x * finalScale}px`
-        indicator.style.top = `${y * finalScale}px`
-        pageWrapper.appendChild(indicator)
-
-        setTimeout(() => { indicator.remove(); setActivePage(null); }, 1500)
-      }
+      // Delegates to PdfPreview, which projects the PDF-space (x, y) onto the
+      // rendered page, scrolls there, and drops the SyncTeX pulse marker.
+      pdfApiRef.current?.scrollToPage?.(n, x, y)
     },
     scrollToPercent: (pct) => {
-      if (containerRef.current) {
+      // PDF scrolls inside PdfPreview's own container; markdown scrolls here.
+      if (type === 'pdf') {
+        pdfApiRef.current?.scrollToRatio?.(pct)
+      } else if (containerRef.current) {
         const maxScroll = containerRef.current.scrollHeight - containerRef.current.clientHeight
         containerRef.current.scrollTop = Math.max(0, pct * maxScroll)
       }
@@ -808,21 +705,23 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
     }
   }))
 
+  // Ctrl/Cmd + wheel zooms the preview. For PDF this is handled inside
+  // PdfPreview (cursor-anchored, drawing-delayed). For markdown it adjusts the
+  // font-size factor (zoomLevel) on this scroll container.
   const handleWheel = useCallback((e) => {
+    if (type !== 'markdown') return
     if (e.ctrlKey || e.metaKey) {
         e.preventDefault(); e.stopPropagation();
         const delta = e.deltaY > 0 ? -0.1 : 0.1
         setZoomLevel(Math.max(0.2, Math.min(4, zoomLevel + delta)))
     }
-  }, [zoomLevel, setZoomLevel])
+  }, [type, zoomLevel, setZoomLevel])
 
   useEffect(() => {
     const el = containerRef.current
     if (el) el.addEventListener('wheel', handleWheel, { passive: false })
     return () => el?.removeEventListener('wheel', handleWheel)
   }, [handleWheel])
-
-  const finalScale = baseScale * zoomLevel
 
   // Pure derivation — title and content share the same source (previewSource),
   // so they cannot disagree by construction.
@@ -906,25 +805,44 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
             <button onClick={() => setZoomLevel(Math.max(0.2, zoomLevel - 0.1))} className="p-2.5 hover:bg-blue-50 dark:hover:bg-sigma-600/20 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-sigma-400 rounded-xl transition-all shadow-sm"><ZoomOut className="w-5 h-5" /></button>
             {type === 'pdf' && <button onClick={() => setZoomLevel(1.0)} className="p-2.5 hover:bg-blue-50 dark:hover:bg-sigma-600/20 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-sigma-400 rounded-xl transition-all shadow-sm" title={t('preview.fitWidth')}><Maximize2 className="w-5 h-5" /></button>}
             <div className="h-px bg-gray-100 dark:bg-gray-700 mx-2 my-1" />
-            <button onClick={() => containerRef.current?.scrollTo({top:0, behavior:'smooth'})} className="p-2.5 hover:bg-blue-50 dark:hover:bg-sigma-600/20 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-sigma-400 rounded-xl transition-all shadow-sm"><ArrowUp className="w-5 h-5" /></button>
+            <button onClick={() => {
+              if (type === 'pdf') pdfApiRef.current?.scrollToRatio?.(0)
+              else containerRef.current?.scrollTo({top:0, behavior:'smooth'})
+            }} className="p-2.5 hover:bg-blue-50 dark:hover:bg-sigma-600/20 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-sigma-400 rounded-xl transition-all shadow-sm"><ArrowUp className="w-5 h-5" /></button>
         </div>
       </div>
 
       <div
         ref={containerRef}
         onScroll={(e) => {
+          // Markdown scrolls in this container; PDF scroll is reported by
+          // PdfPreview's own listener via onScrollRatio below.
+          if (type !== 'markdown') return
           const el = e.currentTarget
           const maxScroll = el.scrollHeight - el.clientHeight
           if (maxScroll > 0) onScroll?.(el.scrollTop / maxScroll)
         }}
         className="flex-1 overflow-auto relative scroll-smooth flex flex-col"
       >
-        {type === 'pdf' && pdf && baseScale > 0 ? (
-          <div className="py-12 px-8 flex flex-col items-center min-w-full w-fit m-auto transition-opacity duration-500 min-h-full">
-            {Array.from({ length: numPages }, (_, i) => i + 1).map(n => (
-              <PDFPage key={n} pdf={pdf} pageNumber={n} scale={finalScale} onDoubleClick={onPageClick} isActive={activePage === n} />
-            ))}
-          </div>
+        {type === 'pdf' ? (
+          pdf ? (
+            <PdfPreview
+              pdfDoc={pdf}
+              zoomLevel={zoomLevel}
+              onZoomChange={setZoomLevel}
+              onPageClick={onPageClick}
+              onScrollRatio={onScroll}
+              onPageCount={setNumPages}
+              onPageChange={setVisiblePage}
+              containerWidth={containerWidth}
+              registerApi={(api) => { pdfApiRef.current = api }}
+            />
+          ) : !compiling ? (
+            <div className="flex flex-col items-center justify-center m-auto text-gray-300 dark:text-gray-600">
+              <FileSearch className="w-16 h-12 mb-4 opacity-20" />
+              <p className="text-[10px] font-black tracking-[0.3em] uppercase">{t('preview.noPreview')}</p>
+            </div>
+          ) : null
         ) : type === 'markdown' ? (
             <div className="flex flex-col items-center w-full m-auto py-12 px-8">
                 <div

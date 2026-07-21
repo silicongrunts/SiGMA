@@ -255,37 +255,9 @@
   padding: 0 0;
 }
 
-/* PDF text layer */
-.textLayer {
-  position: absolute;
-  left: 0;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  overflow: hidden;
-  opacity: 0.2;
-  line-height: 1.0;
-}
-
-.textLayer > span {
-  color: transparent;
-  position: absolute;
-  white-space: pre;
-  cursor: text;
-  transform-origin: 0% 0%;
-}
-
-.textLayer .highlight {
-  background-color: rgba(255, 255, 0, 0.3);
-}
-
-.textLayer .highlight.begin {
-  border-radius: 4px 0px 0px 4px;
-}
-
-.textLayer .highlight.end {
-  border-radius: 0px 4px 4px 0px;
-}
+/* The PDF text layer is styled entirely by pdf.js's own pdf_viewer.css
+ * (imported in main.jsx). Local overrides here previously conflicted with it;
+ * the text layer now comes from the bundled PDFViewer and needs no custom CSS. */
 
 /* Resizer styles */
 .resizer {

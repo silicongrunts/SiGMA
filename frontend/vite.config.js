@@ -8,6 +8,7 @@ function pdfjsAssetsPlugin() {
   const assetRoots = {
     '/pdfjs/cmaps/': path.join(pdfjsRoot, 'cmaps'),
     '/pdfjs/standard_fonts/': path.join(pdfjsRoot, 'standard_fonts'),
+    '/pdfjs/images/': path.join(pdfjsRoot, 'web', 'images'),
   }
 
   const isInside = (root, filePath) => {
