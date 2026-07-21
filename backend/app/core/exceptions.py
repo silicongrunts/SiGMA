@@ -205,6 +205,15 @@ class SyncTeXError(ServiceException):
         super().__init__(message, "SYNCTEX_ERROR", status_code=400)
 
 
+class CompileCancelledError(ServiceException):
+    """A compile was cancelled because a newer compile for the same project
+    superseded it. HTTP 499 mirrors nginx's "Client Closed Request" semantics:
+    the request did not complete, but not because of a server error — it was
+    displaced by a newer request. The frontend surfaces this message as-is."""
+    def __init__(self, message: str = "Compilation cancelled: superseded by a newer compile"):
+        super().__init__(message, "COMPILE_CANCELLED", status_code=499)
+
+
 # ---------------------------------------------------------------------------
 # Task / Agent exceptions
 # ---------------------------------------------------------------------------

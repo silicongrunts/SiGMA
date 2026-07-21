@@ -1,9 +1,11 @@
 import re
 import gzip
 import asyncio
+import contextlib
 import os
 import platform
 import shutil
+import signal
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Optional, Dict, Any, List
@@ -11,7 +13,7 @@ from typing import Optional, Dict, Any, List
 from app.core.config import settings
 from app.core.exceptions import (
     LaTeXCompilationError, SyncTeXError, FileMissingError,
-    InvalidPathError, ProjectNotFoundError,
+    InvalidPathError, ProjectNotFoundError, CompileCancelledError,
 )
 from app.core.logging import get_logger
 from app.services.tex_service import TEXLIVE_ROOT
@@ -23,6 +25,10 @@ LATEX_OUTPUT_BASE = "output"
 LATEX_KEEP_OUTPUTS = {"output.pdf", "output.synctex.gz"}
 LATEX_EXTRA_TEMP_FILES = {"missfont.log", "texput.log"}
 LATEXMK_TIMEOUT_SECONDS = 120
+# Grace window given to the latexmk process group between SIGTERM and the
+# SIGKILL escalation during teardown. Kept as a module constant so tests can
+# shrink it instead of waiting out the real window.
+LATEXMK_TERMINATE_GRACE_SECONDS = 5
 LATEXMK_COMPILER_FLAGS = {
     "latex": "-pdfdvi",
     "pdflatex": "-pdf",
@@ -30,12 +36,28 @@ LATEXMK_COMPILER_FLAGS = {
     "lualatex": "-lualatex",
 }
 
-# Per-project compile locks (module-level singleton)
-_compile_locks: dict[str, asyncio.Lock] = {}
+# Per-project compile orchestration (module-level singletons).
+#
+# ``_compile_tasks`` records the in-flight compile task for each project so a
+# newly-requested compile can cancel the previous one (user refreshes / opens
+# a new tab and clicks compile again). ``_compile_preempted`` marks tasks
+# that were cancelled by a newer request, so the cancelled task's caller can
+# distinguish preemption (surface ``CompileCancelledError``) from an external
+# cancel like a client disconnect (propagate the raw ``CancelledError``).
+# ``_compile_orchestration_locks`` serializes only the cancel-then-register
+# step so two near-simultaneous requests cannot trample each other's task
+# registration; the actual compilation runs outside the orchestration lock
+# and is cancelable.
+#
+# These are process-local. SiGMA runs a single uvicorn worker; if that ever
+# changes, compile serialization must move out-of-process.
+_compile_tasks: dict[str, asyncio.Task] = {}
+_compile_preempted: set[asyncio.Task] = set()
+_compile_orchestration_locks: dict[str, asyncio.Lock] = {}
 
 
-def _get_compile_lock(project_id: str) -> asyncio.Lock:
-    return _compile_locks.setdefault(project_id, asyncio.Lock())
+def _get_orchestration_lock(project_id: str) -> asyncio.Lock:
+    return _compile_orchestration_locks.setdefault(project_id, asyncio.Lock())
 
 
 class LaTeXService:
@@ -339,10 +361,18 @@ class LaTeXService:
         ]
         env = self._latexmk_env()
         try:
+            # ``start_new_session=True`` puts latexmk and every process it
+            # spawns (``sh -c pdflatex``, ``pdflatex``, ...) into their own
+            # process group with latexmk as the leader (``pid == pgid``).
+            # That lets ``_terminate_latexmk`` kill the whole tree via
+            # ``os.killpg``; a single-PID terminate only reaches latexmk and
+            # leaks the children as orphans when a project drives pdflatex
+            # into a loop that ignores SIGTERM.
             process = await asyncio.create_subprocess_exec(
                 *cmd, cwd=str(compile_dir),
                 env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
         except FileNotFoundError:
             return False, "", "latexmk command not found. Install latexmk from the TeX Live manager."
@@ -391,12 +421,61 @@ class LaTeXService:
         return set()
 
     async def _terminate_latexmk(self, process: asyncio.subprocess.Process) -> None:
-        process.terminate()
+        """Force the latexmk process tree to stop.
+
+        ``_run_latexmk`` starts latexmk in its own session
+        (``start_new_session=True``), so ``process.pid`` is the process-group
+        leader and ``os.getpgid`` returns that PGID. We signal the whole group
+        rather than just the latexmk PID, because a single-PID terminate only
+        reaches latexmk: when a bad project drives ``pdflatex`` into a loop,
+        latexmk may exit on SIGTERM while its ``sh -c pdflatex`` /
+        ``pdflatex`` children keep running and get re-parented to init, never
+        timing out.
+
+        Sequence: SIGTERM the group, give it 5s, then unconditionally
+        SIGKILL the group and ``await`` the leader's exit. The SIGKILL is
+        unconditional (not guarded by "still alive?") because a stray child
+        that ignored SIGTERM must not extend the wait past this point — the
+        leader's wait is our only reliable "done" signal.
+        """
         try:
-            await asyncio.wait_for(process.wait(), timeout=5)
+            pgid = os.getpgid(process.pid)
+        except ProcessLookupError:
+            # Leader already gone; nothing to signal.
+            try:
+                await asyncio.wait_for(process.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                pass
+            return
+
+        self._signal_process_group(pgid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=LATEXMK_TERMINATE_GRACE_SECONDS)
+            return
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            pass  # Fall through to SIGKILL.
+
+        self._signal_process_group(pgid, signal.SIGKILL)
+        # ``process.wait()`` waits on the leader (latexmk). It should exit
+        # immediately under SIGKILL; the wait keeps asyncio's internal child
+        # watcher from leaking a zombie.
+        try:
+            await asyncio.wait_for(process.wait(), timeout=LATEXMK_TERMINATE_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "latexmk process %s (pgid %s) did not exit after SIGKILL",
+                process.pid, pgid,
+            )
+
+    @staticmethod
+    def _signal_process_group(pgid: int, sig: int) -> None:
+        """Send ``sig`` to process group ``pgid``; tolerate it already dying."""
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            # Group already gone — the race between a child exiting and us
+            # signaling it is expected during teardown.
+            pass
 
     def _latexmk_log_content(self, compile_dir: Path, stdout: str, stderr: str) -> str:
         parts = ["--- LATEXMK STDOUT ---", stdout, "--- LATEXMK STDERR ---", stderr]
@@ -710,56 +789,114 @@ class LaTeXService:
     ) -> dict:
         """Resolve the main file and compile the project.
 
-        Returns the unified result dict (success/error/log/diagnostics).
+        If a previous compile for the same project is still running, it is
+        cancelled and awaited first — its process tree is torn down via
+        ``_terminate_latexmk`` (SIGTERM/SIGKILL on the whole process group),
+        so no orphan pdflatex survives. The orchestration that swaps the
+        tasks is serialized per project so two near-simultaneous requests
+        cannot race on registration.
+
+        When *this* compile is cancelled by a later request, the
+        ``CancelledError`` from ``await task`` is converted to
+        ``CompileCancelledError`` so the unified exception handler surfaces
+        a clear message instead of "Internal server error". A cancel that
+        comes from outside (client disconnect, server shutdown) is not
+        marked as preemption and propagates as a plain ``CancelledError``.
+
+        Returns the unified result dict (success/error/log/diagnostics) of
+        the *current* compile.
         """
+        # Serialize the cancel-and-register step. The previous task is
+        # awaited inside this lock, but the previous task itself never
+        # acquires this lock (its compile runs lock-free), so there is no
+        # deadlock: we are waiting for the previous task to finish its
+        # own teardown, not for it to release a lock we hold.
+        orchestration_lock = _get_orchestration_lock(project_id)
+        async with orchestration_lock:
+            previous = _compile_tasks.get(project_id)
+            if previous is not None and not previous.done():
+                # Mark the previous task as preempted BEFORE cancelling so
+                # its CancelledError handler can see the flag regardless of
+                # when it runs.
+                _compile_preempted.add(previous)
+                previous.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await previous
+
+            task = asyncio.create_task(
+                self._compile_project_inner(project_id, request_main_file, engine)
+            )
+            _compile_tasks[project_id] = task
+
+        try:
+            return await task
+        except asyncio.CancelledError:
+            # ``task in _compile_preempted`` means a newer request cancelled
+            # us (preemption) — surface a clear message. Otherwise the cancel
+            # came from outside (client disconnect, shutdown) and the raw
+            # CancelledError must propagate so FastAPI/uvicorn handle the
+            # disconnect correctly.
+            if task in _compile_preempted:
+                raise CompileCancelledError() from None
+            raise
+        finally:
+            _compile_preempted.discard(task)
+            # Only clear our own registration. A later request may have
+            # already replaced us; we must not undo its registration.
+            if _compile_tasks.get(project_id) is task:
+                _compile_tasks.pop(project_id, None)
+
+    async def _compile_project_inner(
+        self, project_id: str, request_main_file: str, engine: str,
+    ) -> dict:
+        """Resolve the main file and run the compile. Cancellation points are
+        the awaited ``project_service`` reads and ``self.compile``."""
         from app.services.project_service import project_service
 
-        lock = _get_compile_lock(project_id)
-        async with lock:
-            main_file = request_main_file
-            if not main_file:
-                try:
-                    proj = await project_service.get_project(project_id)
-                    main_file = proj.get("main_file") or ""
-                except Exception:
-                    logger.debug("Failed to read project main_file for %s", project_id, exc_info=True)
-
-            if not main_file:
-                return {
-                    "success": False,
-                    "error": "No main TeX file configured for this project",
-                    "log": "",
-                    "diagnostics": [],
-                }
-
-            ext = main_file.rsplit(".", 1)[-1].lower() if "." in main_file else ""
-            if ext not in TEX_EXTS:
-                return {
-                    "success": False,
-                    "error": f"Cannot compile '{main_file}': not a TeX file",
-                    "log": "",
-                    "diagnostics": [],
-                }
-
+        main_file = request_main_file
+        if not main_file:
             try:
-                resolved = self.resolve_main_file(project_id, main_file)
-            except LaTeXCompilationError as exc:
-                return {
-                    "success": False,
-                    "error": exc.message,
-                    "log": "",
-                    "diagnostics": [],
-                }
-            if resolved and resolved != main_file:
-                try:
-                    await project_service.update_project(project_id, {"main_file": resolved})
-                except Exception:
-                    logger.debug("Failed to update resolved main_file for %s", project_id, exc_info=True)
-                main_file = resolved
+                proj = await project_service.get_project(project_id)
+                main_file = proj.get("main_file") or ""
+            except Exception:
+                logger.debug("Failed to read project main_file for %s", project_id, exc_info=True)
 
-            return await self.compile(
-                project_id=project_id, main_file=main_file, engine=engine,
-            )
+        if not main_file:
+            return {
+                "success": False,
+                "error": "No main TeX file configured for this project",
+                "log": "",
+                "diagnostics": [],
+            }
+
+        ext = main_file.rsplit(".", 1)[-1].lower() if "." in main_file else ""
+        if ext not in TEX_EXTS:
+            return {
+                "success": False,
+                "error": f"Cannot compile '{main_file}': not a TeX file",
+                "log": "",
+                "diagnostics": [],
+            }
+
+        try:
+            resolved = self.resolve_main_file(project_id, main_file)
+        except LaTeXCompilationError as exc:
+            return {
+                "success": False,
+                "error": exc.message,
+                "log": "",
+                "diagnostics": [],
+            }
+        if resolved and resolved != main_file:
+            try:
+                await project_service.update_project(project_id, {"main_file": resolved})
+            except Exception:
+                logger.debug("Failed to update resolved main_file for %s", project_id, exc_info=True)
+            main_file = resolved
+
+        return await self.compile(
+            project_id=project_id, main_file=main_file, engine=engine,
+        )
 
     async def get_pdf_filename(self, project_id: str) -> str:
         """Determine the PDF filename for a project (used by the PDF endpoint)."""
