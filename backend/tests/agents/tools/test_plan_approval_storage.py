@@ -37,7 +37,7 @@ async def test_approved_plan_is_saved_under_session_temp_dir(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_plan_approval_result_does_not_expose_internal_path(tmp_path, monkeypatch):
+async def test_approved_plan_exposes_relative_path_for_compaction(tmp_path, monkeypatch):
     fake_settings = SimpleNamespace(get_project_path=lambda project_id: tmp_path)
     monkeypatch.setattr(
         plan_approval_tool,
@@ -56,6 +56,8 @@ async def test_plan_approval_result_does_not_expose_internal_path(tmp_path, monk
         session_id="session-1",
     )
 
+    # The relative path is intentionally exposed so compaction summaries can
+    # remember where the approved plan file lives.
     assert "internal session temporary storage" in result
-    assert ".SiGMA/sessions" not in result
+    assert ".SiGMA/sessions/session-1/plans/" in result
     assert (tmp_path / ".SiGMA" / "sessions" / "session-1" / "plans").is_dir()
