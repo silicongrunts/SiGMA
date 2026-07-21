@@ -22,7 +22,7 @@ TEX_EXTS = {"tex", "cls", "sty", "bib"}
 LATEX_OUTPUT_BASE = "output"
 LATEX_KEEP_OUTPUTS = {"output.pdf", "output.synctex.gz"}
 LATEX_EXTRA_TEMP_FILES = {"missfont.log", "texput.log"}
-LATEXMK_TIMEOUT_SECONDS = 600
+LATEXMK_TIMEOUT_SECONDS = 120
 LATEXMK_COMPILER_FLAGS = {
     "latex": "-pdfdvi",
     "pdflatex": "-pdf",
