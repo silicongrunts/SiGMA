@@ -31,6 +31,23 @@ from app.services.message_persist import stage_new_messages
 
 logger = get_logger(__name__)
 
+# Guidance appended to every diff-validation error on the free-text retry path.
+# Tool-argument diffs (annotation_new / annotation_reply) have no "lost long
+# message" problem, so they must stay unaffected.
+_DIFF_RETRY_GUIDANCE = (
+    "\n\nCorrect format: "
+    "<diff><before>exact original text, unique in the file</before>"
+    "<after>replacement</after></diff>. "
+    "The user only sees your latest reply — your previous message is not "
+    "visible to them, so restate your full reply (explanation + all corrected "
+    "diffs) now."
+)
+
+
+def _append_retry_guidance(error: str | None) -> str | None:
+    """Attach the retry guidance to a validation error; pass None through."""
+    return (error + _DIFF_RETRY_GUIDANCE) if error else None
+
 
 class AnnotationLoop:
     """LLM interaction loop for a single annotation AI reply."""
@@ -266,7 +283,7 @@ class AnnotationLoop:
         except Exception:
             logger.debug("Failed to read annotation file for diff validation %s", self.file_path, exc_info=True)
             return None
-        return validate_diffs(text_content, file_content)
+        return _append_retry_guidance(validate_diffs(text_content, file_content))
 
     # ------------------------------------------------------------------
     # Persistence
