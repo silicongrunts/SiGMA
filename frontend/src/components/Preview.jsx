@@ -13,7 +13,7 @@ import { storage } from '../utils/storage'
 import { getCompiledPdfName } from '../utils/constants'
 import { toastError } from './Toast'
 import { rewriteProjectImageSrc } from './ChatShared'
-import { extractMath, restoreMath } from '../utils/mathGuard'
+import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
 import PdfPreview from './preview/PdfPreview'
 import { ZoomIn, ZoomOut, ArrowUp, Maximize2, FileSearch, FileText, Download, AlertTriangle, ChevronLeft, ChevronRight } from 'lucide-react'
 
@@ -343,7 +343,12 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
   useEffect(() => {
     if (type === 'markdown' && containerRef.current) {
         const el = containerRef.current.querySelector('.prose')
-        if (el) renderMathInElement(el, { delimiters: [{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}], throwOnError:false })
+        if (el) {
+            renderMathInElement(el, { delimiters: [{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}], throwOnError:false })
+            // After typesetting, flag inline formulas that truly overflow the
+            // column so each gets its own scrollbar. See utils/mathGuard.js.
+            applyMathOverflow(el)
+        }
     }
   }, [mdContent, type, zoomLevel])
 

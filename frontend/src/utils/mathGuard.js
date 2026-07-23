@@ -96,3 +96,64 @@ export function restoreMath(html, map) {
   if (!html || !map) return html
   return html.replace(PH_RE, (full, id) => map.get(id) ?? full)
 }
+
+/**
+ * Mark inline `$...$` formulas that truly overflow the column so each one gets
+ * its own horizontal scrollbar, while leaving short/wrappable formulas as plain
+ * baseline-aligned inline content (no spurious scrollbar, no height shift).
+ *
+ * Why this exists: KaTeX renders `.katex` inline. A single very wide inline
+ * formula (e.g. a long fraction or `\text{...}` run with no break point) would
+ * otherwise push past the column boundary. The CSS rule `.katex { display:
+ * inline-block; max-width: 100% }` already constrains the box so nothing spills
+ * out, and most formulas simply wrap inside it. But the few that CANNOT wrap
+ * need a scrollbar so the user can still reach the clipped part.
+ *
+ * Why this is a measured JS step and not `overflow-x:auto` on every `.katex`:
+ * KaTeX's own layout reports `scrollWidth > clientWidth` by ~2px for some
+ * glyphs (notably `\sqrt` whose rule extends past the measured box). A blanket
+ * `overflow-x:auto` therefore shows a phantom scrollbar on short square-root
+ * formulas. We instead detect the real overflow: an inline-block only reaches
+ * its `max-width:100%` cap (== the available line width) when its content is
+ * too wide to shrink-to-fit. So a formula needs a scrollbar precisely when its
+ * rendered width has hit the cap AND its scrollWidth exceeds that capped width.
+ * Short formulas never reach the cap, so the sqrt artifact never triggers.
+ *
+ * Display math (`$$...$$`, wrapped in `.katex-display`) already scrolls via its
+ * own CSS rule and is skipped here.
+ *
+ * Run this AFTER `renderMathInElement` so the `.katex` nodes exist.
+ */
+
+// Block-level ancestors a formula may sit in. Climbing to one of these (rather
+// than the immediate parent) matters when the formula is wrapped in an inline
+// element like <strong>/<em>/<a> — its width is only a line fragment, not the
+// column, so measuring against it would misjudge whether the formula overflows.
+const BLOCK_ANCESTORS = 'p, li, td, th, blockquote, div, section, article'
+const MATH_SCROLL_CLASS = 'sigma-math-scroll'
+
+export function applyMathOverflow(root) {
+  if (!root || typeof root.querySelectorAll !== 'function') return
+  const formulas = root.querySelectorAll('.katex')
+  formulas.forEach((katex) => {
+    // Reset first; re-measure on every call so width changes (resize, streaming
+    // re-render) re-evaluate correctly.
+    katex.classList.remove(MATH_SCROLL_CLASS)
+    // Skip display math — handled by the dedicated .katex-display rule.
+    if (katex.closest('.katex-display')) return
+    const container = katex.closest(BLOCK_ANCESTORS)
+    if (!container) return
+    const available = container.getBoundingClientRect().width
+    if (!Number.isFinite(available) || available <= 0) return
+    const rendered = katex.getBoundingClientRect().width
+    // "Constrained" = the box hit its max-width cap (rendered ≈ available),
+    // meaning shrink-to-fit could not accommodate the content.
+    const constrained = Math.abs(rendered - available) < 4
+    // Real overflow only when constrained AND natural content exceeds the box.
+    // The +2 tolerance absorbs the KaTeX sqrt sub-pixel artifact for the rare
+    // case where a sqrt formula happens to sit right at the column edge.
+    if (constrained && katex.scrollWidth > katex.clientWidth + 2) {
+      katex.classList.add(MATH_SCROLL_CLASS)
+    }
+  })
+}

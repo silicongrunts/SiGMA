@@ -122,19 +122,32 @@
   overflow-y: hidden;
 }
 
-/* Inline math ($...$): long expressions (e.g. a single very wide equation
-   written inline) must not overflow the column. `overflow` only takes effect
-   on block/inline-block, so promote .katex to inline-block while keeping it
-   baseline-aligned for normal short formulas. `overflow-x:auto` then lets the
-   wide case scroll within the column instead of crossing the boundary. The
-   display-mode case above is unaffected since it wraps a separate wrapper. */
+/* Inline math ($...$): promote to inline-block so `max-width:100%` can cap the
+   box and prevent any formula from crossing the column boundary. Most formulas
+   then simply wrap inside the capped box. `vertical-align: middle` (not
+   `baseline`) keeps the formula visually centered with surrounding text — an
+   inline-block with overflow sits by its bottom edge on the text baseline,
+   which makes formulas look shifted up.
+   We do NOT set `overflow-x:auto` here unconditionally: KaTeX reports a ~2px
+   `scrollWidth > clientWidth` artifact on some glyphs (notably `\sqrt`), which
+   would show a phantom scrollbar on short formulas. Instead the JS helper
+   `applyMathOverflow` (utils/mathGuard.js) adds `.sigma-math-scroll` only to
+   formulas whose content genuinely overflows the capped width, and only those
+   get a scrollbar. The display-mode rule above is unaffected. */
 .prose .katex,
 .sigma-content .katex {
   display: inline-block;
   max-width: 100%;
+  vertical-align: middle;
+}
+
+/* Inline formula confirmed by applyMathOverflow to overflow the column: give it
+   its own horizontal scrollbar so the clipped part stays reachable without any
+   element crossing the boundary. */
+.prose .katex.sigma-math-scroll,
+.sigma-content .katex.sigma-math-scroll {
   overflow-x: auto;
   overflow-y: hidden;
-  vertical-align: baseline;
 }
 
 /* Images and inline SVGs must not exceed the column width. */

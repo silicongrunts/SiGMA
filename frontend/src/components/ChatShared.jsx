@@ -7,7 +7,7 @@ import { useTranslation } from 'react-i18next'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import renderMathInElement from 'katex/dist/contrib/auto-render.mjs'
-import { extractMath, restoreMath } from '../utils/mathGuard'
+import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
 import { ChevronDown, MessageSquare, Cpu, CheckCircle2, Loader2, AlertCircle } from 'lucide-react'
 import TaskList from './TaskList'
 
@@ -147,6 +147,9 @@ export const MarkdownContent = ({ content, projectId = null, onCitation = null }
                 ],
                 throwOnError: false,
             })
+            // After typesetting, flag inline formulas that truly overflow the
+            // bubble so each gets its own scrollbar. See utils/mathGuard.js.
+            applyMathOverflow(containerRef.current)
         }
     }, [html])
 
