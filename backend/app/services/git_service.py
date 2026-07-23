@@ -18,6 +18,16 @@ logger = get_logger(__name__)
 SNAPSHOT_CATEGORY_ORDER = ("added", "deleted", "modified")
 SNAPSHOT_MESSAGE_PREFIX = "sigma:snapshot:v1:"
 
+# LaTeX build artifacts to keep out of snapshot history. These are regenerated
+# by every compile (``latexmk -jobname=output``), so versioning them bloats
+# the per-project git repo with large, diff-unfriendly binaries. The names
+# mirror ``LATEX_KEEP_OUTPUTS`` in latex_service — the files that survive
+# ``_cleanup_latex_outputs`` and would otherwise be swept up by ``git add -A``.
+# Kept as bare filenames (no leading slash) so the rule matches the artifact
+# wherever the main TeX file lives, including subdirectories; this avoids any
+# wildcard that could clobber a user's source such as ``figures/*.pdf``.
+GITIGNORE_LATEX_OUTPUTS = ("output.pdf", "output.synctex.gz")
+
 
 class GitService:
     def __init__(self):
@@ -59,8 +69,13 @@ class GitService:
 
             gitignore = project_path / ".gitignore"
             if not gitignore.exists():
+                artifact_lines = "\n".join(GITIGNORE_LATEX_OUTPUTS)
                 gitignore.write_text(
-                    "# SiGMA auto-generated\n.SiGMA/\n.upload_*\n",
+                    "# SiGMA auto-generated\n"
+                    ".SiGMA/\n"
+                    ".upload_*\n"
+                    f"# LaTeX build artifacts (regenerated on compile)\n"
+                    f"{artifact_lines}\n",
                     encoding="utf-8",
                 )
 
