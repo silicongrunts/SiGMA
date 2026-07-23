@@ -599,7 +599,12 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     const delta = afterText.length - beforeText.length
     const editEnd = matchTo
 
-    // Revalidate: shift non-overlapping annotations, re-match overlapping ones
+    // Realign the in-store annotations to the post-edit document so the store
+    // holds sensible values immediately (the CodeMirror decorations are tracked
+    // via tr.changes, so we read their live positions here). The save path's
+    // `syncAnnotationsNow` then re-derives positions once more straight from
+    // the decorations and overwrites this array on the happy path; this pass
+    // is what stays in the store if that save is skipped or fails.
     const revalidated = currentAnnotations.map(a => {
       const pos = getDecorationPosition(view, a.id)
       if (!pos || pos.from >= pos.to) return null
@@ -622,10 +627,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     }).filter(Boolean)
 
     // Seed the store so the save path's `syncAnnotationsNow` sees these
-    // annotations (it no-ops on an empty store). `syncAnnotationsNow` then
-    // re-derives positions straight from the CodeMirror decorations, which
-    // is more accurate than the delta arithmetic above, so the revalidated
-    // array is intentionally overwritten shortly after.
+    // annotations (it no-ops on an empty store).
     setAnnotations(revalidated)
 
     if (callbacks.current.onContentChange) callbacks.current.onContentChange(view.state.doc.toString())

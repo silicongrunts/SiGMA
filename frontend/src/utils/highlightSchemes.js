@@ -150,12 +150,17 @@ export function getSchemeExtension(id, isDark) {
  * A small palette preview used by the appearance dialog: returns the
  * foreground colors of a few representative token kinds for the given scheme
  * and mode, so the UI can render a color swatch without instantiating a
- * HighlightStyle parser. Values mirror the active palette above.
+ * HighlightStyle parser.
+ *
+ * The @uiw package styles do not expose a clean 1:1 mapping for these four
+ * token kinds (e.g. they fold variableName into a shared "name" entry, and
+ * the @uiw entries often carry uppercase hex while the hand-written light
+ * variants use lowercase), so the swatch values are curated here rather than
+ * mechanically extracted. The JSDoc on each scheme above is the authoritative
+ * source for where each palette comes from.
  */
 export function getSchemePreviewColors(id, isDark) {
   const map = {
-    // `default` light mirrors CodeMirror's built-in defaultHighlightStyle;
-    // dark mirrors @codemirror/theme-one-dark's oneDarkHighlightStyle.
     default:    isDark ? { keyword: '#c678dd', string: '#98c379', comment: '#7f848e', name: '#e06c75' }
                        : { keyword: '#708',    string: '#a11',    comment: '#940',    name: '#00f' },
     github:     isDark ? { keyword: '#ff7b72', string: '#a5d6ff', comment: '#8b949e', name: '#d2a8ff' }

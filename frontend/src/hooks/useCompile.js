@@ -22,7 +22,7 @@ import { compileAPI } from '../api'
 import { toastError } from '../components/Toast'
 import { getCompiledPdfName } from '../utils/constants'
 
-export function useCompile({ projectId, editorRef, previewRef, handleSave }) {
+export function useCompile({ projectId, handleSave }) {
   const { t } = useTranslation()
   const compilingRef = useRef(false)
 
@@ -100,7 +100,7 @@ export function useCompile({ projectId, editorRef, previewRef, handleSave }) {
       state.setCompiling(false)
       compilingRef.current = false
     }
-  }, [projectId, editorRef, previewRef, handleSave, t])
+  }, [projectId, handleSave, t])
 
   return { handleCompile }
 }

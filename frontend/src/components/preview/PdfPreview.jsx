@@ -46,6 +46,13 @@ export default function PdfPreview({
   const [host, setHost] = useState(null)
   const hostRef = useRef(null)
   useEffect(() => { hostRef.current = host }, [host])
+  // Pending SyncTeX indicator auto-remove timers. Tracked so unmount (or a
+  // document swap) can cancel them instead of firing on a detached node.
+  const synctexTimersRef = useRef([])
+  useEffect(() => () => {
+    for (const id of synctexTimersRef.current) clearTimeout(id)
+    synctexTimersRef.current = []
+  }, [])
   // fit-to-width scale for page 1 at the current container width. Kept in a
   // ref (not state) because scale application is imperative and does not need
   // to trigger a re-render.
@@ -205,7 +212,11 @@ export default function PdfPreview({
     indicator.style.left = `${vx}px`
     indicator.style.top = `${vy}px`
     pageView.div.appendChild(indicator)
-    setTimeout(() => indicator.remove(), SYNCTEX_INDICATOR_MS)
+    const timer = setTimeout(() => {
+      indicator.remove()
+      synctexTimersRef.current = synctexTimersRef.current.filter((id) => id !== timer)
+    }, SYNCTEX_INDICATOR_MS)
+    synctexTimersRef.current.push(timer)
   }, [])
 
   return (

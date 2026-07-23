@@ -127,7 +127,7 @@ export default function EditorView() {
   // ── Shared hooks ──
   const handleCompileRef = useRef(null)
   const { handleSave, conflictState, resolveConflict } = useSave({ projectId, editorRef, handleCompileRef })
-  const { handleCompile } = useCompile({ projectId, editorRef, previewRef, handleSave })
+  const { handleCompile } = useCompile({ projectId, handleSave })
   const { handleFileSelect, handleExitNotebook } = useFileActions({ projectId, editorRef, previewRef, handleSave })
   handleCompileRef.current = handleCompile
   useAutoCompile({ currentFile, handleCompile })

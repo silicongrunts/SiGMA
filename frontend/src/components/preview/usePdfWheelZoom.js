@@ -36,6 +36,7 @@ export function usePdfWheelZoom(host, applyScale) {
   const isZoomingRef = useRef(false)
   const isScrollingRef = useRef(false)
   const scrollTimerRef = useRef(null)
+  const zoomLockTimerRef = useRef(null)
   const applyScaleRef = useRef(applyScale)
   useEffect(() => { applyScaleRef.current = applyScale }, [applyScale])
 
@@ -97,7 +98,8 @@ export function usePdfWheelZoom(host, applyScale) {
         if (isZoomingRef.current) return // coalesce burst
         isZoomingRef.current = true
         performZoom(event)
-        setTimeout(() => { isZoomingRef.current = false }, 5)
+        if (zoomLockTimerRef.current) clearTimeout(zoomLockTimerRef.current)
+        zoomLockTimerRef.current = setTimeout(() => { isZoomingRef.current = false }, 5)
       } else {
         isScrollingRef.current = true
         if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current)
@@ -109,6 +111,7 @@ export function usePdfWheelZoom(host, applyScale) {
     return () => {
       container.removeEventListener('wheel', onWheel)
       if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current)
+      if (zoomLockTimerRef.current) clearTimeout(zoomLockTimerRef.current)
     }
   }, [host, performZoom])
 }

@@ -814,10 +814,9 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
     )
   }
 
-  // Editor theme modal — anchored popover (mirrors renderKernelModal structure).
-  // This is a documented exception to CLAUDE.md rule 8: the kernels popover is
-  // the established pattern for settings-anchored panels in this dropdown, so
-  // we mirror it rather than using the centered ModalOverlay primitive.
+  // Editor theme modal — anchored popover that mirrors renderKernelModal: the
+  // kernels popover established the pattern for settings-anchored panels in this
+  // dropdown, so this one follows the same shape instead of a centered modal.
   const renderEditorThemeModal = () => {
     if (!showEditorThemeModal) return null
     return (

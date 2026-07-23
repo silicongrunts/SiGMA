@@ -165,7 +165,8 @@ export function matchAnnotation(doc, annotation) {
   }
 
   // ── Tier 4: Fuzzy match ──
-  // Two independent matchers, both must score >= 0.4 to be accepted:
+  // Two independent matchers; each must clear the 0.4 threshold on its own to
+  // be eligible, then the higher score wins:
   //   4a: longest common substring — clean contiguous overlap, good when
   //       the text was moved but barely edited
   //   4b: Myers bit-vector search — tolerates substitutions/indels, good

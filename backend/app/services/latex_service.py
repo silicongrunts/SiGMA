@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.core.exceptions import (
     LaTeXCompilationError, SyncTeXError, FileMissingError,
     InvalidPathError, ProjectNotFoundError, CompileCancelledError,
+    FileSystemError,
 )
 from app.core.logging import get_logger
 from app.services.tex_service import TEXLIVE_ROOT
@@ -25,6 +26,9 @@ LATEX_OUTPUT_BASE = "output"
 LATEX_KEEP_OUTPUTS = {"output.pdf", "output.synctex.gz"}
 LATEX_EXTRA_TEMP_FILES = {"missfont.log", "texput.log"}
 LATEXMK_TIMEOUT_SECONDS = 120
+# SyncTeX view/edit lookups are short one-shot commands; bound them so a wedged
+# synctex binary cannot hold the request open indefinitely.
+SYNCTEX_TIMEOUT_SECONDS = 30
 # Grace window given to the latexmk process group between SIGTERM and the
 # SIGKILL escalation during teardown. Kept as a module constant so tests can
 # shrink it instead of waiting out the real window.
@@ -75,6 +79,26 @@ class LaTeXService:
         if any(part in ("", ".", "..") or part.startswith(".") for part in path.parts):
             return False
         return bool(re.match(r'^[a-zA-Z0-9_\-\./]+$', filename))
+
+    def _resolve_within_project(
+        self, project_path: Path, filename: str, exc,
+    ) -> Path:
+        """Resolve *filename* under *project_path*, rejecting unsafe names and
+        any path that escapes the project root. *exc* is a callable that takes
+        the offending filename and returns the domain-specific exception to
+        raise (e.g. ``FileMissingError``, ``lambda f: SyncTeXError(...)``), so
+        each call site keeps its own error contract while sharing the
+        containment check that ``get_pdf_path`` / ``run_synctex`` /
+        ``get_compile_status`` all need.
+        """
+        if not self._is_safe_filename(filename):
+            raise exc(filename)
+        resolved = (project_path / filename).resolve()
+        try:
+            resolved.relative_to(project_path)
+        except ValueError:
+            raise exc(filename)
+        return resolved
 
     async def compile(self, project_id: str, main_file: Optional[str] = None, engine: Optional[str] = None) -> Dict[str, Any]:
         project_path = settings.get_project_path(project_id).resolve()
@@ -606,13 +630,7 @@ class LaTeXService:
         mode = data.type
         if mode == "forward":
             target_file = data.file or main_file
-            if not self._is_safe_filename(target_file):
-                raise SyncTeXError(f"Invalid file: {target_file}")
-            target_path = (project_path / target_file).resolve()
-            try:
-                target_path.relative_to(project_path)
-            except ValueError:
-                raise SyncTeXError(f"Invalid file: {target_file}")
+            target_path = self._resolve_within_project(project_path, target_file, lambda f: SyncTeXError(f"Invalid file: {f}"))
             source_arg = str(target_path)
             cmd = ["synctex", "view", "-i", f"{data.line or 1}:{data.column or 0}:{source_arg}", "-o", str(pdf_path)]
         elif mode == "backward":
@@ -622,7 +640,13 @@ class LaTeXService:
 
         try:
             process = await asyncio.create_subprocess_exec(*cmd, cwd=str(compile_dir), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            stdout, stderr = await process.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=SYNCTEX_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
+                raise SyncTeXError(f"SyncTeX command timed out after {SYNCTEX_TIMEOUT_SECONDS} seconds")
             output = stdout.decode('utf-8')
             if process.returncode != 0:
                 stderr_text = stderr.decode('utf-8', 'ignore')
@@ -719,13 +743,7 @@ class LaTeXService:
         project_path = settings.get_project_path(project_id).resolve()
         if not project_path.exists():
             raise ProjectNotFoundError(project_id)
-        if not self._is_safe_filename(filename):
-            raise FileMissingError(filename)
-        pdf_path = (project_path / filename).resolve()
-        try:
-            pdf_path.relative_to(project_path)
-        except ValueError:
-            raise FileMissingError(filename)
+        pdf_path = self._resolve_within_project(project_path, filename, FileMissingError)
         if not pdf_path.exists() or not pdf_path.is_file():
             raise FileMissingError(filename)
         return pdf_path
@@ -743,13 +761,9 @@ class LaTeXService:
         except Exception:
             logger.warning("Failed to determine compile status PDF path for %s", project_id, exc_info=True)
 
-        if not self._is_safe_filename(pdf_filename):
-            return {"has_pdf": False, "pdf_files": []}
-
-        pdf_file = (project_path / pdf_filename).resolve()
         try:
-            pdf_file.relative_to(project_path)
-        except ValueError:
+            pdf_file = self._resolve_within_project(project_path, pdf_filename, lambda f: FileSystemError("invalid pdf path", code="INVALID_PATH"))
+        except FileSystemError:
             return {"has_pdf": False, "pdf_files": []}
 
         pdf_files = [pdf_filename] if pdf_file.exists() and pdf_file.is_file() else []
@@ -862,31 +876,13 @@ class LaTeXService:
                 logger.debug("Failed to read project main_file for %s", project_id, exc_info=True)
 
         if not main_file:
-            return {
-                "success": False,
-                "error": "No main TeX file configured for this project",
-                "log": "",
-                "diagnostics": [],
-            }
+            raise LaTeXCompilationError("No main TeX file configured for this project")
 
         ext = main_file.rsplit(".", 1)[-1].lower() if "." in main_file else ""
         if ext not in TEX_EXTS:
-            return {
-                "success": False,
-                "error": f"Cannot compile '{main_file}': not a TeX file",
-                "log": "",
-                "diagnostics": [],
-            }
+            raise LaTeXCompilationError(f"Cannot compile '{main_file}': not a TeX file")
 
-        try:
-            resolved = self.resolve_main_file(project_id, main_file)
-        except LaTeXCompilationError as exc:
-            return {
-                "success": False,
-                "error": exc.message,
-                "log": "",
-                "diagnostics": [],
-            }
+        resolved = self.resolve_main_file(project_id, main_file)
         if resolved and resolved != main_file:
             try:
                 await project_service.update_project(project_id, {"main_file": resolved})
