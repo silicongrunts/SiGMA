@@ -46,7 +46,8 @@ const delAnnoEffect = StateEffect.define()
 /**
  * Map annotation status to CSS class.
  *   'exact' / 'valid' → solid yellow underline (exact match)
- *   'fuzzy' / 'modified' / 'orphan' → dashed orange underline (text changed or unmatched)
+ *   'fuzzy' / 'modified' → dashed orange underline (text changed)
+ *   'orphan' never reaches here — orphans have no body decoration.
  */
 const annoCls = (status) =>
   (status === 'exact' || status === 'valid') ? 'cm-annotation' : 'cm-annotation-modified'
@@ -66,6 +67,9 @@ const annotationField = StateField.define({
       } else if (e.is(setAnnosEffect)) {
         const docLen = tr.state.doc.length
         const validAnnos = e.value.map(a => {
+          // Orphans render no body decoration (surfaced via the broken-anchor
+          // list instead); also drop zero-width / out-of-bounds ranges.
+          if (a.status === 'orphan') return null
           const from = Math.min(a.from ?? 0, docLen)
           const to = Math.min(a.to ?? 0, docLen)
           if (from >= to) return null
@@ -347,7 +351,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     clampNavIndices()
 
     // Save to backend. The backend preserves stored anchors for orphan
-    // annotations, so placeholder render positions are not written back.
+    // annotations, so orphans are kept as-is without writing back positions.
     const toSave = resolved
     if (toSave.length > 0 || toRemove.length > 0) {
       try { await filesAPI.saveAnnotations(pid, file, toSave) } catch { /* non-critical */ }
@@ -589,9 +593,10 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     return annos.map(a => {
       const m = matchAnnotation(doc, { from: a.from, to: a.to, originalText: a.originalText })
       if (m.status === 'orphan') {
-        // No match found — render dashed decoration at end of document.
-        // Keep original originalText; do NOT update position in backend saves.
-        return { ...a, from: m.from, to: m.to, originalText: a.originalText, status: 'orphan' }
+        // No match in the document — zero-width range, so no body decoration.
+        // Keep stored anchors intact (do NOT overwrite with the zero range);
+        // the backend preserves them and the broken-anchor list surfaces them.
+        return { ...a, status: 'orphan' }
       }
       return {
         ...a,
@@ -933,12 +938,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     dispatchSetAnnos: (annos) => {
       const view = viewRef.current
       if (!view) return
-      const docLen = view.state.doc.length
-      // Filter out annotations with no valid position (from >= to or out of bounds)
-      const placed = annos.filter(a =>
-        a.from != null && a.to != null && a.from >= 0 && a.from < a.to && a.to <= docLen
-      )
-      view.dispatch({ effects: setAnnosEffect.of(placed) })
+      view.dispatch({ effects: setAnnosEffect.of(annos) })
       clampNavIndices()
       // Keep the annotation nav panel in sync after decorations change.
       requestAnimationFrame(() => callbacks.current.onAnnoNavScroll?.())
@@ -949,6 +949,14 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
 
     /** Revalidate backend annotations against current document using matching algorithm. */
     revalidateBackendAnnos: revalidateBackendAnnotations,
+
+    /** Orphan annotations (original text no longer in the document), read from
+     *  the live Zustand store so it reflects the latest revalidation. */
+    getOrphanAnnotations: () => useStore.getState().annotations.filter(a => a.status === 'orphan'),
+
+    /** Open an annotation popup at a fixed anchor point (used for orphans,
+     *  which have no in-document position). */
+    openPopupAt: (id, clientX, clientY) => openAnnotationPopup(id, clientX, clientY),
 
     // ── Annotation navigation ─────────────────────────────────────────
     // Two independent code paths:

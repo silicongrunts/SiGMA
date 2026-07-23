@@ -7,6 +7,7 @@
  * problem where both EditorView and SynthesisTab called the same hooks.
  */
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import { useStore } from '../store/useStore'
 import { compileAPI } from '../api'
@@ -16,7 +17,7 @@ import Editor from './Editor'
 import Preview from './Preview'
 import NotebookEditor from './NotebookEditor'
 import { ResizablePanels } from './ResizablePanels'
-import { ChevronRight, ChevronUp, ChevronDown, FileText, Loader2 } from 'lucide-react'
+import { ChevronRight, ChevronUp, ChevronDown, FileText, Loader2, Unlink } from 'lucide-react'
 
 export default function SynthesisTab({
   projectId,
@@ -47,6 +48,19 @@ export default function SynthesisTab({
   const [topAnnoIndex, setTopAnnoIndex] = useState(null)
   const annoNavRafRef = useRef(0)
 
+  // Orphan annotations (original text gone from the document) — surfaced via
+  // a broken-anchor badge next to the nav counter, since they have no in-body
+  // decoration to click.
+  const [orphanList, setOrphanList] = useState([])
+  const [orphanMenu, setOrphanMenu] = useState(null) // { x, y } | null
+
+  const refreshOrphanList = useCallback(() => {
+    setOrphanList(editorRef.current?.getOrphanAnnotations?.() ?? [])
+  }, [editorRef])
+
+  // Re-pull orphans whenever the annotation store changes (load / SSE / edit).
+  useEffect(() => { refreshOrphanList() }, [annotations, refreshOrphanList])
+
   const refreshAnnoNav = useCallback(() => {
     if (!editorRef.current) return
     const positions = editorRef.current.getAnnotationPositions?.() ?? []
@@ -64,9 +78,9 @@ export default function SynthesisTab({
 
   // Refresh after file load / ready
   useEffect(() => {
-    if (!currentFile) { setAnnoCount(0); setTopAnnoIndex(null); return }
-    editorRef.current?.whenReady?.().then(refreshAnnoNav).catch(() => {})
-  }, [currentFile, editorRef, refreshAnnoNav])
+    if (!currentFile) { setAnnoCount(0); setTopAnnoIndex(null); setOrphanList([]); return }
+    editorRef.current?.whenReady?.().then(() => { refreshAnnoNav(); refreshOrphanList() }).catch(() => {})
+  }, [currentFile, editorRef, refreshAnnoNav, refreshOrphanList])
 
   // Refresh when decorations change via SSE (annotations array mutation)
   useEffect(() => { refreshAnnoNav() }, [annotations, refreshAnnoNav])
@@ -102,6 +116,7 @@ export default function SynthesisTab({
   const showPreview = !isNotebookMode
 
   return (
+    <>
     <ResizablePanels
       initialSizes={showPreview ? ['50%', '1'] : ['1']}
       resizerContent={showPreview ? [(
@@ -149,29 +164,41 @@ export default function SynthesisTab({
                 <FileText className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 mr-2 flex-shrink-0" />
                 <span className="text-xs font-bold text-gray-600 dark:text-gray-400 truncate">{currentFile}</span>
               </div>
-              {annoCount > 0 && (
-                <div className="flex items-center gap-1.5 flex-shrink-0 ml-2">
-                  <span className="text-[11px] font-bold tabular-nums text-gray-500 dark:text-gray-400">
-                    {t('annotations.navPosition', { current: topAnnoIndex ?? '—', total: annoCount })}
-                  </span>
+              <div className="flex items-center gap-1.5 flex-shrink-0 ml-2">
+                {orphanList.length > 0 && (
                   <button
-                    onClick={prevAnnotation}
-                    disabled={annoCount > 1 && topAnnoIndex === 1}
-                    title={t('annotations.prevAnnotation')}
-                    className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent transition-colors"
+                    onClick={(e) => setOrphanMenu({ x: e.clientX, y: e.clientY })}
+                    title={t('annotations.orphanTooltip', { count: orphanList.length })}
+                    className="flex items-center gap-0.5 px-1.5 h-5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400 hover:bg-orange-200 dark:hover:bg-orange-900/50 transition-colors"
                   >
-                    <ChevronUp className="w-3.5 h-3.5" />
+                    <Unlink className="w-3 h-3" />
+                    <span className="text-[10px] font-black tabular-nums leading-none">{orphanList.length}</span>
                   </button>
-                  <button
-                    onClick={nextAnnotation}
-                    disabled={annoCount > 1 && topAnnoIndex === annoCount}
-                    title={t('annotations.nextAnnotation')}
-                    className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent transition-colors"
-                  >
-                    <ChevronDown className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              )}
+                )}
+                {annoCount > 0 && (
+                  <>
+                    <span className="text-[11px] font-bold tabular-nums text-gray-500 dark:text-gray-400">
+                      {t('annotations.navPosition', { current: topAnnoIndex ?? '—', total: annoCount })}
+                    </span>
+                    <button
+                      onClick={prevAnnotation}
+                      disabled={annoCount > 1 && topAnnoIndex === 1}
+                      title={t('annotations.prevAnnotation')}
+                      className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent transition-colors"
+                    >
+                      <ChevronUp className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={nextAnnotation}
+                      disabled={annoCount > 1 && topAnnoIndex === annoCount}
+                      title={t('annotations.nextAnnotation')}
+                      className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent transition-colors"
+                    >
+                      <ChevronDown className="w-3.5 h-3.5" />
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
             <div className="flex-1 min-h-0">
               <Editor
@@ -262,5 +289,37 @@ export default function SynthesisTab({
         </aside>
       )}
     </ResizablePanels>
+    {orphanMenu && createPortal(
+      <div className="fixed inset-0 z-[9997]" onClick={() => setOrphanMenu(null)}>
+        <div
+          className="absolute bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 shadow-[0_10px_40px_rgba(0,0,0,0.15)] rounded-xl overflow-hidden py-1 w-72 animate-in fade-in zoom-in duration-150"
+          style={{ left: Math.min(orphanMenu.x, window.innerWidth - 300), top: orphanMenu.y }}
+          onClick={e => e.stopPropagation()}
+        >
+          <div className="px-3 py-2 text-[10px] font-black uppercase tracking-widest text-orange-500 dark:text-orange-400 border-b border-gray-100 dark:border-gray-700">
+            {t('annotations.orphanCount', { count: orphanList.length })}
+          </div>
+          {orphanList.map(a => {
+            const firstMsg = a.thread?.[0]?.content || ''
+            const preview = (firstMsg || a.originalText || '').slice(0, 50)
+            return (
+              <button
+                key={a.id}
+                className="w-full text-left px-3 py-2.5 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors border-b border-gray-50 dark:border-gray-700 last:border-0"
+                onClick={() => {
+                  const { x, y } = orphanMenu
+                  setOrphanMenu(null)
+                  editorRef.current?.openPopupAt?.(a.id, x, y)
+                }}
+              >
+                <div className="text-xs text-gray-800 dark:text-gray-200 truncate">{preview}{preview.length >= 50 ? '...' : ''}</div>
+              </button>
+            )
+          })}
+        </div>
+      </div>,
+      document.body
+    )}
+    </>
   )
 }

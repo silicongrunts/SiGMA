@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Send, X, User, Bot, Check, MessageSquarePlus, Trash2, RotateCw, Sparkles, GripVertical, Square } from 'lucide-react'
+import { Send, X, User, Bot, Check, MessageSquarePlus, Trash2, RotateCw, Sparkles, GripVertical, Square, Unlink } from 'lucide-react'
 import { filesAPI } from '../api'
 import { InlineDiffViewer } from './DiffViewer'
 import { SideBySideDiffViewer } from './DiffViewer'
@@ -577,7 +577,8 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     zIndex: 9998,
   } : {}
 
-  const isModified = annotation.status === 'modified' || annotation.status === 'fuzzy' || annotation.status === 'orphan'
+  const isModified = annotation.status === 'modified' || annotation.status === 'fuzzy'
+  const isOrphan = annotation.status === 'orphan'
 
   // SiGMADO: only when last message is from User AND not working
   const shouldShowSiGMADO = hasMessages && isUserMsg(lastMsg) && !isSiGMADOProcessing && !isStreaming
@@ -658,6 +659,25 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
           <div className="px-4 py-2 bg-orange-50 dark:bg-orange-900/20 border-b border-orange-100 dark:border-orange-800/50 text-[10px] text-orange-600 dark:text-orange-400 flex items-center gap-1.5">
             <MessageSquarePlus className="w-3 h-3" />
             {t('annotations.modifiedWarning')}
+          </div>
+        )}
+        {isOrphan && (
+          <div className="px-4 py-2 bg-orange-50 dark:bg-orange-900/20 border-b border-orange-100 dark:border-orange-800/50 text-[10px] text-orange-600 dark:text-orange-400 flex items-center gap-1.5">
+            <Unlink className="w-3 h-3" />
+            {t('annotations.orphanWarning')}
+          </div>
+        )}
+
+        {/* Original text preview — only for orphans, since it no longer exists
+            in the document and there is no body decoration to read it from. */}
+        {isOrphan && annotation.originalText && (
+          <div className="px-4 py-3 border-b border-gray-100 dark:border-gray-800 bg-gray-50 dark:bg-gray-800/50">
+            <div className="text-[10px] font-black uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1.5">
+              {t('annotations.originalText')}
+            </div>
+            <div className="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed">
+              {annotation.originalText}
+            </div>
           </div>
         )}
 

@@ -9,7 +9,7 @@
  *   2. Exact match elsewhere, unique            → status='exact'  (solid)
  *   3. Exact match elsewhere, multiple          → status='fuzzy'  (dashed), closest pos
  *   4. Fuzzy match (LCS or Myers, best wins)    → status='fuzzy'  (dashed), >=40% similarity
- *   5. No match                                 → status='orphan' (dashed, pinned at doc end)
+ *   5. No match                                 → status='orphan' (from==to, no decoration)
  */
 
 import search from 'approx-string-match'
@@ -118,6 +118,9 @@ function fuzzyFind(originalText, doc, storedFrom, storedTo) {
 /**
  * Core 5-tier annotation matcher.
  *
+ * Orphans return a zero-width range (from === to) and are never rendered as
+ * body decorations — the UI surfaces them in a separate broken-anchor list.
+ *
  * @param {string} doc - current document content
  * @param {{ from: number, to: number, originalText: string }} annotation
  * @returns {{ status: 'exact'|'fuzzy'|'orphan', from: number, to: number, originalText: string }}
@@ -132,8 +135,7 @@ export function matchAnnotation(doc, annotation) {
 
   // Guard: no original text to match against
   if (!originalText) {
-    const pos = Math.max(0, doc.length - 1)
-    return { status: 'orphan', from: pos, to: doc.length, originalText }
+    return { status: 'orphan', from: 0, to: 0, originalText }
   }
 
   const len = originalText.length
@@ -210,7 +212,6 @@ export function matchAnnotation(doc, annotation) {
     return { status: 'fuzzy', from: fuzzy.from, to: fuzzy.to, originalText: fuzzy.originalText }
   }
 
-  // ── Tier 5: No match — pin to document end ──
-  const lastPos = Math.max(0, doc.length - 1)
-  return { status: 'orphan', from: lastPos, to: lastPos + 1, originalText }
+  // ── Tier 5: No match — zero-width range, no decoration ──
+  return { status: 'orphan', from: 0, to: 0, originalText }
 }
