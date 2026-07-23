@@ -1,9 +1,10 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Send, X, User, Bot, Check, MessageSquarePlus, Trash2, RotateCw, Sparkles, GripVertical, Square, Unlink } from 'lucide-react'
+import { Send, X, User, Bot, Check, MessageSquarePlus, Trash2, RotateCw, RotateCcw, Sparkles, GripVertical, Square, Unlink } from 'lucide-react'
 import { filesAPI } from '../api'
 import { InlineDiffViewer } from './DiffViewer'
 import { SideBySideDiffViewer } from './DiffViewer'
+import { findAllOccurrences } from '../utils/annotationMatching'
 import { useStore } from '../store/useStore'
 import { createSSEStreamParser } from '../utils/sse'
 import { ThinkingProcess } from './ChatShared'
@@ -40,7 +41,7 @@ function streamStatusText(data, t) {
  * entry's `.process` array, not in separate state variables.
  * All thread mutations use functional store updates to avoid stale closures.
  */
-export function AnnotationPopup({ annotation, projectId, filePath, editorContent, onDelete, onClose, onApplyDiff, onPersist, onConfirmAnchor, onReloadAnnotation, onSaveBeforeAnnotationChat, autoFocusReply, popupStyle, onAnnotationChanged }) {
+export function AnnotationPopup({ annotation, projectId, filePath, editorContent, onDelete, onClose, onApplyDiff, onLocateDiff, onClearHighlight, onPersist, onConfirmAnchor, onReloadAnnotation, onSaveBeforeAnnotationChat, autoFocusReply, popupStyle, onAnnotationChanged }) {
   const { t } = useTranslation()
   const [reply, setReply] = useState('')
   const siGMADOProcessingAnnotationId = useStore(s => s.siGMADOProcessingAnnotationId)
@@ -583,14 +584,43 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   // SiGMADO: only when last message is from User AND not working
   const shouldShowSiGMADO = hasMessages && isUserMsg(lastMsg) && !isSiGMADOProcessing && !isStreaming
 
-  // Check if the expanded diff's "before" text can still be found in the editor
-  const diffApplicable = expandedDiff && editorContent?.includes(expandedDiff.before)
+  // Resolve the expanded diff's state against the live document using unique
+  // matching (consistent with backend validate_diffs). Three outcomes:
+  //   • canApply  — before found exactly once, after absent  → not yet applied
+  //   • canRevert — after found exactly once, before absent  → already applied
+  //   • neither   — ambiguous / both present / neither present → no action
+  const diffState = useMemo(() => {
+    if (!expandedDiff) return { canApply: false, canRevert: false }
+    const beforeOcc = findAllOccurrences(editorContent, expandedDiff.before)
+    const afterOcc = findAllOccurrences(editorContent, expandedDiff.after)
+    const canApply = beforeOcc.length === 1 && afterOcc.length === 0
+    const canRevert = beforeOcc.length === 0 && afterOcc.length === 1
+    return { canApply, canRevert }
+  }, [expandedDiff, editorContent])
 
   const handleApplyDiffFromPanel = () => {
-    if (expandedDiff && onApplyDiff && diffApplicable) {
+    if (expandedDiff && onApplyDiff && diffState.canApply) {
       onApplyDiff(annotation.id, expandedDiff)
       setExpandedDiff(null)
     }
+  }
+
+  // Revert an already-applied diff: swap before/after so the applied "after"
+  // text in the document is replaced back by "before". Reuses onApplyDiff —
+  // no separate replace path needed.
+  const handleRevertDiffFromPanel = () => {
+    if (expandedDiff && onApplyDiff && diffState.canRevert) {
+      onApplyDiff(annotation.id, { before: expandedDiff.after, after: expandedDiff.before })
+      setExpandedDiff(null)
+    }
+  }
+
+  // Close the side diff panel and drop any active locate highlight. Used by
+  // the panel's X, Close, and reject buttons so the flash never lingers after
+  // the panel that owns it is gone.
+  const closeDiffPanel = () => {
+    setExpandedDiff(null)
+    onClearHighlight?.()
   }
 
   // Thread area height = total height - header(~48) - input(~52) - resize handle(~12)
@@ -704,6 +734,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
                     <InlineDiffViewer
                       annotation={annotation}
                       message={msg}
+                      messageIndex={i}
                       onApplyDiff={onApplyDiff}
                       onDeleteAnnotation={onDelete}
                       onExpandDiff={setExpandedDiff}
@@ -779,7 +810,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
         <div className="w-[600px] bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-700 shadow-lg rounded-r-2xl overflow-hidden flex flex-col max-h-[400px]">
           <div className="px-4 py-3 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between bg-gray-50 dark:bg-gray-800 flex-shrink-0">
             <span className="text-xs font-bold text-gray-700 dark:text-gray-300">{t('annotations.suggestedChanges')}</span>
-            <button onClick={() => setExpandedDiff(null)} className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors" title={t('annotations.hideChanges')}>
+            <button onClick={closeDiffPanel} className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors" title={t('annotations.hideChanges')}>
               <X className="w-4 h-4 text-gray-600 dark:text-gray-400" />
             </button>
           </div>
@@ -787,17 +818,27 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
             <SideBySideDiffViewer
               before={expandedDiff.before}
               after={expandedDiff.after}
+              canApply={diffState.canApply}
+              canRevert={diffState.canRevert}
+              onLocate={onLocateDiff}
               onAccept={handleApplyDiffFromPanel}
-              onReject={() => setExpandedDiff(null)}
+              onReject={closeDiffPanel}
             />
           </div>
           <div className="p-3 border-t border-gray-100 dark:border-gray-800 bg-gray-50 dark:bg-gray-800 flex gap-2 flex-shrink-0">
-            {diffApplicable ? (
+            {diffState.canApply ? (
               <button
                 onClick={handleApplyDiffFromPanel}
                 className="flex-1 flex items-center justify-center gap-1 py-2 bg-green-600 text-white text-xs font-bold rounded-lg hover:bg-green-700 transition-colors"
               >
                 <Check className="w-3 h-3" /> {t('common.apply')}
+              </button>
+            ) : diffState.canRevert ? (
+              <button
+                onClick={handleRevertDiffFromPanel}
+                className="flex-1 flex items-center justify-center gap-1 py-2 bg-amber-600 text-white text-xs font-bold rounded-lg hover:bg-amber-700 transition-colors"
+              >
+                <RotateCcw className="w-3 h-3" /> {t('common.restore')}
               </button>
             ) : (
               <div className="flex-1 flex items-center justify-center gap-1 py-2 bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400 text-xs font-bold rounded-lg cursor-not-allowed select-none">
@@ -805,7 +846,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
               </div>
             )}
             <button
-              onClick={() => setExpandedDiff(null)}
+              onClick={closeDiffPanel}
               className="flex-1 py-2 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 text-xs font-bold rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
             >
               {t('common.close')}

@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next'
+import { Crosshair } from 'lucide-react'
 import { MarkdownContent } from './ChatShared'
 
 /**
@@ -43,15 +44,36 @@ export function parseDiffs(text) {
 
 /**
  * Side-by-side Diff Viewer Component
+ *
+ * `canApply` / `canRevert` gate the locate buttons next to the Original /
+ * Suggested headers:
+ *   • canApply  → Original (before) is uniquely in the doc (diff not applied)
+ *   • canRevert → Suggested (after) is uniquely in the doc (diff applied)
+ * Clicking the button scrolls the editor to that match and flashes it.
  */
-export function SideBySideDiffViewer({ before, after, onAccept, onReject }) {
+export function SideBySideDiffViewer({ before, after, onAccept, onReject, canApply = false, canRevert = false, onLocate }) {
   const { t } = useTranslation()
+  const locateBtn = (active, target) => (active && onLocate) ? (
+    <button
+      onClick={() => onLocate(target)}
+      className="ml-1 p-0.5 rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
+      title={t('annotations.locate')}
+    >
+      <Crosshair className="w-3 h-3" />
+    </button>
+  ) : null
   return (
     <div className="flex gap-0 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden text-sm h-full flex flex-col">
       {/* Title bar - outside scroll area */}
       <div className="flex border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
-        <div className="flex-1 text-xs font-bold text-red-700 dark:text-red-300 py-1 px-3 bg-red-50 dark:bg-red-900/30 border-r border-gray-200 dark:border-gray-700">{t('diff.original')}</div>
-        <div className="flex-1 text-xs font-bold text-green-700 dark:text-green-300 py-1 px-3 bg-green-50 dark:bg-green-900/30">{t('diff.suggested')}</div>
+        <div className="flex-1 flex items-center text-xs font-bold text-red-700 dark:text-red-300 py-1 px-3 bg-red-50 dark:bg-red-900/30 border-r border-gray-200 dark:border-gray-700">
+          <span>{t('diff.original')}</span>
+          {locateBtn(canApply, before)}
+        </div>
+        <div className="flex-1 flex items-center text-xs font-bold text-green-700 dark:text-green-300 py-1 px-3 bg-green-50 dark:bg-green-900/30">
+          <span>{t('diff.suggested')}</span>
+          {locateBtn(canRevert, after)}
+        </div>
       </div>
 
       {/* Content area - scrollable. break-all so long unbreakable tokens
@@ -75,7 +97,7 @@ export function SideBySideDiffViewer({ before, after, onAccept, onReject }) {
 /**
  * Diff Viewer with inline expansion - simplified to only show buttons
  */
-export function InlineDiffViewer({ annotation, message, onApplyDiff, onDeleteAnnotation, onExpandDiff, expandedDiff, editorContent, projectId = null }) {
+export function InlineDiffViewer({ annotation, message, messageIndex = 0, onApplyDiff, onDeleteAnnotation, onExpandDiff, expandedDiff, editorContent, projectId = null }) {
   // Use message.content if message is given, otherwise use annotation text.
   const textToParse = message?.content || annotation.text
   const { diffs, parts } = parseDiffs(textToParse)
@@ -89,10 +111,14 @@ export function InlineDiffViewer({ annotation, message, onApplyDiff, onDeleteAnn
   const handleExpand = (diffIndex) => {
     const diff = diffs[diffIndex]
     if (onExpandDiff) {
+      // Identify the expanded diff by BOTH its message and its index within
+      // that message, so diffs in sibling messages (which each restart at
+      // diffIndex 0) don't all appear expanded at once.
       onExpandDiff({
         before: diff.before,
         after: diff.afterText,
-        diffIndex: diffIndex
+        diffIndex: diffIndex,
+        messageIndex: messageIndex
       })
     }
   }
@@ -106,7 +132,9 @@ export function InlineDiffViewer({ annotation, message, onApplyDiff, onDeleteAnn
         }
 
         const diff = diffs[part.diffIndex]
-        const isExpanded = expandedDiff && expandedDiff.diffIndex === part.diffIndex
+        const isExpanded = expandedDiff
+          && expandedDiff.messageIndex === messageIndex
+          && expandedDiff.diffIndex === part.diffIndex
         const found = editorContent?.includes(diff.before)
 
         return (

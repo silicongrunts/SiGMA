@@ -281,6 +281,20 @@
   100% { transform: scale(1); opacity: 0; }
 }
 
+/* Annotation diff "locate" flash — applied as a CodeMirror mark class.
+   Vivid magenta (distinct from the yellow annotation underline) with two
+   distinct glow pulses over ~2.4s so the located range is unmistakable. The
+   decoration itself is also removed via a timer in Editor.jsx, so the effect
+   is gone even if the page is idle. */
+@keyframes anno-flash {
+  0%   { background-color: rgba(217, 70, 239, 0);   box-shadow: 0 0 0 0 rgba(217, 70, 239, 0); }
+  12%  { background-color: rgba(217, 70, 239, 0.65); box-shadow: 0 0 14px 3px rgba(217, 70, 239, 0.9); }
+  38%  { background-color: rgba(217, 70, 239, 0.25); box-shadow: 0 0 4px 0 rgba(217, 70, 239, 0.3); }
+  58%  { background-color: rgba(217, 70, 239, 0.65); box-shadow: 0 0 14px 3px rgba(217, 70, 239, 0.9); }
+  82%  { background-color: rgba(217, 70, 239, 0.3);  box-shadow: 0 0 4px 0 rgba(217, 70, 239, 0.3); }
+  100% { background-color: rgba(217, 70, 239, 0);    box-shadow: 0 0 0 0 rgba(217, 70, 239, 0); }
+}
+
 /* Custom Animations */
 .animate-in {
   animation-duration: 150ms;

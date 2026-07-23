@@ -26,7 +26,7 @@ import { TEX_EXTS } from '../utils/constants'
 import { getFontCss } from '../utils/editorFonts'
 import { getSchemeExtension } from '../utils/highlightSchemes'
 import { storage } from '../utils/storage'
-import { matchAnnotation } from '../utils/annotationMatching'
+import { matchAnnotation, findAllOccurrences } from '../utils/annotationMatching'
 import { AnnotationPopup } from './Annotations'
 import ContextMenu from './ContextMenu'
 
@@ -42,6 +42,37 @@ function formatTimestamp(iso) {
 const addAnnoEffect = StateEffect.define()
 const setAnnosEffect = StateEffect.define()
 const delAnnoEffect = StateEffect.define()
+
+// --- Diff-locate flash effect ---
+// A SEPARATE, self-clearing highlight layer for the "locate in document" action.
+// Deliberately not folded into annotationField so the persistent annotation
+// underlines are never touched, and so the flash can fade out on its own
+// without disturbing decorations.
+//   flashEffect.of({ from, to }) → highlight that range
+//   flashEffect.of(null)         → clear
+const flashEffect = StateEffect.define()
+const flashField = StateField.define({
+  create() { return Decoration.none },
+  update(flash, tr) {
+    // Keep the highlight in sync as the document changes (so it doesn't drift
+    // off its text if the user edits while it's still showing).
+    flash = flash.map(tr.changes)
+    for (const e of tr.effects) {
+      if (e.is(flashEffect)) {
+        if (e.value) {
+          const { from, to } = e.value
+          flash = Decoration.set([
+            Decoration.mark({ class: 'cm-anno-flash' }).range(from, to)
+          ])
+        } else {
+          flash = Decoration.none
+        }
+      }
+    }
+    return flash
+  },
+  provide: f => EditorView.decorations.from(f)
+})
 
 /**
  * Map annotation status to CSS class.
@@ -121,6 +152,12 @@ const lightEditorTheme = EditorView.theme({
     borderRadius: '2px',
     padding: '1px 3px'
   },
+  '.cm-anno-flash': {
+    animation: 'anno-flash 2.4s ease-out forwards',
+    borderRadius: '2px',
+    outline: '2px solid rgba(217, 70, 239, 0.95)',
+    outlineOffset: '1px',
+  },
 })
 
 const darkEditorTheme = EditorView.theme({
@@ -147,6 +184,12 @@ const darkEditorTheme = EditorView.theme({
     cursor: 'pointer',
     borderRadius: '2px',
     padding: '1px 3px'
+  },
+  '.cm-anno-flash': {
+    animation: 'anno-flash 2.4s ease-out forwards',
+    borderRadius: '2px',
+    outline: '2px solid rgba(217, 70, 239, 0.95)',
+    outlineOffset: '1px',
   },
 })
 
@@ -215,6 +258,10 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   //   fight the button's arithmetic.
   const lastNavScrollAt = useRef(0)
   const NAV_SUPPRESS_MS = 350
+
+  // Auto-clear timer for the locate flash. Cleared on unmount and whenever a
+  // new locate supersedes the previous one, so at most one timer is pending.
+  const flashTimerRef = useRef(null)
 
   // Clamp both nav index refs to the live decoration count. Called after any
   // mutation that can shrink the count (delete, sync, reload, bulk replace);
@@ -585,6 +632,38 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     try { await callbacks.current.onApplyDiffSave?.() } catch { /* non-critical: save failure surfaces elsewhere */ }
   }, [setAnnotations, getDecorationPosition])
 
+  /** Locate a unique diff text in the document and flash it (used by the
+   *  annotation diff panel's locate buttons). Scrolls only if off-screen. */
+  const handleLocateDiff = useCallback((text) => {
+    const view = viewRef.current
+    if (!view || !text) return false
+    const doc = view.state.doc.toString()
+    const occ = findAllOccurrences(doc, text)
+    if (occ.length !== 1) return false
+    const from = occ[0]
+    const to = from + text.length
+    const blockTop = view.lineBlockAt(from).top
+    const scrollTop = view.scrollDOM.scrollTop
+    const inView = blockTop >= scrollTop && blockTop <= scrollTop + view.scrollDOM.clientHeight
+    const effects = [flashEffect.of({ from, to })]
+    if (!inView) effects.push(EditorView.scrollIntoView(from, { y: 'center' }))
+    view.dispatch({ effects })
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current)
+    flashTimerRef.current = setTimeout(() => {
+      flashTimerRef.current = null
+      const v = viewRef.current
+      if (v) v.dispatch({ effects: flashEffect.of(null) })
+    }, 2500)
+    return true
+  }, [])
+
+  /** Clear the locate flash immediately (popup / diff panel closed). */
+  const handleClearFlash = useCallback(() => {
+    const view = viewRef.current
+    if (flashTimerRef.current) { clearTimeout(flashTimerRef.current); flashTimerRef.current = null }
+    if (view) view.dispatch({ effects: flashEffect.of(null) })
+  }, [])
+
   const revalidateBackendAnnotations = useCallback((annos) => {
     const view = viewRef.current
     if (!view) return annos
@@ -726,6 +805,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       themeCompartment.of(initialIsDark ? darkEditorTheme : lightEditorTheme),
       fontCompartment.of(buildFontExtension(initialAppearance.fontFamily, initialAppearance.fontSize, initialAppearance.lineHeight)),
       annotationField,
+      flashField,
       languageConf.of([]),
       keymap.of([
         { key: 'Mod-s', run: (view) => { if(autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current); callbacks.current.onSave?.(); return true; }, preventDefault: true },
@@ -775,7 +855,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
           }
         }
     }, { passive: true })
-    viewRef.current = view; return () => { if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current); view.destroy() }
+    viewRef.current = view; return () => { if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current); if (flashTimerRef.current) clearTimeout(flashTimerRef.current); view.destroy() }
   }, [])
 
   // ── Reconfigure editor theme/syntax/font when dark mode or appearance changes ──
@@ -1103,8 +1183,12 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
                         setActiveAnnotationId(null)
                         popupAnnoFromRef.current = null
                       }
+                      // Cancel any active locate highlight when the popup closes.
+                      handleClearFlash()
                     }}
                     onApplyDiff={handleApplyDiff}
+                    onLocateDiff={handleLocateDiff}
+                    onClearHighlight={handleClearFlash}
                     onPersist={handlePersistAnnotation}
                     onConfirmAnchor={handleConfirmAnnotationAnchor}
                     onReloadAnnotation={handleReloadAnnotations}
