@@ -12,7 +12,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useStore } from '../store/useStore'
-import { projectsAPI, filesAPI, libraryAPI } from '../api'
+import { projectsAPI, filesAPI, libraryAPI, compileAPI } from '../api'
 import { LogModal, ModalOverlay } from '../components/Modal'
 import { EditorHeader } from '../components/Header'
 import FileTree from '../components/FileTree'
@@ -131,6 +131,31 @@ export default function EditorView() {
   const { handleFileSelect, handleExitNotebook } = useFileActions({ projectId, editorRef, previewRef, handleSave })
   handleCompileRef.current = handleCompile
   useAutoCompile({ currentFile, handleCompile })
+
+  // Compile, then immediately download the produced PDF. Compile failures
+  // (no usable PDF) are surfaced by handleCompile via toast/log modal, so we
+  // only attempt the download when a pdfPath comes back.
+  const handleCompileAndDownload = useCallback(async () => {
+    if (!projectId) return
+    const result = await handleCompile(false, false)
+    if (!result?.pdfPath) return
+    try {
+      const blob = await compileAPI.getPDF(projectId, result.pdfPath)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      // Friendly name from the main .tex file (main.tex → main.pdf).
+      const mainFile = useStore.getState().currentProject?.main_file || ''
+      const stem = mainFile.split('/').pop()?.replace(/\.tex$/i, '') || 'output'
+      a.href = url
+      a.download = `${stem}.pdf`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      toastError(t('api.downloadFailed') + ': ' + (e.message || String(e)))
+    }
+  }, [projectId, handleCompile, t])
 
   // ── Build user_state for LLM status context ──
   const getUserState = useCallback(() => {
@@ -554,6 +579,7 @@ export default function EditorView() {
         <EditorHeader
           onBack={() => navigate('/')}
           onCompile={() => handleCompile(false, false)}
+          onCompileAndDownload={handleCompileAndDownload}
           onShowLogs={() => setShowLogModal(true)}
           onSave={handleSave}
         />

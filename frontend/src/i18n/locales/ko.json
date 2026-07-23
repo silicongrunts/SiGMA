@@ -163,6 +163,7 @@
   "editor.appearance.syntaxScheme": "구문 테마",
   "editor.actions.compile": "PDF 컴파일",
   "editor.actions.compiling": "컴파일 중...",
+  "editor.actions.compileAndDownload": "컴파일 후 PDF 다운로드",
   "editor.actions.logs": "로그",
   "editor.actions.toggleTerminal": "터미널 전환",
   "editor.actions.refreshLibrary": "라이브러리 새로고침",

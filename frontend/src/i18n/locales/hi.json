@@ -163,6 +163,7 @@
   "editor.appearance.syntaxScheme": "सिंटैक्स थीम",
   "editor.actions.compile": "PDF कंपाइल करें",
   "editor.actions.compiling": "कंपाइल हो रहा है...",
+  "editor.actions.compileAndDownload": "कंपाइल करें और PDF डाउनलोड करें",
   "editor.actions.logs": "लॉग",
   "editor.actions.toggleTerminal": "टर्मिनल टॉगल करें",
   "editor.actions.refreshLibrary": "लाइब्रेरी ताज़ा करें",

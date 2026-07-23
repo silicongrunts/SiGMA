@@ -163,6 +163,7 @@
   "editor.appearance.syntaxScheme": "シンタックステーマ",
   "editor.actions.compile": "PDF をコンパイル",
   "editor.actions.compiling": "コンパイル中...",
+  "editor.actions.compileAndDownload": "コンパイルしてPDFをダウンロード",
   "editor.actions.logs": "ログ",
   "editor.actions.toggleTerminal": "ターミナルを切り替え",
   "editor.actions.refreshLibrary": "ライブラリを更新",

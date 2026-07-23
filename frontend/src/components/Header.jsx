@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useContext } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useStore } from '../store/useStore'
-import { ArrowLeft, Pencil, Play, RefreshCw, CheckCircle2, Settings, ChevronDown, FileCode, Cpu, Book, X, Loader2, AlertTriangle, Check, RotateCw, Redo2, Plus, Upload, FolderPlus, FileText, Loader, AlertCircle, Camera, Clock, ArrowUpDown, TerminalSquare, Lightbulb, Sun, Moon, Monitor, Trash2, Palette, Minus } from 'lucide-react'
+import { ArrowLeft, Pencil, Play, RefreshCw, CheckCircle2, Settings, ChevronDown, FileCode, Cpu, Book, X, Loader2, AlertTriangle, Check, RotateCw, Redo2, Plus, Upload, FolderPlus, FileText, Loader, AlertCircle, Camera, Clock, ArrowUpDown, TerminalSquare, Lightbulb, Sun, Moon, Monitor, Trash2, Palette, Minus, Download } from 'lucide-react'
 import { projectsAPI, filesAPI, notebooksAPI, libraryAPI, browserAPI } from '../api'
 import { computeIsTexFile, getCompiledPreviewSource } from '../utils/constants'
 import { toastError, toastSuccess } from './Toast'
@@ -223,7 +223,7 @@ function TipsEditModal({ isOpen, onClose, initialValue, onSave }) {
 }
 
 
-export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
+export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLogs, onSave }) {
   const currentProject = useStore(state => state.currentProject)
   const setCurrentProject = useStore(state => state.setCurrentProject)
   const activeTab = useStore(state => state.activeTab)
@@ -261,8 +261,10 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
   const [showKernelModal, setShowKernelModal] = useState(false)
   const [showEditorThemeModal, setShowEditorThemeModal] = useState(false)
   const [showLibraryAddMenu, setShowLibraryAddMenu] = useState(false)
+  const [showCompileMenu, setShowCompileMenu] = useState(false)
   const [libraryStatusPopup, setLibraryStatusPopup] = useState(null) // key of open status popup
   const libraryAddMenuRef = useRef(null)
+  const compileMenuRef = useRef(null)
   const libraryStatusRef = useRef(null)
   const [texFiles, setTexFiles] = useState([])
 
@@ -362,6 +364,18 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
   }, [showLibraryAddMenu])
+
+  // Click outside to close compile split-button menu
+  useEffect(() => {
+    if (!showCompileMenu) return
+    const handler = (e) => {
+      if (compileMenuRef.current && !compileMenuRef.current.contains(e.target)) {
+        setShowCompileMenu(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showCompileMenu])
 
   // Click outside to close library status popup
   useEffect(() => {
@@ -1106,15 +1120,37 @@ export function EditorHeader({ onBack, onCompile, onShowLogs, onSave }) {
         {showLatexFeatures && (
           <>
             <button type="button" onClick={onShowLogs} className={`text-xs font-bold px-3 py-1.5 border rounded-lg transition-colors uppercase tracking-widest ${compileFailed ? 'logs-alert' : 'text-gray-400 dark:text-gray-500 border-gray-200 dark:border-gray-700 hover:text-gray-900 dark:hover:text-gray-200'}`}>{t('editor.actions.logs')}</button>
-            <button
-              type="button"
-              onClick={() => { if (!compiling) onCompile?.(); }}
-              disabled={compiling}
-              className="bg-sigma-600 hover:bg-sigma-700 disabled:bg-gray-300 text-white px-4 py-1.5 rounded-lg flex items-center shadow-lg shadow-blue-100 dark:shadow-none text-sm font-bold transition-all active:scale-95 disabled:cursor-not-allowed"
-            >
-              {compiling ? <RefreshCw className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
-              {compiling ? t('editor.actions.compiling') : t('editor.actions.compile')}
-            </button>
+            <div className="relative flex items-stretch" ref={compileMenuRef}>
+              <button
+                type="button"
+                onClick={() => { if (!compiling) onCompile?.(); }}
+                disabled={compiling}
+                className="bg-sigma-600 hover:bg-sigma-700 disabled:bg-gray-300 text-white px-4 py-1.5 rounded-l-lg flex items-center shadow-lg shadow-blue-100 dark:shadow-none text-sm font-bold transition-all active:scale-95 disabled:cursor-not-allowed"
+              >
+                {compiling ? <RefreshCw className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
+                {compiling ? t('editor.actions.compiling') : t('editor.actions.compile')}
+              </button>
+              {/* Caret — visually attached to the compile button, opens the menu */}
+              <button
+                type="button"
+                onClick={() => { if (!compiling) setShowCompileMenu(v => !v) }}
+                disabled={compiling}
+                title={t('editor.actions.compileAndDownload')}
+                className="bg-sigma-600 hover:bg-sigma-700 disabled:bg-gray-300 text-white px-2 py-1.5 rounded-r-lg flex items-center border-l border-sigma-700/40 shadow-lg shadow-blue-100 dark:shadow-none text-sm font-bold transition-all active:scale-95 disabled:cursor-not-allowed"
+              >
+                <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showCompileMenu ? 'rotate-180' : ''}`} />
+              </button>
+              {showCompileMenu && (
+                <div className="absolute right-0 top-full mt-1 bg-white/95 dark:bg-gray-800/95 backdrop-blur-xl border border-gray-200 dark:border-gray-700 shadow-2xl rounded-xl py-1.5 min-w-[200px] z-50 animate-in fade-in zoom-in duration-150">
+                  <button
+                    onClick={() => { setShowCompileMenu(false); if (!compiling) onCompileAndDownload?.() }}
+                    className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-sigma-600/20 hover:text-blue-600 dark:hover:text-sigma-400 transition-colors"
+                  >
+                    <Download className="w-4 h-4" /><span>{t('editor.actions.compileAndDownload')}</span>
+                  </button>
+                </div>
+              )}
+            </div>
           </>
         )}
 

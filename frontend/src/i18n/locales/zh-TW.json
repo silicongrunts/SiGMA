@@ -163,6 +163,7 @@
   "editor.appearance.syntaxScheme": "高亮方案",
   "editor.actions.compile": "編譯 PDF",
   "editor.actions.compiling": "編譯中...",
+  "editor.actions.compileAndDownload": "編譯並下載 PDF",
   "editor.actions.logs": "日誌",
   "editor.actions.toggleTerminal": "切換終端機",
   "editor.actions.refreshLibrary": "重新整理文獻庫",

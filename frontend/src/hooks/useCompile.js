@@ -10,6 +10,10 @@
  *
  * Pre-compile save delegates to handleSave() so conflict detection is
  * handled uniformly.
+ *
+ * Returns { success, pdfPath } so callers (e.g. compile-and-download) can
+ * branch on whether a usable PDF was produced. Early-exit and error paths
+ * resolve to { success: false, pdfPath: null }.
  */
 import { useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -23,11 +27,11 @@ export function useCompile({ projectId, editorRef, previewRef, handleSave }) {
   const compilingRef = useRef(false)
 
   const handleCompile = useCallback(async (isSilent = false, skipSave = false) => {
-    if (!projectId) return
-    if (compilingRef.current) return
+    if (!projectId) return { success: false, pdfPath: null }
+    if (compilingRef.current) return { success: false, pdfPath: null }
 
     // Only compile in TeX mode (isTexFile is the single source of truth)
-    if (!useStore.getState().isTexFile) return
+    if (!useStore.getState().isTexFile) return { success: false, pdfPath: null }
 
     compilingRef.current = true
 
@@ -39,7 +43,7 @@ export function useCompile({ projectId, editorRef, previewRef, handleSave }) {
       if (!saved) {
         // Conflict cancelled or save failed — abort compile
         compilingRef.current = false
-        return
+        return { success: false, pdfPath: null }
       }
     }
 
@@ -85,11 +89,13 @@ export function useCompile({ projectId, editorRef, previewRef, handleSave }) {
           state.setShowLogModal(true)
         }
       }
+      return { success: !!res.success, pdfPath: res.pdf_path || null }
     } catch (e) {
       if (!isSilent) {
         toastError(t('compile.error', { message: e.message }))
         state.setShowLogModal(true)
       }
+      return { success: false, pdfPath: null }
     } finally {
       state.setCompiling(false)
       compilingRef.current = false

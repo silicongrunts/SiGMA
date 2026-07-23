@@ -163,6 +163,7 @@
   "editor.appearance.syntaxScheme": "Syntax Theme",
   "editor.actions.compile": "Compile PDF",
   "editor.actions.compiling": "Compiling...",
+  "editor.actions.compileAndDownload": "Compile & Download PDF",
   "editor.actions.logs": "Logs",
   "editor.actions.toggleTerminal": "Toggle Terminal",
   "editor.actions.refreshLibrary": "Refresh library",
