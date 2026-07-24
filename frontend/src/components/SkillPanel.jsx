@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap, lineNumbers } from '@codemirror/view'
-import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
+import { defaultKeymap, history, historyKeymap, indentWithTab, redo } from '@codemirror/commands'
 import { syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language'
 import { oneDarkHighlightStyle } from '@codemirror/theme-one-dark'
 import { markdown } from '@codemirror/lang-markdown'
@@ -598,6 +598,7 @@ export default function SkillPanel({ isOpen, onClose }) {
         history(),
         keymap.of([
           { key: 'Mod-s', run: () => { saveHandlerRef.current?.(); return true }, preventDefault: true },
+          { key: 'Mod-Shift-z', run: redo, preventDefault: true },
           ...defaultKeymap, ...historyKeymap, indentWithTab,
         ]),
         cmSyntaxCompartment.of(syntaxHighlighting(document.documentElement.classList.contains('dark') ? oneDarkHighlightStyle : defaultHighlightStyle)),

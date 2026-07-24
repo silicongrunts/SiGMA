@@ -5,7 +5,7 @@ import { EditorState, Compartment, StateField, StateEffect, Transaction } from '
 import { keymap, Decoration } from '@codemirror/view'
 import { autocompletion, completionKeymap, closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
 import { bracketMatching } from '@codemirror/language'
-import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
+import { defaultKeymap, history, historyKeymap, indentWithTab, redo } from '@codemirror/commands'
 import { searchKeymap, highlightSelectionMatches } from '@codemirror/search'
 import { lintKeymap, setDiagnostics } from '@codemirror/lint'
 import { indentOnInput, foldGutter } from '@codemirror/language'
@@ -813,6 +813,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
         { key: 'Mod-s', run: (view) => { if(autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current); callbacks.current.onSave?.(); return true; }, preventDefault: true },
         { key: 'Mod-=', run: () => { adjustFontSize(1); return true }, preventDefault: true },
         { key: 'Mod--', run: () => { adjustFontSize(-1); return true }, preventDefault: true },
+        { key: 'Mod-Shift-z', run: redo, preventDefault: true },
         ...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap,
         ...completionKeymap, ...lintKeymap, indentWithTab,
       ]),
