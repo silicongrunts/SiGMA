@@ -76,15 +76,31 @@ export class PdfViewerHost {
   }
 
   /**
-   * Jump to a PDF-space coordinate. pdf.js's "XYZ" destination takes (x, y)
-   * measured from the bottom-left of the page in PDF units, which matches the
-   * convention the SyncTeX forward-search result already uses.
+   * Resolve a SyncTeX forward-search point to a viewport-pixel offset relative
+   * to the scroll container, suitable for minimal "scroll only if needed".
+   *
+   * The incoming `y` uses the SyncTeX top-of-page convention (distance from the
+   * page's top edge in PDF units). pdf.js's viewport works in bottom-origin PDF
+   * space, so we flip y via `viewBox[3] - y` before projecting — the SAME
+   * projection `showSynctexIndicator` already uses for the highlight, so scroll
+   * and highlight can never disagree on a coordinate again.
+   *
+   * Returns `{ top, left }` in CSS pixels relative to the scroll container's
+   * content origin, or `null` if the page isn't laid out yet.
    */
-  scrollToPdfPoint(pageNumber, x, y) {
-    this.viewer.scrollPageIntoView({
-      pageNumber,
-      destArray: [null, { name: 'XYZ' }, x, y, null],
-    })
+  pointToContainerOffset(pageNumber, x, yTop) {
+    const pageView = this.viewer.getPageView(pageNumber - 1)
+    if (!pageView?.viewport || !pageView?.div) return null
+    const pdfYBottom = pageView.viewport.viewBox[3] - yTop
+    const [vx, vy] = pageView.viewport.convertToViewportPoint(x, pdfYBottom)
+    // convertToViewportPoint yields pixels relative to the page div's top-left.
+    // The page div lives in the scroll container (its offsetParent), so
+    // offsetTop/offsetLeft place it inside that container — adding them yields
+    // a container-relative offset we can scroll to.
+    return {
+      top: pageView.div.offsetTop + vy,
+      left: pageView.div.offsetLeft + vx,
+    }
   }
 
   /**

@@ -10,6 +10,36 @@ const PAGE_SIDE_PADDING = 80
 // forward-jump indicator behaves the same to the user.
 const SYNCTEX_INDICATOR_MS = 1500
 
+// Breathing room kept around the SyncTeX target so the highlight isn't flush
+// against the viewport edge. Matches the markdown side (Preview.jsx).
+const SCROLL_MARGIN = 12
+
+/**
+ * Scroll the PDF scroll container by the minimum amount needed to bring
+ * `targetTop` (a container-content pixel offset, NOT a scrollTop) into view.
+ *
+ * The three branches are mutually exclusive and exhaustive, so a given state
+ * always yields the same delta — callers re-invoke on every forward jump, so
+ * the branches MUST be idempotent (a structure flipping between two positions
+ * would oscillate forever). Mirrors Preview.jsx's scrollIntoViewMinimal intent
+ * but works on a bare offset instead of a DOM element rect.
+ */
+function scrollContainerToContainerOffset(container, targetTop) {
+  const viewportH = container.clientHeight
+  const curTop = container.scrollTop
+  const margin = SCROLL_MARGIN
+  if (targetTop >= curTop + margin && targetTop <= curTop + viewportH - margin) {
+    return // already visible — do nothing (minimal scroll)
+  }
+  if (targetTop < curTop + margin) {
+    // above the visible band — bring it to the top margin
+    container.scrollTop = targetTop - margin
+  } else {
+    // below the visible band — bring it to the bottom margin
+    container.scrollTop = targetTop - viewportH + margin
+  }
+}
+
 /**
  * PDF preview pane built on pdf.js's PDFViewer.
  *
@@ -124,7 +154,8 @@ export default function PdfPreview({
       scrollToPage: (pageNumber, x, y) => {
         const current = hostRef.current
         if (!current) return
-        current.scrollToPdfPoint(pageNumber, x, y)
+        const offset = current.pointToContainerOffset(pageNumber, x, y)
+        if (offset) scrollContainerToContainerOffset(current.container, offset.top)
         showSynctexIndicator(pageNumber, x, y)
       },
       goToPage: (pageNumber) => {
