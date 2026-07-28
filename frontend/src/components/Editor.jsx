@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { EditorView } from 'codemirror'
 import { EditorState, Compartment, StateField, StateEffect, Transaction } from '@codemirror/state'
 import { keymap, Decoration } from '@codemirror/view'
-import { autocompletion, completionKeymap, closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
+import { autocompletion, completionKeymap, closeBrackets, closeBracketsKeymap, acceptCompletion } from '@codemirror/autocomplete'
 import { bracketMatching } from '@codemirror/language'
 import { defaultKeymap, history, historyKeymap, indentWithTab, redo } from '@codemirror/commands'
 import { searchKeymap, highlightSelectionMatches } from '@codemirror/search'
@@ -11,18 +11,13 @@ import { lintKeymap, setDiagnostics } from '@codemirror/lint'
 import { indentOnInput, foldGutter } from '@codemirror/language'
 import { lineNumbers, highlightActiveLine, highlightActiveLineGutter, dropCursor } from '@codemirror/view'
 
-import { StreamLanguage } from '@codemirror/language'
-import { stex } from '@codemirror/legacy-modes/mode/stex'
-import { markdown } from '@codemirror/lang-markdown'
-import { json } from '@codemirror/lang-json'
-import { javascript } from '@codemirror/lang-javascript'
-import { python } from '@codemirror/lang-python'
+// Language recognition and loading go through @codemirror/language-data (see utils/editorLanguages.js).
+import { getLanguageDescription, loadLanguage } from '../utils/editorLanguages'
 import { useStore } from '../store/useStore'
 import { useTheme } from '../hooks/useTheme'
 import { useEditorAppearance } from '../hooks/useEditorAppearance'
 import { useTranslation } from 'react-i18next'
 import { filesAPI } from '../api'
-import { TEX_EXTS } from '../utils/constants'
 import { getFontCss } from '../utils/editorFonts'
 import { getSchemeExtension } from '../utils/highlightSchemes'
 import { storage } from '../utils/storage'
@@ -209,13 +204,6 @@ function buildFontExtension(fontFamily, fontSize, lineHeight) {
     '&': { fontSize: `${fontSize}px` },
     '.cm-scroller': { fontFamily: getFontCss(fontFamily), lineHeight },
   })
-}
-
-const getLanguage = (path) => {
-  const ext = path?.split('.').pop()?.toLowerCase()
-  if (TEX_EXTS.includes(ext)) return StreamLanguage.define(stex)
-  if (ext === 'md') return markdown(); if (ext === 'json') return json(); if (ext === 'js') return javascript(); if (ext === 'py') return python()
-  return []
 }
 
 // ── Pending annotation ID generator ──────────────────────────────────
@@ -815,7 +803,8 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
         { key: 'Mod--', run: () => { adjustFontSize(-1); return true }, preventDefault: true },
         { key: 'Mod-Shift-z', run: redo, preventDefault: true },
         ...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap,
-        ...completionKeymap, ...lintKeymap, indentWithTab,
+        ...completionKeymap, ...lintKeymap,
+        { key: 'Tab', run: acceptCompletion }, indentWithTab,
       ]),
       EditorView.updateListener.of((u) => {
         if (u.docChanged) {
@@ -905,10 +894,21 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
 
       viewRef.current.dispatch({
         changes: { from: 0, to: viewRef.current.state.doc.length, insert: typeof data === 'string' ? data : (data.content || '') },
-        effects: languageConf.reconfigure(getLanguage(currentFile)),
+        effects: languageConf.reconfigure([]),
         annotations: Transaction.addToHistory.of(false)
       })
       setFileHash(data?.hash ?? null)
+
+      // Language support is loaded async by extension (first use dynamically
+      // imports the language package; later opens hit the desc.support cache).
+      // isMounted flips to false on file switch/unmount, discarding stale loads.
+      const desc = getLanguageDescription(currentFile)
+      if (desc) {
+        loadLanguage(desc).then(support => {
+          if (!isMounted || !viewRef.current || prevFileRef.current !== currentFile) return
+          viewRef.current.dispatch({ effects: languageConf.reconfigure(support) })
+        }).catch(e => console.warn('Failed to load language support:', e))
+      }
 
       if (savedScroll !== null) {
         requestAnimationFrame(() => {

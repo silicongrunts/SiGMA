@@ -5,12 +5,8 @@ import { EditorView, keymap, lineNumbers } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap, indentWithTab, redo } from '@codemirror/commands'
 import { syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language'
 import { oneDarkHighlightStyle } from '@codemirror/theme-one-dark'
-import { markdown } from '@codemirror/lang-markdown'
-import { json } from '@codemirror/lang-json'
-import { javascript } from '@codemirror/lang-javascript'
-import { python } from '@codemirror/lang-python'
-import { css } from '@codemirror/lang-css'
-import { html } from '@codemirror/lang-html'
+// Language recognition and loading go through @codemirror/language-data (see utils/editorLanguages.js).
+import { getLanguageDescription, loadLanguage } from '../utils/editorLanguages'
 import { ModalOverlay, InputModal, ConfirmModal } from './Modal'
 import { skillsAPI } from '../api'
 import { toastError, toastSuccess } from './Toast'
@@ -43,17 +39,6 @@ const darkCmTheme = EditorView.theme({
   '.cm-selectionBackground, ::selection': { backgroundColor: '#264f78' },
   '&.cm-focused .cm-selectionBackground': { backgroundColor: '#264f78' },
 })
-
-function getLanguage(filename) {
-  const ext = filename.includes('.') ? filename.split('.').pop().toLowerCase() : ''
-  if (ext === 'md') return markdown()
-  if (ext === 'json') return json()
-  if (ext === 'js' || ext === 'jsx' || ext === 'ts' || ext === 'tsx') return javascript()
-  if (ext === 'py') return python()
-  if (ext === 'css') return css()
-  if (ext === 'html' || ext === 'xml' || ext === 'svg') return html()
-  return []
-}
 
 // ---------------------------------------------------------------------------
 // Icons (inline SVG)
@@ -590,7 +575,6 @@ export default function SkillPanel({ isOpen, onClose }) {
       cmViewRef.current = null
     }
 
-    const lang = getLanguage(activeFilePath)
     const state = EditorState.create({
       doc: fileContent,
       extensions: [
@@ -602,7 +586,7 @@ export default function SkillPanel({ isOpen, onClose }) {
           ...defaultKeymap, ...historyKeymap, indentWithTab,
         ]),
         cmSyntaxCompartment.of(syntaxHighlighting(document.documentElement.classList.contains('dark') ? oneDarkHighlightStyle : defaultHighlightStyle)),
-        languageConf.of(lang),
+        languageConf.of([]),
         cmThemeCompartment.of(isDark ? darkCmTheme : lightCmTheme),
         EditorView.updateListener.of((update) => {
           if (update.docChanged && !isInternalUpdate.current) {
@@ -613,7 +597,20 @@ export default function SkillPanel({ isOpen, onClose }) {
         }),
       ],
     })
-    cmViewRef.current = new EditorView({ state, parent: editorRef.current })
+    const view = new EditorView({ state, parent: editorRef.current })
+    cmViewRef.current = view
+
+    // Language support is loaded async by extension (first use dynamically
+    // imports the language package; later opens hit the cache instantly).
+    // Switching files destroys this view, so after load we must verify this
+    // view is still current to avoid applying the old file's language to it.
+    const desc = getLanguageDescription(activeFilePath)
+    if (desc) {
+      loadLanguage(desc).then(support => {
+        if (cmViewRef.current !== view) return
+        view.dispatch({ effects: languageConf.reconfigure(support) })
+      }).catch(e => console.warn('Failed to load language support:', e))
+    }
 
     return () => {
       if (cmViewRef.current) { cmViewRef.current.destroy(); cmViewRef.current = null }
