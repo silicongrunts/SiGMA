@@ -153,8 +153,62 @@ const lightEditorTheme = EditorView.theme({
     outline: '2px solid rgba(217, 70, 239, 0.95)',
     outlineOffset: '1px',
   },
+  // Search panel — light variant.
+  '.cm-panel.cm-search': {
+    padding: '8px 12px',
+    backgroundColor: '#f8fafc',
+    borderBottom: '1px solid #e2e8f0',
+    display: 'flex',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: '6px 8px',
+  },
+  '.cm-panel.cm-search .cm-textfield': {
+    padding: '4px 8px',
+    border: '1px solid #cbd5e1',
+    borderRadius: '4px',
+    backgroundColor: '#ffffff',
+    fontSize: '13px',
+  },
+  '.cm-panel.cm-search .cm-textfield:focus': {
+    outline: 'none',
+    borderColor: '#3b82f6',
+    boxShadow: '0 0 0 2px rgba(59, 130, 246, 0.2)',
+  },
+  '.cm-panel.cm-search .cm-button': {
+    padding: '4px 10px',
+    border: '1px solid #cbd5e1',
+    borderRadius: '4px',
+    backgroundColor: '#ffffff',
+    color: '#334155',
+    fontSize: '12px',
+    cursor: 'pointer',
+  },
+  '.cm-panel.cm-search .cm-button:hover': {
+    backgroundColor: '#f1f5f9',
+    borderColor: '#94a3b8',
+  },
+  '.cm-panel.cm-search label': {
+    display: 'inline-flex',
+    alignItems: 'center',
+    fontSize: '11px',
+    color: '#64748b',
+    whiteSpace: 'nowrap',
+  },
+  '.cm-panel.cm-search [name=close]': {
+    top: '6px', right: '8px', width: '22px', height: '22px', borderRadius: '4px',
+    color: '#94a3b8', fontSize: '18px', lineHeight: '20px',
+  },
+  '.cm-panel.cm-search [name=close]:hover': {
+    backgroundColor: '#e2e8f0', color: '#475569',
+  },
 })
 
+// { dark: true } flips CodeMirror's darkTheme facet, so the editor root gets
+// the dark scope class and &dark-prefixed rules (ours below + CodeMirror's
+// built-in dark defaults for panels/cursor/etc.) take effect. Without it the
+// editor only *looks* dark via our colors, but CodeMirror still treats it as a
+// light editor — which is why the search panel rendered light.
 const darkEditorTheme = EditorView.theme({
   '&': { height: '100%', backgroundColor: '#111827', color: '#e5e7eb' },
   '&.cm-focused': { outline: 'none' },
@@ -186,7 +240,60 @@ const darkEditorTheme = EditorView.theme({
     outline: '2px solid rgba(217, 70, 239, 0.95)',
     outlineOffset: '1px',
   },
-})
+  // Search panel — dark variant. This theme is only active in dark mode (it is
+  // swapped in via themeCompartment.reconfigure), so these rules need no &dark
+  // guard. (&dark/&light are reserved for CodeMirror's built-in baseTheme and
+  // throw "Unsupported selector" when used in EditorView.theme().)
+  '.cm-panel.cm-search': {
+    padding: '8px 12px',
+    backgroundColor: '#1e293b',
+    borderBottom: '1px solid #334155',
+    display: 'flex',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: '6px 8px',
+  },
+  '.cm-panel.cm-search .cm-textfield': {
+    padding: '4px 8px',
+    border: '1px solid #475569',
+    borderRadius: '4px',
+    backgroundColor: '#0f172a',
+    color: '#e2e8f0',
+    fontSize: '13px',
+  },
+  '.cm-panel.cm-search .cm-textfield:focus': {
+    outline: 'none',
+    borderColor: '#3b82f6',
+    boxShadow: '0 0 0 2px rgba(59, 130, 246, 0.3)',
+  },
+  '.cm-panel.cm-search .cm-button': {
+    padding: '4px 10px',
+    border: '1px solid #475569',
+    borderRadius: '4px',
+    backgroundColor: '#334155',
+    color: '#e2e8f0',
+    fontSize: '12px',
+    cursor: 'pointer',
+  },
+  '.cm-panel.cm-search .cm-button:hover': {
+    backgroundColor: '#475569',
+    borderColor: '#64748b',
+  },
+  '.cm-panel.cm-search label': {
+    display: 'inline-flex',
+    alignItems: 'center',
+    fontSize: '11px',
+    color: '#94a3b8',
+    whiteSpace: 'nowrap',
+  },
+  '.cm-panel.cm-search [name=close]': {
+    top: '6px', right: '8px', width: '22px', height: '22px', borderRadius: '4px',
+    color: '#94a3b8', fontSize: '18px', lineHeight: '20px',
+  },
+  '.cm-panel.cm-search [name=close]:hover': {
+    backgroundColor: '#334155', color: '#cbd5e1',
+  },
+}, { dark: true })
 
 const themeCompartment = new Compartment()
 const syntaxCompartment = new Compartment()
