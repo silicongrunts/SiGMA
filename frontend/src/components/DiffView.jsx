@@ -9,6 +9,7 @@
  */
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
+import { intraLineDiff } from '../utils/intraLineDiff'
 
 function pairDiffLines(lines) {
   const paired = []
@@ -27,10 +28,22 @@ function pairDiffLines(lines) {
       while (i < lines.length && lines[i].type === 'add') { adds.push(lines[i]); i++ }
       const maxLen = Math.max(removes.length, adds.length)
       for (let j = 0; j < maxLen; j++) {
-        paired.push({
-          left: j < removes.length ? removes[j] : { type: 'empty', content: '', line_number: null },
-          right: j < adds.length ? adds[j] : { type: 'empty', content: '', line_number: null },
-        })
+        const leftRaw = j < removes.length ? removes[j] : { type: 'empty', content: '', line_number: null }
+        const rightRaw = j < adds.length ? adds[j] : { type: 'empty', content: '', line_number: null }
+        // GitHub-style intra-line highlight: only on a clean 1:1 remove↔add
+        // pair. Unpaired rows (uneven runs, truncated diffs) keep whole-line
+        // tinting. We copy the line objects so context lines elsewhere stay
+        // untouched.
+        let left = leftRaw
+        let right = rightRaw
+        if (leftRaw.type === 'remove' && rightRaw.type === 'add') {
+          const seg = intraLineDiff(leftRaw.content, rightRaw.content)
+          if (seg) {
+            left = { ...leftRaw, segments: seg.removed }
+            right = { ...rightRaw, segments: seg.added }
+          }
+        }
+        paired.push({ left, right })
       }
       continue
     }
@@ -43,6 +56,25 @@ function pairDiffLines(lines) {
     i++
   }
   return paired
+}
+
+/**
+ * Render the content cell of a line. When `line.segments` is present (a
+ * paired remove↔add row with an intra-line diff), changed spans get a deeper
+ * tint so the exact edited words stand out against the lighter line bg.
+ */
+function renderLineContent(line) {
+  if (!line.segments) {
+    return line.content
+  }
+  const changedCls = line.type === 'remove'
+    ? 'bg-red-200 dark:bg-red-900/40'
+    : 'bg-green-200 dark:bg-green-900/40'
+  return line.segments.map((seg, idx) =>
+    seg.changed
+      ? <span key={idx} className={`rounded-sm ${changedCls}`}>{seg.text}</span>
+      : <span key={idx}>{seg.text}</span>
+  )
 }
 
 function renderPairedLine(line, idx) {
@@ -61,7 +93,7 @@ function renderPairedLine(line, idx) {
       <span className="w-10 shrink-0 text-right pr-2 select-none text-gray-300 dark:text-gray-600">
         {line.line_number || ''}
       </span>
-      <span className="flex-1 whitespace-pre-wrap break-all">{line.content}</span>
+      <span className="flex-1 whitespace-pre-wrap break-all">{renderLineContent(line)}</span>
     </div>
   )
 }

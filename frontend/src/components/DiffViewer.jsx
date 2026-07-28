@@ -1,6 +1,8 @@
+import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Crosshair } from 'lucide-react'
 import { MarkdownContent } from './ChatShared'
+import { intraLineDiff } from '../utils/intraLineDiff'
 
 /**
  * Parse diff tags from text
@@ -62,6 +64,20 @@ export function SideBySideDiffViewer({ before, after, onAccept, onReject, canApp
       <Crosshair className="w-3 h-3" />
     </button>
   ) : null
+
+  // Word/char-level highlight so the exact changed words inside a suggestion
+  // stand out against the unchanged ones (GitHub-style).
+  const segments = useMemo(() => intraLineDiff(before, after), [before, after])
+
+  const renderSegmentText = (segs, changedCls) =>
+    segs
+      ? segs.map((seg, idx) =>
+          seg.changed
+            ? <span key={idx} className={`rounded-sm ${changedCls}`}>{seg.text}</span>
+            : <span key={idx}>{seg.text}</span>
+        )
+      : null
+
   return (
     <div className="flex gap-0 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden text-sm h-full flex flex-col">
       {/* Title bar - outside scroll area */}
@@ -82,11 +98,15 @@ export function SideBySideDiffViewer({ before, after, onAccept, onReject, canApp
         <div className="flex min-w-full">
           {/* Before (left side) - light red background */}
           <div className="flex-1 min-w-0 p-3 font-mono text-xs leading-snug border-r border-gray-200 dark:border-gray-700 bg-red-50 dark:bg-red-900/20">
-            <div className="whitespace-pre-wrap break-all text-gray-800 dark:text-red-300">{before}</div>
+            <div className="whitespace-pre-wrap break-all text-gray-800 dark:text-red-300">
+              {renderSegmentText(segments?.removed, 'bg-red-200 dark:bg-red-900/40') || before}
+            </div>
           </div>
           {/* After (right side) - light green background */}
           <div className="flex-1 min-w-0 p-3 font-mono text-xs leading-snug bg-green-50 dark:bg-green-900/20">
-            <div className="whitespace-pre-wrap break-all text-gray-800 dark:text-green-300">{after}</div>
+            <div className="whitespace-pre-wrap break-all text-gray-800 dark:text-green-300">
+              {renderSegmentText(segments?.added, 'bg-green-200 dark:bg-green-900/40') || after}
+            </div>
           </div>
         </div>
       </div>
