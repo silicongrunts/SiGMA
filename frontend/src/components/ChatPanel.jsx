@@ -2412,7 +2412,11 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
                             {m.created_at && <span className="text-[8px] text-gray-300 dark:text-gray-600">{formatTimestamp(m.created_at)}</span>}
                           </div>
                           <div className={`max-w-full px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-sigma-100 dark:bg-sigma-600/20 text-sigma-800 dark:text-sigma-300' : 'bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 text-gray-600 dark:text-gray-400'}`}>
-                            {m.content ? (m.content.length > 300 ? m.content.slice(0, 300) + '…' : m.content) : (m.process?.length > 0 ? t('chat.toolCalls') : t('chat.emptyMsg'))}
+                            {m.content
+                              ? (m.role === 'SiGMA'
+                                  ? <MarkdownContent content={m.content} projectId={projectId} onCitation={onCitation} />
+                                  : <div className="whitespace-pre-wrap">{m.content}</div>)
+                              : (m.process?.length > 0 ? t('chat.toolCalls') : t('chat.emptyMsg'))}
                             {m.role === 'user' && (
                               <AttachmentStrip projectId={projectId} attachments={m.attachments} compact />
                             )}
