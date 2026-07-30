@@ -327,6 +327,10 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   const readyResolversRef = useRef([])
   const [ctxMenu, setCtxMenu] = useState(null)
   const [popupStyle, setPopupStyle] = useState(null)
+  // Visual dim state for the annotation/diff popup: clicking outside the popup
+  // dims it to 70% instead of closing it. It is restored to fully opaque on any
+  // interaction with the popup or when switching to another annotation.
+  const [isPopupDimmed, setIsPopupDimmed] = useState(false)
   // Multiple annotation selection: when click hits overlapping annotations
   const [annoChoices, setAnnoChoices] = useState(null)
   const popupAnnoFromRef = useRef(null)
@@ -834,9 +838,9 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     const view = viewRef.current; if (!view) return
 
     const annoEl = e.target.closest('.cm-annotation, .cm-annotation-modified')
-    if (!annoEl) { setActiveAnnotationId(null); setAnnoChoices(null); return }
+    if (!annoEl) { setIsPopupDimmed(true); setAnnoChoices(null); return }
     const annoId = annoEl.dataset.annoId
-    if (!annoId) { setActiveAnnotationId(null); setAnnoChoices(null); return }
+    if (!annoId) { setIsPopupDimmed(true); setAnnoChoices(null); return }
 
     // Collect ALL annotation IDs at this click position (for overlapping annotations)
     const pos = view.posAtCoords({ x: e.clientX, y: e.clientY })
@@ -850,7 +854,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     })
 
     if (!foundIds.includes(annoId)) foundIds.push(annoId)
-    if (foundIds.length === 0) { setActiveAnnotationId(null); setAnnoChoices(null); return }
+    if (foundIds.length === 0) { setIsPopupDimmed(true); setAnnoChoices(null); return }
 
     if (foundIds.length === 1) {
       setAnnoChoices(null)
@@ -873,6 +877,8 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
 
     setPopupStyle({ left: clientX, top: clientY })
     setActiveAnnotationId(id)
+    // Switching to a (possibly different) annotation always shows it fully opaque.
+    setIsPopupDimmed(false)
     if (!anno.isPending) {
       handleReloadAnnotations(id).catch(() => {})
     }
@@ -1278,7 +1284,16 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
           document.body
         )}
         {activeAnno && popupStyle && createPortal(
-            <div onClick={e => e.stopPropagation()}>
+            <div
+                // Restore full opacity as soon as the user interacts with the
+                // popup. Capture phase so it fires before the header's drag
+                // handler. No stopPropagation here: the popup is portaled to
+                // document.body (a sibling of the editor container, not a
+                // descendant), so its events never reach handleEditorClick
+                // anyway, and stopping capture would also swallow the drag.
+                onMouseDownCapture={() => { if (isPopupDimmed) setIsPopupDimmed(false) }}
+                onClick={e => e.stopPropagation()}
+            >
                 <AnnotationPopup
                     annotation={activeAnno}
                     projectId={currentProject?.id}
@@ -1292,6 +1307,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
                       } else {
                         setActiveAnnotationId(null)
                         popupAnnoFromRef.current = null
+                        setIsPopupDimmed(false)
                       }
                       // Cancel any active locate highlight when the popup closes.
                       handleClearFlash()
@@ -1305,6 +1321,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
                     onSaveBeforeAnnotationChat={() => callbacks.current.onSaveBeforeAnnotationChat?.()}
                     autoFocusReply={activeAnno.isPending && activeAnno.thread.length === 0}
                     popupStyle={popupStyle}
+                    isPopupDimmed={isPopupDimmed}
                 />
             </div>,
             document.body

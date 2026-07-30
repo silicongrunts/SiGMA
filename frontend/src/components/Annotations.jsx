@@ -12,6 +12,16 @@ import { toastError } from './Toast'
 
 const MIN_WIDTH = 320
 const MIN_HEIGHT = 200
+// Vertical space reserved by the card chrome (header + input + resize grip),
+// so the scrollable thread area = total card height minus this. 100 is the
+// absolute floor below which the thread becomes unusable.
+const CARD_CHROME_HEIGHT = 112
+const MIN_THREAD_HEIGHT = 100
+
+/** Max scrollable thread height for a given total card height. Shared by the
+ *  React-derived maxHeight and the DOM-direct resize path so they stay in sync. */
+const threadMaxHeightFor = (cardHeight) =>
+  Math.max(MIN_THREAD_HEIGHT, cardHeight - CARD_CHROME_HEIGHT)
 
 /** Format ISO timestamp → "2026-01-01 12:34:22" */
 function formatTimestamp(iso) {
@@ -41,7 +51,7 @@ function streamStatusText(data, t) {
  * entry's `.process` array, not in separate state variables.
  * All thread mutations use functional store updates to avoid stale closures.
  */
-export function AnnotationPopup({ annotation, projectId, filePath, editorContent, onDelete, onClose, onApplyDiff, onLocateDiff, onClearHighlight, onPersist, onConfirmAnchor, onReloadAnnotation, onSaveBeforeAnnotationChat, autoFocusReply, popupStyle, onAnnotationChanged }) {
+export function AnnotationPopup({ annotation, projectId, filePath, editorContent, onDelete, onClose, onApplyDiff, onLocateDiff, onClearHighlight, onPersist, onConfirmAnchor, onReloadAnnotation, onSaveBeforeAnnotationChat, autoFocusReply, popupStyle, isPopupDimmed, onAnnotationChanged }) {
   const { t } = useTranslation()
   const [reply, setReply] = useState('')
   const siGMADOProcessingAnnotationId = useStore(s => s.siGMADOProcessingAnnotationId)
@@ -55,13 +65,23 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   const stopAbortTimerRef = useRef(null)
   const stopRequestedRef = useRef(false)
   const scrollRef = useRef(null)
+  // True once the thread has been auto-scrolled to the bottom on first mount.
+  const hasAutoScrolledRef = useRef(false)
   const replyInputRef = useRef(null)
   const wrapperRef = useRef(null)
   const isDraggingRef = useRef(false)
+  // True only while the resize grip is held. Guards card/thread inline styles
+  // so a concurrent re-render can't snap them back to the pre-resize size while
+  // the DOM holds live values. Separate from isDraggingRef (drag moves the
+  // wrapper, never resizes the card).
+  const isResizingRef = useRef(false)
   const dragOffsetRef = useRef({ x: 0, y: 0 })
   // Tracks the active drag/resize document listeners so they can be removed on
   // unmount (a mouseup lost over an iframe would otherwise leak them forever).
   const activeDragRef = useRef(null)
+  // The annotation card element; resize writes its width/height directly during
+  // the gesture for responsiveness, then commits to `size` state on release.
+  const cardRef = useRef(null)
   const annoIdRef = useRef(annotation.id)
 
   // Keep ref in sync
@@ -161,7 +181,15 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   useEffect(() => {
     const el = scrollRef.current
     if (!el) return
-    // Only auto-scroll if user is near the bottom (within 80px)
+    // On the popup's first mount we always jump to the bottom so the latest
+    // message is visible. After that we only auto-scroll when the user is
+    // already near the bottom, so growing the thread never yanks someone who
+    // has scrolled up to read earlier messages.
+    if (!hasAutoScrolledRef.current) {
+      hasAutoScrolledRef.current = true
+      el.scrollTop = el.scrollHeight
+      return
+    }
     const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
     if (isNearBottom) {
       el.scrollTop = el.scrollHeight
@@ -172,18 +200,56 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   const hasMessages = annotation.thread?.length > 0
 
   // ── Drag (position) ──
+  // For responsiveness we move the popup by writing left/top straight to the
+  // DOM during the drag — no React re-render per move, which the heavy thread
+  // + diff subtree could not keep up with. The wrapper's size is read ONCE at
+  // drag start (not every move) so each mousemove avoids a forced layout
+  // reflow, which is what made earlier versions feel laggy. The final position
+  // is committed to `position` state on mouseup so React and the DOM agree.
   const handleDragStart = (e) => {
     if (e.target.closest('button')) return
     isDraggingRef.current = true
+    const wrapper = wrapperRef.current
+    // Cache the wrapper's current size; clamping during the drag is read-only
+    // arithmetic, never touching offsetWidth/offsetHeight again.
+    const w = wrapper?.offsetWidth || 0
+    const h = wrapper?.offsetHeight || 0
+    const winW = window.innerWidth
+    const winH = window.innerHeight
+    const padding = 10
+    const clamp = (desired) => {
+      let { left, top } = desired
+      if (w && left + w > winW - padding) left = winW - w - padding
+      if (h && top + h > winH - padding) top = winH - h - padding
+      if (left < padding) left = padding
+      if (top < padding) top = padding
+      return { left, top }
+    }
     dragOffsetRef.current = {
       x: e.clientX - (position?.left ?? 0),
       y: e.clientY - (position?.top ?? 0),
     }
-    const handleMouseMove = (ev) => {
-      setPosition({ left: ev.clientX - dragOffsetRef.current.x, top: ev.clientY - dragOffsetRef.current.y })
+    const apply = (desired) => {
+      const next = clamp(desired)
+      if (wrapper) {
+        wrapper.style.left = `${next.left}px`
+        wrapper.style.top = `${next.top}px`
+      }
+      return next
     }
-    const handleMouseUp = () => {
+    const handleMouseMove = (ev) => {
+      apply({
+        left: ev.clientX - dragOffsetRef.current.x,
+        top: ev.clientY - dragOffsetRef.current.y,
+      })
+    }
+    const handleMouseUp = (ev) => {
       isDraggingRef.current = false
+      const finalPos = apply({
+        left: ev.clientX - dragOffsetRef.current.x,
+        top: ev.clientY - dragOffsetRef.current.y,
+      })
+      setPosition(finalPos)
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
       activeDragRef.current = null
@@ -194,20 +260,47 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   }
 
   // ── Resize handle ──
+  // Resizes the card live by writing width/height straight to the DOM. The
+  // thread area's maxHeight is a React-derived value (size.height - 112), so we
+  // must update it in lockstep via the DOM too — otherwise the card grows but
+  // the thread area keeps its old cap and a blank gap opens at the bottom until
+  // release. The final size is committed to `size` state on mouseup.
   const handleResizeStart = (e) => {
     e.preventDefault()
     e.stopPropagation()
+    // Flag the gesture so concurrent re-renders (e.g. an SSE thread update
+    // arriving mid-resize) don't re-apply the stale `size` to the card/thread
+    // inline styles and snap them back. The card/thread styles read this flag
+    // (see the JSX below) and defer to the DOM values while a resize is live.
+    isResizingRef.current = true
     const startX = e.clientX
     const startY = e.clientY
     const startSize = { ...size }
+    const card = cardRef.current
+    const thread = scrollRef.current
 
+    const apply = (next) => {
+      if (card) {
+        card.style.width = `${next.width}px`
+        card.style.height = `${next.height}px`
+      }
+      if (thread) {
+        thread.style.maxHeight = `${threadMaxHeightFor(next.height)}px`
+      }
+    }
     const handleMouseMove = (ev) => {
-      setSize({
+      apply({
         width: Math.max(MIN_WIDTH, startSize.width + (ev.clientX - startX)),
         height: Math.max(MIN_HEIGHT, startSize.height + (ev.clientY - startY)),
       })
     }
-    const handleMouseUp = () => {
+    const handleMouseUp = (ev) => {
+      const finalSize = {
+        width: Math.max(MIN_WIDTH, startSize.width + (ev.clientX - startX)),
+        height: Math.max(MIN_HEIGHT, startSize.height + (ev.clientY - startY)),
+      }
+      setSize(finalSize)
+      isResizingRef.current = false
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
       activeDragRef.current = null
@@ -571,12 +664,24 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     startSiGMADOStream()
   }
 
+  // Positioning + z-index for the outer wrapper. Opacity is NOT applied here:
+  // this element carries the `zoom-in` entrance animation whose keyframe ends at
+  // `opacity: 1`, and `animation-fill-mode: forwards` would otherwise pin that
+  // end-state and override any inline opacity. The dim opacity lives on an
+  // inner, animation-free wrapper instead.
   const wrapperStyle = position ? {
     position: 'fixed',
     left: position.left,
     top: position.top,
     zIndex: 9998,
   } : {}
+
+  // Dim (70%) applied here, on a layer with no entrance animation, so the
+  // opacity transition works in both directions. The popup stays interactive.
+  const dimStyle = {
+    opacity: isPopupDimmed ? 0.7 : 1,
+    transition: 'opacity 120ms ease',
+  }
 
   const isModified = annotation.status === 'modified' || annotation.status === 'fuzzy'
   const isOrphan = annotation.status === 'orphan'
@@ -623,8 +728,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     onClearHighlight?.()
   }
 
-  // Thread area height = total height - header(~48) - input(~52) - resize handle(~12)
-  const threadMaxH = Math.max(100, size.height - 112)
+  const threadMaxH = threadMaxHeightFor(size.height)
 
   // Auto-resize reply textarea, capped at 3 visible lines (~72px at text-sm + py-1.5)
   function autoResizeReply() {
@@ -641,13 +745,21 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   return (
     <div
       ref={wrapperRef}
-      className="flex gap-0 animate-in fade-in zoom-in duration-200 pointer-events-auto"
+      className="animate-in fade-in zoom-in duration-200 pointer-events-auto"
       style={wrapperStyle}
     >
-      {/* Main annotation popup */}
+      {/* Inner layer carries the dim opacity (kept off the animated wrapper so
+          the entrance keyframe's `forwards` end-state can't pin it) and lays out
+          the annotation card next to its optional diff panel. */}
+      <div className="flex gap-0" style={dimStyle}>
+      {/* Main annotation popup. Height is driven by `size.height` so the side
+          diff panel (a flex sibling) stretches to match it. During a live resize
+          we omit width/height here so React re-renders can't snap the card back
+          to its pre-resize size (the DOM holds the live values until mouseup). */}
       <div
+        ref={cardRef}
         className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 shadow-[0_10px_40px_rgba(0,0,0,0.15)] rounded-2xl overflow-hidden flex flex-col relative"
-        style={{ width: size.width }}
+        style={isResizingRef.current ? undefined : { width: size.width, height: size.height }}
       >
         {/* Header - Draggable */}
         <div
@@ -711,8 +823,10 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
           </div>
         )}
 
-        {/* Thread */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 bg-white dark:bg-gray-900" style={{ maxHeight: threadMaxH }}>
+        {/* Thread. maxHeight is omitted during a live resize for the same
+            reason the card size is: the resize path writes it to the DOM
+            directly and a re-render here would snap it back to the old cap. */}
+        <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4 bg-white dark:bg-gray-900" style={isResizingRef.current ? undefined : { maxHeight: threadMaxH }}>
           {annotation.thread.map((msg, i) => (
             <div key={i} className={`flex flex-col ${msg.role === 'SiGMA' ? 'items-start' : 'items-end'}`}>
               <div className={`flex items-center gap-1.5 mb-1 text-[10px] font-bold uppercase tracking-wider ${msg.role === 'SiGMA' ? 'text-sigma-600 dark:text-sigma-400' : 'text-gray-400 dark:text-gray-500'}`}>
@@ -805,9 +919,10 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
         </div>
       </div>
 
-      {/* Right side diff panel */}
+      {/* Right side diff panel. self-stretch makes it match the annotation
+          card's height (driven by size.height) instead of a fixed cap. */}
       {expandedDiff && (
-        <div className="w-[600px] bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-700 shadow-lg rounded-r-2xl overflow-hidden flex flex-col max-h-[400px]">
+        <div className="w-[600px] self-stretch bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-700 shadow-lg rounded-r-2xl overflow-hidden flex flex-col min-h-0">
           <div className="px-4 py-3 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between bg-gray-50 dark:bg-gray-800 flex-shrink-0">
             <span className="text-xs font-bold text-gray-700 dark:text-gray-300">{t('annotations.suggestedChanges')}</span>
             <button onClick={closeDiffPanel} className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors" title={t('annotations.hideChanges')}>
@@ -854,6 +969,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
           </div>
         </div>
       )}
+      </div>
     </div>
   )
 }
