@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 from app.agents.tools.bash_permissions import check_bash_permission
 from app.agents.tools.registry import tool_registry
+from app.agents.tools.schema_validation import validate_tool_args
 from app.core.logging import get_logger
 from app.services.file_service import PathAccessLevel, compute_diff_lines, file_service
 from app.services.llm_loop_runner import LLMLoopRunner
@@ -125,6 +126,13 @@ async def execute_with_permission(
     if tool_def.call is None:
         return f"Error: Tool '{tool_name}' has no call implementation"
 
+    # Structural pre-check: reject malformed arguments before any approval gate.
+    # A doomed call (missing/typo'd param) must never surface a permission
+    # dialog — the user would approve, then the tool would error anyway.
+    schema_error = validate_tool_args(tool_def.input_schema, tool_args)
+    if schema_error:
+        return schema_error
+
     denied = await _check_permission(
         tool_name, tool_args, tool_def, project_id,
     )
@@ -144,6 +152,17 @@ async def _check_permission(
     Raises ``PermissionRequestPause`` when user approval is needed and the
     category is not auto-approved.
     """
+    # Deterministic preflight: a tool may declare checks that are guaranteed to
+    # fail at execution time (must-read-first contract, edit's old==new
+    # invariant). Run them *before* the category-specific gate so a doomed call
+    # never surfaces an approval dialog — the user would approve, then the tool
+    # would error anyway. The preflight receives the same kwargs the runner
+    # injected (project_id/session_id); None means "proceed to the gate".
+    if tool_def.preflight is not None:
+        preflight_error = await tool_def.preflight(**tool_args)
+        if preflight_error:
+            return preflight_error
+
     if tool_name == "bash":
         return await _check_bash(tool_args, project_id)
     if tool_name == "notebook_run_cell":

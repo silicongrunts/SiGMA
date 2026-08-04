@@ -14,8 +14,8 @@ from html import escape as _html_escape
 import re as _re
 
 from app.agents.tools.read_state import (
+    must_read_first_error,
     record_path_read,
-    verify_path_readable_fresh,
 )
 from app.agents.prompts import (
     PROMPT_NOTEBOOK_READ,
@@ -223,12 +223,11 @@ async def _notebook_edit(
         target_location = normalize_notebook_path(notebook_path, project_id)
     except NotebookToolError as exc:
         return f"Error: {exc}"
-    if not verify_path_readable_fresh(session_id, target_location.absolute_path):
-        return (
-            f"Error: Notebook '{notebook_path}' has not been read yet (or has "
-            "changed since the last read). Use notebook_read first, then retry "
-            "the edit."
-        )
+    stale_err = must_read_first_error(
+        session_id, target_location.absolute_path, op="notebook edit",
+    )
+    if stale_err:
+        return stale_err
 
     try:
         notebook, location = await read_notebook_json(notebook_path, project_id)
@@ -314,12 +313,11 @@ async def _notebook_run_cell(
         target_location = normalize_notebook_path(notebook_path, project_id)
     except NotebookToolError as exc:
         return f"Error: {exc}"
-    if not verify_path_readable_fresh(session_id, target_location.absolute_path):
-        return (
-            f"Error: Notebook '{notebook_path}' has not been read yet (or has "
-            "changed since the last read). Use notebook_read first, then retry "
-            "the run."
-        )
+    stale_err = must_read_first_error(
+        session_id, target_location.absolute_path, op="notebook run",
+    )
+    if stale_err:
+        return stale_err
 
     try:
         notebook, location = await read_notebook_json(notebook_path, project_id)
@@ -421,6 +419,38 @@ async def _notebook_run_cell(
     return _format_run_result(result, warning=warning)
 
 
+# ── Permission-gate preflight ───────────────────────────────────────
+#
+# Run by the permission executor before the approval dialog. They re-run the
+# must-read-first checks the tool bodies perform, so a doomed call (un-read or
+# stale notebook) is rejected before bothering the user. Deterministic
+# parameter checks (edit_mode, cell_type) are covered by the schema validator
+# instead. Each returns an error string (fed back to the LLM) or None.
+
+async def _notebook_edit_preflight(
+    notebook_path: str, project_id: str = "", session_id: str = "", **_extra,
+) -> str | None:
+    try:
+        target_location = normalize_notebook_path(notebook_path, project_id)
+    except NotebookToolError as exc:
+        return f"Error: {exc}"
+    return must_read_first_error(
+        session_id, target_location.absolute_path, op="notebook edit",
+    )
+
+
+async def _notebook_run_cell_preflight(
+    notebook_path: str, project_id: str = "", session_id: str = "", **_extra,
+) -> str | None:
+    try:
+        target_location = normalize_notebook_path(notebook_path, project_id)
+    except NotebookToolError as exc:
+        return f"Error: {exc}"
+    return must_read_first_error(
+        session_id, target_location.absolute_path, op="notebook run",
+    )
+
+
 # ── Register tools ───────────────────────────────────────────────────
 
 tool_registry.register(ToolDefinition(
@@ -482,6 +512,7 @@ tool_registry.register(ToolDefinition(
     requires_project_id=True,
     requires_session_id=True,
     is_read_only=False,
+    preflight=_notebook_edit_preflight,
 ))
 
 tool_registry.register(ToolDefinition(
@@ -518,4 +549,5 @@ tool_registry.register(ToolDefinition(
     requires_project_id=True,
     requires_session_id=True,
     is_read_only=False,
+    preflight=_notebook_run_cell_preflight,
 ))

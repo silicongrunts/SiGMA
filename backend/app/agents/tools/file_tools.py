@@ -12,11 +12,11 @@ from app.agents.tools.base import ToolDefinition
 from app.agents.tools.formatting import format_range_footer
 from app.agents.tools.registry import tool_registry
 from app.agents.tools.read_state import (
+    must_read_first_error,
     path_mtime,
     path_read_state_key,
     read_state_cache,
     record_path_read,
-    verify_path_readable_fresh,
 )
 from app.agents.prompts import (
     PROMPT_READ, PROMPT_WRITE, PROMPT_EDIT, PROMPT_GLOB, PROMPT_GREP, PROMPT_LS,
@@ -339,12 +339,9 @@ async def _write_file(
     re-read after compact). Stale reads (file modified on disk since read) are
     rejected.
     """
-    if not _verify_readable_fresh(project_id, session_id, file_path):
-        return (
-            f"Error: File '{file_path}' has not been read yet (or has changed "
-            "since the last read). Use the read tool first, then retry the "
-            "write."
-        )
+    err = _must_read_first_error_for(project_id, session_id, file_path, op="write")
+    if err:
+        return err
 
     if file_path.startswith('/'):
         await file_service.write_file_absolute(project_id, file_path, content)
@@ -372,12 +369,9 @@ async def _edit_file(
     if old_string == new_string:
         return "Error: old_string and new_string are identical. No changes needed."
 
-    if not _verify_readable_fresh(project_id, session_id, file_path):
-        return (
-            f"Error: File '{file_path}' has not been read yet (or has changed "
-            "since the last read). Use the read tool first, then retry the "
-            "edit."
-        )
+    err = _must_read_first_error_for(project_id, session_id, file_path, op="edit")
+    if err:
+        return err
 
     # Read file content — supports absolute and relative paths.
     content = None
@@ -414,39 +408,21 @@ async def _edit_file(
     return f"File edited: {file_path} ({count} replacement(s))"
 
 
-def _verify_readable_fresh(
-    project_id: str, session_id: str, file_path: str,
-) -> bool:
-    """Return True iff *file_path* may be modified under the must-read-first rule.
+def _must_read_first_error_for(
+    project_id: str, session_id: str, file_path: str, *, op: str,
+) -> str | None:
+    """Resolve *file_path* and return the standard must-read-first error, if any.
 
-    The check is two-pronged:
-    1. The file must have been read earlier in this conversation segment.
-       Paginated reads with offset/limit satisfy this requirement.
-    2. The file's current mtime must match the mtime captured at read time —
-       if the file changed on disk (e.g. the user edited it in another tab),
-       the cached read is stale and the LLM must re-read.
-
-    Non-existing files are exempt (creating a new file does not require a
-    prior read).
+    Thin wrapper over the shared ``must_read_first_error`` helper that handles
+    the tool's path-resolution failure modes — when the path cannot be resolved
+    (project missing, unreadable dir), there is no meaningful must-read state,
+    so no error is surfaced and the tool's own later logic handles the failure.
     """
-    # New files bypass the check
     try:
-        exists = _resolve_file_path(project_id, file_path).is_file()
+        resolved = _resolve_file_path(project_id, file_path)
     except (OSError, ProjectNotFoundError, FileSystemError):
-        exists = False
-    if not exists:
-        return True
-
-    entry = read_state_cache.get(session_id, _read_state_key(project_id, file_path))
-    if entry is None:
-        return False
-
-    try:
-        return verify_path_readable_fresh(
-            session_id, _resolve_file_path(project_id, file_path),
-        )
-    except (OSError, ProjectNotFoundError, FileSystemError):
-        return False
+        return None
+    return must_read_first_error(session_id, resolved, op=op)
 
 
 async def _list_files(project_id: str, dirname: str = "") -> str:
@@ -813,6 +789,32 @@ async def _grep_fallback(
     return body + suffix if body else f"No matches for '{pattern}'{suffix}"
 
 
+# ── Permission-gate preflight for write/edit ────────────────────────
+#
+# These run in the permission executor before the approval dialog. They re-run
+# the same must-read-first / invariant checks the tool body performs, so a call
+# that is guaranteed to fail is rejected before bothering the user. Each returns
+# an error string (fed back to the LLM) or None to proceed to the gate.
+
+async def _write_preflight(
+    project_id: str, session_id: str, file_path: str, **_extra,
+) -> str | None:
+    return _must_read_first_error_for(
+        project_id, session_id, file_path, op="write",
+    )
+
+
+async def _edit_preflight(
+    project_id: str, session_id: str, file_path: str,
+    old_string: str = "", new_string: str = "", **_extra,
+) -> str | None:
+    if old_string == new_string:
+        return "Error: old_string and new_string are identical. No changes needed."
+    return _must_read_first_error_for(
+        project_id, session_id, file_path, op="edit",
+    )
+
+
 # ── Register file tools ──
 
 tool_registry.register(ToolDefinition(
@@ -855,6 +857,7 @@ tool_registry.register(ToolDefinition(
     requires_project_id=True,
     requires_session_id=True,
     is_read_only=False,
+    preflight=_write_preflight,
 ))
 
 tool_registry.register(ToolDefinition(
@@ -877,6 +880,7 @@ tool_registry.register(ToolDefinition(
     requires_project_id=True,
     requires_session_id=True,
     is_read_only=False,
+    preflight=_edit_preflight,
 ))
 
 tool_registry.register(ToolDefinition(

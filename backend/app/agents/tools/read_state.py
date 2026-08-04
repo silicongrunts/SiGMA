@@ -132,3 +132,32 @@ def verify_path_readable_fresh(session_id: str, path: str | Path) -> bool:
     if current_mtime is None:
         return False
     return entry.mtime == current_mtime
+
+
+# Standard must-read-first error message. Kept here so the file/notebook tools
+# and the permission-gate preflight produce identical wording — the LLM sees one
+# consistent failure shape whether the check runs before or after approval.
+_MUST_READ_ERROR = (
+    "Error: '{path}' has not been read yet (or has changed since the last "
+    "read). Read the file first, then retry the {op}."
+)
+
+
+def must_read_first_error(
+    session_id: str, path: str | Path, *, op: str = "write",
+) -> Optional[str]:
+    """Return the standard must-read-first error string, or ``None`` if ok.
+
+    Single source of truth for the must-read-first contract. ``None`` (ok) is
+    returned when the file does not exist (new-file exemption — creating a file
+    never requires a prior read) or when the file was read in this session and
+    its mtime is unchanged. Used by the file/notebook tools and by the
+    permission-gate preflight so a doomed call is rejected *before* the approval
+    dialog is shown.
+    """
+    target = Path(path)
+    if not target.is_file():
+        return None
+    if verify_path_readable_fresh(session_id, target):
+        return None
+    return _MUST_READ_ERROR.format(path=target, op=op)
