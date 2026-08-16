@@ -13,6 +13,7 @@ import { lineNumbers, highlightActiveLine, highlightActiveLineGutter, dropCursor
 
 // Language recognition and loading go through @codemirror/language-data (see utils/editorLanguages.js).
 import { getLanguageDescription, loadLanguage } from '../utils/editorLanguages'
+import { buildFormatKeymap } from '../utils/textFormat'
 import { useStore } from '../store/useStore'
 import { useTheme } from '../hooks/useTheme'
 import { useEditorAppearance } from '../hooks/useEditorAppearance'
@@ -322,6 +323,9 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   const containerRef = useRef(null); const viewRef = useRef(null); const cursorRef = useRef({ line: 1, column: 0 })
   const autoSaveTimerRef = useRef(null)
   const prevFileRef = useRef(null)
+  // Language used by the format key bindings ('markdown' or 'latex'); updated
+  // on file load. Kept in a ref because the keymap is captured once at mount.
+  const fileLanguageRef = useRef('markdown')
   const [isEditorReady, setIsEditorReady] = useState(false)
   const isEditorReadyRef = useRef(false)
   const readyResolversRef = useRef([])
@@ -915,6 +919,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
         { key: 'Mod-=', run: () => { adjustFontSize(1); return true }, preventDefault: true },
         { key: 'Mod--', run: () => { adjustFontSize(-1); return true }, preventDefault: true },
         { key: 'Mod-Shift-z', run: redo, preventDefault: true },
+        ...buildFormatKeymap(() => fileLanguageRef.current),
         ...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap,
         ...completionKeymap, ...lintKeymap,
         { key: 'Tab', run: acceptCompletion }, indentWithTab,
@@ -1016,6 +1021,9 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       // imports the language package; later opens hit the desc.support cache).
       // isMounted flips to false on file switch/unmount, discarding stale loads.
       const desc = getLanguageDescription(currentFile)
+      // Format shortcuts emit LaTeX markers only for LaTeX files; every other
+      // file (markdown, plain text, unknown) uses markdown markers.
+      fileLanguageRef.current = desc?.name === 'latex' ? 'latex' : 'markdown'
       if (desc) {
         loadLanguage(desc).then(support => {
           if (!isMounted || !viewRef.current || prevFileRef.current !== currentFile) return
