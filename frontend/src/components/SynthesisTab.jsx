@@ -182,17 +182,15 @@ export default function SynthesisTab({
                     </span>
                     <button
                       onClick={prevAnnotation}
-                      disabled={annoCount > 1 && topAnnoIndex === 1}
                       title={t('annotations.prevAnnotation')}
-                      className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent transition-colors"
+                      className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 transition-colors"
                     >
                       <ChevronUp className="w-3.5 h-3.5" />
                     </button>
                     <button
                       onClick={nextAnnotation}
-                      disabled={annoCount > 1 && topAnnoIndex === annoCount}
                       title={t('annotations.nextAnnotation')}
-                      className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent transition-colors"
+                      className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 transition-colors"
                     >
                       <ChevronDown className="w-3.5 h-3.5" />
                     </button>

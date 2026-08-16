@@ -1165,8 +1165,8 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     // ── Annotation navigation ─────────────────────────────────────────
     // Two independent code paths:
     //  • Button clicks (navToAnnotation): pure arithmetic on currentIndexRef —
-    //    cur±1, clamp, scroll, echo. Step is always exactly 1, immune to
-    //    pixel-exact viewport comparisons.
+    //    cur±1, wrap-around at the ends, scroll, echo. Step is always exactly
+    //    1, immune to pixel-exact viewport comparisons.
     //  • Free/user scrolling (computeTopAnnoIndex in the scroll listener):
     //    re-derives the index from content-space geometry (lineBlock top vs
     //    scrollTop), so the counter tracks where the user scrolled.
@@ -1186,22 +1186,25 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     getCurrentAnnotationIndex: () => displayIndexRef.current,
 
     /** Navigate to the previous or next annotation. Pure arithmetic on
-     *  currentIndexRef (cur±1, clamp) — never reads geometry. Writes both
-     *  currentIndexRef (navigation source of truth) and displayIndexRef (so
-     *  the counter updates instantly). Skips the scroll dispatch only when
-     *  truly stuck at a multi-annotation boundary (avoids drift on repeated
-     *  clicks at first/last); with a single annotation the scroll always
-     *  fires so the user can jump to it even when the index is already 1. */
+     *  currentIndexRef (cur±1, wrap-around) — never reads geometry. Writes
+     *  both currentIndexRef (navigation source of truth) and displayIndexRef
+     *  (so the counter updates instantly). Wraps at the ends (1 → total,
+     *  total → 1); with a single annotation the scroll always fires so the
+     *  user can jump to it even when the index is already 1. */
     navToAnnotation: (dir) => {
       const view = viewRef.current
       if (!view) return null
       const positions = readAnnoPositions(view)
       if (!positions.length) return null
       const total = positions.length
-      const cur = currentIndexRef.current
-      let next = cur
-      if (dir === 'prev') next = Math.max(1, cur - 1)
-      else if (dir === 'next') next = Math.min(total, cur + 1)
+      // Normalize the base into [1, total]: the ref can be momentarily stale
+      // (e.g. after a deletion, before clampNavIndices runs), and modular
+      // arithmetic on an out-of-range base lands on a wrong-but-valid index
+      // instead of the adjacent one.
+      const cur = Math.min(Math.max(1, currentIndexRef.current), total)
+      let next
+      if (dir === 'prev') next = ((cur - 2 + total) % total) + 1
+      else if (dir === 'next') next = (cur % total) + 1
       else return null
       // Always sync both refs so the display tracks the button immediately.
       currentIndexRef.current = next
@@ -1209,12 +1212,9 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       // Stamp the suppression window so free-scroll geometry re-derivation
       // is skipped while this scrollIntoView is settling.
       lastNavScrollAt.current = Date.now()
-      const stuckAtBoundary = total > 1 && next === cur
-      if (!stuckAtBoundary) {
-        view.dispatch({
-          effects: EditorView.scrollIntoView(positions[next - 1].from, { y: 'start' }),
-        })
-      }
+      view.dispatch({
+        effects: EditorView.scrollIntoView(positions[next - 1].from, { y: 'start' }),
+      })
       // Echo the index to the display (covers no-op-scroll case).
       requestAnimationFrame(() => callbacks.current.onAnnoNavScroll?.())
       return next
