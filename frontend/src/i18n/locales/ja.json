@@ -760,8 +760,6 @@
   "annotations.orphanTooltip": "原文が見つからない注釈 ({{count}})",
   "annotations.orphanCount": "原文が見つかりません ({{count}})",
   "editor.citeInChat": "チャットに引用",
-  "annotations.askSigma": "SiGMA にこの注釈への回答を依頼",
-  "annotations.sigmaDo": "SiGMADO",
   "annotations.stopResponse": "AI 応答を停止",
   "annotations.deleteTitle": "注釈を削除",
   "annotations.modifiedWarning": "元のテキストが変更されています。適用前に慎重に確認してください。",

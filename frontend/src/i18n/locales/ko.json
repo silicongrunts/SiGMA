@@ -759,8 +759,6 @@
   "annotations.orphanTooltip": "원문이 누락된 주석 ({{count}})",
   "annotations.orphanCount": "원문 누락 ({{count}})",
   "editor.citeInChat": "채팅에 인용",
-  "annotations.askSigma": "SiGMA에 이 주석에 대한 응답 요청",
-  "annotations.sigmaDo": "SiGMADO",
   "annotations.stopResponse": "AI 응답 중지",
   "annotations.deleteTitle": "주석 삭제",
   "annotations.modifiedWarning": "원문이 수정되었습니다. 적용 전에 주의 깊게 검토하세요.",

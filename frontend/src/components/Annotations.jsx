@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Send, X, User, Bot, Check, MessageSquarePlus, Trash2, RotateCw, RotateCcw, Sparkles, GripVertical, Square, Unlink } from 'lucide-react'
+import { Send, X, User, Bot, Check, MessageSquarePlus, Trash2, RotateCw, RotateCcw, GripVertical, Square, Unlink } from 'lucide-react'
 import { filesAPI } from '../api'
 import { InlineDiffViewer } from './DiffViewer'
 import { SideBySideDiffViewer } from './DiffViewer'
@@ -27,11 +27,6 @@ const threadMaxHeightFor = (cardHeight) =>
 function formatTimestamp(iso) {
   if (!iso) return ''
   return new Date(iso).toLocaleString('sv-SE', { hour12: false }).replace('T', ' ')
-}
-
-/** Check if a message role represents a user message (case-insensitive). */
-function isUserMsg(msg) {
-  return msg?.role?.toLowerCase() === 'user'
 }
 
 function streamStatusText(data, t) {
@@ -195,9 +190,6 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       el.scrollTop = el.scrollHeight
     }
   }, [annotation.thread])
-
-  const lastMsg = annotation.thread?.length > 0 ? annotation.thread[annotation.thread.length - 1] : null
-  const hasMessages = annotation.thread?.length > 0
 
   // ── Drag (position) ──
   // For responsiveness we move the popup by writing left/top straight to the
@@ -491,7 +483,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       }
     } finally {
       // Only clear state if this is still the active controller.
-      // A new handleSiGMADO call may have started between 'done' and here.
+      // A new stream may have started between 'done' and here.
       if (abortRef.current === controller) {
         setIsStreaming(false)
         setSiGMADOProcessingAnnotationId(null)
@@ -512,12 +504,6 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       return false
     }
   }, [onSaveBeforeAnnotationChat])
-
-  const handleSiGMADO = useCallback(async () => {
-    const saved = await saveBeforeAnnotationChat()
-    if (!saved) return
-    await startSiGMADOStream()
-  }, [saveBeforeAnnotationChat, startSiGMADOStream])
 
   useEffect(() => {
     if (annotation.isPending || !projectId || !annotation.id) return
@@ -632,7 +618,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       }
       if (!persistedId) return
       setReply('')
-      // Update ref to new ID so handleSiGMADO uses the correct one
+      // Update ref to new ID so startSiGMADOStream uses the correct one
       annoIdRef.current = persistedId
       // Auto-trigger AI reply
       startSiGMADOStream()
@@ -685,9 +671,6 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
 
   const isModified = annotation.status === 'modified' || annotation.status === 'fuzzy'
   const isOrphan = annotation.status === 'orphan'
-
-  // SiGMADO: only when last message is from User AND not working
-  const shouldShowSiGMADO = hasMessages && isUserMsg(lastMsg) && !isSiGMADOProcessing && !isStreaming
 
   // Resolve the expanded diff's state against the live document using unique
   // matching (consistent with backend validate_diffs). Three outcomes:
@@ -771,16 +754,6 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
             <MessageSquarePlus className="w-3.5 h-3.5" /> {t('annotations.title')}
           </div>
           <div className="flex items-center gap-1">
-            {shouldShowSiGMADO && (
-              <button
-                onClick={handleSiGMADO}
-                className="p-1.5 bg-sigma-600 text-white hover:bg-sigma-700 rounded-lg transition-colors text-[10px] font-bold flex items-center gap-1"
-                title={t('annotations.askSigma')}
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                {t('annotations.sigmaDo')}
-              </button>
-            )}
             {(isSiGMADOProcessing || isStreaming) && (
               <button
                 onClick={handleStop}

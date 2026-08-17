@@ -759,8 +759,6 @@
   "annotations.orphanTooltip": "原始文字缺失的批註 ({{count}})",
   "annotations.orphanCount": "原始文字缺失 ({{count}})",
   "editor.citeInChat": "引用到聊天",
-  "annotations.askSigma": "請 SiGMA 回覆此標註",
-  "annotations.sigmaDo": "SiGMADO",
   "annotations.stopResponse": "停止 AI 回應",
   "annotations.deleteTitle": "刪除標註",
   "annotations.modifiedWarning": "原始文字已被修改。套用前請仔細檢查。",

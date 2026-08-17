@@ -759,8 +759,6 @@
   "annotations.orphanTooltip": "Annotations dont le texte original est manquant ({{count}})",
   "annotations.orphanCount": "Texte original manquant ({{count}})",
   "editor.citeInChat": "Citer dans le chat",
-  "annotations.askSigma": "Demander à SiGMA de répondre à cette annotation",
-  "annotations.sigmaDo": "SiGMADO",
   "annotations.stopResponse": "Arrêter la réponse de l'IA",
   "annotations.deleteTitle": "Supprimer l'annotation",
   "annotations.modifiedWarning": "Le texte original a été modifié. Vérifiez attentivement avant d'appliquer.",
