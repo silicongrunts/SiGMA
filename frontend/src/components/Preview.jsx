@@ -12,7 +12,7 @@ import { filesAPI, compileAPI } from '../api'
 import { storage } from '../utils/storage'
 import { getCompiledPdfName } from '../utils/constants'
 import { toastError } from './Toast'
-import { rewriteProjectImageSrc } from './ChatShared'
+import { rewriteProjectImageSrc, decorateMarkdownLinks } from './ChatShared'
 import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
 import PdfPreview from './preview/PdfPreview'
 import { ZoomIn, ZoomOut, ArrowUp, Maximize2, FileSearch, FileText, Download, AlertTriangle, ChevronLeft, ChevronRight } from 'lucide-react'
@@ -126,7 +126,7 @@ function scrollIntoViewMinimal(container, el) {
   }
 }
 
-const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
+const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
   const { t } = useTranslation()
   const currentProjectId = useStore(state => state.currentProject?.id)
   const previewSource = useStore(state => state.previewSource)
@@ -853,11 +853,25 @@ const Preview = forwardRef(({ onPageClick, onScroll }, ref) => {
                 <div
                     className="prose dark:prose-invert max-w-none prose-pre:font-mono prose-code:font-mono prose-code:before:hidden prose-code:after:hidden bg-white dark:bg-gray-800 p-12 mx-auto shadow-2xl border border-gray-200 dark:border-gray-700 mb-12"
                     style={{ maxWidth: '48rem', width: '100%', fontSize: `${zoomLevel}rem` }}
+                    onClick={(e) => {
+                        // Project-relative markdown links (marked by
+                        // decorateMarkdownLinks with data-sigma-path) open
+                        // in-app via openProjectPath — never a navigation that
+                        // would unload the editor. External links need no
+                        // interception: they carry target="_blank".
+                        if (!onOpenPath) return
+                        const anchor = e.target.closest?.('a[data-sigma-path]')
+                        if (!anchor) return
+                        e.preventDefault()
+                        onOpenPath(anchor.getAttribute('data-sigma-path'))
+                    }}
                     dangerouslySetInnerHTML={{ __html: (() => {
                         const md = String(mdContent ?? '')
                         const { text, map } = extractMath(md)
                         const restored = restoreMath(previewMarked.parse(text), map)
-                        return DOMPurify.sanitize(rewriteProjectImageSrc(restored, currentProjectId))
+                        return decorateMarkdownLinks(
+                            DOMPurify.sanitize(rewriteProjectImageSrc(restored, currentProjectId)),
+                            currentProjectId)
                     })() }}
                 />
             </div>

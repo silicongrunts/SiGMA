@@ -4,8 +4,8 @@ import { createContext } from 'react'
  * Context for LibraryBrowser ↔ EditorHeader / EditorView communication.
  *
  * LibraryBrowser writes callbacks + status; EditorHeader reads them to render
- * action buttons and status indicators. LibraryTab reads browsing state for
- * LLM user_state context. EditorView writes navigation requests (below) that
+ * action buttons and status indicators. EditorView reads browsing state for
+ * the LLM user_state context and writes navigation requests (below) that
  * LibraryBrowser consumes to drive folder/document reveal from chat citations.
  */
 export const LibraryActionsContext = createContext({

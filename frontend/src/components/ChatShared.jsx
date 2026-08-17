@@ -1,6 +1,8 @@
 /**
  * ChatShared - Reusable chat sub-components
- * Extracted from App.jsx for use in sidebar chat, ExploreTab, and LibraryTab.
+ * Markdown rendering (MarkdownContent) and workflow-timeline components
+ * shared by the sidebar ChatPanel, DiffViewer, LibraryBrowser, and
+ * PlanApprovalDialog.
  */
 import { useEffect, useState, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -43,6 +45,54 @@ export function rewriteProjectImageSrc(html, projectId) {
         img.setAttribute('src', `/api/v1/files/${encodeURIComponent(projectId)}/inline?path=${encodeURIComponent(src)}`)
     })
     return doc.body.innerHTML
+}
+
+// A href has a URI scheme if it starts with e.g. "mailto:" or "c:". Used to
+// separate "browser-handled link" from "project-relative path" below. A
+// single letter before ":" also catches Windows drive paths ("C:\...").
+const URI_SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i
+
+/**
+ * Classify and decorate links in rendered markdown HTML:
+ *
+ *   - external (http(s)://, protocol-relative //) → target="_blank" +
+ *     rel="noopener noreferrer", so they never navigate the SPA away
+ *   - project-relative paths → data-sigma-path attribute; clicks are
+ *     intercepted by MarkdownContent / Preview and opened in-app (same
+ *     convention as rewriteProjectImageSrc: relative = project-root-relative)
+ *   - everything else (#anchors, sigma: citations, mailto:/tel:/... schemes)
+ *     → untouched
+ *
+ * href attributes are never rewritten: they stay honest for copy-link, and
+ * no DOMPurify URI-regexp changes are needed (a rewritten sigma: href would
+ * be stripped by the default regexp in callers without citation support).
+ * data-sigma-path is only set when a projectId is in scope — without a
+ * project the path cannot resolve to a file, so those links stay native.
+ */
+export function decorateMarkdownLinks(html, projectId) {
+    if (!html) return html
+    const doc = new DOMParser().parseFromString(html, 'text/html')
+    let changed = false
+    doc.querySelectorAll('a[href]').forEach(a => {
+        const href = a.getAttribute('href') || ''
+        if (!href || href.startsWith('#') || href.startsWith('sigma:')) return
+        if (/^(?:https?:|\/\/)/i.test(href)) {
+            a.setAttribute('target', '_blank')
+            a.setAttribute('rel', 'noopener noreferrer')
+            changed = true
+            return
+        }
+        if (URI_SCHEME_RE.test(href)) return
+        if (!projectId) return
+        // marked percent-encodes hrefs; store the decoded path so the click
+        // handler re-encodes it exactly once when building the open URL
+        // (encode → URLSearchParams.get decode = lossless round-trip).
+        let path = href
+        try { path = decodeURIComponent(href) } catch { /* malformed escape — keep raw */ }
+        a.setAttribute('data-sigma-path', path)
+        changed = true
+    })
+    return changed ? doc.body.innerHTML : html
 }
 
 function isAgentToolName(tool) {
@@ -126,10 +176,12 @@ export const MarkdownContent = ({ content, projectId = null, onCitation = null }
         const parsed = marked.parse(text)
         const restored = restoreMath(parsed, map)
         const rewritten = rewriteProjectImageSrc(restored, projectId)
-        if (!onCitation) return DOMPurify.sanitize(rewritten)
-        return DOMPurify.sanitize(rewritten, {
-            ALLOWED_URI_REGEXP: citationUriRegexp,
-        })
+        // Decorate AFTER sanitize: attributes added past this point are never
+        // filtered, so no DOMPurify config changes are needed for them.
+        const sanitized = onCitation
+            ? DOMPurify.sanitize(rewritten, { ALLOWED_URI_REGEXP: citationUriRegexp })
+            : DOMPurify.sanitize(rewritten)
+        return decorateMarkdownLinks(sanitized, projectId)
     }, [content, projectId, onCitation])
 
     // Render math ($...$ inline, $$...$$ display) after React commits the HTML.
@@ -153,14 +205,25 @@ export const MarkdownContent = ({ content, projectId = null, onCitation = null }
         }
     }, [html])
 
-    // Citation links are never real navigation. Intercept via a single delegated
-    // handler instead of per-anchor binding. Only active when onCitation is set,
-    // so other MarkdownContent callers are unaffected.
+    // Links that are never real navigation are intercepted via a single
+    // delegated handler instead of per-anchor binding: sigma: citations, and
+    // project-relative markdown links (marked by decorateMarkdownLinks with
+    // data-sigma-path). The latter dispatch through the citation channel as a
+    // synthesized sigma://synthesis URL, so validation, tab switching,
+    // autosave-before-switch, and error toasts all live in one place
+    // (EditorView's handleCitation / openProjectPath). Only active when
+    // onCitation is set, so other MarkdownContent callers are unaffected.
     const handleClick = useMemo(() => {
         if (!onCitation) return undefined
         return (e) => {
             const anchor = e.target.closest?.('a')
             if (!anchor) return
+            const sigmaPath = anchor.getAttribute('data-sigma-path')
+            if (sigmaPath) {
+                e.preventDefault()
+                onCitation(`sigma://synthesis/file?path=${encodeURIComponent(sigmaPath)}`)
+                return
+            }
             const href = anchor.getAttribute('href') || ''
             if (!href.startsWith(SIGMA_CITATION_SCHEME + ':')) return
             e.preventDefault()

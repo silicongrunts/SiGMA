@@ -29,6 +29,7 @@ export default function SynthesisTab({
   onFileReady,
   onSaveBeforeAnnotationChat,
   onApplyDiffSave,
+  onOpenPath,
 }) {
   const { t } = useTranslation()
   const currentFile = useStore(s => s.currentFile)
@@ -283,7 +284,7 @@ export default function SynthesisTab({
             previewScrollRafRef.current = requestAnimationFrame(() => {
               storage.setPreviewScroll(projectId, previewPath, ratio)
             })
-          }} />
+          }} onOpenPath={onOpenPath} />
         </aside>
       )}
     </ResizablePanels>
