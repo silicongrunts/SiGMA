@@ -306,11 +306,17 @@ const fontCompartment = new Compartment()
  * reconfigured at runtime via `setEditorAppearance` without rebuilding the
  * editor state. Background is intentionally NOT set here — only dark mode
  * controls it.
+ *
+ * Ligatures are disabled: the selectable ligature fonts (JetBrains Mono,
+ * Fira Code, Cascadia Code) turn markdown syntax runs like `---`/`***`
+ * into contextual substitutions that can blank out leading characters
+ * depending on the browser's shaping path, so every character must render
+ * literally.
  */
 function buildFontExtension(fontFamily, fontSize, lineHeight) {
   return EditorView.theme({
     '&': { fontSize: `${fontSize}px` },
-    '.cm-scroller': { fontFamily: getFontCss(fontFamily), lineHeight },
+    '.cm-scroller': { fontFamily: getFontCss(fontFamily), lineHeight, fontVariantLigatures: 'none' },
   })
 }
 

@@ -21,17 +21,19 @@ const languageConf = new Compartment()
 const cmThemeCompartment = new Compartment()
 const cmSyntaxCompartment = new Compartment()
 
+// Both themes disable ligatures: JetBrains Mono / Fira Code ligatures can
+// blank out characters in syntax runs (see Editor.jsx buildFontExtension).
 const lightCmTheme = EditorView.theme({
   '&': { height: '100%', backgroundColor: '#ffffff' },
   '.cm-scroller': { overflow: 'auto' },
-  '.cm-content': { fontFamily: "'JetBrains Mono', 'Fira Code', monospace", fontSize: '13px' },
+  '.cm-content': { fontFamily: "'JetBrains Mono', 'Fira Code', monospace", fontSize: '13px', fontVariantLigatures: 'none' },
   '.cm-gutters': { backgroundColor: '#f8f9fa', borderRight: '1px solid #e5e7eb' },
 })
 
 const darkCmTheme = EditorView.theme({
   '&': { height: '100%', backgroundColor: '#111827', color: '#e5e7eb' },
   '.cm-scroller': { overflow: 'auto' },
-  '.cm-content': { fontFamily: "'JetBrains Mono', 'Fira Code', monospace", fontSize: '13px', caretColor: '#e5e7eb' },
+  '.cm-content': { fontFamily: "'JetBrains Mono', 'Fira Code', monospace", fontSize: '13px', caretColor: '#e5e7eb', fontVariantLigatures: 'none' },
   '.cm-cursor': { borderLeftColor: '#e5e7eb' },
   '.cm-gutters': { backgroundColor: '#0f172a', borderRight: '1px solid #1f2937', color: '#4b5563' },
   '.cm-activeLine': { backgroundColor: '#1e293b' },
