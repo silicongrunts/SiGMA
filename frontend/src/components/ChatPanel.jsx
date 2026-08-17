@@ -2376,7 +2376,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         )}
       </div>
 
-      <div className="p-4 bg-white dark:bg-gray-900 border-t border-gray-100 dark:border-gray-800 space-y-3 shadow-[0_-10px_20px_rgba(0,0,0,0.02)]">
+      <div className="px-4 pt-4 pb-2 bg-white dark:bg-gray-900 border-t border-gray-100 dark:border-gray-800 space-y-3 shadow-[0_-10px_20px_rgba(0,0,0,0.02)]">
         {tokenBudget && (
           <div className="flex items-center justify-between rounded-xl border border-amber-100 dark:border-amber-800/50 bg-amber-50 dark:bg-amber-900/30 px-3 py-2 text-[10px] font-medium text-amber-700 dark:text-amber-300">
             <span>{t('chat.tokenBudget')}{formatTokenCount(tokenBudget)}{t('chat.tokenBudgetFor')}</span>
@@ -2385,26 +2385,6 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
             </button>
           </div>
         )}
-        {contextStats && (() => {
-          const current = Number(contextStats.current_tokens || 0)
-          const threshold = Number(contextStats.compact_threshold || 0)
-          const max = Number(contextStats.max_context_length || 0)
-          const pct = max > 0 ? Math.min(100, (current / max) * 100) : 0
-          const thresholdPct = max > 0 ? Math.min(100, (threshold / max) * 100) : 0
-          return (
-            <div className="space-y-1">
-              <div className="flex items-center justify-between text-[10px] font-mono text-gray-400 dark:text-gray-500">
-                <span>{t('chat.ctxLength')}{formatTokenCount(current)}, {pct.toFixed(1)}%</span>
-                <span>{t('chat.threshold')}{formatTokenCount(threshold)}{t('chat.maxToken')}{formatTokenCount(max)}</span>
-              </div>
-              <div className="relative h-1.5 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800">
-                <div className="absolute inset-y-0 left-0 bg-pink-200/70" style={{ width: '100%' }} />
-                <div className="absolute inset-y-0 left-0 bg-green-200/80" style={{ width: `${thresholdPct}%` }} />
-                <div className="absolute inset-y-0 left-0 bg-blue-300/80" style={{ width: `${pct}%` }} />
-              </div>
-            </div>
-          )
-        })()}
         {citation && (
           <div className="bg-blue-50/50 dark:bg-blue-900/30 border border-blue-100 dark:border-blue-800/50 rounded-xl px-3 py-2 flex items-start gap-3 animate-in slide-in-from-bottom-2 duration-200" title={citation.fullText}>
             <Quote className="w-3.5 h-3.5 text-blue-400 mt-1 flex-shrink-0" />
@@ -2474,7 +2454,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
               </div>
             </div>
           )}
-          <div className="flex items-end gap-2 bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-2xl px-4 py-2 focus-within:ring-2 focus-within:ring-sigma-600/20 focus-within:bg-white dark:focus-within:bg-gray-900 transition-all">
+          <div className="flex items-end gap-2 bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-2xl px-4 py-1.5 focus-within:ring-2 focus-within:ring-sigma-600/20 focus-within:bg-white dark:focus-within:bg-gray-900 transition-all">
           <input
             ref={imageInputRef}
             type="file"
@@ -2583,6 +2563,31 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
           </div>
         </div>
       </div>
+
+      {/* ── Context usage bar (hover for exact numbers) ── */}
+      {contextStats && (() => {
+        const current = Number(contextStats.current_tokens || 0)
+        const threshold = Number(contextStats.compact_threshold || 0)
+        const max = Number(contextStats.max_context_length || 0)
+        const pct = max > 0 ? Math.min(100, (current / max) * 100) : 0
+        const thresholdPct = max > 0 ? Math.min(100, (threshold / max) * 100) : 0
+        return (
+          <div className="group/ctx relative flex-shrink-0 px-4 pb-2 cursor-help">
+            <div
+              role="tooltip"
+              className="pointer-events-none absolute bottom-full left-4 z-50 mb-1.5 hidden w-max max-w-[calc(100%-2rem)] space-y-0.5 group-hover/ctx:block rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-800 dark:bg-gray-900 px-3 py-2 text-[11px] font-mono leading-relaxed text-gray-100 shadow-2xl"
+            >
+              <div>{t('chat.ctxLength')}{formatTokenCount(current)} ({pct.toFixed(1)}%)</div>
+              <div>{t('chat.threshold')}{formatTokenCount(threshold)}{t('chat.maxToken')}{formatTokenCount(max)}</div>
+            </div>
+            <div className="relative h-2 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800">
+              <div className="absolute inset-y-0 left-0 bg-pink-200/70" style={{ width: '100%' }} />
+              <div className="absolute inset-y-0 left-0 bg-green-200/80" style={{ width: `${thresholdPct}%` }} />
+              <div className="absolute inset-y-0 left-0 bg-blue-300/80" style={{ width: `${pct}%` }} />
+            </div>
+          </div>
+        )
+      })()}
 
       {/* ── Auto-approve settings menu ── */}
       {showAutoApproveMenu && (() => {
