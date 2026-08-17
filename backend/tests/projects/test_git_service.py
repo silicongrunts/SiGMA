@@ -6,6 +6,7 @@ from urllib.parse import unquote
 import pytest
 
 import app.services.git_service as git_module
+from app.core.exceptions import FileMissingError
 from app.services.git_service import GitService, SNAPSHOT_MESSAGE_PREFIX
 
 
@@ -117,3 +118,92 @@ def test_snapshot_zip_uses_temp_file_outside_project_and_cleans_up(tmp_path, mon
     assert seen_output_paths == [str(archive_path)]
     assert not archive_path.exists()
     assert not any(project_path.glob(".tmp_snapshot_*.zip"))
+
+
+@pytest.mark.timeout(30)
+def test_commit_files_and_blob_return_real_non_ascii_paths(tmp_path):
+    service = GitService()
+    service.USERDATA_DIR = tmp_path
+    project_id = "project1"
+    project_path = tmp_path / project_id
+    project_path.mkdir()
+    chinese_name = "你是一个一个一个.md"
+    tab_name = "str\tange.md"
+    (project_path / chinese_name).write_text("# 啊啊啊啊啊\n", encoding="utf-8")
+    (project_path / tab_name).write_text("tab name\n", encoding="utf-8")
+
+    assert service.init_git(project_id) is True
+    root_commit = service.get_log(project_id, 1)[0]["hash"]
+
+    # Root commit must list its files; paths must be the real names, not the
+    # C-quoted form git emits by default.
+    files = {f["path"]: f for f in service.get_commit_files(project_id, root_commit)}
+    assert chinese_name in files
+    assert files[chinese_name]["status"] == "A"
+    assert tab_name in files
+
+    blob = service.get_blob(project_id, chinese_name, root_commit)
+    assert blob["success"] is True
+    assert blob["content"] == "# 啊啊啊啊啊\n"
+    assert service.get_file_history(project_id, chinese_name)
+
+
+@pytest.mark.timeout(30)
+def test_commit_files_reports_renamed_non_ascii_file_as_modified(tmp_path):
+    service = GitService()
+    service.USERDATA_DIR = tmp_path
+    project_id = "project1"
+    project_path = tmp_path / project_id
+    project_path.mkdir()
+    old_name = "你是一个一个一个.md"
+    new_name = "いいよ！こいよ.md"
+    (project_path / old_name).write_text("content\n", encoding="utf-8")
+
+    service.init_git(project_id)
+    parent = service.get_log(project_id, 1)[0]["hash"]
+
+    (project_path / old_name).rename(project_path / new_name)
+    service.stage_all(project_id)
+    message = service.build_staged_snapshot_message(project_id)
+    assert service.commit(project_id, message)["success"] is True
+
+    changes = _decode_snapshot_subject(message)
+    assert changes["modified"]["names"] == [new_name]
+
+    commit = service.get_log(project_id, 1)[0]["hash"]
+    assert service.get_commit_files(project_id, commit, parent_commit=parent) == [
+        {"path": new_name, "name": new_name, "status": "M"},
+    ]
+    assert service.get_blob(project_id, new_name, commit)["content"] == "content\n"
+
+
+@pytest.mark.timeout(30)
+def test_blob_falls_back_to_parent_for_file_deleted_in_commit(tmp_path):
+    service = GitService()
+    service.USERDATA_DIR = tmp_path
+    project_id = "project1"
+    project_path = tmp_path / project_id
+    project_path.mkdir()
+    chinese_name = "中文测试.md"
+    (project_path / chinese_name).write_text("final content\n", encoding="utf-8")
+
+    service.init_git(project_id)
+    parent = service.get_log(project_id, 1)[0]["hash"]
+
+    (project_path / chinese_name).unlink()
+    service.stage_all(project_id)
+    assert service.commit(project_id, "delete file")["success"] is True
+    commit = service.get_log(project_id, 1)[0]["hash"]
+
+    assert service.get_commit_files(project_id, commit, parent_commit=parent) == [
+        {"path": chinese_name, "name": chinese_name, "status": "D"},
+    ]
+
+    # The file has no blob at the deleting commit; the preview must show the
+    # content as it was just before deletion.
+    blob = service.get_blob(project_id, chinese_name, commit)
+    assert blob["success"] is True
+    assert blob["content"] == "final content\n"
+
+    with pytest.raises(FileMissingError):
+        service.get_blob(project_id, "不存在的文件.md", commit)

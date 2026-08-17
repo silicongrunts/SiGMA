@@ -46,7 +46,11 @@ class GitService:
         project_path = self.get_project_path(project_id)
         try:
             result = subprocess.run(
-                ["git", "--git-dir", str(project_path / ".git"),
+                # quotepath=false: git C-quotes non-ASCII paths by default
+                # (e.g. "gpt\347\273\231....md"); every caller needs the raw
+                # path so it can be passed back to git or shown to the user.
+                ["git", "-c", "core.quotepath=false",
+                 "--git-dir", str(project_path / ".git"),
                  "-C", str(project_path)] + args,
                 capture_output=True, timeout=30
             )
@@ -157,28 +161,53 @@ class GitService:
         changes = self._get_staged_snapshot_changes(project_id)
         return self._format_snapshot_message(changes)
 
+    @staticmethod
+    def _parse_name_status_z(stdout: bytes) -> List[Dict[str, str]]:
+        """Parse NUL-separated `--name-status -z` output into status/path pairs.
+
+        Renames and copies carry two paths (old, new); only the new path is
+        kept. Paths are raw bytes until here because NUL is the only byte that
+        cannot appear in a filename — this is what makes -z safe for names
+        containing quotes, newlines, tabs, or non-ASCII characters, none of
+        which survive line/tab-based parsing reliably.
+        """
+        entries: List[Dict[str, str]] = []
+        fields = stdout.split(b"\0")
+        i = 0
+        while i < len(fields):
+            status = fields[i]
+            if not status:
+                i += 1
+                continue
+            status_code = status.decode("ascii", errors="replace").strip().upper()[:1]
+            path_count = 2 if status_code in ("R", "C") else 1
+            path_fields = fields[i + 1:i + 1 + path_count]
+            if len(path_fields) < path_count:
+                break
+            entries.append({
+                "status": status_code,
+                "path": path_fields[-1].decode("utf-8", errors="replace"),
+            })
+            i += 1 + path_count
+        return entries
+
     def _get_staged_snapshot_changes(self, project_id: str) -> Dict[str, List[str]]:
-        stdout, stderr, rc = self._run_git(project_id, ["diff", "--cached", "--name-status"])
+        stdout, stderr, rc = self._run_git(
+            project_id, ["diff", "--cached", "--name-status", "-z"], as_binary=True,
+        )
         if rc != 0:
             raise FileSystemError(f"Git diff --cached failed: {stderr}", code="INTERNAL_ERROR")
 
         changes: Dict[str, List[str]] = {category: [] for category in SNAPSHOT_CATEGORY_ORDER}
-        for raw_line in stdout.splitlines():
-            parts = raw_line.split("\t")
-            if len(parts) < 2:
-                continue
-            status = parts[0].upper()
-            status_code = status[0]
-            if status_code == "A" or status_code == "C":
+        for entry in self._parse_name_status_z(stdout):
+            status = entry["status"]
+            if status in ("A", "C"):
                 category = "added"
-                path = parts[-1]
-            elif status_code == "D":
+            elif status == "D":
                 category = "deleted"
-                path = parts[-1]
             else:
                 category = "modified"
-                path = parts[-1]
-            name = Path(path).name
+            name = Path(entry["path"]).name
             if len(name) > 10:
                 name = name[:10] + "..."
             if name and name not in changes[category]:
@@ -281,47 +310,26 @@ class GitService:
         """Get the list of files changed in a commit."""
         try:
             if parent_commit:
-                # git diff --name-status between parent and commit
                 stdout, stderr, rc = self._run_git(project_id, [
-                    "diff", "--name-status", f"{parent_commit}..{commit}"
-                ])
+                    "diff", "--name-status", "-z", f"{parent_commit}..{commit}"
+                ], as_binary=True)
             else:
-                # First commit (no parent) - list all files
+                # Root commit has no parent to diff against; --root diffs it
+                # against the empty tree so its files are listed too.
                 stdout, stderr, rc = self._run_git(project_id, [
-                    "diff-tree", "--no-commit-id", "-r", "--name-status", commit
-                ])
+                    "diff-tree", "--no-commit-id", "-r", "--name-status", "--root", "-z", commit
+                ], as_binary=True)
 
-            if rc != 0 or not stdout.strip():
+            if rc != 0 or not stdout.strip(b"\0").strip():
                 return []
 
             files = []
-            for raw_line in stdout.strip().split('\n'):
-                raw_line = raw_line.strip()
-                if not raw_line:
-                    continue
-                # Format: "STATUS\tfilename" or "R100\told\tnew"
-                parts = raw_line.split('\t')
-                if not parts:
-                    continue
-                status = parts[0].upper()  # e.g. "M", "A", "D", "R100", "C100"
-                status_code = status[0]  # Just the letter
-
-                if status_code in ('R', 'C'):
-                    # Rename or copy: STATUS\told_path\tnew_path
-                    if len(parts) >= 3:
-                        line = parts[-1]  # new path
-                    elif len(parts) == 2:
-                        line = parts[-1]
-                    status_code = 'M'  # treat renames as modified
-                elif len(parts) >= 2:
-                    line = parts[-1]
-                else:
-                    line = parts[0]
-
-                name = Path(line).name
+            for entry in self._parse_name_status_z(stdout):
+                # Renames and copies are reported as modifications of the new path.
+                status_code = "M" if entry["status"] in ("R", "C") else entry["status"]
                 files.append({
-                    "path": line,
-                    "name": name,
+                    "path": entry["path"],
+                    "name": Path(entry["path"]).name,
                     "status": status_code,
                 })
             return files
@@ -341,9 +349,18 @@ class GitService:
 
         try:
             # Use git show to get the file content in binary mode
+            source_ref = f"{commit}:{path}"
             stdout, stderr, rc = self._run_git(project_id, [
-                "show", f"{commit}:{path}"
+                "show", source_ref
             ], as_binary=True)
+            if rc != 0:
+                # A file deleted in this commit has no blob at `commit`; read
+                # the parent's version so previews show the content as it was
+                # just before deletion.
+                source_ref = f"{commit}^:{path}"
+                stdout, stderr, rc = self._run_git(project_id, [
+                    "show", source_ref
+                ], as_binary=True)
 
             if rc != 0:
                 raise FileMissingError(path)
@@ -351,7 +368,7 @@ class GitService:
             # Get file size
             # Use git cat-file -s to get the blob size
             size_out, size_err, size_rc = self._run_git(project_id, [
-                "cat-file", "-s", f"{commit}:{path}"
+                "cat-file", "-s", source_ref
             ])
             file_size = int(size_out.strip()) if size_rc == 0 and size_out.strip() else len(stdout)
 
