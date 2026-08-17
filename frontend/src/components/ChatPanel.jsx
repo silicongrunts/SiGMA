@@ -6,9 +6,10 @@
  * If a background task is running, silently reconnects to SSE for live updates.
  */
 import { useState, useRef, useEffect, useCallback } from 'react'
+import { flushSync } from 'react-dom'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { MarkdownContent, ThinkingProcess } from './ChatShared'
-import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronDown, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2 } from 'lucide-react'
+import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2 } from 'lucide-react'
 import { toastError, toastSuccess } from './Toast'
 import { ModalOverlay, ConfirmModal } from './Modal'
 import Toggle from './Toggle'
@@ -115,6 +116,18 @@ function displayMessageText(text, planLabel) {
   return text
 }
 
+// Sentinel highlight id for a just-sent/edit-resend bubble that has no server
+// id yet — by definition the latest, so the list highlights its final entry.
+const NAV_HIGHLIGHT_LAST = '__latest__'
+
+// One-line summary for the message-list popup: whitespace only is collapsed
+// (multi-line content must render as a single row). Visual truncation is
+// left to CSS (`truncate`), which adapts to actual glyph widths — counting
+// characters cannot, because CJK and Latin glyphs are not equally wide.
+function summarizeForNav(text) {
+  return (text || '').replace(/\s+/g, ' ').trim()
+}
+
 function attachmentSrc(projectId, attachment) {
   return `/api/v1/files/${encodeURIComponent(projectId)}/inline?path=${encodeURIComponent(attachment.path)}`
 }
@@ -166,6 +179,10 @@ function AttachmentStrip({ projectId, attachments, onRemove = null, compact = fa
 // ---- Intra-process lock: prevent concurrent session creation for the same project ----
 const sessionInitLocks = new Map() // projectId → Promise<sessionId>
 const HISTORY_PAGE_SIZE = 10
+// Cap for full-history sweeps (nav list build, nav jump preload). Only guards
+// against a runaway cursor — real sessions end via has_more far earlier. The
+// list must never offer entries the jump cannot reach, so both sweeps share it.
+const NAV_SWEEP_PAGE_LIMIT = 100
 
 export default function ChatPanel({ projectId, placeholder, citation = null, onClearCitation = null, onFileChanged = null, onAnnotationChanged = null, getUserState = null, onSaveBeforeChat = null, onCitation = null }) {
   const { t } = useTranslation()
@@ -198,6 +215,9 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   const pendingInteractionRef = useRef(null)  // deferred dispatch to avoid cross-render setState
   const genRef = useRef(0)  // generation counter — prevents stale finally() from overwriting isStreaming
   const isUserAtBottom = useRef(true)
+  // Whether the chat content overflows the scroll container. Gates the message
+  // navigation buttons — they are useless on a chat short enough to fit.
+  const [chatScrollable, setChatScrollable] = useState(false)
   const taskIdRef = useRef(null)  // current backend task ID for cancellation
   const stopAbortTimerRef = useRef(null)
   const stopRequestedRef = useRef(false)
@@ -206,6 +226,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   const historyLoadingRef = useRef(false)
   const lastSkillsVersionRef = useRef(-1)  // dedup /skill submenu fetches across re-renders
   const historyModeRef = useRef('latest')
+  const sessionIdRef = useRef(null)  // latest sessionId, for async guards (nav jump sweep)
 
   // Session title inline editing
   const [isEditingTitle, setIsEditingTitle] = useState(false)
@@ -388,8 +409,10 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   }
 
   function setHistoryPaging(page) {
+    // Test the raw value: Number(null) === 0 is finite, and an exhausted page
+    // must leave the cursor null, not a bogus seq-0 cursor.
     const cursor = page.has_more ? page.next_before_seq : null
-    historyCursorRef.current = Number.isFinite(Number(cursor)) ? Number(cursor) : null
+    historyCursorRef.current = Number.isFinite(cursor) ? cursor : null
     setHasMoreHistory(Boolean(page.has_more && historyCursorRef.current !== null))
   }
 
@@ -642,11 +665,17 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
     if (el.scrollTop < 80) {
       loadOlderHistory()
     }
-  }, [projectId, sessionId, hasMoreHistory, isLoadingHistory])
+  }, [projectId, sessionId, hasMoreHistory])
 
+  // Loads one older history page for the scroll-top trigger (wheel-driven
+  // pagination). The message-list jump does not use this — far-back targets
+  // need bulk loading (see jumpToNavEntry), and while a jump is bulk-loading
+  // its sweep owns the cursor: a wheel-triggered page load here would race
+  // it for pages.
   async function loadOlderHistory() {
+    if (navJumpingRef.current || !hasMoreHistory) return
     const cursor = historyCursorRef.current
-    if (!projectId || !sessionId || !hasMoreHistory || historyLoadingRef.current || cursor === null) return
+    if (!projectId || !sessionId || cursor === null || historyLoadingRef.current) return
     const el = chatScrollRef.current
     const prevHeight = el?.scrollHeight || 0
     historyLoadingRef.current = true
@@ -686,10 +715,269 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
     if (!el || !content) return
     const ro = new ResizeObserver(() => {
       if (isUserAtBottom.current) el.scrollTop = el.scrollHeight
+      setChatScrollable(el.scrollHeight - el.clientHeight > 8)
     })
+    // Observe the container too: dragging the sidebar resizes the viewport and
+    // can flip scrollability without any content height change.
     ro.observe(content)
+    ro.observe(el)
     return () => ro.disconnect()
   }, [])
+
+  // ---- Message navigation (floating buttons) ----
+  // The anchor line: the y position an aligned message's top sits at (the
+  // scroll container's content top — border-box top plus its top padding).
+  const chatAnchorTop = useCallback((el) => {
+    return el.getBoundingClientRect().top + (parseFloat(getComputedStyle(el).paddingTop) || 0)
+  }, [])
+
+  // Aligns a message node's top with the anchor line. Instant, and disarms
+  // auto-pin BEFORE scrolling: the scroll event will update the flag too, but
+  // an interleaved ResizeObserver tick could otherwise read the stale value
+  // and snap the jump back to the bottom mid-flight.
+  const alignStopTop = useCallback((node, nodeTop) => {
+    const el = chatScrollRef.current
+    if (!el || !node) return
+    isUserAtBottom.current = false
+    el.scrollTop = Math.max(0, el.scrollTop + (nodeTop ?? node.getBoundingClientRect().top) - chatAnchorTop(el))
+  }, [chatAnchorTop])
+
+  // Stops are the message roots (data-chat-msg). Each press jumps to the
+  // nearest stop strictly above/below the anchor. Pressing Up from
+  // mid-message lands on that message's own start, then walks back one
+  // message per press; Down mirrors it and falls through to the very bottom
+  // once no message start lies below. Geometry is read from the DOM at click
+  // time, so streaming updates, history prepends, and message-list refreshes
+  // can never desync it. scrollTop is assigned directly (instant) for the
+  // same reason the auto-pin above avoids smooth scrolling: an animation
+  // would fight the pin/pagination corrections.
+  const jumpChatMessage = useCallback((dir) => {
+    const el = chatScrollRef.current
+    if (!el) return
+    const anchor = chatAnchorTop(el)
+    let target = null
+    let targetTop = 0
+    for (const m of el.querySelectorAll('[data-chat-msg]')) {
+      const top = m.getBoundingClientRect().top
+      // 2px tolerance: sub-pixel layout and scrollTop rounding can leave an
+      // aligned message a fraction of a pixel off the anchor
+      if (dir < 0 && top < anchor - 2) { target = m; targetTop = top }
+      if (dir > 0 && top > anchor + 2) { target = m; targetTop = top; break }
+    }
+    if (dir < 0 && !target) return
+    if (target) {
+      alignStopTop(target, targetTop)
+    } else {
+      // Terminal Down stop: the bottom. Re-arm auto-pin so an active stream
+      // keeps following after we land.
+      isUserAtBottom.current = true
+      el.scrollTop = el.scrollHeight
+    }
+  }, [alignStopTop, chatAnchorTop])
+
+  // ---- Message list popup ----
+  const [navListOpen, setNavListOpen] = useState(false)
+  const [navList, setNavList] = useState([])
+  const [navListLoading, setNavListLoading] = useState(false)
+  const [navHighlightId, setNavHighlightId] = useState(null)
+  const navPopupRef = useRef(null)
+  const navListScrollRef = useRef(null)
+  const navListBtnRef = useRef(null)
+  const navJumpingRef = useRef(false)
+
+  // The "current" message: the last user bubble at or above the anchor (an
+  // assistant reply maps back to the question that produced it).
+  const computeNavHighlight = useCallback(() => {
+    const el = chatScrollRef.current
+    if (!el) return
+    const anchor = chatAnchorTop(el)
+    let currentId = null
+    for (const m of el.querySelectorAll('[data-chat-msg][data-msg-role="user"]')) {
+      if (m.getBoundingClientRect().top > anchor + 2) break
+      currentId = m.getAttribute('data-msg-id') || NAV_HIGHLIGHT_LAST
+    }
+    setNavHighlightId(currentId)
+  }, [chatAnchorTop])
+
+  // The popup lists EVERY user message of the session, not just the loaded
+  // window (initial load is only HISTORY_PAGE_SIZE). Refetched on every open —
+  // a single-user local app only pays cheap SQLite-backed paged reads, and
+  // having no cache means no stale cache to invalidate.
+  const openNavList = useCallback(async () => {
+    if (navListOpen) {
+      setNavListOpen(false)
+      return
+    }
+    setNavListOpen(true)
+    if (!projectId || !sessionId) {
+      setNavListLoading(false)
+      return
+    }
+    setNavListLoading(true)
+    setNavList([])
+    try {
+      const entries = []
+      let beforeSeq = null
+      // Full sweep; the page cap only guards a runaway cursor — real sessions
+      // end far earlier via has_more.
+      for (let pageIdx = 0; pageIdx < NAV_SWEEP_PAGE_LIMIT; pageIdx++) {
+        const page = normalizeHistoryPage(await chatAPI.history(projectId, sessionId, { limit: 200, beforeSeq }))
+        // Checked after the await: a session switch while a page was in
+        // flight must stop the sweep before it can overwrite the new
+        // session's list with the old session's entries.
+        if (sessionIdRef.current !== sessionId) return
+        for (const m of page.messages) {
+          if (m.role !== 'user') continue
+          const text = displayMessageText(m.content || '', t('chat.planDisplay'))
+          const hasText = text.trim().length > 0
+          entries.push({
+            id: m.id,
+            seq: messageSeq(m),
+            summary: hasText ? summarizeForNav(text) : t('chat.navImageOnly'),
+          })
+        }
+        if (!page.has_more || page.next_before_seq === null) break
+        beforeSeq = page.next_before_seq
+      }
+      // Pages arrive newest-first; the list reads top-to-bottom, oldest-first.
+      entries.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+      setNavList(entries)
+    } catch (e) {
+      console.error('Failed to load message list:', e)
+      setNavList([])
+    } finally {
+      // After a mid-sweep session switch, a reopened popup is owned by the
+      // new session's own sweep — do not clear its loading state from under it.
+      if (sessionIdRef.current === sessionId) setNavListLoading(false)
+    }
+  }, [navListOpen, projectId, sessionId, t])
+
+  // Jumping to a far-back entry needs the whole span from that entry to the
+  // latest message loaded. Loading it through the wheel-driven 10-turn pages
+  // would re-render the full list once per page (minutes on long sessions)
+  // and could not reach entries beyond its own page budget. So the jump
+  // sweeps with the same 200-turn pages the list itself uses, merges
+  // everything in a single render, and aligns. flushSync guarantees the DOM
+  // is committed when alignment measures it — an rAF wait can fire before
+  // React commits under heavy renders. The sweep continues from the current
+  // cursor so pages the user already scrolled up to load are not refetched.
+  const jumpToNavEntry = useCallback(async (entry) => {
+    if (navJumpingRef.current || !entry.id) return
+    const el = chatScrollRef.current
+    if (!el) return
+    // Jumping is a destination action — close first so the list never lingers
+    // over the chat while pages load for a far-back target.
+    setNavListOpen(false)
+    navJumpingRef.current = true
+    historyLoadingRef.current = true
+    setIsLoadingHistory(true)
+    try {
+      const findNode = () => el.querySelector(`[data-msg-id="${CSS.escape(entry.id)}"]`)
+      let node = findNode()
+      if (!node) {
+        // A just-sent/edit-resend bubble has no server id yet, but by
+        // definition it is the latest message — match it positionally.
+        const userStops = el.querySelectorAll('[data-chat-msg][data-msg-role="user"]')
+        const lastUser = userStops[userStops.length - 1]
+        if (!lastUser?.getAttribute('data-msg-id') && entry === navList[navList.length - 1]) node = lastUser
+      }
+      if (!node && projectId && sessionId) {
+        const older = []
+        let beforeSeq = historyCursorRef.current
+        for (let pageIdx = 0; beforeSeq !== null && pageIdx < NAV_SWEEP_PAGE_LIMIT; pageIdx++) {
+          const page = normalizeHistoryPage(await chatAPI.history(projectId, sessionId, { limit: 200, beforeSeq }))
+          // Checked after the await: a session switch while a page was in
+          // flight must stop the sweep before it writes the old session's
+          // cursor into paging state owned by the new session.
+          if (sessionIdRef.current !== sessionId) return
+          older.push(...page.messages)
+          setHistoryPaging(page)
+          if (page.messages.some(m => m.id === entry.id) || !page.has_more || page.next_before_seq === null) break
+          beforeSeq = page.next_before_seq
+        }
+        if (older.length > 0) {
+          historyModeRef.current = 'expanded'
+          // Drop the loading row and commit the merged span atomically: the
+          // row's removal would otherwise shift alignment after the fact.
+          flushSync(() => {
+            setIsLoadingHistory(false)
+            setMessages(prev => mergeHistoryMessages(prev, older))
+          })
+        }
+        node = findNode()
+      }
+      // History exhausted without the target (deleted concurrently, etc.) —
+      // leave the scroll position untouched rather than guessing.
+      if (node) alignStopTop(node)
+    } catch (e) {
+      console.error('Failed to load messages for jump:', e)
+    } finally {
+      navJumpingRef.current = false
+      // After a mid-sweep session switch, the new session's effect already
+      // reset these (resetHistoryPaging) and its own in-flight page load may
+      // own the lock — clearing unconditionally would release it and hide
+      // its loading row.
+      if (sessionIdRef.current === sessionId) {
+        historyLoadingRef.current = false
+        setIsLoadingHistory(false)
+      }
+    }
+  }, [alignStopTop, navList, projectId, sessionId])
+
+  // Close the popup when the session changes; its entries belong to the old
+  // one. sessionIdRef lets the in-flight nav sweeps (list build, jump
+  // preload) detect the switch and drop their results instead of applying
+  // them to the new session.
+  useEffect(() => {
+    sessionIdRef.current = sessionId
+    setNavListOpen(false)
+  }, [sessionId])
+
+  // Live highlight while open: follows both manual scrolling and jumps.
+  useEffect(() => {
+    if (!navListOpen) return
+    const el = chatScrollRef.current
+    if (!el) return
+    computeNavHighlight()
+    el.addEventListener('scroll', computeNavHighlight, { passive: true })
+    return () => el.removeEventListener('scroll', computeNavHighlight)
+  }, [navListOpen, navListLoading, computeNavHighlight])
+
+  useEffect(() => {
+    if (!navListOpen) return
+    const onKey = (e) => { if (e.key === 'Escape') setNavListOpen(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [navListOpen])
+
+  // One outside-click region = popup ∪ toggle button. Two separate
+  // useClickOutside calls would treat popup clicks as "outside the button"
+  // and unmount the entry before its click event could fire.
+  useEffect(() => {
+    if (!navListOpen) return
+    const onMouseDown = (e) => {
+      const target = e.target
+      if (navPopupRef.current?.contains(target) || navListBtnRef.current?.contains(target)) return
+      setNavListOpen(false)
+    }
+    document.addEventListener('mousedown', onMouseDown)
+    return () => document.removeEventListener('mousedown', onMouseDown)
+  }, [navListOpen])
+
+  // One-shot: reveal the current entry when the list opens. The scroll is
+  // computed by hand and applied only to the popup's own list: native
+  // scrollIntoView() also scrolls every programmatically-scrollable ancestor
+  // (overflow: hidden boxes included), which shifts the whole chat panel and
+  // leaves a persistent blank strip at its bottom. Layout-based offsets
+  // (offsetTop/offsetHeight) are used because the popup's entrance animation
+  // transforms getBoundingClientRect() values mid-flight.
+  useEffect(() => {
+    if (!navListOpen || navListLoading) return
+    const list = navListScrollRef.current
+    const row = list?.querySelector('[data-nav-current]')
+    if (!list || !row) return
+    list.scrollTop = row.offsetTop - list.offsetTop + row.offsetHeight / 2 - list.clientHeight / 2
+  }, [navListOpen, navListLoading, navList])
 
   // ---- Close dropdown on outside click ----
   useClickOutside(dropdownRef, () => setShowDropdown(false), showDropdown)
@@ -1742,6 +2030,9 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
 
   // ---- Render helpers ----
   const activeSessions = sessions.filter(s => !s.is_archived)
+  // Floating message-nav buttons: quiet by default (opacity-60), fully visible
+  // on hover — they sit over the chat's right edge and must stay unobtrusive.
+  const chatNavBtnClass = 'pointer-events-auto w-6 h-6 rounded-full bg-white/90 dark:bg-gray-800/90 border border-gray-200 dark:border-gray-700 shadow-sm backdrop-blur flex items-center justify-center text-gray-500 dark:text-gray-400 hover:text-sigma-600 dark:hover:text-sigma-200 opacity-60 hover:opacity-100 transition-opacity'
   const archivedCount = sessions.filter(s => s.is_archived).length
 
   const slashSuggestions = getSlashSuggestions(chatInput)
@@ -1901,112 +2192,188 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         </div>
       </div>
 
-      <div ref={chatScrollRef} onScroll={handleChatScroll} className="flex-1 overflow-y-auto p-4">
-        <div ref={chatContentRef} className="space-y-6">
-        {isLoadingHistory && (
-          <div className="text-center text-[10px] text-gray-400 dark:text-gray-500 font-medium">{t('chat.loadingHistory')}</div>
-        )}
-        {messages.length === 0 && (
-          <div className="bg-white dark:bg-gray-900 p-6 rounded-3xl shadow-sm border border-gray-100 dark:border-gray-800 text-sm text-gray-500 dark:text-gray-400 italic leading-relaxed text-center mt-10">
-            <Bot className="w-8 h-8 mx-auto mb-3 text-sigma-600/30" />
-            {t('chat.welcome')}
-          </div>
-        )}
-        {messages.map((m, i) => {
-          const isLastMessage = i === messages.length - 1
-          const isCurrentlyStreaming = isLastMessage && isStreaming
-          return (
-            <div key={m.id || i} className={`group/message flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
-              <div className="flex items-center gap-2 mb-1.5 px-1">
-                {m.role === 'SiGMA' ? <Zap className="w-3 h-3 text-sigma-600" /> : <User className="w-3 h-3 text-gray-400 dark:text-gray-500" />}
-                <span className="text-[10px] font-black uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.role}</span>
-                {m.created_at && (
-                  <span className="text-[9px] text-gray-300 select-none">
-                    {formatTimestamp(m.created_at)}
-                  </span>
-                )}
-              </div>
-              {m.role === 'SiGMA' && <ThinkingProcess steps={m.process} isStreaming={isCurrentlyStreaming} />}
-              <div className={`max-w-[90%] px-4 py-3 rounded-2xl shadow-sm animate-in fade-in slide-in-from-bottom-1 duration-300 overflow-hidden break-words ${
-                m.role === 'user' ? 'bg-sigma-600 text-white rounded-tr-none' : 'bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 border border-gray-100 dark:border-gray-800 rounded-tl-none'
-              }`}>
-                {m.role === 'SiGMA' ? <MarkdownContent content={m.content || ''} projectId={projectId} onCitation={onCitation} /> : (
-                  <div className={`text-sm leading-relaxed whitespace-pre-wrap ${editingMessageId === m.id ? 'opacity-50' : ''}`}>{m.content}</div>
-                )}
-                {m.role === 'user' && (
-                  <AttachmentStrip projectId={projectId} attachments={m.attachments} compact />
-                )}
-                {m.role === 'user' && m.citation && (
-                  <button
-                    onClick={() => setViewingCitation(m.citation)}
-                    className="mt-2 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-white/60 hover:text-white/90 transition-colors"
-                  >
-                    <TextQuote className="w-3 h-3" />
-                    {t('chat.viewCitation')}
-                  </button>
-                )}
-                {isStreaming && i === messages.length - 1 && !m.content && (
-                  <div className="flex items-center gap-2 text-gray-400 dark:text-gray-500 mt-1">
-                    <RotateCw className="w-3.5 h-3.5 animate-spin" />
-                    <span className="text-[11px] font-bold italic tracking-wider animate-pulse">{currentHintRef.current}</span>
-                  </div>
-                )}
-              </div>
-              {editingMessageId === m.id && m.role === 'user' && (
-                <div className="max-w-[90%] mt-2 p-3 rounded-xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 shadow-sm">
-                  <textarea
-                    value={editingText}
-                    onChange={e => setEditingText(e.target.value)}
-                    disabled={isStreaming}
-                    autoFocus
-                    className="w-full min-h-24 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 px-3 py-2 text-sm text-gray-800 dark:text-gray-200 outline-none placeholder:text-gray-400 focus:ring-2 focus:ring-sigma-300 focus:border-sigma-300 disabled:opacity-60"
-                  />
-                  <div className="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5">
-                    {t('chat.editWarning')}
-                  </div>
-                  <div className="flex justify-end gap-2 mt-2">
-                    <button disabled={isStreaming} onClick={cancelEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">{t('common.cancel')}</button>
-                    <button disabled={isStreaming} onClick={submitEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sigma-600 text-white hover:bg-sigma-700 disabled:opacity-50">{t('common.send')}</button>
-                  </div>
-                </div>
-              )}
-              {editingMessageId !== m.id && (
-                <div className={`mt-1 px-1 flex items-center gap-1 opacity-0 group-hover/message:opacity-100 transition-opacity ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <button onClick={() => copyMessage(m)} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800" title={t('chat.copy')}>
-                    {copiedMessageId === m.id ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3" />}
-                  </button>
-                  {m.role === 'user' && m.can_edit && !isStreaming && !awaiting && (
-                    <button onClick={() => startEditMessage(m)} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800" title={t('common.edit')}>
-                      <Pencil className="w-3 h-3" />
-                    </button>
+      <div className="relative flex-1 min-h-0">
+        {/* relative: without it the scroller is not the containing block for
+            absolutely positioned content inside messages (KaTeX's hidden
+            .katex-mathml a11y span), so such content escapes this box's
+            clipping and silently inflates the panel root's scrollable
+            overflow — room that programmatic scrolling must never have. */}
+        <div ref={chatScrollRef} onScroll={handleChatScroll} className="relative h-full overflow-y-auto p-4">
+          <div ref={chatContentRef} className="space-y-6">
+          {isLoadingHistory && (
+            <div className="text-center text-[10px] text-gray-400 dark:text-gray-500 font-medium">{t('chat.loadingHistory')}</div>
+          )}
+          {messages.length === 0 && (
+            <div className="bg-white dark:bg-gray-900 p-6 rounded-3xl shadow-sm border border-gray-100 dark:border-gray-800 text-sm text-gray-500 dark:text-gray-400 italic leading-relaxed text-center mt-10">
+              <Bot className="w-8 h-8 mx-auto mb-3 text-sigma-600/30" />
+              {t('chat.welcome')}
+            </div>
+          )}
+          {messages.map((m, i) => {
+            const isLastMessage = i === messages.length - 1
+            const isCurrentlyStreaming = isLastMessage && isStreaming
+            return (
+              <div key={m.id || i} data-chat-msg="" data-msg-id={m.id} data-msg-role={m.role} className={`group/message flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+                <div className="flex items-center gap-2 mb-1.5 px-1">
+                  {m.role === 'SiGMA' ? <Zap className="w-3 h-3 text-sigma-600" /> : <User className="w-3 h-3 text-gray-400 dark:text-gray-500" />}
+                  <span className="text-[10px] font-black uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.role}</span>
+                  {m.created_at && (
+                    <span className="text-[9px] text-gray-300 select-none">
+                      {formatTimestamp(m.created_at)}
+                    </span>
                   )}
                 </div>
-              )}
-              {m.role === 'SiGMA' && (m.usage || m.token_count > 0) && (
-                <div className="text-[9px] text-gray-300 dark:text-gray-600 select-none px-1 mt-1">
-                  {(() => {
-                    const u = m.usage || {}
-                    const fmt = n => {
-                      if (n == null || n === 0) return null
-                      if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M'
-                      if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'k'
-                      return String(n)
-                    }
-                    const parts = []
-                    const inp = fmt(u.input ?? m.input_tokens)
-                    const out = fmt(u.output ?? m.token_count)
-                    const cached = fmt(u.cached ?? m.cached_tokens)
-                    if (inp) parts.push(`${t('chat.tokenInput')}${inp}`)
-                    if (out) parts.push(`${t('chat.tokenOutput')}${out}`)
-                    if (cached) parts.push(`${t('chat.tokenCached')}${cached}`)
-                    return parts.join(' · ')
-                  })()}
+                {m.role === 'SiGMA' && <ThinkingProcess steps={m.process} isStreaming={isCurrentlyStreaming} />}
+                <div className={`max-w-[90%] px-4 py-3 rounded-2xl shadow-sm animate-in fade-in slide-in-from-bottom-1 duration-300 overflow-hidden break-words ${
+                  m.role === 'user' ? 'bg-sigma-600 text-white rounded-tr-none' : 'bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 border border-gray-100 dark:border-gray-800 rounded-tl-none'
+                }`}>
+                  {m.role === 'SiGMA' ? <MarkdownContent content={m.content || ''} projectId={projectId} onCitation={onCitation} /> : (
+                    <div className={`text-sm leading-relaxed whitespace-pre-wrap ${editingMessageId === m.id ? 'opacity-50' : ''}`}>{m.content}</div>
+                  )}
+                  {m.role === 'user' && (
+                    <AttachmentStrip projectId={projectId} attachments={m.attachments} compact />
+                  )}
+                  {m.role === 'user' && m.citation && (
+                    <button
+                      onClick={() => setViewingCitation(m.citation)}
+                      className="mt-2 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-white/60 hover:text-white/90 transition-colors"
+                    >
+                      <TextQuote className="w-3 h-3" />
+                      {t('chat.viewCitation')}
+                    </button>
+                  )}
+                  {isStreaming && i === messages.length - 1 && !m.content && (
+                    <div className="flex items-center gap-2 text-gray-400 dark:text-gray-500 mt-1">
+                      <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                      <span className="text-[11px] font-bold italic tracking-wider animate-pulse">{currentHintRef.current}</span>
+                    </div>
+                  )}
+                </div>
+                {editingMessageId === m.id && m.role === 'user' && (
+                  <div className="max-w-[90%] mt-2 p-3 rounded-xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 shadow-sm">
+                    <textarea
+                      value={editingText}
+                      onChange={e => setEditingText(e.target.value)}
+                      disabled={isStreaming}
+                      autoFocus
+                      className="w-full min-h-24 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 px-3 py-2 text-sm text-gray-800 dark:text-gray-200 outline-none placeholder:text-gray-400 focus:ring-2 focus:ring-sigma-300 focus:border-sigma-300 disabled:opacity-60"
+                    />
+                    <div className="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5">
+                      {t('chat.editWarning')}
+                    </div>
+                    <div className="flex justify-end gap-2 mt-2">
+                      <button disabled={isStreaming} onClick={cancelEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">{t('common.cancel')}</button>
+                      <button disabled={isStreaming} onClick={submitEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sigma-600 text-white hover:bg-sigma-700 disabled:opacity-50">{t('common.send')}</button>
+                    </div>
+                  </div>
+                )}
+                {editingMessageId !== m.id && (
+                  <div className={`mt-1 px-1 flex items-center gap-1 opacity-0 group-hover/message:opacity-100 transition-opacity ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    <button onClick={() => copyMessage(m)} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800" title={t('chat.copy')}>
+                      {copiedMessageId === m.id ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3" />}
+                    </button>
+                    {m.role === 'user' && m.can_edit && !isStreaming && !awaiting && (
+                      <button onClick={() => startEditMessage(m)} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800" title={t('common.edit')}>
+                        <Pencil className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+                )}
+                {m.role === 'SiGMA' && (m.usage || m.token_count > 0) && (
+                  <div className="text-[9px] text-gray-300 dark:text-gray-600 select-none px-1 mt-1">
+                    {(() => {
+                      const u = m.usage || {}
+                      const fmt = n => {
+                        if (n == null || n === 0) return null
+                        if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M'
+                        if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'k'
+                        return String(n)
+                      }
+                      const parts = []
+                      const inp = fmt(u.input ?? m.input_tokens)
+                      const out = fmt(u.output ?? m.token_count)
+                      const cached = fmt(u.cached ?? m.cached_tokens)
+                      if (inp) parts.push(`${t('chat.tokenInput')}${inp}`)
+                      if (out) parts.push(`${t('chat.tokenOutput')}${out}`)
+                      if (cached) parts.push(`${t('chat.tokenCached')}${cached}`)
+                      return parts.join(' · ')
+                    })()}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+          </div>
+        </div>
+        {/* Overlay outside the scroller so it never scrolls away with the
+            content; the wrapper is click-through — only the buttons hit-test. */}
+        {chatScrollable && (
+          <div className="absolute right-2 top-1/2 -translate-y-1/2 z-10 flex flex-col gap-1 pointer-events-none">
+            <button onClick={() => jumpChatMessage(-1)} className={chatNavBtnClass} title={t('chat.navPrevMessage')} aria-label={t('chat.navPrevMessage')}>
+              <ChevronUp className="w-3.5 h-3.5" />
+            </button>
+            {messages.some(m => m.role === 'user') && (
+              <button
+                ref={navListBtnRef}
+                onClick={openNavList}
+                className={`${chatNavBtnClass} ${navListOpen ? 'opacity-100 text-sigma-600 dark:text-sigma-200' : ''}`}
+                title={t('chat.navMessageList')}
+                aria-label={t('chat.navMessageList')}
+                aria-expanded={navListOpen}
+              >
+                <List className="w-3 h-3" />
+              </button>
+            )}
+            <button onClick={() => jumpChatMessage(1)} className={chatNavBtnClass} title={t('chat.navNextMessage')} aria-label={t('chat.navNextMessage')}>
+              <ChevronDown className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+        {navListOpen && (
+          // Height-capped on purpose: without the cap a long list would
+          // swallow the whole panel. The offset clears the floating button
+          // column. The nesting isolates the centering translate from the
+          // entrance animation: the animation's forwards-filled transform
+          // replaces the utility transform it animates over, which would
+          // drop the popup to start at the panel's vertical center.
+          <div className="absolute top-1/2 -translate-y-1/2 right-11 z-20 w-56 max-w-[calc(100%_-_56px)]">
+            <div
+              ref={navPopupRef}
+              className="max-h-[min(320px,50vh)] flex flex-col rounded-2xl bg-white/95 dark:bg-gray-900/95 shadow-[0_8px_30px_rgba(0,0,0,0.12)] border border-gray-100 dark:border-gray-800 overflow-hidden animate-in fade-in zoom-in duration-150"
+            >
+              {navListLoading ? (
+                <div className="flex items-center gap-2 px-3.5 py-3.5 text-xs text-gray-400 dark:text-gray-500">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  {t('chat.navLoading')}
+                </div>
+              ) : navList.length === 0 ? (
+                <div className="px-3.5 py-3.5 text-xs text-gray-400 dark:text-gray-500">{t('chat.navEmpty')}</div>
+              ) : (
+                <div ref={navListScrollRef} className="overflow-y-auto p-1.5 flex flex-col gap-0.5">
+                  {navList.map((entry, idx) => {
+                    const current = entry.id === navHighlightId
+                      || (navHighlightId === NAV_HIGHLIGHT_LAST && idx === navList.length - 1)
+                    return (
+                      <button
+                        key={entry.id ?? idx}
+                        data-nav-current={current || undefined}
+                        onClick={() => jumpToNavEntry(entry)}
+                        title={entry.summary}
+                        className={`w-full px-2.5 py-1.5 rounded-lg text-left transition-colors ${
+                          current
+                            ? 'bg-sigma-100 dark:bg-sigma-600/20 text-sigma-700 dark:text-sigma-200'
+                            : 'text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800'
+                        }`}
+                      >
+                        <span className="block truncate text-xs">{entry.summary}</span>
+                      </button>
+                    )
+                  })}
                 </div>
               )}
             </div>
-          )
-        })}
-        </div>
+          </div>
+        )}
       </div>
 
       <div className="p-4 bg-white dark:bg-gray-900 border-t border-gray-100 dark:border-gray-800 space-y-3 shadow-[0_-10px_20px_rgba(0,0,0,0.02)]">
