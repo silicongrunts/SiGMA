@@ -10,6 +10,7 @@ from unittest.mock import patch, AsyncMock, MagicMock
 
 import pytest
 
+import app.services.snapshot_service as snapshot_module
 from app.core.exceptions import DatabaseIncompatibleError
 from app.services.project_service import ProjectService
 
@@ -117,6 +118,30 @@ async def test_update_project_modifies_json(ps):
     assert updated["name"] == "Renamed"
     data = json.loads(ps.PROJECTS_FILE.read_text())
     assert data[pid]["name"] == "Renamed"
+
+
+# ---------------------------------------------------------------------------
+# open_project — detail read + auto-snapshot catch-up
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+async def test_open_project_returns_details_and_runs_snapshot_catchup(ps):
+    """open_project returns get_project data and triggers one snapshot check."""
+    details = {"id": "p1", "name": "One"}
+    snapshot_calls = []
+
+    async def _fake_maybe_snapshot(project_id):
+        snapshot_calls.append(project_id)
+
+    with (
+        patch.object(ProjectService, "get_project", AsyncMock(return_value=details)),
+        patch.object(snapshot_module.snapshot_service, "maybe_snapshot", _fake_maybe_snapshot),
+    ):
+        result = await ps.open_project("p1")
+
+    assert result == details
+    assert snapshot_calls == ["p1"]
 
 
 # ---------------------------------------------------------------------------

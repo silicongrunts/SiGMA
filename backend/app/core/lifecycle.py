@@ -154,6 +154,13 @@ async def shutdown_event():
     except Exception as e:
         logger.warning("Failed to stop document processing service: %s", e, exc_info=True)
 
+    # ---- Pending auto-snapshot timers ----
+    from app.services.snapshot_service import snapshot_service
+    try:
+        await snapshot_service.shutdown()
+    except Exception as e:
+        logger.warning("Failed to cancel pending auto-snapshot timers: %s", e, exc_info=True)
+
     # ---- RAG service ----
     from app.services.rag_service import rag_service
     try:

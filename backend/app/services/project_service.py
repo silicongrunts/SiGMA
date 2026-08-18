@@ -835,6 +835,19 @@ class ProjectService:
             "db_status": db_status,
         }
 
+    async def open_project(self, project_id: str) -> Dict[str, Any]:
+        """Return project details for a user-opened project.
+
+        Opening a project also re-runs the auto-snapshot check so edits whose
+        snapshot was skipped inside an interval window (e.g. across a backend
+        restart) are picked up without waiting for the next file save.
+        """
+        from app.services.snapshot_service import snapshot_service
+
+        data = await self.get_project(project_id)
+        await snapshot_service.maybe_snapshot(project_id)
+        return data
+
     async def _check_db_status(self, project_id: str) -> str:
         """Return 'ok', 'incompatible', or 'error' for the project's database."""
         from app.database.manager import get_db_manager

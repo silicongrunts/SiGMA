@@ -94,7 +94,7 @@ async def register_project(body: ProjectRegister):
 
 @router.get("/{project_id}")
 async def get_project(project_id: str):
-    data = await project_service.get_project(project_id)
+    data = await project_service.open_project(project_id)
     return ok(data)
 
 

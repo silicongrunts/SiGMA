@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from app.core.exceptions import FileSystemError
@@ -68,3 +70,22 @@ async def test_import_project_rejects_actual_oversize_after_read(monkeypatch):
 
     assert exc_info.value.code == "ZIP_TOO_LARGE"
     assert upload.read_called is True
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_get_project_delegates_to_open_project(monkeypatch):
+    calls = {}
+
+    async def open_project(project_id):
+        calls["open"] = project_id
+        return {"id": project_id, "name": "One"}
+
+    monkeypatch.setattr(
+        projects, "project_service", SimpleNamespace(open_project=open_project)
+    )
+
+    result = await projects.get_project("p1")
+
+    assert result["data"] == {"id": "p1", "name": "One"}
+    assert calls["open"] == "p1"
