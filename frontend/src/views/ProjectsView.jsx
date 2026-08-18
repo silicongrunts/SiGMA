@@ -8,7 +8,7 @@ import { useTranslation } from 'react-i18next'
 import { useStore } from '../store/useStore'
 import { projectsAPI, systemAPI } from '../api'
 import { storage } from '../utils/storage'
-import { toastError } from '../components/Toast'
+import { toastError, toastSuccess } from '../components/Toast'
 import { CreateProjectModal, ConfirmModal, UploadProjectModal } from '../components/Modal'
 import SkillPanel from '../components/SkillPanel'
 import SystemSettingsModal from '../components/SystemSettingsModal'
@@ -18,6 +18,7 @@ import LanguageSelector from '../components/LanguageSelector'
 import { Spinner } from '../components/ui'
 import Toggle from '../components/Toggle'
 import { useTheme } from '../hooks/useTheme'
+import { useLanguage } from '../hooks/useLanguage'
 import { Folder, Plus, Search, Trash2, Download, Pencil, Clock, Check, X, Wrench, Settings, Sun, Moon, ChevronDown, Globe, FileText, FilePlus, UploadCloud } from 'lucide-react'
 
 function formatDate(dateStr, t) {
@@ -66,10 +67,12 @@ export default function ProjectsView() {
   const [showNewProjectMenuEmpty, setShowNewProjectMenuEmpty] = useState(false)
   const [showUploadProjectModal, setShowUploadProjectModal] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState(null) // { id, name } or null
+  const [showClearCacheConfirm, setShowClearCacheConfirm] = useState(false)
   const settingsMenuRef = useRef(null)
   const newProjectMenuHeaderRef = useRef(null)
   const newProjectMenuEmptyRef = useRef(null)
   const { isDark, toggleTheme } = useTheme()
+  const { lang } = useLanguage()
   const { t } = useTranslation()
 
   const [editingField, setEditingField] = useState({ projectId: null, field: null })
@@ -268,6 +271,11 @@ export default function ProjectsView() {
 
   const handleOpenProject = (id) => { navigate(`/editor/${id}`) }
 
+  const handleClearCacheConfirm = () => {
+    storage.clearCache({ theme: isDark ? 'dark' : 'light', language: lang })
+    toastSuccess(t('settings.cacheCleared'))
+  }
+
   const startEditName = (e, project) => {
     e.stopPropagation()
     setEditingField({ projectId: project.id, field: 'name' })
@@ -396,6 +404,14 @@ export default function ProjectsView() {
                   </span>
                   <LanguageSelector />
                 </div>
+                <div className="h-px bg-gray-100 dark:bg-gray-700 my-1" />
+                <button
+                  onClick={() => { setShowClearCacheConfirm(true); setShowSettingsMenu(false) }}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 text-sm font-bold text-gray-700 dark:text-gray-300 hover:bg-red-50 dark:hover:bg-red-900/20 hover:text-red-600 dark:hover:text-red-400 rounded-xl transition-colors"
+                >
+                  <Trash2 className="w-4 h-4 text-gray-400 dark:text-gray-500" />
+                  <span>{t('settings.clearCache')}</span>
+                </button>
               </div>
             )}
           </div>
@@ -607,6 +623,14 @@ export default function ProjectsView() {
         onConfirm={handleDeleteProject}
         title={t('projects.deleteTitle')}
         message={deleteTarget ? t('projects.deleteConfirm', { name: deleteTarget.name }) : ''}
+        danger
+      />
+      <ConfirmModal
+        isOpen={showClearCacheConfirm}
+        onClose={() => setShowClearCacheConfirm(false)}
+        onConfirm={handleClearCacheConfirm}
+        title={t('settings.clearCacheTitle')}
+        message={t('settings.clearCacheConfirm')}
         danger
       />
 

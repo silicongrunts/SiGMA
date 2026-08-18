@@ -525,6 +525,23 @@ export const storage = {
     })
   },
 
+  /**
+   * Wipe every localStorage key, then re-seed the global object with the
+   * theme/language the caller passes in (its live UI state) so preferences
+   * survive the clear. Everything else resets to defaults.
+   */
+  clearCache({ theme, language } = {}) {
+    if (canUseStorage()) {
+      try {
+        window.localStorage.clear()
+      } catch {
+        // Best-effort wipe; the re-seed below is equally best-effort.
+      }
+    }
+    const seed = sanitizeGlobalState({ theme, language })
+    return writeJson(STORAGE_KEYS.global, { ...seed, updatedAt: now() })
+  },
+
   getLastFile(projectId) {
     return this.getProject(projectId).synthesis.editorFile
   },
