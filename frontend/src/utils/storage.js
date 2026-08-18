@@ -54,10 +54,16 @@ const DEFAULT_GLOBAL_STATE = Object.freeze({
   updatedAt: 0,
 })
 
+const DEFAULT_LAYOUT_STATE = Object.freeze({
+  sidebarPercent: 20,
+  editorPercent: 50,
+})
+
 const DEFAULT_PROJECT_STATE = Object.freeze({
   version: STORAGE_VERSION,
   updatedAt: 0,
   lastAccessedAt: 0,
+  layout: { ...DEFAULT_LAYOUT_STATE },
   chat: {
     sessionId: null,
     budgetsBySession: {},
@@ -223,6 +229,24 @@ function sanitizeBudgetMap(value) {
   return out
 }
 
+const LAYOUT_PERCENT_MIN = 5
+const LAYOUT_PERCENT_MAX = 95
+
+function sanitizePercent(value, fallback) {
+  const n = Number(value)
+  return Number.isFinite(n) && n >= LAYOUT_PERCENT_MIN && n <= LAYOUT_PERCENT_MAX
+    ? Math.round(n * 10) / 10
+    : fallback
+}
+
+function sanitizeLayout(value) {
+  const source = isPlainObject(value) ? value : {}
+  return {
+    sidebarPercent: sanitizePercent(source.sidebarPercent, DEFAULT_LAYOUT_STATE.sidebarPercent),
+    editorPercent: sanitizePercent(source.editorPercent, DEFAULT_LAYOUT_STATE.editorPercent),
+  }
+}
+
 function sanitizeGlobalState(value) {
   const source = isPlainObject(value) ? value : {}
   return {
@@ -240,6 +264,7 @@ function sanitizeProjectState(value) {
   const workspace = isPlainObject(source.workspace) ? source.workspace : {}
   const synthesis = isPlainObject(source.synthesis) ? source.synthesis : {}
   const library = isPlainObject(source.library) ? source.library : {}
+  const layout = sanitizeLayout(source.layout)
 
   const activeTab = ['synthesis', 'explore', 'library'].includes(workspace.activeTab)
     ? workspace.activeTab
@@ -261,6 +286,7 @@ function sanitizeProjectState(value) {
     version: STORAGE_VERSION,
     updatedAt: Number.isFinite(source.updatedAt) ? source.updatedAt : 0,
     lastAccessedAt: Number.isFinite(source.lastAccessedAt) ? source.lastAccessedAt : 0,
+    layout,
     chat: {
       sessionId: isNonEmptyString(chat.sessionId) ? chat.sessionId : null,
       budgetsBySession: sanitizeBudgetMap(chat.budgetsBySession),
@@ -295,6 +321,7 @@ function mergeProjectState(current, patch) {
     workspace: { ...current.workspace, ...(nextPatch.workspace || {}) },
     synthesis: { ...current.synthesis, ...(nextPatch.synthesis || {}) },
     library: { ...current.library, ...(nextPatch.library || {}) },
+    layout: { ...current.layout, ...(nextPatch.layout || {}) },
   })
 }
 
@@ -727,6 +754,14 @@ export const storage = {
 
   setLibrary(projectId, library) {
     this.setProject(projectId, { library })
+  },
+
+  getLayout(projectId) {
+    return this.getProject(projectId).layout
+  },
+
+  setLayout(projectId, layout) {
+    this.setProject(projectId, { layout })
   },
 }
 

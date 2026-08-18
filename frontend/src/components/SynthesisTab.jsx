@@ -116,10 +116,20 @@ export default function SynthesisTab({
 
   const showPreview = !isNotebookMode
 
+  // Split-pane layout: seed from storage once, then track the committed value
+  // in state so panel-count re-syncs (notebook enter/exit) restore the latest
+  // drag, not the mount-time value. Persist on drag end.
+  const [editorPercent, setEditorPercent] = useState(() => storage.getLayout(projectId).editorPercent)
+  const commitEditorSize = useCallback((sizes) => {
+    setEditorPercent(sizes[0])
+    storage.setLayout(projectId, { editorPercent: sizes[0] })
+  }, [projectId])
+
   return (
     <>
     <ResizablePanels
-      initialSizes={showPreview ? ['50%', '1'] : ['1']}
+      initialSizes={showPreview ? [editorPercent, null] : [null]}
+      onSizesCommit={commitEditorSize}
       resizerContent={showPreview ? [(
         <button
           onMouseDown={(e) => e.stopPropagation()}

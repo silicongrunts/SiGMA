@@ -1,20 +1,28 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react'
 
-export function ResizablePanels({ direction = 'horizontal', children, className = '', initialSizes = [], resizerContent = [] }) {
+/**
+ * Convert public sizes (percent number, or null for a flexible panel) into the
+ * internal flex values ('23.4%' / '1') used by getPanelStyle.
+ */
+function toFlexSizes(initialSizes) {
+  return initialSizes.map((size) => (size === null ? '1' : `${size}%`))
+}
+
+export function ResizablePanels({ direction = 'horizontal', children, className = '', initialSizes = [], resizerContent = [], onSizesCommit }) {
   const containerRef = useRef(null)
   const isHorizontal = direction === 'horizontal'
 
   const childrenArray = React.Children.toArray(children).filter(Boolean)
 
   const [sizes, setSizes] = useState(() => {
-    if (initialSizes.length === childrenArray.length) return initialSizes
+    if (initialSizes.length === childrenArray.length) return toFlexSizes(initialSizes)
     return childrenArray.map(() => (100 / childrenArray.length) + '%')
   })
 
   // Re-sync sizes when the number of panels changes (e.g. entering/exiting notebook mode)
   useEffect(() => {
     if (initialSizes.length === childrenArray.length) {
-      setSizes(initialSizes)
+      setSizes(toFlexSizes(initialSizes))
     } else {
       setSizes(childrenArray.map(() => (100 / childrenArray.length) + '%'))
     }
@@ -173,11 +181,15 @@ export function ResizablePanels({ direction = 'horizontal', children, className 
       }
 
       setSizes(newSizes)
+      if (onSizesCommit) {
+        // Report in the public format: percent number per panel, null for flexible.
+        onSizesCommit(newSizes.map((s) => (s === '1' ? null : Math.round(parseFloat(s) * 10) / 10)))
+      }
     }
 
     d.index = null
     d.panels = []
-  }, [isHorizontal, removeOverlay])
+  }, [isHorizontal, removeOverlay, onSizesCommit])
 
   // Always-on event listeners
   useEffect(() => {

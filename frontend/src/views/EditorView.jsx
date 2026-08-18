@@ -8,7 +8,7 @@
  * A single ChatPanel instance is shared across Explore, Library, and Synthesis
  * so tab switches do not reload the active chat session.
  */
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useStore } from '../store/useStore'
@@ -131,6 +131,12 @@ export default function EditorView() {
   const { handleFileSelect, handleExitNotebook } = useFileActions({ projectId, editorRef, previewRef, handleSave })
   handleCompileRef.current = handleCompile
   useAutoCompile({ currentFile, handleCompile })
+
+  // Split-pane layout: restore once per project, persist on drag end.
+  const layout = useMemo(() => storage.getLayout(projectId), [projectId])
+  const commitSidebarSize = useCallback((sizes) => {
+    storage.setLayout(projectId, { sidebarPercent: sizes[0] })
+  }, [projectId])
 
   // Compile, then immediately download the produced PDF. Compile failures
   // (no usable PDF) are surfaced by handleCompile via toast/log modal, so we
@@ -598,8 +604,10 @@ export default function EditorView() {
         />
 
         <ResizablePanels
+          key={projectId}
           className="flex-1"
-          initialSizes={['20%', '1']}
+          initialSizes={[layout.sidebarPercent, null]}
+          onSizesCommit={commitSidebarSize}
         >
           <aside className="h-full flex flex-col bg-white dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 overflow-hidden">
             {activeTab === 'synthesis' && (
