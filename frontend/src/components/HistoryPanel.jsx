@@ -320,7 +320,7 @@ function CommitModal({ isOpen, onClose, commit, parentHash, projectId, onDownloa
           <div className="min-w-0 flex-1">
             <h2 className="text-lg font-bold text-gray-900 dark:text-gray-100 break-words">{commitTitle}</h2>
             <div className="flex items-center gap-3 mt-2 text-xs text-gray-500 dark:text-gray-400 flex-wrap">
-              <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{getRelativeTime(commit.date, t)}</span>
+              <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{getCommitTime(commit.date, t)}</span>
               <span className="font-mono text-gray-400 dark:text-gray-500 bg-gray-100 dark:bg-gray-800 px-2 py-0.5 rounded cursor-pointer hover:text-gray-600 dark:hover:text-gray-300"
                 onClick={async () => { try { await copyToClipboard(commit.hash) } catch { /* best-effort */ } }}>
                 {commit.short_hash}
@@ -481,6 +481,13 @@ function HistoryPanel({ onBeforeCommit }) {
       setRangeFirst(null)
     }
     setTagsOnly(!tagsOnly)
+  }
+
+  // Context-menu entry into compare mode with the first endpoint pre-picked.
+  const startRangeFrom = (commit) => {
+    setTagsOnly(false)
+    setSelectingRange(true)
+    setRangeFirst(commit.hash)
   }
 
   // Clicking rows while comparing: first click fixes one endpoint, second
@@ -673,11 +680,11 @@ function HistoryPanel({ onBeforeCommit }) {
                 <div className="flex-1 min-w-0">
                   <div className="text-sm text-gray-700 dark:text-gray-300 font-medium truncate leading-snug">{commitTitle}</div>
                   <div className="flex items-center gap-1.5 mt-1 text-[10px] text-gray-400 dark:text-gray-500 flex-wrap">
-                    <span className="flex items-center gap-1 shrink-0"><Clock className="w-2.5 h-2.5" />{getRelativeTime(commit.date, t)}</span>
+                    <span className="flex items-center gap-1 shrink-0"><Clock className="w-2.5 h-2.5" />{getCommitTime(commit.date, t)}</span>
+                    <span className={`font-mono text-[9px] px-1.5 py-0.5 rounded shrink-0 ${rangeFirst === commit.hash ? 'bg-sigma-600 text-white' : 'bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500'}`}>{commit.short_hash}</span>
                     {(tagsByCommit[commit.hash] || []).map(name => <TagChip key={name} name={name} />)}
                   </div>
                 </div>
-                <span className={`font-mono text-[9px] px-1.5 py-0.5 rounded shrink-0 ${rangeFirst === commit.hash ? 'bg-sigma-600 text-white' : 'bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500'}`}>{commit.short_hash}</span>
                 <button
                   onClick={(e) => { e.stopPropagation(); handleDownloadSnapshot(commit.hash, commit.short_hash, projectName) }}
                   disabled={snapshotDownloading === commit.hash}
@@ -747,7 +754,9 @@ function HistoryPanel({ onBeforeCommit }) {
           x={contextMenu.x}
           y={contextMenu.y}
           options={[
+            { label: t('history.context.view'), icon: <Eye className="w-4 h-4" />, action: () => handleViewCommit(contextMenu.commit) },
             { label: t('history.tag.add'), icon: <Tag className="w-4 h-4" />, action: () => setTagInput({ commit: contextMenu.commit }) },
+            { label: t('history.toolbar.range'), icon: <GitCompare className="w-4 h-4" />, action: () => startRangeFrom(contextMenu.commit) },
           ]}
           onClose={() => setContextMenu(null)}
         />
@@ -756,25 +765,33 @@ function HistoryPanel({ onBeforeCommit }) {
   )
 }
 
-function getRelativeTime(dateStr, t) {
+// Real local time plus a relative suffix; the year is dropped for commits
+// from the current calendar year (08-18 12:27:34 (1h ago)).
+function getCommitTime(dateStr, t) {
   if (!dateStr || typeof dateStr !== 'string') return t('history.relativeUnknown')
   try {
     const date = new Date(dateStr)
     if (isNaN(date.getTime())) return dateStr
     const now = new Date()
-    const diffMs = now - date
-    const diffSec = Math.floor(diffMs / 1000)
+    const diffSec = Math.floor((now - date) / 1000)
     const diffMin = Math.floor(diffSec / 60)
     const diffHour = Math.floor(diffMin / 60)
     const diffDay = Math.floor(diffHour / 24)
 
-    if (diffSec < 60) return t('time.justNow')
-    if (diffMin < 60) return t('history.relativeMin', { count: diffMin })
-    if (diffHour < 24) return t('history.relativeHour', { count: diffHour })
-    if (diffDay < 7) return t('history.relativeDay', { count: diffDay })
+    let relative
+    if (diffSec < 60) relative = t('time.justNow')
+    else if (diffMin < 60) relative = t('history.relativeMin', { count: diffMin })
+    else if (diffHour < 24) relative = t('history.relativeHour', { count: diffHour })
+    else if (diffDay < 7) relative = t('history.relativeDay', { count: diffDay })
+    else if (diffDay < 30) relative = t('history.relativeWeek', { count: Math.floor(diffDay / 7) })
+    else if (diffDay < 365) relative = t('history.relativeMonth', { count: Math.floor(diffDay / 30) })
+    else relative = t('history.relativeYear', { count: Math.floor(diffDay / 365) })
 
-    return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: diffDay > 365 ? 'numeric' : undefined })
-  } catch (e) {
+    const pad = (n) => String(n).padStart(2, '0')
+    const mdhms = `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+    const datetime = date.getFullYear() === now.getFullYear() ? mdhms : `${date.getFullYear()}-${mdhms}`
+    return t('history.timeWithRelative', { datetime, relative })
+  } catch {
     return String(dateStr)
   }
 }
