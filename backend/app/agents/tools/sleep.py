@@ -32,7 +32,6 @@ async def _sleep(duration: int = 5) -> str:
 
 tool_registry.register(ToolDefinition(
     name="sleep",
-    description="Wait for a specified duration.",
     prompt=PROMPT_SLEEP,
     input_schema={
         "type": "object",

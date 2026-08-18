@@ -63,6 +63,19 @@ class AgentService:
             **extra,
         )
 
+    def _general_system_prompt(self, project_id: str) -> str:
+        """Render the general-agent template plus the <skills> list.
+
+        General agents have skill_load, so their system prompt must carry the
+        same <skills> block the main loop injects.
+        """
+        system_prompt = self._render_agent_prompt("agents/general", project_id=project_id)
+        from app.services.skill_service import skill_service
+        skills_summary = skill_service.build_skills_prompt()
+        if skills_summary:
+            system_prompt += f"\n\n{skills_summary}"
+        return system_prompt
+
     # ------------------------------------------------------------------
     # Public dispatch
     # ------------------------------------------------------------------
@@ -258,9 +271,7 @@ class AgentService:
             history = await uow.messages.get_messages_for_llm(agent_session_id)
         agent_usage_baseline = self._usage_total(history)
 
-        system_prompt = self._render_agent_prompt(
-            "agents/general", project_id=project_id,
-        )
+        system_prompt = self._general_system_prompt(project_id)
         messages, persisted_token_baseline = self._messages_from_history(
             system_prompt, history,
         )
@@ -311,7 +322,8 @@ class AgentService:
             e.parent_tool_call_id = parent_tool_call_id
             raise
 
-        return self._extract_final_text(messages)
+        final_text = self._extract_final_text(messages)
+        return f"<resume_id>{agent_session_id}</resume_id>\n{final_text}"
 
     # ------------------------------------------------------------------
     # Permission-aware tool executor
@@ -392,9 +404,7 @@ class AgentService:
             agent_session_id = session.id
         agent_usage_baseline = {"input": 0, "output": 0, "cached": 0}
 
-        system_prompt = self._render_agent_prompt(
-            "agents/general", project_id=project_id,
-        )
+        system_prompt = self._general_system_prompt(project_id)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
@@ -680,9 +690,7 @@ class AgentService:
             history = await uow.messages.get_messages_for_llm(agent_session_id)
         agent_usage_baseline = self._usage_total(history)
 
-        system_prompt = self._render_agent_prompt(
-            "agents/general", project_id=project_id,
-        )
+        system_prompt = self._general_system_prompt(project_id)
         messages, persisted_token_baseline = self._messages_from_history(
             system_prompt, history,
         )

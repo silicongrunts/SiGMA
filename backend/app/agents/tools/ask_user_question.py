@@ -134,10 +134,6 @@ def _format_answers(answers) -> str:
 
 tool_registry.register(ToolDefinition(
     name="ask_user_question",
-    description=(
-        "Ask the user a question (single-choice, multi-choice, or open-ended "
-        "text) to gather information or make decisions."
-    ),
     prompt=PROMPT_ASK_USER_QUESTION,
     input_schema={
         "type": "object",

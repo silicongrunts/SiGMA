@@ -20,6 +20,7 @@ import pytest
 from app.agents.tools.browser_manager import BrowserManager
 from app.agents.tools.browser_tools import (
     _browser_console,
+    _browser_input,
     _browser_vision,
     _take_snapshot,
 )
@@ -249,3 +250,91 @@ def test_all_browser_tools_in_annotation_tools():
     assert not missing, (
         f"Browser tools missing from ANNOTATION_TOOLS: {sorted(missing)}"
     )
+
+
+# ── browser_input — element type validation ─────────────────────────
+
+class _FakeCDP:
+    """CDP session stub answering DOM.resolveNode / Runtime.callFunctionOn."""
+
+    def __init__(self, predicate_value: bool, object_id: str | None = "obj-1"):
+        self._predicate_value = predicate_value
+        self._object_id = object_id
+        self.detached = False
+
+    async def send(self, method, params=None):
+        if method == "DOM.resolveNode":
+            return {"object": {"objectId": self._object_id}}
+        if method == "Runtime.callFunctionOn":
+            return {"result": {"value": self._predicate_value}}
+        raise AssertionError(f"unexpected CDP call: {method}")
+
+    async def detach(self):
+        self.detached = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value,expected", [(True, True), (False, False)])
+async def test_is_text_input_reports_element_predicate(value, expected):
+    """is_text_input returns the JS predicate result and detaches the session."""
+    page = MagicMock()
+    cdp = _FakeCDP(predicate_value=value)
+    page.context.new_cdp_session = AsyncMock(return_value=cdp)
+
+    assert await BrowserManager.is_text_input(BrowserManager(), page, 42) is expected
+    assert cdp.detached
+
+
+@pytest.mark.asyncio
+async def test_is_text_input_detached_node_is_not_text_input():
+    """A node that cannot be resolved to a JS object is not typeable."""
+    page = MagicMock()
+    cdp = _FakeCDP(predicate_value=True, object_id=None)
+    page.context.new_cdp_session = AsyncMock(return_value=cdp)
+
+    assert await BrowserManager.is_text_input(BrowserManager(), page, 42) is False
+    assert cdp.detached
+
+
+def _input_manager(is_text_input: bool) -> MagicMock:
+    """Manager stub for _browser_input: page resolved, ref e1 -> backendNodeId 7."""
+    mgr = MagicMock()
+    mgr.get_page = MagicMock(return_value=None)  # _with_timeout is patched
+    mgr.resolve_ref = MagicMock(return_value=7)
+    mgr.is_text_input = AsyncMock(return_value=is_text_input)
+    mgr.input_text = AsyncMock(return_value=True)
+    mgr._active_entry = MagicMock(return_value={"id": "tab-0"})
+    return mgr
+
+
+@pytest.mark.asyncio
+async def test_browser_input_rejects_non_text_element():
+    """Typing into a button/link fails loudly instead of reporting success."""
+    mgr = _input_manager(is_text_input=False)
+
+    with patch("app.agents.tools.browser_tools.get_browser_manager",
+               return_value=mgr), \
+         patch("app.agents.tools.browser_tools._with_timeout",
+               new=AsyncMock(return_value=MagicMock())):
+        result = await _browser_input(element_ref="e1", text="abc")
+
+    assert result == (
+        "Element 'e1' is not a text input (input, textarea, or contenteditable). "
+        "Use browser_click for buttons and links."
+    )
+    mgr.input_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_browser_input_passes_text_element_through():
+    """A typeable element flows through to input_text unchanged."""
+    mgr = _input_manager(is_text_input=True)
+
+    with patch("app.agents.tools.browser_tools.get_browser_manager",
+               return_value=mgr), \
+         patch("app.agents.tools.browser_tools._with_timeout",
+               new=AsyncMock(return_value=MagicMock())):
+        result = await _browser_input(element_ref="e1", text="abc")
+
+    mgr.input_text.assert_awaited_once()
+    assert "Input 'abc' into e1" in result

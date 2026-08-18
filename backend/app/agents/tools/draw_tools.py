@@ -33,7 +33,6 @@ async def _draw_image(prompt: str, project_id: str = "") -> str:
 
 tool_registry.register(ToolDefinition(
     name="draw_image",
-    description="Generate an image from a detailed prompt and save it in the project",
     input_schema={
         "type": "object",
         "properties": {

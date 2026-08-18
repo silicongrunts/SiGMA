@@ -381,6 +381,13 @@ async def _browser_input(
         except ValueError as e:
             return str(e)
 
+        if not await mgr.is_text_input(page, backend_node_id):
+            return (
+                f"Element '{element_ref}' is not a text input "
+                f"(input, textarea, or contenteditable). "
+                f"Use browser_click for buttons and links."
+            )
+
         ok = await mgr.input_text(
             page, backend_node_id, text,
             clear_first=clear_first, submit=submit,
@@ -706,11 +713,6 @@ _MODE_PROP = {
 # ── browser_navigate ──
 tool_registry.register(ToolDefinition(
     name="browser_navigate",
-    description=(
-        "Navigate to a URL or search the web. If input is not a URL, "
-        "performs a search. Opens a new tab if no tab_id given. "
-        "Returns a page snapshot in the chosen mode."
-    ),
     prompt=PROMPT_BROWSER_NAVIGATE,
     input_schema={
         "type": "object",
@@ -725,13 +727,20 @@ tool_registry.register(ToolDefinition(
             "mode": _MODE_PROP,
             "tab_id": {
                 "type": "string",
-                "description": "Target tab ID (e.g. 'tab-0'). Leave empty to open a NEW tab.",
+                "description": (
+                    "Target tab ID (e.g. 'tab-0'). Empty: reuse the active tab "
+                    "if it is on a blank page, else open a new tab."
+                ),
                 "default": "",
             },
             "wait_until": {
                 "type": "string",
                 "enum": ["load", "domcontentloaded", "networkidle"],
-                "description": "When to consider navigation done.",
+                "description": (
+                    "When to consider navigation done. Only used when an "
+                    "existing tab is reused; new tabs always wait for "
+                    "domcontentloaded."
+                ),
                 "default": "domcontentloaded",
             },
         },
@@ -745,11 +754,6 @@ tool_registry.register(ToolDefinition(
 # ── browser_snapshot ──
 tool_registry.register(ToolDefinition(
     name="browser_snapshot",
-    description=(
-        "Get a page snapshot. mode='dom': enhanced DOM with [ref=eN] "
-        "element markers for clicking/input. mode='markdown': page as readable "
-        "Markdown for reading content."
-    ),
     prompt=PROMPT_BROWSER_SNAPSHOT,
     input_schema={
         "type": "object",
@@ -770,11 +774,6 @@ tool_registry.register(ToolDefinition(
 # ── browser_click ──
 tool_registry.register(ToolDefinition(
     name="browser_click",
-    description=(
-        "Click an element or expand content by its reference ID. "
-        "eN = click DOM element, fN/tN = expand virtual content. "
-        "mode only applies to real element refs (eN); virtual refs always return dom."
-    ),
     prompt=PROMPT_BROWSER_CLICK,
     input_schema={
         "type": "object",
@@ -803,18 +802,13 @@ tool_registry.register(ToolDefinition(
 # ── browser_input ──
 tool_registry.register(ToolDefinition(
     name="browser_input",
-    description=(
-        "Type text into an input field identified by its element ref. "
-        "Returns a snapshot after submit (mode applies). "
-        "Without submit, only confirms input success."
-    ),
     prompt=PROMPT_BROWSER_INPUT,
     input_schema={
         "type": "object",
         "properties": {
             "element_ref": {
                 "type": "string",
-                "description": "Element reference for the input/textarea element.",
+                "description": "Element reference for the input/textarea/contenteditable element.",
             },
             "text": {
                 "type": "string",
@@ -847,7 +841,6 @@ tool_registry.register(ToolDefinition(
 # ── browser_scroll ──
 tool_registry.register(ToolDefinition(
     name="browser_scroll",
-    description="Scroll the page and return a snapshot of the new view.",
     prompt=PROMPT_BROWSER_SCROLL,
     input_schema={
         "type": "object",
@@ -879,7 +872,6 @@ tool_registry.register(ToolDefinition(
 # ── browser_console ──
 tool_registry.register(ToolDefinition(
     name="browser_console",
-    description="Read browser console logs or execute JavaScript.",
     prompt=PROMPT_BROWSER_CONSOLE,
     input_schema={
         "type": "object",
@@ -892,7 +884,10 @@ tool_registry.register(ToolDefinition(
             },
             "tab_id": {
                 "type": "string",
-                "description": "Target tab ID. Default: active tab.",
+                "description": (
+                    "Target tab ID (e.g. 'tab-0'). Empty: all tabs for "
+                    "action='read'; the active tab for action='execute'."
+                ),
                 "default": "",
             },
             "js_code": {
@@ -919,7 +914,6 @@ tool_registry.register(ToolDefinition(
 # ── browser_vision ──
 tool_registry.register(ToolDefinition(
     name="browser_vision",
-    description="Take a screenshot and analyze it with AI vision.",
     prompt=PROMPT_BROWSER_VISION,
     input_schema={
         "type": "object",
@@ -950,7 +944,6 @@ tool_registry.register(ToolDefinition(
 # ── browser_back ──
 tool_registry.register(ToolDefinition(
     name="browser_back",
-    description="Navigate back in browser history. Returns a page snapshot.",
     prompt=PROMPT_BROWSER_BACK,
     input_schema={
         "type": "object",
@@ -971,7 +964,6 @@ tool_registry.register(ToolDefinition(
 # ── browser_cdp ──
 tool_registry.register(ToolDefinition(
     name="browser_cdp",
-    description="Send a raw Chrome DevTools Protocol (CDP) command.",
     prompt=PROMPT_BROWSER_CDP,
     input_schema={
         "type": "object",
@@ -1000,7 +992,6 @@ tool_registry.register(ToolDefinition(
 # ── browser_pages ──
 tool_registry.register(ToolDefinition(
     name="browser_pages",
-    description="List all open browser tabs with their IDs, URLs, titles, and active status.",
     prompt=PROMPT_BROWSER_PAGES,
     input_schema={
         "type": "object",

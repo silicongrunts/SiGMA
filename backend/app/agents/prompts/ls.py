@@ -2,13 +2,12 @@
 Prompt for the ls tool.
 """
 
-PROMPT = """List files and directories.
+PROMPT = """List a directory.
 
 Usage:
 - Empty `dirname` returns a recursive tree of the project root (depth-limited).
-- Relative `dirname` (e.g. "src/components") returns the immediate children of that sandbox directory.
+- Relative `dirname` (e.g. "src/components") lists the immediate children of that directory inside the project.
 - Absolute `dirname` (e.g. "/home/user") browses the host filesystem directly (read-only) — useful when the user references paths outside the project.
-- Hidden entries (those starting with ".") are filtered out.
-- Directories are suffixed with "/".
+- Hidden entries (starting with ".") are filtered out. Directories are suffixed with "/".
 
-Output: one entry per line on success; "(empty directory)" / "(empty project)" if nothing to list; or an "Error: ..." string if the path does not exist or is not a directory."""
+Output: entries one per line (tree mode indents by depth); "(empty directory)" / "(empty project)" when there is nothing to list; "Directory not found: {dirname}" when the path does not exist; a "Not a directory" error when it is not a directory."""

@@ -90,10 +90,6 @@ MAX_TEXT_LEN = 8000
 MAX_ATTR_LEN = 500
 MAX_HREF_LEN = 150
 
-# Pixel buffer beyond viewport edges — elements within this distance
-# are still considered visible so the LLM sees nearby context.
-VIEWPORT_THRESHOLD = 500
-
 # Max chars shown per virtual-ref expansion. Longer content is paginated
 # with sub-refs so the LLM can keep clicking to drill deeper.
 VIRTUAL_REF_CHUNK_SIZE = 20000
@@ -206,25 +202,6 @@ class DomService:
         if not cdp_data:
             return "(empty page)", {}, {}
 
-        # 1b. Capture viewport dimensions + scroll position for visibility
-        self._viewport_w = None
-        self._viewport_h = None
-        self._scroll_x = 0
-        self._scroll_y = 0
-        try:
-            viewport = page.viewport_size
-            if viewport:
-                self._viewport_w = viewport["width"]
-                self._viewport_h = viewport["height"]
-        except Exception:
-            logger.debug("Failed to read browser viewport size", exc_info=True)
-        try:
-            pos = await page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
-            self._scroll_x = pos["x"]
-            self._scroll_y = pos["y"]
-        except Exception:
-            logger.debug("Failed to read browser scroll position", exc_info=True)
-
         # 2. Build node trees for all frames
         root = self._build_all_trees(cdp_data, dpr=dpr)
         if not root:
@@ -260,25 +237,6 @@ class DomService:
         cdp_data, dpr = await self._capture_cdp_data(page)
         if not cdp_data:
             return "<html></html>"
-
-        # 1b. Viewport dimensions for visibility
-        self._viewport_w = None
-        self._viewport_h = None
-        self._scroll_x = 0
-        self._scroll_y = 0
-        try:
-            viewport = page.viewport_size
-            if viewport:
-                self._viewport_w = viewport["width"]
-                self._viewport_h = viewport["height"]
-        except Exception:
-            logger.debug("Failed to read browser viewport size", exc_info=True)
-        try:
-            pos = await page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
-            self._scroll_x = pos["x"]
-            self._scroll_y = pos["y"]
-        except Exception:
-            logger.debug("Failed to read browser scroll position", exc_info=True)
 
         # 2. Build node trees
         root = self._build_all_trees(cdp_data, dpr=dpr)
@@ -551,10 +509,10 @@ class DomService:
         _walk_collect_iframes(node, result)
         return result
 
-    # ── Visibility (CSS checks + viewport intersection) ─────────────────
+    # ── Visibility (CSS checks) ──────────────────────────────────────────
 
     def _mark_visibility(self, node: DomNode):
-        """Mark visibility — CSS checks + viewport intersection."""
+        """Mark visibility via CSS checks."""
         if node.is_text:
             node.is_visible = node.parent.is_visible if node.parent else True
         else:
@@ -585,13 +543,6 @@ class DomService:
                 w, h = node.bounding_box.get("w", 0), node.bounding_box.get("h", 0)
                 if w <= 0 and h <= 0:
                     node.is_visible = False
-                elif node.is_visible and self._viewport_w is not None:
-                    # Viewport intersection check — drop elements far outside
-                    # the visible area (off-screen modals, dropdowns, etc.)
-                    x = node.bounding_box.get("x", 0)
-                    y = node.bounding_box.get("y", 0)
-                    if not self._intersects_viewport(x, y, w, h):
-                        node.is_visible = False
             elif not node.computed_styles:
                 # CDP did not assign layout data → no layout box → invisible.
                 # Catches display:none elements (which CDP omits from the
@@ -600,14 +551,6 @@ class DomService:
 
         for child in node.children:
             self._mark_visibility(child)
-
-    def _intersects_viewport(self, x: float, y: float, w: float, h: float) -> bool:
-        """Check if rect (x,y,w,h) overlaps viewport area + buffer."""
-        vp_top = self._scroll_y - VIEWPORT_THRESHOLD
-        vp_bottom = self._scroll_y + self._viewport_h + VIEWPORT_THRESHOLD
-        vp_left = self._scroll_x - VIEWPORT_THRESHOLD
-        vp_right = self._scroll_x + self._viewport_w + VIEWPORT_THRESHOLD
-        return x + w > vp_left and x < vp_right and y + h > vp_top and y < vp_bottom
 
     # ── Interactive detection ──────────────────────────────────────────
 

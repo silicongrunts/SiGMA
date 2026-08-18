@@ -9,6 +9,7 @@ Two-phase interactive tool for the plan agent:
 import re
 from pathlib import Path
 
+from app.agents.prompts import PROMPT_SUBMIT_PLAN_FOR_APPROVAL
 from app.agents.tools.base import ToolDefinition
 from app.agents.tools.registry import tool_registry
 from app.core.config import settings
@@ -123,7 +124,6 @@ async def _submit_plan_dispatch(
 
 tool_registry.register(ToolDefinition(
     name="submit_plan_for_approval",
-    description="Submit an implementation plan for user approval",
     input_schema={
         "type": "object",
         "properties": {
@@ -135,12 +135,7 @@ tool_registry.register(ToolDefinition(
         "required": ["plan_content"],
     },
     call=_submit_plan_dispatch,
-    prompt=(
-        "Submit a complete implementation plan for user approval. "
-        "The plan must be in Markdown format. After submission, the user will "
-        "review and either approve or reject with feedback. If rejected, revise "
-        "the plan and submit again."
-    ),
+    prompt=PROMPT_SUBMIT_PLAN_FOR_APPROVAL,
     requires_user_interaction=True,
     requires_project_id=True,
     requires_session_id=True,

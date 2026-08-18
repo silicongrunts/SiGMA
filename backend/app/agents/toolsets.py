@@ -33,6 +33,8 @@ WRITE_EXEC_TOOLS: frozenset[str] = frozenset({
     "notebook_edit", "notebook_run_cell",
     "library_new", "library_rm", "library_mkdir", "library_mv", "library_update",
     "annotation_new", "annotation_rm", "annotation_reply",
+    # skill_load only reads instructions, but stays out of READ_ONLY_TOOLS so
+    # explore/plan agents don't get a tool their prompts never advertise.
     "skill_load",
     "draw_image",
 })
@@ -68,7 +70,8 @@ EXPLORE_TOOLS: frozenset[str] = READ_ONLY_TOOLS
 # but these tools remain blocked at runtime.
 FORK_FORBIDDEN_TOOLS: frozenset[str] = frozenset({"agent"}) | TASK_TOOLS
 
-# Annotation context toolset (unchanged from AnnotationLoop whitelist)
+# Annotation context toolset (read-only investigation; skill_load backs the
+# <skills> block injected into the annotation system prompt)
 ANNOTATION_TOOLS: frozenset[str] = frozenset({
     # File system (read-only)
     "read", "ls", "glob", "grep",
@@ -82,6 +85,8 @@ ANNOTATION_TOOLS: frozenset[str] = frozenset({
     "browser_back", "browser_console", "browser_cdp", "browser_pages",
     # Notebook (read-only)
     "notebook_read",
+    # Skills (read-only)
+    "skill_load",
     # Agent (explore only — enforced at runtime)
     "agent",
     # Utility

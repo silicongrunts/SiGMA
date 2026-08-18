@@ -1,9 +1,7 @@
 """SiGMA Agent Prompts — one file per tool.
 
-Each module exports a PROMPT string used by the corresponding tool's
-ToolDefinition.prompt field.  Prompts are detailed instructions that
-appear in the system message; descriptions are short summaries for the
-OpenAI function schema.
+Each module exports one or more PROMPT strings; each becomes its tool's
+description in the OpenAI function schema via ToolDefinition.prompt.
 """
 
 from .read import PROMPT as PROMPT_READ
@@ -63,6 +61,7 @@ from .annotation import (
 )
 
 from .skill import PROMPT as PROMPT_SKILL_LOAD
+from .plan_approval import PROMPT as PROMPT_SUBMIT_PLAN_FOR_APPROVAL
 
 from .draw import PROMPT as PROMPT_DRAW_IMAGE
 from .vision import PROMPT as PROMPT_VISION_ANALYZE

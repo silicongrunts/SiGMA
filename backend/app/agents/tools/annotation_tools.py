@@ -345,7 +345,6 @@ async def _annotation_list(project_id: str, file_name) -> str:
 
 tool_registry.register(ToolDefinition(
     name="annotation_new",
-    description="Create a new annotation on a project file. Anchors the annotation to a text range identified by file_content.",
     prompt=PROMPT_ANNOTATION_NEW,
     input_schema={
         "type": "object",
@@ -374,7 +373,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="annotation_rm",
-    description="Delete one or more annotations by ID.",
     prompt=PROMPT_ANNOTATION_RM,
     input_schema={
         "type": "object",
@@ -396,7 +394,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="annotation_get",
-    description="Retrieve the full conversation thread of an annotation.",
     prompt=PROMPT_ANNOTATION_GET,
     input_schema={
         "type": "object",
@@ -418,7 +415,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="annotation_reply",
-    description="Reply to an existing annotation. Supports <diff> blocks for suggesting code changes.",
     prompt=PROMPT_ANNOTATION_REPLY,
     input_schema={
         "type": "object",
@@ -440,7 +436,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="annotation_list",
-    description="List all annotations on a project file.",
     prompt=PROMPT_ANNOTATION_LIST,
     input_schema={
         "type": "object",

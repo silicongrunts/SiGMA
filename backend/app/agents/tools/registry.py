@@ -15,12 +15,10 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: Dict[str, ToolDefinition] = {}
-        self._schemas_cache: List[dict] | None = None
 
     def register(self, tool: ToolDefinition) -> None:
         """Register a tool definition."""
         self._tools[tool.name] = tool
-        self._schemas_cache = None  # invalidate cache
 
     def get(self, name: str) -> Optional[ToolDefinition]:
         """Get a tool by name."""
@@ -33,12 +31,6 @@ class ToolRegistry:
     def list_all(self) -> List[ToolDefinition]:
         """Get all registered tools."""
         return list(self._tools.values())
-
-    def to_openai_schemas(self) -> List[dict]:
-        """Get all tools in OpenAI function-calling format (cached)."""
-        if self._schemas_cache is None:
-            self._schemas_cache = [t.to_openai_schema() for t in self._tools.values()]
-        return self._schemas_cache
 
     @property
     def names(self) -> List[str]:

@@ -524,7 +524,13 @@ async def _glob_search(project_id: str = "", pattern: str = "", path: str = ".")
     matches: list[str] = []
     for sub_pattern in _expand_braces(pattern):
         for m in glob_mod.glob(sub_pattern, root_dir=search_dir, recursive=True):
-            full = m if path_is_absolute else rel_prefix + m
+            if os.path.isabs(m):
+                # An absolute pattern ignores root_dir; results are already absolute.
+                full = m
+            elif path_is_absolute:
+                full = os.path.normpath(os.path.join(search_dir, m))
+            else:
+                full = rel_prefix + m
             if full not in seen:
                 seen.add(full)
                 matches.append(full)
@@ -560,7 +566,7 @@ _GREP_TIMEOUT_SECONDS = 15
 
 def _build_rg_command(
     pattern: str,
-    full_path: str,
+    search_path: str,
     *,
     output_mode: str,
     glob_filter: str,
@@ -602,7 +608,7 @@ def _build_rg_command(
     if type_filter:
         cmd.extend(["--type", type_filter])
     # ``-e`` accepts the pattern as a single argument even if it starts with -
-    cmd.extend(["-e", pattern, full_path])
+    cmd.extend(["-e", pattern, search_path])
     return cmd
 
 
@@ -662,14 +668,22 @@ async def _grep_search(
     # ``context`` wins over ``-C`` if both supplied
     effective_context = context if context else (int(flag_c) if flag_c else 0)
 
+    # Run rg/grep with cwd=project root and a relative search path so they
+    # echo project-relative paths (glob does the same); an absolute `path`
+    # keeps absolute output. A root search passes "." — rg and grep then
+    # prefix every echoed path with "./", which is stripped afterwards
+    # (safe: every output line starts with the path in that mode; explicit
+    # single-file searches never pass "."). Omitting the path argument
+    # instead would make rg read stdin, not search the cwd.
     if os.path.isabs(path):
-        full_path = path
+        cwd = None
+        search_arg = path
     else:
-        base = str(file_service.get_project_path(project_id)) if project_id else "."
-        full_path = os.path.join(base, path)
+        cwd = str(file_service.get_project_path(project_id)) if project_id else "."
+        search_arg = "." if path in ("", ".", "./") else path
 
     cmd = _build_rg_command(
-        pattern, full_path,
+        pattern, search_arg,
         output_mode=output_mode, glob_filter=glob_filter, type_filter=type_filter,
         case_insensitive=case_insensitive, line_numbers=line_numbers,
         after_context=after_context, before_context=before_context,
@@ -679,11 +693,14 @@ async def _grep_search(
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_GREP_TIMEOUT_SECONDS)
         output = stdout.decode("utf-8", errors="replace").strip()
+        if output and search_arg == ".":
+            output = _strip_leading_dot_slash(output)
         if not output:
             return f"No matches for '{pattern}'"
         return _format_grep_output(
@@ -693,7 +710,7 @@ async def _grep_search(
     except FileNotFoundError:
         # rg missing — fall back to grep with reduced feature set
         return await _grep_fallback(
-            pattern, full_path, glob_filter,
+            pattern, search_arg, cwd, glob_filter,
             output_mode=output_mode, case_insensitive=case_insensitive,
             context=effective_context, after_context=after_context,
             before_context=before_context, multiline=multiline,
@@ -707,9 +724,18 @@ async def _grep_search(
         return f"grep error: {e}"
 
 
+def _strip_leading_dot_slash(output: str) -> str:
+    """Remove the "./" prefix rg/grep put on every path for a "." search."""
+    return "\n".join(
+        line[2:] if line.startswith("./") else line
+        for line in output.split("\n")
+    )
+
+
 async def _grep_fallback(
     pattern: str,
-    full_path: str,
+    search_arg: str,
+    cwd: str | None,
     glob_filter: str,
     *,
     output_mode: str,
@@ -742,16 +768,21 @@ async def _grep_fallback(
     if type_filter:
         ignored.append("type")
 
+    # The root search passes "." (see the comment in _grep_search); the
+    # "./" prefixes grep then echoes are stripped by the shared helper.
+    root_search = search_arg == "."
     cmd = ["grep", "-rn"]
     if case_insensitive:
         cmd.append("-i")
     if glob_filter:
         cmd.append(f"--include={glob_filter}")
-    cmd.extend([pattern, full_path])
+    # ``-e`` keeps patterns starting with ``-`` from being parsed as flags.
+    cmd.extend(["-e", pattern, search_arg])
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -762,6 +793,9 @@ async def _grep_fallback(
     except Exception as e:
         logger.exception("grep subprocess failed")
         return f"grep error: {e}"
+
+    if root_search and output:
+        output = _strip_leading_dot_slash(output)
 
     if not output:
         return f"No matches for '{pattern}'"
@@ -819,7 +853,6 @@ async def _edit_preflight(
 
 tool_registry.register(ToolDefinition(
     name="read",
-    description="Read a text/PDF/image file from the local filesystem.",
     prompt=PROMPT_READ,
     input_schema={
         "type": "object",
@@ -843,7 +876,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="write",
-    description="Write content to a file. Overwrites if exists. Prefer Edit for modifications.",
     prompt=PROMPT_WRITE,
     input_schema={
         "type": "object",
@@ -862,7 +894,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="edit",
-    description="Perform exact string replacements in an existing file.",
     prompt=PROMPT_EDIT,
     input_schema={
         "type": "object",
@@ -885,7 +916,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="glob",
-    description="Fast file pattern matching tool. Find files by glob patterns.",
     prompt=PROMPT_GLOB,
     input_schema={
         "type": "object",
@@ -902,7 +932,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="grep",
-    description="Search file contents using regex. Built on ripgrep.",
     prompt=PROMPT_GREP,
     input_schema={
         "type": "object",
@@ -945,7 +974,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="ls",
-    description="List files and directories in the project (or any host directory).",
     prompt=PROMPT_LS,
     input_schema={
         "type": "object",

@@ -8,22 +8,22 @@ file_content must appear exactly once in the file — zero or multiple matches i
 
 annotation_content may contain <diff> blocks to suggest code changes:
 <diff><before>original text</before><after>new text</after></diff>
-Each <before> must appear exactly once in the file — zero or multiple matches is not allowed..
+Each <before> must likewise appear exactly once in the file.
 
-Tool result: "Annotation created successfully, ID: {id}" on success.  
+Output: "Annotation created successfully, ID: {id}".
 These IDs are for subsequent tool calls only and not visible to the user."""
 
 PROMPT_ANNOTATION_RM = """Delete one or more annotations.
 
 Accepts a single ID or an array of IDs.
 
-Tool result, one line per ID: "Annotation {id} deleted" or "Error for {id}: {reason}". These IDs are for subsequent tool calls only."""
+Output, one line per ID: "Annotation {id} deleted" or "Error for {id}: {reason}". These IDs are for subsequent tool calls only."""
 
 PROMPT_ANNOTATION_GET = """Retrieve the full thread of one or more annotations.
 
 Accepts a single ID or an array of IDs.
 
-Tool result (XML):
+Output (XML):
 <annotation><id>full-id</id><file_content>original text snapshot</file_content><reply><role>SiGMA|user</role><text>message content</text></reply>...</annotation>
 One block per matched annotation. Errors shown inline as "Error for {id}: {reason}"."""
 
@@ -33,13 +33,13 @@ reply_content may contain <diff> blocks:
 <diff><before>original text</before><after>new text</after></diff>
 Each <before> must appear exactly once in the annotation's file.
 
-Tool result: "Reply added to annotation {id}" or "Error: {reason}"."""
+Output: "Reply added to annotation {id}" or "Error: {reason}"."""
 
 PROMPT_ANNOTATION_LIST = """List annotations on one or more project files.
 
 Accepts a single file path or an array of file paths.
 
-Tool result (XML):
+Output (XML):
 --- {file} ({N} annotations) ---
 <annotation><id>full-id</id><summary>first 80 chars of first reply...</summary></annotation>
 Grouped by file. Files with no annotations show "No annotations on {file}"."""

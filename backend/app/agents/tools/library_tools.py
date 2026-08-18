@@ -723,7 +723,6 @@ async def _library_rm(project_id: str, id) -> str:
 
 tool_registry.register(ToolDefinition(
     name="library_search",
-    description="Search the project library for documents by keyword or semantic similarity.",
     prompt=PROMPT_LIBRARY_SEARCH,
     input_schema={
         "type": "object",
@@ -744,7 +743,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="library_ls",
-    description="List contents of library directories.",
     prompt=PROMPT_LIBRARY_LS,
     input_schema={
         "type": "object",
@@ -767,7 +765,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="library_new",
-    description="Add a new document to the library from text, file, or browser tab.",
     prompt=PROMPT_LIBRARY_NEW,
     input_schema={
         "type": "object",
@@ -788,7 +785,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="library_mkdir",
-    description="Create a new folder in the library.",
     prompt=PROMPT_LIBRARY_MKDIR,
     input_schema={
         "type": "object",
@@ -805,7 +801,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="library_mv",
-    description="Move documents or folders to a target folder.",
     prompt=PROMPT_LIBRARY_MV,
     input_schema={
         "type": "object",
@@ -828,7 +823,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="library_update",
-    description="Update a document's or folder's title, description, or content. Folders only support title updates.",
     prompt=PROMPT_LIBRARY_UPDATE,
     input_schema={
         "type": "object",
@@ -850,7 +844,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="library_get",
-    description="Read a document's fields from the library.",
     prompt=PROMPT_LIBRARY_GET,
     input_schema={
         "type": "object",
@@ -878,7 +871,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="library_rm",
-    description="Delete one or more documents or folders from the library.",
     prompt=PROMPT_LIBRARY_RM,
     input_schema={
         "type": "object",

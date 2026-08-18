@@ -4,146 +4,77 @@ Browser tool prompts — detailed instructions for the LLM.
 Each constant is used by the corresponding tool's ToolDefinition.prompt field.
 """
 
-PROMPT_BROWSER_NAVIGATE = """Navigate to a URL or search the web in the shared browser.
+PROMPT_BROWSER_NAVIGATE = """Navigate to a URL or run a web search in the shared browser.
 
-If the input looks like a URL (starts with http://, https://, or is a valid domain),
-navigates directly. Otherwise, treats the input as a search query and uses the
-configured search engine.
+Input that looks like a URL (http://, https://, or a bare domain) is navigated to directly; anything else is treated as a search query for the configured search engine.
 
-Leave tab_id empty to OPEN A NEW TAB. Pass a tab_id to navigate an existing tab.
+- Pass tab_id to navigate an existing tab. Without tab_id: the active tab is reused if it is still on a blank page (about:blank or the new-tab page); otherwise a new tab is opened.
+- mode controls the returned snapshot: 'dom' (default) = enhanced DOM with element refs; 'markdown' = readable Markdown.
+- wait_until is honored only when an existing tab is reused; opening a new tab always waits for domcontentloaded.
+- In dom mode, interactive elements carry [ref=eN] for browser_click; browser_snapshot documents the other ref kinds.
 
-The mode parameter controls the return format:
-- mode='dom' (default): Enhanced DOM snapshot with element refs for interaction.
-- mode='markdown': Readable Markdown for understanding page content.
+Use browser_pages first to see which tabs are already open."""
 
-Three ref types appear in dom mode:
-- [ref=eN] — interactive DOM element (button, link, input, etc.). Use with browser_click.
-- [ref=fN] — folded content (consecutive repeated elements collapsed). Click to expand.
-- [ref=tN] — truncated content (section omitted due to length). Click to expand.
+PROMPT_BROWSER_SNAPSHOT = """Get a snapshot of a page.
 
-Usage notes:
-- Use browser_pages first to see what tabs are already open
-- To open a new tab (most common), omit tab_id
-- To reuse an existing tab, pass its tab_id
-"""
+- mode='dom' (default): enhanced DOM with [ref=eN] on interactive elements, [ref=fN] on folded runs of repeated elements, and [ref=tN] on truncated sections. Use when you need refs for browser_click/browser_input.
+- mode='markdown': the page as readable Markdown. Use to read articles, search results, and data tables.
 
-PROMPT_BROWSER_SNAPSHOT = """Get a snapshot of a page's content.
+When the output exceeds the size limit: markdown mode paginates the omitted tail into chunk ref [ref=m1]; dom mode keeps sections by content density and gives each shortened or dropped section its own [ref=tN] marker (markers for fully dropped sections appear at the end, out of document order). Expanding a chunk may chain continuation refs (m1-a, m1-a-a, ...). Expand any chunk with browser_click.
 
-Two modes controlled by the mode parameter:
+- Element refs are per-tab. A new dom-mode snapshot of that tab replaces all its previous refs; a markdown snapshot that paginates (one ending in a [ref=m1] marker) also replaces that tab's virtual refs. If a ref no longer resolves, take a new snapshot.
+- tab_id selects the tab; omit for the active tab.
+- Call browser_snapshot(mode='dom') before interacting with a page."""
 
-- mode='dom' (default): Enhanced DOM snapshot with [ref=eN] markers on interactive
-  elements, plus [ref=fN] for folded items and [ref=tN] for truncated sections.
-  Use this when you need element refs for browser_click, browser_input, etc.
-- mode='markdown': Page as readable Markdown. Best for reading articles,
-  search results, data tables, and understanding page content.
+PROMPT_BROWSER_CLICK = """Click an element or expand content by its ref.
 
-Ref types in dom mode:
-- [ref=eN] — interactive DOM element. Click with browser_click.
-- [ref=fN] — folded content (e.g. "5 similar <li> items"). Click to expand.
-- [ref=tN] — truncated content with preview of beginning/end. Click to expand.
+- [ref=eN]: click the DOM element (button, link, ...) and return a page snapshot; mode controls the format. The ref must come from a recent snapshot of the SAME tab; if it is stale, call browser_snapshot to refresh.
+- [ref=fN]: return the complete run of items that was folded. Always returns dom; mode is ignored.
+- [ref=tN] / [ref=mN] (and their -a continuations): return the stored chunk content — dom format for tN, raw markdown for mN. mode is ignored.
+- tab_id applies only to eN clicks. Virtual refs (fN/tN/mN) always resolve against the latest snapshot of the active tab."""
 
-In markdown mode, when the page exceeds the output limit, the tail is paginated
-into [ref=mN] chunks. Use browser_click to expand each chunk.
+PROMPT_BROWSER_INPUT = """Type text into a form field selected by its element ref.
 
-Usage notes:
-- Call browser_snapshot(mode='dom') before interacting with a page
-- Element refs are per-tab — a snapshot on tab-0 gives refs for tab-0 only
-- Use tab_id to snapshot a specific tab; omit for the current active tab
-"""
+- clear_first (default true) clears the field before typing; set false to append.
+- Each newline in text is sent as an Enter keypress; literal newlines cannot be typed.
+- submit=true presses Enter after typing and returns a page snapshot (mode controls the format); submit=false only confirms the input.
+- The ref must point to an input, textarea, or contenteditable element.
+- tab_id selects the tab; omit for the active tab."""
 
-PROMPT_BROWSER_CLICK = """Click an element or expand content by its reference ID.
+PROMPT_BROWSER_SCROLL = """Scroll a page and return a snapshot.
 
-Four ref types:
-- [ref=eN]: Click a DOM element (button, link, etc.). Performs the click action
-  and returns a page snapshot. The mode parameter controls the return format.
-- [ref=fN]: Expand folded content. Returns the full list of folded items.
-  mode parameter is ignored — always returns dom format.
-- [ref=tN]: Expand truncated content. Returns the full truncated section.
-  mode parameter is ignored — always returns dom format.
-- [ref=mN]: Expand a paginated markdown chunk. Returns the chunk content.
-  mode parameter is ignored — always returns the raw markdown text.
+- direction: up/down scroll by `amount` pixels (default 500); top/bottom jump to the page edges.
+- The snapshot covers the whole document regardless of scroll position. Scrolling mainly triggers lazy-loaded content (waited for before capture) and changes what browser_vision screenshots.
+- mode controls the snapshot format ('dom' default, 'markdown').
+- tab_id selects the tab; omit for the active tab."""
 
-Usage notes:
-- Use tab_id to click on a specific tab; omit for the active tab
-- Element refs (eN) must come from a recent snapshot of the SAME tab
-- Virtual refs (fN, tN) also come from the most recent snapshot
-- If a ref is stale, call browser_snapshot first to refresh
-"""
+PROMPT_BROWSER_CONSOLE = """Read the browser console or execute JavaScript.
 
-PROMPT_BROWSER_INPUT = """Input text into a form field by its reference ID.
+- action='read': console messages and page errors from all tabs share one 200-entry buffer; the 50 most recent entries are returned. Pass tab_id to filter to one tab — combined output does not label which tab each line came from.
+- action='execute': run JavaScript in the page and return the result; tab_id selects the tab (default: the active tab).
+- With action='read', clear=true only clears the buffer and returns "Console buffer cleared." (to isolate events: clear, then read in a separate call). With action='execute', clear=true clears the buffer before running the JS."""
 
-Clears any existing content before typing. Optionally presses Enter after input.
+PROMPT_BROWSER_VISION = """Take a viewport screenshot and analyze it with the vision model.
 
-When submit=true, returns a page snapshot (mode controls the format).
-When submit=false, only confirms input success (no snapshot returned).
+Use when the text snapshot misses layout, charts, colors, or other visual state.
 
-Usage notes:
-- Use tab_id to target a specific tab; omit for the active tab
-- The element_ref must point to an input, textarea, or contenteditable element
-- Use submit=true to press Enter after input (useful for search boxes and forms)
-"""
+- question: what to analyze in the screenshot.
+- element_ref optionally crops to an element from the latest snapshot.
+- tab_id selects the tab; omit for the active tab."""
 
-PROMPT_BROWSER_SCROLL = """Scroll a page and get a snapshot of the new view.
+PROMPT_BROWSER_BACK = """Go back one step in browser history and return a page snapshot.
 
-Directions: up, down, top, bottom. Returns a page snapshot showing the
-newly visible content. The mode parameter controls the return format.
+The result starts with the new URL and Title, then the snapshot. mode controls the format ('dom' default, 'markdown'). tab_id selects the tab; omit for the active tab."""
 
-Usage notes:
-- Use tab_id to scroll a specific tab; omit for the active tab
-- 'up' and 'down' scroll by a configurable amount (default 500px)
-- 'top' and 'bottom' scroll to page edges
-"""
+PROMPT_BROWSER_CDP = """Send one raw Chrome DevTools Protocol (CDP) command.
 
-PROMPT_BROWSER_CONSOLE = """Get browser console output or execute JavaScript.
+Escape hatch for operations no other browser tool covers. Each call opens a fresh CDP session, sends one command, and detaches: no state persists between calls and events are not captured, so stateful command sequences (e.g. Network.enable followed by a later query) do not work.
 
-Usage notes:
-- With action='read': returns recent console.log/warn/error from the ring buffer.
-  Pass tab_id to filter to a specific tab; omit for all tabs combined.
-- With action='execute': runs JavaScript in the page context and returns the result
-- Use clear=true to clear the buffer before reading (helps isolate events)
-"""
+- method is a CDP command name (e.g. 'Runtime.evaluate'); params is an optional parameter object.
+- tab_id selects the tab; omit for the active tab."""
 
-PROMPT_BROWSER_VISION = """Take a screenshot and analyze it with AI vision.
+PROMPT_BROWSER_PAGES = """List the open browser tabs.
 
-Captures the page and sends it to the vision model for analysis. Use when you
-need to understand visual layout, colors, charts, or elements the text
-snapshot doesn't capture well.
+Returns a table of each tab's ID, URL (truncated to 58 chars), and title (truncated to 38 chars). The active tab is marked with * and is the tab most operations default to when no tab_id is given.
 
-Usage notes:
-- Use tab_id to screenshot a specific tab; omit for the active tab
-- The prompt parameter guides what the vision model focuses on when a separate
-  vision model is needed
-- Optionally crop to a specific element ref
-"""
-
-PROMPT_BROWSER_BACK = """Navigate back in browser history. Returns a page snapshot.
-
-The mode parameter controls the return format:
-- mode='dom' (default): Enhanced DOM with element refs.
-- mode='markdown': Readable Markdown.
-
-Usage notes:
-- Use tab_id to go back on a specific tab; omit for the active tab
-"""
-
-PROMPT_BROWSER_CDP = """Send a raw Chrome DevTools Protocol (CDP) command.
-
-Power-user escape hatch for operations not covered by other browser tools.
-Use only when other tools cannot achieve your goal.
-
-Usage notes:
-- Use tab_id to target a specific tab; omit for the active tab
-- method is a CDP command name (e.g. 'Runtime.evaluate', 'Network.enable')
-- params is an optional object with the command parameters
-"""
-
-PROMPT_BROWSER_PAGES = """List all open browser tabs.
-
-Returns a table showing each tab's ID, URL, title, and which is active.
-The active tab (marked with *) is the one VNC displays and the one
-most operations default to when no tab_id is given.
-
-Usage notes:
-- Call this before cross-tab workflows to see what tabs are available
-- Tab IDs (tab-0, tab-1, ...) are used by other browser tools' tab_id parameter
-"""
+Tab IDs (tab-0, tab-1, ...) are the tab_id values used by the other browser tools."""

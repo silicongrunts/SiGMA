@@ -258,8 +258,6 @@ async def _check_notebook_run(
             notebook, _location = await read_notebook_json(notebook_path, project_id)
             cells = notebook.get("cells", [])
             idx = find_cell_index(cells, cell_id)
-            if idx == -2:
-                return f"Error: Cell ID '{cell_id}' matches multiple cells. Provide more characters for a unique match."
             if idx < 0:
                 return f"Error: Cell not found: {cell_id}"
             cell = cells[idx]

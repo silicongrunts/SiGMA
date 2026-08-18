@@ -455,7 +455,6 @@ async def _notebook_run_cell_preflight(
 
 tool_registry.register(ToolDefinition(
     name="notebook_read",
-    description="Read Jupyter notebook cells and their execution outputs in XML format.",
     prompt=PROMPT_NOTEBOOK_READ,
     input_schema={
         "type": "object",
@@ -492,7 +491,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="notebook_edit",
-    description="Edit Jupyter notebook cells (.ipynb). Supports replace, insert, and delete operations.",
     prompt=PROMPT_NOTEBOOK_EDIT,
     input_schema={
         "type": "object",
@@ -517,7 +515,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="notebook_run_cell",
-    description="Execute a code cell in a Jupyter notebook on its kernel and return the output.",
     prompt=PROMPT_NOTEBOOK_RUN_CELL,
     input_schema={
         "type": "object",

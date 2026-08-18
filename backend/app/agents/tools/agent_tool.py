@@ -15,6 +15,7 @@ of a leading underscore reflects that.
 
 import contextvars
 
+from app.agents.prompts import PROMPT_AGENT
 from app.agents.tools.base import ToolDefinition
 from app.agents.tools.registry import tool_registry
 
@@ -83,7 +84,6 @@ async def _run_agent_validated(**kwargs) -> str:
 
 tool_registry.register(ToolDefinition(
     name="agent",
-    description="Launch a specialized subagent to handle a task",
     input_schema={
         "type": "object",
         "properties": {
@@ -115,21 +115,7 @@ tool_registry.register(ToolDefinition(
         "required": ["prompt"],
     },
     call=_run_agent_validated,
-    prompt=(
-        "Launch a subagent for complex or isolated work.\n\n Agent types:\n"
-        "- 'general': full-capability worker for decomposed complex tasks; "
-        "resumable. (will return <resume_id> tag in result)\n"
-        "- 'explore': read-only investigation over project files, Library, and browser/web."
-        "Fast model, no file modifications.\n"
-        "- 'plan': Read-only agent that can explore and create plans. "
-        "(will return a user approved plan)\n"
-        "- '' (fork): Inherits the current conversation context and returns "
-        "only its final assistant message as the tool result. \n\n"
-        "Do not use for simple reads, small edits, short Q&A, "
-        "or tasks you can complete directly with low context cost \n\n"
-        "For general / explore / plan, write a detailed self-contained prompt. "
-        "For fork, write a bounded subtask prompt with the expected handoff details. "
-    ),
+    prompt=PROMPT_AGENT,
     is_agent_tool=True,
     requires_project_id=True,
     requires_session_id=True,

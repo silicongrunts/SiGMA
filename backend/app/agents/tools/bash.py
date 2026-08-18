@@ -126,7 +126,6 @@ async def _run_bash(project_id: str, command: str, timeout: int = 120) -> str:
 
 tool_registry.register(ToolDefinition(
     name="bash",
-    description="Executes a given bash command and returns its output.",
     prompt=PROMPT_BASH,
     input_schema={
         "type": "object",

@@ -1,47 +1,15 @@
 """
-Prompt for the agent tool — describes the five agent execution modes.
+Prompt for the agent tool — describes the four agent execution modes.
 """
 
-PROMPT = """Launch a specialized subagent to handle complex tasks autonomously.
+PROMPT = """Launch a subagent for complex or isolated work. The call blocks until the subagent finishes; its final report is the tool result.
 
-The agent tool launches specialized agents that autonomously handle complex tasks.
-Each agent type has specific capabilities and tools available to it.
+Agent types:
+- 'general': full-capability worker with every tool except agent, the task tools, and submit_plan_for_approval (tasks and plan approval belong to the main loop). Creates a persistent session; the result starts with a <resume_id> tag — pass it as resume_id to continue that session later.
+- 'explore': read-only investigation over project files, Library, and browser/web. Runs on the fast model; single-shot, no persistence.
+- 'plan': read-only planner that can spawn explore agents. The call blocks until the user approves a plan; the result is the approved plan (rejection feedback goes back to the planner for revision).
+- '' (fork): inherits the current conversation context, with some tools forbidden at runtime (nested agents, parent-state changes). Returns only its final assistant message.
 
-## Agent Types
+Do not use this tool for simple reads, small edits, or short Q&A you can complete directly.
 
-- **general** (agent_type="general"): Full-capability agent with all tools except agent.
-  Creates a persistent session that can be resumed later with resume_id.
-  Use for: implementation work, multi-step analysis, code refactoring.
-
-- **explore** (agent_type="explore"): Fast read-only agent for codebase exploration.
-  Uses the fast model. No file modifications allowed.
-  Use for: finding files, searching patterns, understanding architecture.
-
-- **plan** (agent_type="plan"): Read-only architect agent that creates implementation plans.
-  Can spawn explore agents. Plans require user approval before saving.
-  Use for: designing implementation strategy for complex tasks.
-
-- **fork** (agent_type="" or empty): Inherits the current conversation context.
-  No persistence. Runtime guardrails may reject tools that would nest agents or
-  modify parent task state.
-  Use for: context-dependent subtasks whose intermediate work should not remain
-  in the parent context.
-
-## Resume
-
-General agents create persistent sessions. To continue a previous general agent
-session, pass its resume_id:
-  agent(prompt="Continue the analysis", resume_id="<session_id>")
-
-## When NOT to use the agent tool:
-- If you want to read a specific file path, use read or glob instead
-- If you are searching for a specific class definition, use glob instead
-- If you are searching code within a specific file, use read instead
-
-## Usage notes:
-- Each agent invocation is synchronous — it blocks until the subagent completes
-- Provide a complete task description in the prompt parameter
-- Clearly state whether the agent should write code or just research
-- For fork mode, clearly state the bounded subtask and what the final handoff
-  must include
-"""
+For general/explore/plan the subagent sees nothing of this conversation: write a detailed, self-contained prompt (background, goal, constraints, expected result, and the evidence/paths/IDs it must return). For fork, state the bounded subtask and the expected handoff."""

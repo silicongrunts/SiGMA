@@ -102,7 +102,6 @@ async def _task_get(id: str, project_id: str = "", session_id: str = "") -> str:
 
 tool_registry.register(ToolDefinition(
     name="task_create",
-    description="Create a new task to track progress. Use for breaking down complex work into steps.",
     prompt=PROMPT_TASK_CREATE,
     input_schema={
         "type": "object",
@@ -122,7 +121,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="task_update",
-    description="Update a task's status or details. Use to mark progress (pending→in_progress→completed).",
     prompt=PROMPT_TASK_UPDATE,
     input_schema={
         "type": "object",
@@ -144,7 +142,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="task_list",
-    description="List all tasks with their status.",
     prompt=PROMPT_TASK_LIST,
     input_schema={
         "type": "object",
@@ -159,7 +156,6 @@ tool_registry.register(ToolDefinition(
 
 tool_registry.register(ToolDefinition(
     name="task_get",
-    description="Get full details of a specific task.",
     prompt=PROMPT_TASK_GET,
     input_schema={
         "type": "object",
@@ -201,14 +197,13 @@ async def _task_write(todos: list, project_id: str = "", session_id: str = "") -
         len(completed) >= 3
         and not any("verif" in (t.get("content", "") + t.get("subject", "")).lower() for t in completed)
     ):
-        lines.append("\nNote: All items are marked complete. Consider verifying the work before considering it done.")
+        lines.append(f"\nNote: {len(completed)} item(s) are marked complete. Consider verifying the work before considering it done.")
 
     return "\n".join(lines)
 
 
 tool_registry.register(ToolDefinition(
     name="task_write",
-    description="Replace the entire task list for the current session.",
     prompt=PROMPT_TASK_WRITE,
     input_schema={
         "type": "object",

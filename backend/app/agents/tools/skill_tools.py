@@ -34,7 +34,6 @@ async def _skill_load(skill_id: str, file_path: str | None = None) -> str:
 
 tool_registry.register(ToolDefinition(
     name="skill_load",
-    description="Load the full content of a skill by its folder ID. Returns SKILL.md or a specified file inside the skill directory.",
     prompt=PROMPT_SKILL_LOAD,
     input_schema={
         "type": "object",

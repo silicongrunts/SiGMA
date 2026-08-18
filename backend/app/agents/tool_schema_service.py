@@ -36,25 +36,29 @@ def tool_schemas_for_model_role(
 
 
 def _read_schema(schema: dict, accepts_images: bool) -> dict:
+    """Append a model-context clause to the read tool's base prompt.
+
+    The base prompt (PROMPT_READ, set on the ToolDefinition) stays the single
+    source of truth for behavior; only the image-capability difference between
+    model contexts is added here.
+    """
     next_schema = deepcopy(schema)
-    function = next_schema.get("function", {})
-    base = (
-        "Reads text files from the local filesystem. By default, it returns up "
-        "to 200 lines and supports optional offset/limit line ranges."
-    )
     if accepts_images:
-        function["description"] = (
-            f"{base} In this model context, Read also supports PNG and JPG "
-            "image files up to 3840x3840 pixels; image contents are injected "
-            "directly for visual inspection."
+        variant = (
+            "In this model context, Read also supports PNG and JPG image files "
+            "up to 3840x3840 pixels; image contents are injected directly for "
+            "visual inspection."
         )
     else:
-        function["description"] = (
-            f"{base} In this model context, Read can identify PNG and JPG image "
-            "files but cannot inject image bytes directly; use vision_analyze "
-            "with the returned image path when visual inspection is needed. "
-            "Other binary files will return a binary-file error."
+        variant = (
+            "In this model context, Read cannot inject image bytes directly; "
+            "it returns the image path instead — use vision_analyze with that "
+            "path when visual inspection is needed."
         )
+    function = next_schema.get("function", {})
+    function["description"] = (
+        f"{function.get('description', '')}\n\n{variant}"
+    ).strip()
     return next_schema
 
 
@@ -62,7 +66,11 @@ def _browser_vision_direct_schema(schema: dict) -> dict:
     next_schema = deepcopy(schema)
     function = next_schema.get("function", {})
     function["description"] = (
-        "Take a browser screenshot and return it for direct visual inspection. "
-        "Use when the page snapshot misses layout, charts, colors, or visual state."
+        "Take a viewport screenshot and return it for direct visual inspection "
+        "in this model context. Use when the page snapshot misses layout, "
+        "charts, colors, or visual state. question is required by the schema "
+        "but is not used in this mode. tab_id selects the tab (default: the "
+        "active tab); element_ref optionally crops to an element from the "
+        "latest snapshot."
     )
     return next_schema

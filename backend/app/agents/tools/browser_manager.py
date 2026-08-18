@@ -561,6 +561,35 @@ class BrowserManager:
         finally:
             await cdp.detach()
 
+    async def is_text_input(self, page, backend_node_id: int) -> bool:
+        """Check whether an element accepts typed text (input/textarea/contenteditable).
+
+        ``isContentEditable`` is the computed property, so ``contenteditable="false"``
+        and nested editables inside a contenteditable root are handled correctly.
+        """
+        cdp = await page.context.new_cdp_session(page)
+        try:
+            node_info = await cdp.send("DOM.resolveNode", {
+                "backendNodeId": backend_node_id,
+            })
+            object_id = (node_info.get("object", {}) or {}).get("objectId")
+            if not object_id:
+                return False
+            result = await cdp.send("Runtime.callFunctionOn", {
+                "functionDeclaration": (
+                    "function() {"
+                    "  const el = this;"
+                    "  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'"
+                    "    || el.isContentEditable;"
+                    "}"
+                ),
+                "objectId": object_id,
+                "returnByValue": True,
+            })
+            return bool(result.get("result", {}).get("value"))
+        finally:
+            await cdp.detach()
+
     async def input_text(
         self,
         page,
@@ -644,7 +673,7 @@ class BrowserManager:
                     "  const el = this;"
                     "  if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {"
                     "    el.value = '';"
-                    "  } else if (el.getAttribute('contenteditable')) {"
+                    "  } else if (el.isContentEditable) {"
                     "    el.textContent = '';"
                     "  }"
                     "  el.dispatchEvent(new Event('input', {bubbles: true}));"

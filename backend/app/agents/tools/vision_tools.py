@@ -37,7 +37,6 @@ async def _vision(question: str, image_path: str, project_id: str) -> str:
 
 tool_registry.register(ToolDefinition(
     name="vision_analyze",
-    description="Analyze an image path with the configured vision model.",
     prompt=PROMPT_VISION_ANALYZE,
     input_schema={
         "type": "object",

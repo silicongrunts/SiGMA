@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from app.agents.tools.file_tools import _glob_search, _grep_search
+from app.agents.tools.file_tools import _glob_search, _grep_fallback, _grep_search
 
 
 def _patch_file_service(monkeypatch, tmp_path):
@@ -79,6 +79,22 @@ async def test_glob_root_path_returns_unprefixed(tmp_path, monkeypatch):
     lines = result.split("\n")
     assert "top.txt" in lines
     assert "src/nested.txt" in lines
+
+
+@pytest.mark.asyncio
+async def test_glob_absolute_path_returns_absolute_sorted_by_mtime(tmp_path, monkeypatch):
+    _patch_file_service(monkeypatch, tmp_path)
+    sub = tmp_path / "src"
+    sub.mkdir()
+    older = sub / "aa.py"  # alphabetically first, but older
+    newer = sub / "zz.py"
+    older.write_text("a")
+    newer.write_text("b")
+    _set_mtime(older, time.time() - 1000)
+    _set_mtime(newer, time.time())
+
+    result = await _glob_search("proj", "*.py", str(sub))
+    assert result.split("\n") == [str(newer), str(older)]
 
 
 # ── glob: truncation marker ─────────────────────────────────────────
@@ -229,3 +245,66 @@ async def test_grep_head_limit_zero_means_unlimited(tmp_path, monkeypatch):
     assert "Showing results" not in result
     # All 50 matches returned
     assert result.count("\n") >= 49
+
+
+# ── grep: project-relative output paths ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_grep_root_search_returns_project_relative_paths(tmp_path, monkeypatch):
+    _patch_file_service(monkeypatch, tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("target_token\n")
+    (tmp_path / "b.py").write_text("target_token\n")
+
+    result = await _grep_search(
+        "proj", "target_token", ".", output_mode="files_with_matches",
+        flags={}, head_limit=10, offset=0,
+    )
+    assert set(result.split("\n")) == {"src/a.py", "b.py"}
+    assert str(tmp_path) not in result
+    assert "./" not in result
+
+
+@pytest.mark.asyncio
+async def test_grep_subdir_search_returns_project_relative_paths(tmp_path, monkeypatch):
+    _patch_file_service(monkeypatch, tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("target_token\n")
+    (tmp_path / "top.py").write_text("target_token\n")
+
+    result = await _grep_search(
+        "proj", "target_token", "src", output_mode="content",
+        flags={"-n": True}, head_limit=10, offset=0,
+    )
+    assert "src/a.py:1:target_token" in result
+    assert "top.py" not in result
+
+
+@pytest.mark.asyncio
+async def test_grep_absolute_path_returns_absolute_paths(tmp_path, monkeypatch):
+    _patch_file_service(monkeypatch, tmp_path)
+    (tmp_path / "a.py").write_text("target_token\n")
+
+    result = await _grep_search(
+        "proj", "target_token", str(tmp_path), output_mode="files_with_matches",
+        flags={}, head_limit=10, offset=0,
+    )
+    assert result.strip() == str(tmp_path / "a.py")
+
+
+@pytest.mark.asyncio
+async def test_grep_fallback_strips_dot_slash_prefix(tmp_path, monkeypatch):
+    """The grep fallback passes "." for the root search and must strip the
+    "./" prefixes grep echoes (rg is not involved in this path)."""
+    _patch_file_service(monkeypatch, tmp_path)
+    (tmp_path / "a.py").write_text("target_token\n")
+
+    result = await _grep_fallback(
+        "target_token", ".", str(tmp_path), "",
+        output_mode="content", case_insensitive=False,
+        context=0, after_context=0, before_context=0,
+        multiline=False, type_filter="",
+        head_limit=10, offset=0,
+    )
+    assert "a.py:1:target_token" in result
+    assert "./a.py" not in result
