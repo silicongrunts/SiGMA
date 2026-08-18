@@ -1,12 +1,14 @@
 import json
 import os
 import subprocess
+from pathlib import Path
 from urllib.parse import unquote
 
 import pytest
 
+import app.core.config as config_module
 import app.services.git_service as git_module
-from app.core.exceptions import FileMissingError
+from app.core.exceptions import FileMissingError, FileSystemError, ValidationError
 from app.services.git_service import GitService, SNAPSHOT_MESSAGE_PREFIX
 
 
@@ -207,3 +209,110 @@ def test_blob_falls_back_to_parent_for_file_deleted_in_commit(tmp_path):
 
     with pytest.raises(FileMissingError):
         service.get_blob(project_id, "不存在的文件.md", commit)
+
+
+def _init_real_repo(service: GitService, tmp_path, project_id="project1") -> Path:
+    """Create a real initialized repo under tmp_path and return its path."""
+    project_path = tmp_path / project_id
+    project_path.mkdir()
+    (project_path / "main.md").write_text("# Title\n", encoding="utf-8")
+    assert service.init_git(project_id) is True
+    return project_path
+
+
+def test_create_tag_rejects_invalid_names_before_running_git():
+    service = GitService()
+
+    def fail_run_git(*args, **kwargs):
+        raise AssertionError("validation must reject the name before git runs")
+
+    service._run_git = fail_run_git
+    invalid_names = [
+        "", "  ", "spa ce", "-option", "--force", "a..b", "v1.lock",
+        "a/b", "x" * 65, "尾部空白 ",
+    ]
+    for name in invalid_names:
+        with pytest.raises((ValidationError, FileSystemError)):
+            service.create_tag("p1", name, "0" * 40)
+
+    with pytest.raises(FileSystemError):
+        service.create_tag("p1", "valid-name", "not-a-hash!")
+
+
+@pytest.mark.timeout(30)
+def test_tag_crud_on_real_repo(tmp_path):
+    service = GitService()
+    service.USERDATA_DIR = tmp_path
+    project_id = "project1"
+    _init_real_repo(service, tmp_path, project_id)
+    head = service.get_log(project_id, 1)[0]["hash"]
+
+    assert service.list_tags(project_id) == []
+
+    created = service.create_tag(project_id, "milestone-1", head)
+    assert created == {"success": True, "name": "milestone-1", "commit": head}
+    assert [(t["name"], t["commit"], t["short_hash"]) for t in service.list_tags(project_id)] == [
+        ("milestone-1", head, head[:7]),
+    ]
+
+    with pytest.raises(FileSystemError) as exc_info:
+        service.create_tag(project_id, "milestone-1", head)
+    assert exc_info.value.code == "TAG_EXISTS"
+
+    assert service.delete_tag(project_id, "milestone-1") == {"success": True, "name": "milestone-1"}
+    assert service.list_tags(project_id) == []
+
+    with pytest.raises(FileSystemError) as exc_info:
+        service.delete_tag(project_id, "milestone-1")
+    assert exc_info.value.code == "TAG_NOT_FOUND"
+
+
+@pytest.mark.timeout(30)
+def test_create_snapshot_commit_commits_staged_changes_and_reports_clean_tree(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(config_module, "SIGMA_DIR", tmp_path / "locks")
+    service = GitService()
+    service.USERDATA_DIR = tmp_path
+    project_id = "project1"
+    project_path = _init_real_repo(service, tmp_path, project_id)
+
+    # init_git already committed everything — a clean tree reports no changes.
+    assert service.create_snapshot_commit(project_id)["success"] is False
+
+    (project_path / "main.md").write_text("# Title\n\nNew paragraph.\n", encoding="utf-8")
+    result = service.create_snapshot_commit(project_id)
+    assert result["success"] is True
+    head = service.get_log(project_id, 1)
+    assert head[0]["hash"].startswith(result["commit"])
+    assert head[0]["message"].startswith(SNAPSHOT_MESSAGE_PREFIX)
+
+    assert service.create_snapshot_commit(project_id)["success"] is False
+
+
+@pytest.mark.timeout(30)
+def test_commit_files_covers_non_adjacent_commit_range(tmp_path):
+    service = GitService()
+    service.USERDATA_DIR = tmp_path
+    project_id = "project1"
+    project_path = _init_real_repo(service, tmp_path, project_id)
+    c1 = service.get_log(project_id, 1)[0]["hash"]
+
+    (project_path / "notes.md").write_text("notes v1\n", encoding="utf-8")
+    service.create_snapshot_commit(project_id)
+    c2 = service.get_log(project_id, 1)[0]["hash"]
+
+    (project_path / "main.md").write_text("# Title (edited)\n", encoding="utf-8")
+    service.create_snapshot_commit(project_id)
+    c3 = service.get_log(project_id, 1)[0]["hash"]
+
+    # The c1..c3 range aggregates changes from both intermediate commits.
+    files = {f["path"]: f["status"] for f in service.get_commit_files(project_id, c3, parent_commit=c1)}
+    assert files == {"notes.md": "A", "main.md": "M"}
+
+    # An edit followed by a full revert cancels out of the net range diff.
+    (project_path / "main.md").write_text("# Title\n", encoding="utf-8")
+    service.create_snapshot_commit(project_id)
+    c4 = service.get_log(project_id, 1)[0]["hash"]
+    files = {f["path"]: f["status"] for f in service.get_commit_files(project_id, c4, parent_commit=c1)}
+    assert files == {"notes.md": "A"}

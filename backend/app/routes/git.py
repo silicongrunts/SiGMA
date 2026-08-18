@@ -1,6 +1,9 @@
+import asyncio
+
 from fastapi import APIRouter, Query
 from typing import Optional
 
+from app.models.requests import CreateTagRequest
 from app.services.git_service import git_service
 from app.core.downloads import download_headers
 from app.core.response import ok
@@ -77,3 +80,32 @@ async def get_snapshot(
         content=zip_bytes, media_type="application/zip",
         headers=download_headers(f"{project_id}_{commit[:7]}.zip"),
     )
+
+
+@router.post("/{project_id}/commit")
+async def manual_commit(project_id: str):
+    """Commit the current working tree now, bypassing the snapshot interval.
+
+    Unlike the auto-snapshot checks, this runs off the event loop: the
+    stage/diff/commit chain can spawn several git subprocesses.
+    """
+    result = await asyncio.to_thread(git_service.create_snapshot_commit, project_id)
+    return ok(result)
+
+
+@router.get("/{project_id}/tags")
+async def list_tags(project_id: str):
+    tags = git_service.list_tags(project_id)
+    return ok({"tags": tags})
+
+
+@router.post("/{project_id}/tags")
+async def create_tag(project_id: str, request: CreateTagRequest):
+    result = git_service.create_tag(project_id, request.name, request.commit)
+    return ok(result)
+
+
+@router.delete("/{project_id}/tags/{name}")
+async def delete_tag(project_id: str, name: str):
+    result = git_service.delete_tag(project_id, name)
+    return ok(result)

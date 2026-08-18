@@ -219,6 +219,14 @@ export default function EditorView() {
     }
   }, [handleSave])
 
+  // ── Save editor content before a manual snapshot commit ──
+  // Git only sees the working tree, so the history panel flushes the current
+  // buffer to disk first. Save failures toast inside handleSave; the commit
+  // then proceeds on the (possibly stale) disk state, which stays honest.
+  const saveBeforeCommit = useCallback(async () => {
+    await handleSave(false, false)
+  }, [handleSave])
+
   // ── Save editor content after applying an annotation diff ──
   // Save without compiling: applying a diff is an edit, not a build trigger.
   // handleSave also runs `syncAnnotationsNow`, which is the real reason we
@@ -624,7 +632,7 @@ export default function EditorView() {
             )}
             {activeTab === 'synthesis' && leftTab === 'git' && (
               <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
-                <HistoryPanel />
+                <HistoryPanel onBeforeCommit={saveBeforeCommit} />
               </div>
             )}
             <div className={`${activeTab !== 'synthesis' || leftTab === 'chat' ? 'flex' : 'hidden'} flex-1 min-h-0 flex-col overflow-hidden`}>

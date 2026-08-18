@@ -18,7 +18,6 @@ from app.core.logging import get_logger
 from app.core.utils import utcnow, parse_iso
 from app.services.git_service import git_service
 from app.database.unit_of_work import UnitOfWork
-from app.core.atomic_file import ProjectFileLock
 
 logger = get_logger(__name__)
 
@@ -122,15 +121,11 @@ class SnapshotService:
     def _auto_commit(self, project_id: str) -> None:
         """Stage all changes and commit (sync). Caller must guarantee config permits this."""
         try:
-            project_path = git_service.get_project_path(project_id)
-            with ProjectFileLock(project_path / ".git" / "index"):
-                git_service.stage_all(project_id)
-                message = git_service.build_staged_snapshot_message(project_id)
-                result = git_service.commit(project_id, message)
+            result = git_service.create_snapshot_commit(project_id)
             if result.get("success") is False:
                 logger.debug(f"Auto-snapshot skipped (nothing to commit) for {project_id}")
             else:
-                logger.info(f"Auto-snapshot created: {message} ({result.get('commit', '?')}) for {project_id}")
+                logger.info(f"Auto-snapshot committed for {project_id}: {result.get('commit', '?')}")
         except Exception as e:
             logger.warning("Auto-snapshot commit failed for %s: %s", project_id, e, exc_info=True)
 

@@ -56,14 +56,8 @@ class FakeGit:
     def get_project_path(self, project_id):
         return self._project_path
 
-    def stage_all(self, project_id):
-        pass
-
-    def build_staged_snapshot_message(self, project_id):
-        return "Auto-snapshot"
-
-    def commit(self, project_id, message):
-        self.commits.append(message)
+    def create_snapshot_commit(self, project_id):
+        self.commits.append("Auto-snapshot")
         return {"success": True, "commit": "fakehash"}
 
 

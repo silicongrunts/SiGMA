@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import tempfile
 import os
@@ -7,8 +8,9 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from app.core.exceptions import (
-    FileSystemError, ProjectNotFoundError, FileMissingError,
+    FileSystemError, ProjectNotFoundError, FileMissingError, ValidationError,
 )
+from app.core.atomic_file import ProjectFileLock
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.utils import is_within
@@ -27,6 +29,27 @@ SNAPSHOT_MESSAGE_PREFIX = "sigma:snapshot:v1:"
 # wherever the main TeX file lives, including subdirectories; this avoids any
 # wildcard that could clobber a user's source such as ``figures/*.pdf``.
 GITIGNORE_LATEX_OUTPUTS = ("output.pdf", "output.synctex.gz")
+
+# Tag names become positional git arguments, so a leading dash or option-like
+# value must be impossible. The whitelist (alphanumerics plus . _ -, no
+# slashes) also stays inside git's own refname rules; the extra checks reject
+# the remaining git-forbidden forms that the charset alone still allows.
+TAG_NAME_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$")
+
+
+def _validate_tag_name(name: str) -> str:
+    """Return the stripped tag name, or raise if git would reject it."""
+    name = name.strip()
+    if not TAG_NAME_PATTERN.match(name) or ".." in name or name.endswith(".lock"):
+        raise ValidationError(f"Invalid tag name: {name!r}")
+    return name
+
+
+def _validate_commit_hash(commit: str) -> str:
+    """Reject anything that is not a plain hex commit id (7-64 chars)."""
+    if not (7 <= len(commit) <= 64 and all(c in "0123456789abcdefABCDEF" for c in commit)):
+        raise FileSystemError("Invalid commit hash", code="INVALID_INPUT")
+    return commit
 
 
 class GitService:
@@ -102,6 +125,19 @@ class GitService:
             raise
         except Exception as e:
             raise FileSystemError(f"Stage all failed: {e}", code="INTERNAL_ERROR")
+
+    def create_snapshot_commit(self, project_id: str) -> Dict[str, Any]:
+        """Stage the working tree and commit it as one snapshot step.
+
+        Shared by auto-snapshot and the manual-commit route. The index lock
+        serializes overlapping callers (auto and manual, multiple tabs) so
+        staged changes and commit messages can never interleave.
+        """
+        project_path = self.get_project_path(project_id)
+        with ProjectFileLock(project_path / ".git" / "index"):
+            self.stage_all(project_id)
+            message = self.build_staged_snapshot_message(project_id)
+            return self.commit(project_id, message)
 
     def get_snapshot_zip(self, project_id: str, commit: str) -> bytes:
         """Get a ZIP archive of the project at a specific commit using git archive.
@@ -271,8 +307,7 @@ class GitService:
             fmt = "\n".join(fmt_lines)
             args = ["log", f"-n", str(limit), f"--pretty={fmt}"]
             if before:
-                if not (7 <= len(before) <= 64 and all(c in "0123456789abcdefABCDEF" for c in before)):
-                    raise FileSystemError("Invalid commit cursor", code="INVALID_INPUT")
+                _validate_commit_hash(before)
                 args.extend(["--skip=1", before])
             else:
                 args.append(f"--skip={offset}")
@@ -550,6 +585,53 @@ class GitService:
             commit = commits[0]["hash"]
             short_hash = commits[0]["short_hash"]
         return self.get_diff(project_id, path, commit, short_hash or commit[:7], parent_commit)
+
+    def list_tags(self, project_id: str) -> List[Dict[str, Any]]:
+        """List tags with the commit each one points at.
+
+        Only lightweight tags are created by this service, so ``%(objectname)``
+        is the commit hash directly — no annotated-tag peeling needed.
+        """
+        stdout, stderr, rc = self._run_git(project_id, [
+            "for-each-ref", "refs/tags",
+            "--format=%(refname:short)%09%(objectname)",
+        ])
+        if rc != 0:
+            raise FileSystemError(f"Failed to list tags: {stderr}", code="INTERNAL_ERROR")
+
+        tags = []
+        for line in stdout.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) != 2 or not parts[0].strip():
+                continue
+            commit_hash = parts[1].strip()
+            tags.append({
+                "name": parts[0].strip(),
+                "commit": commit_hash,
+                "short_hash": commit_hash[:7],
+            })
+        return tags
+
+    def create_tag(self, project_id: str, name: str, commit: str) -> Dict[str, Any]:
+        """Create a lightweight tag pointing at a commit."""
+        name = _validate_tag_name(name)
+        _validate_commit_hash(commit)
+        stdout, stderr, rc = self._run_git(project_id, ["tag", name, commit])
+        if rc != 0:
+            if "already exists" in stderr:
+                raise FileSystemError(f"Tag already exists: {name}", code="TAG_EXISTS", status_code=409)
+            raise FileSystemError(f"Failed to create tag: {stderr}", code="INTERNAL_ERROR")
+        return {"success": True, "name": name, "commit": commit}
+
+    def delete_tag(self, project_id: str, name: str) -> Dict[str, Any]:
+        """Delete a tag. Commits the tag pointed at are untouched."""
+        name = _validate_tag_name(name)
+        stdout, stderr, rc = self._run_git(project_id, ["tag", "-d", name])
+        if rc != 0:
+            if "not found" in stderr:
+                raise FileSystemError(f"Tag not found: {name}", code="TAG_NOT_FOUND", status_code=404)
+            raise FileSystemError(f"Failed to delete tag: {stderr}", code="INTERNAL_ERROR")
+        return {"success": True, "name": name}
 
 
 git_service = GitService()

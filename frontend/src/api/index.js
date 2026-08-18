@@ -402,6 +402,10 @@ export const gitsAPI = {
   snapshot: (projectId, commit) => {
     return `${API_BASE_URL}/git/${projectId}/snapshot?commit=${encodeURIComponent(commit)}`;
   },
+  commitNow: (projectId) => request(`/git/${projectId}/commit`, { method: 'POST' }),
+  tags: (projectId) => request(`/git/${projectId}/tags`),
+  createTag: (projectId, data) => request(`/git/${projectId}/tags`, { method: 'POST', body: JSON.stringify(data) }),
+  deleteTag: (projectId, name) => request(`/git/${projectId}/tags/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   downloadSnapshot: (projectId, commitHash) => fetch(
     `${API_BASE_URL}/git/${projectId}/snapshot?commit=${encodeURIComponent(commitHash)}`
   ).then(async r => {
