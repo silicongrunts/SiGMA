@@ -52,6 +52,21 @@ async def get_blob(
     return ok(result)
 
 
+@router.get("/{project_id}/blob-download")
+async def download_blob(
+    project_id: str,
+    path: str = Query(...),
+    commit: str = Query(...),
+):
+    """Download a file's content at a specific commit (binary, exempt from unified format)."""
+    from fastapi.responses import Response
+    result = git_service.get_blob_raw(project_id, path, commit)
+    return Response(
+        content=result["content"], media_type="application/octet-stream",
+        headers=download_headers(result["name"]),
+    )
+
+
 @router.get("/{project_id}/commit-files")
 async def get_commit_files(
     project_id: str,

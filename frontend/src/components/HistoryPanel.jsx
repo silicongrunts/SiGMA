@@ -18,7 +18,7 @@ import {
 const SNAPSHOT_MESSAGE_PREFIX = 'sigma:snapshot:v1:'
 const SNAPSHOT_CATEGORY_ORDER = ['added', 'deleted', 'modified']
 
-function formatCommitMessage(message, t) {
+export function formatCommitMessage(message, t) {
   if (message === 'Initial commit') return t('history.snapshot.initialCommit')
   if (message === 'Auto-snapshot') return t('history.snapshot.autoSnapshot')
   if (!message || !message.startsWith(SNAPSHOT_MESSAGE_PREFIX)) return message
@@ -767,7 +767,7 @@ function HistoryPanel({ onBeforeCommit }) {
 
 // Real local time plus a relative suffix; the year is dropped for commits
 // from the current calendar year (08-18 12:27:34 (1h ago)).
-function getCommitTime(dateStr, t) {
+export function getCommitTime(dateStr, t) {
   if (!dateStr || typeof dateStr !== 'string') return t('history.relativeUnknown')
   try {
     const date = new Date(dateStr)

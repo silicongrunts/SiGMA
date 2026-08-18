@@ -468,6 +468,31 @@ class GitService:
         except Exception as e:
             raise FileSystemError(f"Failed to read file: {e}", code="INTERNAL_ERROR")
 
+    def get_blob_raw(self, project_id: str, path: str, commit: str) -> Dict[str, Any]:
+        """Get raw file bytes at a commit, for download (binary-safe)."""
+        project_path = self.get_project_path(project_id)
+        full_path = project_path / path
+        if not is_within(full_path, project_path):
+            raise FileSystemError("Path traversal attempt detected", code="PERMISSION_DENIED", status_code=403)
+
+        try:
+            stdout, stderr, rc = self._run_git(project_id, [
+                "show", f"{commit}:{path}"
+            ], as_binary=True)
+            if rc != 0:
+                # A file deleted in this commit has no blob at `commit`; fall
+                # back to the parent so the pre-deletion version downloads.
+                stdout, stderr, rc = self._run_git(project_id, [
+                    "show", f"{commit}^:{path}"
+                ], as_binary=True)
+            if rc != 0:
+                raise FileMissingError(path)
+            return {"name": Path(path).name, "content": stdout}
+        except FileSystemError:
+            raise
+        except Exception as e:
+            raise FileSystemError(f"Failed to read file: {e}", code="INTERNAL_ERROR")
+
     def get_diff(self, project_id: str, path: str,
                   commit: str, short_hash: str,
                   parent_commit: Optional[str] = None) -> Dict[str, Any]:

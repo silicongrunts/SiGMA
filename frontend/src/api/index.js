@@ -399,6 +399,10 @@ export const gitsAPI = {
     const params = new URLSearchParams({ path: data.path, commit: data.commit });
     return request(`/git/${projectId}/blob?${params.toString()}`);
   },
+  blobDownload: (projectId, path, commit) => {
+    const params = new URLSearchParams({ path, commit });
+    return `${API_BASE_URL}/git/${projectId}/blob-download?${params.toString()}`;
+  },
   snapshot: (projectId, commit) => {
     return `${API_BASE_URL}/git/${projectId}/snapshot?commit=${encodeURIComponent(commit)}`;
   },

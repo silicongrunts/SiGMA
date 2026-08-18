@@ -5,11 +5,12 @@ import { filesAPI, projectsAPI } from '../api'
 import { storage } from '../utils/storage'
 import {
    File, FilePlus, FolderPlus, Upload, ChevronRight, ChevronDown,
-   FileText, FileCode, FolderOpen, Folder, Edit3, Trash2, Download, RefreshCw, Package
+   FileText, FileCode, FolderOpen, Folder, Edit3, Trash2, Download, RefreshCw, Package, History
 } from 'lucide-react'
 import { toastError, toastSuccess } from './Toast'
 import { InputModal, ConfirmModal, ConflictModal } from './Modal'
 import ContextMenu from './ContextMenu'
+import FileHistoryModal from './FileHistoryModal'
 import { Spinner, LoadingOverlay } from './ui'
 import { useTranslation } from 'react-i18next'
 
@@ -292,6 +293,7 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
   const [menu, setMenu] = useState(null)
   const [modal, setModal] = useState({ open: false, type: 'file', parent: '', initial: '', title: '' })
   const [confirmModal, setConfirmModal] = useState({ open: false, node: null })
+  const [fileHistoryModal, setFileHistoryModal] = useState(null)
   const [conflictModal, setConflictModal] = useState({ open: false, conflicts: [], entries: null, targetDir: '' })
   const [extracting, setExtracting] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -806,6 +808,11 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
         { separator: true },
       )
     }
+    if (node.type !== 'directory') {
+      options.push(
+        { label: t('filetree.viewHistory'), icon: <History className="w-4 h-4" />, action: () => setFileHistoryModal({ path: node.path }) },
+      )
+    }
     options.push(
       { label: t('common.rename'), icon: <Edit3 className="w-4 h-4" />, action: () => setModal({ open: true, mode: 'rename', node, initial: node.name, title: t('common.rename'), placeholder: t('filetree.renamePlaceholder'), icon: Edit3 }) },
       { label: t('common.download'), icon: <Download className="w-4 h-4" />, action: async () => {
@@ -957,6 +964,13 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
           : t('filetree.deleteSingleConfirm', { name: confirmModal.node?.name })
         }
         danger={true}
+      />
+
+      <FileHistoryModal
+        isOpen={!!fileHistoryModal}
+        onClose={() => setFileHistoryModal(null)}
+        projectId={currentProjectId}
+        path={fileHistoryModal?.path}
       />
 
       <ConflictModal

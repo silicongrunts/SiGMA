@@ -151,6 +151,33 @@ def test_commit_files_and_blob_return_real_non_ascii_paths(tmp_path):
 
 
 @pytest.mark.timeout(30)
+def test_blob_raw_returns_exact_bytes_for_text_and_binary(tmp_path):
+    service = GitService()
+    service.USERDATA_DIR = tmp_path
+    project_id = "project1"
+    project_path = tmp_path / project_id
+    project_path.mkdir()
+    text_bytes = "# 你好\n".encode("utf-8")
+    binary_bytes = bytes([0x00, 0xFF, 0x10, 0x42]) + b"\n"
+    (project_path / "doc.md").write_bytes(text_bytes)
+    (project_path / "img.bin").write_bytes(binary_bytes)
+
+    assert service.init_git(project_id) is True
+    commit = service.get_log(project_id, 1)[0]["hash"]
+
+    raw = service.get_blob_raw(project_id, "doc.md", commit)
+    assert raw["name"] == "doc.md"
+    assert raw["content"] == text_bytes
+
+    raw = service.get_blob_raw(project_id, "img.bin", commit)
+    assert raw["name"] == "img.bin"
+    assert raw["content"] == binary_bytes
+
+    with pytest.raises(FileMissingError):
+        service.get_blob_raw(project_id, "missing.md", commit)
+
+
+@pytest.mark.timeout(30)
 def test_commit_files_reports_renamed_non_ascii_file_as_modified(tmp_path):
     service = GitService()
     service.USERDATA_DIR = tmp_path
