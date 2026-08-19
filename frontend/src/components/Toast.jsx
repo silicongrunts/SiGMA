@@ -23,13 +23,16 @@ export function ToastContainer() {
   return (
     <div className="fixed top-8 right-8 z-[9999] flex flex-col gap-4 pointer-events-none">
       {toasts.map((toast) => (
-        <Toast key={toast.id} toast={toast} onRemove={() => removeToast(toast.id)} />
+        <Toast key={toast.id} toast={toast} removeToast={removeToast} />
       ))}
     </div>
   )
 }
 
-function Toast({ toast, onRemove }) {
+// removeToast must be the stable store action: an inline closure from the
+// container would change identity on every list update, re-running the timer
+// effect and making surviving toasts slide back in after each removal.
+function Toast({ toast, removeToast }) {
   const [visible, setVisible] = useState(false)
   const hideTimerRef = useRef(null)
 
@@ -37,14 +40,14 @@ function Toast({ toast, onRemove }) {
     const timer = setTimeout(() => setVisible(true), 10)
     const removeTimer = setTimeout(() => {
         setVisible(false)
-        hideTimerRef.current = setTimeout(onRemove, 400)
+        hideTimerRef.current = setTimeout(() => removeToast(toast.id), 400)
     }, 4000) // Increased display time to 4s
     return () => {
       clearTimeout(timer)
       clearTimeout(removeTimer)
       if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
     }
-  }, [onRemove])
+  }, [removeToast, toast.id])
 
   const icons = {
     success: <CheckCircle2 className="w-6 h-6 text-green-500" />,
@@ -69,7 +72,7 @@ function Toast({ toast, onRemove }) {
     >
       <div className="flex-shrink-0 drop-shadow-sm">{icons[toast.type]}</div>
       <div className="flex-1 text-base font-bold text-gray-900 dark:text-gray-100 tracking-tight">{toast.message}</div>
-      <button onClick={() => { setVisible(false); setTimeout(onRemove, 400); }} className="p-1.5 hover:bg-white/50 dark:hover:bg-gray-800/50 rounded-xl text-gray-500 dark:text-gray-400 transition-colors">
+      <button onClick={() => { setVisible(false); setTimeout(() => removeToast(toast.id), 400); }} className="p-1.5 hover:bg-white/50 dark:hover:bg-gray-800/50 rounded-xl text-gray-500 dark:text-gray-400 transition-colors">
         <X className="w-5 h-5" />
       </button>
     </div>
