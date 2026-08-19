@@ -90,6 +90,18 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     }
   }, [autoFocusReply])
 
+  // The popup instance survives switching to another annotation, but the diff
+  // panel, reply draft, and first-open auto-scroll belong to one thread —
+  // reset them whenever the annotation id changes. The pending→persisted id
+  // swap (annoIdRef handoff below) passes through here before any of that
+  // state can hold content, so it resets nothing.
+  useEffect(() => {
+    setExpandedDiff(null)
+    setReply('')
+    hasAutoScrolledRef.current = false
+    onClearHighlight?.()
+  }, [annotation.id, onClearHighlight])
+
   // Disconnect the popup's SSE subscription on unmount. The backend task keeps
   // running; data synchronization is owned by explicit open/recovery/terminal
   // paths rather than cleanup, so React dev-mode cleanup cannot duplicate reads.
