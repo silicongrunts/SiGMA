@@ -22,6 +22,7 @@ from app.core.task_status import (
 )
 from app.database.unit_of_work import UnitOfWork
 from app.services.file_service import file_service
+from app.services.project_service import project_service
 
 logger = get_logger(__name__)
 
@@ -154,13 +155,16 @@ class AnnotationService:
 
             # Re-fetch to include the message in the returned dict
             refreshed = await uow.annotations.get_by_id(annotation.id)
-            return serialize_annotation(refreshed) if refreshed else {
+            created = serialize_annotation(refreshed) if refreshed else {
                 "id": anno_id,
                 "from": from_pos,
                 "to": to_pos,
                 "originalText": original_text,
                 "success": True,
             }
+
+        project_service.touch_project(project_id)
+        return created
 
     async def save_annotations(
         self,
@@ -210,6 +214,7 @@ class AnnotationService:
                         role=role,
                         content=content,
                     )
+        project_service.touch_project(project_id)
         return {"success": True}
 
     async def reply_annotation(
@@ -239,6 +244,7 @@ class AnnotationService:
                 role=role,
                 content=content,
             )
+        project_service.touch_project(project_id)
         return {"success": True, "anno_id": anno_id}
 
     async def get_active_reply_task(
@@ -287,7 +293,10 @@ class AnnotationService:
         Returns (annotation_orm, error_message). One of them is None.
         """
         async with UnitOfWork(project_id) as uow:
-            return await uow.annotations.resolve(annotation_id)
+            resolved, error = await uow.annotations.resolve(annotation_id)
+        if error is None:
+            project_service.touch_project(project_id)
+        return resolved, error
 
     async def list_annotations_by_file(
         self, project_id: str, file_path: str
@@ -304,7 +313,10 @@ class AnnotationService:
         Returns (success: bool, error_message: str|None).
         """
         async with UnitOfWork(project_id) as uow:
-            return await uow.annotations.delete_by_id(annotation_id)
+            deleted, error = await uow.annotations.delete_by_id(annotation_id)
+        if deleted:
+            project_service.touch_project(project_id)
+        return deleted, error
 
     async def start_ai_reply_stream(
         self,

@@ -13,13 +13,13 @@ from app.services.file_service import file_service, PathAccessLevel
 @pytest.mark.asyncio
 async def test_write_absolute_inside_sandbox_triggers_snapshot(tmp_path, monkeypatch):
     """A write to an absolute path resolving inside the sandbox should
-    call _notify_snapshot for the owning project."""
+    call _after_file_mutation for the owning project."""
     triggered = []
 
     async def fake_notify(project_id):
         triggered.append(project_id)
 
-    monkeypatch.setattr(file_service, "_notify_snapshot", fake_notify)
+    monkeypatch.setattr(file_service, "_after_file_mutation", fake_notify)
     monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
 
     # classify_path will resolve to SANDBOX for any path under tmp_path
@@ -37,7 +37,7 @@ async def test_write_absolute_outside_sandbox_skips_snapshot(tmp_path, monkeypat
     async def fake_notify(project_id):
         triggered.append(project_id)
 
-    monkeypatch.setattr(file_service, "_notify_snapshot", fake_notify)
+    monkeypatch.setattr(file_service, "_after_file_mutation", fake_notify)
     monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
 
     # Path outside the project sandbox

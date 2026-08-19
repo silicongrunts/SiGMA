@@ -63,6 +63,9 @@ class NotebookService:
         # Sync atomic write is acceptable here: local FS, single-user, fast
         atomic_write_text(full_path, json.dumps(notebook, indent=1, ensure_ascii=False))
 
+        from app.services.project_service import project_service
+        project_service.touch_project(project_id)
+
         return {"success": True, "path": path}
 
     async def create_empty(self, project_id: str, path: str) -> dict:

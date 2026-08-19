@@ -18,6 +18,7 @@ from app.database.unit_of_work import UnitOfWork
 from app.core.config import settings
 from app.core.exceptions import RAGIndexModelMismatchError, DuplicateTitleError, ValidationError
 from app.core.logging import get_logger
+from app.services.project_service import project_service
 logger = get_logger(__name__)
 
 
@@ -158,6 +159,7 @@ class LibraryService:
             from app.services.background_task_service import background_task_service
             await background_task_service.enqueue_rag_index(project_id, doc.id)
 
+        project_service.touch_project(project_id)
         return doc.to_dict()
 
     async def update_document(self, project_id: str, doc_id: str, data: Dict) -> Optional[Dict]:
@@ -255,6 +257,7 @@ class LibraryService:
             from app.services.background_task_service import background_task_service
             await background_task_service.enqueue_rag_index(project_id, doc_id)
 
+        project_service.touch_project(project_id)
         return doc.to_dict()
 
     async def delete_document(self, project_id: str, doc_id: str) -> bool:
@@ -336,6 +339,8 @@ class LibraryService:
 
             await uow.library.delete(doc_id)
 
+        project_service.touch_project(project_id)
+
     async def _post_delete_cleanup(self, project_id: str):
         """Clean up orphan files and ChromaDB chunks after deletion."""
         async with UnitOfWork(project_id) as uow:
@@ -392,7 +397,9 @@ class LibraryService:
                 parent_id=parent_id,
                 processing_status=STATUS_COMPLETED,
             )
-            return folder.to_summary_dict()
+
+        project_service.touch_project(project_id)
+        return folder.to_summary_dict()
 
     async def move_items(self, project_id: str, ids: List[str],
                          target_folder_id: Optional[str]) -> Dict:
@@ -443,6 +450,7 @@ class LibraryService:
 
             moved = await uow.library.move_items(ids, target_folder_id)
 
+        project_service.touch_project(project_id)
         return {"success": True, "moved": moved}
 
     async def batch_delete(self, project_id: str, ids: List[str]) -> Dict:

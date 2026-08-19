@@ -82,7 +82,7 @@ def _service_for_project(tmp_path, project_id: str = "p1") -> FileService:
     service.get_project_path = lambda pid: project_path
     async def _noop_snapshot(pid, paths=None):
         return None
-    service._notify_snapshot = _noop_snapshot
+    service._after_file_mutation = _noop_snapshot
     return service
 
 

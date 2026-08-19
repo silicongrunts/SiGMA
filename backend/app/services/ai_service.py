@@ -26,6 +26,7 @@ from app.core.chat_attachments import (
     strip_internal_image_tags,
 )
 from app.services.query_loop import QueryLoop
+from app.services.project_service import project_service
 from app.database.unit_of_work import UnitOfWork
 from app.database.seq_utils import MAX_RETRIES, RETRY_DELAY
 from app.services.task_service import task_to_dict
@@ -313,6 +314,10 @@ class AIService:
 
         if not session_id:
             raise ValidationError("session_id is required for llm_chat tasks")
+
+        # A chat turn is project activity — refresh the list ordering timestamp.
+        project_service.touch_project(project_id)
+
         async with UnitOfWork(project_id) as uow:
             await uow.task_state.set_queued(
                 task_id,
@@ -387,6 +392,9 @@ class AIService:
             await uow.sessions.stage_touch(session_id)
 
         await UnitOfWork.execute_atomic(project_id, _operation)
+
+        # A chat turn is project activity — refresh the list ordering timestamp.
+        project_service.touch_project(project_id)
 
         async with UnitOfWork(project_id) as uow:
             await uow.task_state.delete_by_session(session_id)

@@ -10,7 +10,7 @@ async def noop_snapshot(project_id, paths=None):
 @pytest.mark.asyncio
 async def test_frontend_save_requires_hash_for_existing_file(tmp_path, monkeypatch):
     monkeypatch.setattr(file_service, "get_project_path", lambda project_id: tmp_path)
-    monkeypatch.setattr(file_service, "_notify_snapshot", noop_snapshot)
+    monkeypatch.setattr(file_service, "_after_file_mutation", noop_snapshot)
 
     path = tmp_path / "main.tex"
     path.write_text("disk version\n", encoding="utf-8")
@@ -29,7 +29,7 @@ async def test_frontend_save_requires_hash_for_existing_file(tmp_path, monkeypat
 @pytest.mark.asyncio
 async def test_frontend_save_conflicts_on_stale_hash(tmp_path, monkeypatch):
     monkeypatch.setattr(file_service, "get_project_path", lambda project_id: tmp_path)
-    monkeypatch.setattr(file_service, "_notify_snapshot", noop_snapshot)
+    monkeypatch.setattr(file_service, "_after_file_mutation", noop_snapshot)
 
     path = tmp_path / "main.tex"
     base_hash = file_service.compute_hash("base\n")
@@ -50,7 +50,7 @@ async def test_frontend_save_conflicts_on_stale_hash(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_tool_write_can_still_update_existing_file_without_hash(tmp_path, monkeypatch):
     monkeypatch.setattr(file_service, "get_project_path", lambda project_id: tmp_path)
-    monkeypatch.setattr(file_service, "_notify_snapshot", noop_snapshot)
+    monkeypatch.setattr(file_service, "_after_file_mutation", noop_snapshot)
 
     path = tmp_path / "main.tex"
     path.write_text("disk version\n", encoding="utf-8")

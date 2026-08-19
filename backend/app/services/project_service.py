@@ -360,6 +360,8 @@ class ProjectService:
                 "created": info.get("created"),
                 "modified": info.get("modified"),
             })
+        # Most recently modified first; projects without a timestamp last.
+        result.sort(key=lambda p: p.get("modified") or "", reverse=True)
         return result
 
     async def create_project(self, name: str, description: str = "", template: str = "latex") -> Dict[str, Any]:
@@ -864,6 +866,28 @@ class ProjectService:
         except Exception as exc:
             logger.warning("DB health check failed for %s: %s", project_id, exc, exc_info=True)
             return "error"
+
+    def touch_project(self, project_id: str) -> None:
+        """Bump the project's ``modified`` timestamp after a content change.
+
+        Called by content services (files, notebooks, chat, annotations,
+        library) so the project list ordering reflects real user activity.
+        Best-effort: a failed touch must never fail the content operation
+        behind it, so errors are logged and swallowed, and missing or
+        inactive projects are ignored without rewriting the index.
+        """
+        def _touch(projects):
+            entry = projects.get(project_id)
+            if isinstance(entry, dict) and self._status_of(entry) == PROJECT_STATUS_ACTIVE:
+                entry["modified"] = to_iso(utcnow())
+
+        try:
+            entry = self._get_project_entry(project_id)
+            if entry is None or self._status_of(entry) != PROJECT_STATUS_ACTIVE:
+                return
+            self._update_projects(_touch)
+        except Exception:
+            logger.warning("Failed to update modified time for project %s", project_id, exc_info=True)
 
     async def update_project(self, project_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
         json_updates = {k: v for k, v in updates.items()

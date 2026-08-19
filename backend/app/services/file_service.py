@@ -149,12 +149,16 @@ class FileService:
         # If the absolute path resolves inside the project sandbox, trigger
         # auto-snapshot so the edit is tracked.
         if self.classify_path(project_id, path) is PathAccessLevel.SANDBOX:
-            await self._notify_snapshot(project_id)
+            await self._after_file_mutation(project_id)
 
         return {"conflict": False, "hash": self.compute_hash(content)}
 
-    async def _notify_snapshot(self, project_id: str) -> None:
-        """Trigger auto-snapshot check after a file mutation."""
+    async def _after_file_mutation(self, project_id: str) -> None:
+        """Post-mutation bookkeeping: refresh the project's modified time
+        so the project list ordering tracks real activity, then trigger
+        the auto-snapshot check."""
+        from app.services.project_service import project_service
+        project_service.touch_project(project_id)
         try:
             await snapshot_service.maybe_snapshot(project_id)
         except Exception:
@@ -341,7 +345,7 @@ class FileService:
             full_path.parent.mkdir(parents=True, exist_ok=True)
             atomic_replace_bytes(full_path, content.encode('utf-8'))
 
-        await self._notify_snapshot(project_id)
+        await self._after_file_mutation(project_id)
         return {"conflict": False, "hash": self.compute_hash(content)}
 
     @staticmethod
@@ -390,7 +394,7 @@ class FileService:
                 atomic_write_text(full_path, json.dumps(empty_nb, indent=1))
             else:
                 full_path.touch()
-        await self._notify_snapshot(project_id)
+        await self._after_file_mutation(project_id)
 
     async def delete_item(self, project_id: str, path: str):
         root = self.get_project_path(project_id)
@@ -398,7 +402,7 @@ class FileService:
         if not full_path.exists(): raise FileMissingError(path)
         if full_path.is_dir(): shutil.rmtree(full_path)
         else: full_path.unlink()
-        await self._notify_snapshot(project_id)
+        await self._after_file_mutation(project_id)
 
     async def move_item(self, project_id: str, src_path: str, dest_path: str):
         root = self.get_project_path(project_id)
@@ -412,7 +416,7 @@ class FileService:
             raise FileAlreadyExistsError(src.name)
         if is_within(final_dest, src) and final_dest != src: raise FileSystemError("Cannot move into self", code="INVALID_REQUEST")
         shutil.move(str(src), str(final_dest))
-        await self._notify_snapshot(project_id)
+        await self._after_file_mutation(project_id)
 
     async def rename_item(self, project_id: str, old_path: str, new_name: str):
         self._validate_visible_name(new_name)
@@ -422,7 +426,7 @@ class FileService:
         if not old.exists(): raise FileMissingError(old_path)
         if new.exists(): raise FileAlreadyExistsError(new_name)
         old.rename(new)
-        await self._notify_snapshot(project_id)
+        await self._after_file_mutation(project_id)
 
     # ------------------------------------------------------------------
     # Upload / download
@@ -439,7 +443,7 @@ class FileService:
             atomic_write_bytes(dest_path, content, fail_if_exists=not overwrite)
         except AtomicFileExistsError:
             raise FileAlreadyExistsError(safe_name)
-        await self._notify_snapshot(project_id)
+        await self._after_file_mutation(project_id)
         return safe_name
 
     async def get_download_info(self, project_id: str, path: str) -> dict:
@@ -714,7 +718,7 @@ class FileService:
         else:
             raise FileSystemError(f"Unsupported archive format: {name}", code="INVALID_REQUEST")
 
-        await self._notify_snapshot(project_id)
+        await self._after_file_mutation(project_id)
         return {"extracted_to": target_dirname, "file_count": count}
 
 

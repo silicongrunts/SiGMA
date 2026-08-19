@@ -24,6 +24,7 @@ from app.core.exceptions import (
     DocumentNotFoundError, ServiceException, FileMissingError, LLMResponseError,
     DocumentConversionError, AIExtractionError, FileSystemError,
 )
+from app.services.project_service import project_service
 logger = get_logger(__name__)
 
 # Text file extensions that can be read directly
@@ -254,6 +255,8 @@ class DocumentProcessingService:
                 logger.error("Failed to upload file %s: %s", upload_file.filename, e, exc_info=True)
                 errors.append({"file": upload_file.filename or "unknown", "reason": str(e)})
 
+        if results:
+            project_service.touch_project(project_id)
         return {"documents": results, "errors": errors}
 
     @staticmethod
