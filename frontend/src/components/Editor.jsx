@@ -22,7 +22,8 @@ import { filesAPI } from '../api'
 import { getFontCss } from '../utils/editorFonts'
 import { getSchemeExtension } from '../utils/highlightSchemes'
 import { storage } from '../utils/storage'
-import { matchAnnotation, findAllOccurrences } from '../utils/annotationMatching'
+import { matchAnnotation } from '../utils/annotationMatching'
+import { findIndependentOccurrences } from '../utils/diffState'
 import { AnnotationPopup } from './Annotations'
 import ContextMenu from './ContextMenu'
 
@@ -686,15 +687,19 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     const afterText = diff.after ?? diff.afterText ?? ''
     const doc = view.state.doc.toString()
 
-    // Simple indexOf — before text is exact, no fuzzy matching needed
-    const idx = doc.indexOf(beforeText)
-    if (idx === -1) {
-      // before text no longer in file — mark annotation as modified
+    // Require a single independent match: occurrences nested inside the
+    // counterpart text don't count (e.g. reverting an insertion diff, where
+    // before is a prefix of the applied after text), and 2+ matches are
+    // ambiguous — refuse to edit either (same rule as the diff panel).
+    const occ = findIndependentOccurrences(doc, beforeText, afterText)
+    if (occ.length !== 1) {
+      // before text missing or ambiguous — mark annotation as modified
       setAnnotations(currentAnnotations.map(a =>
         a.id === annotationId ? { ...a, status: 'modified' } : a
       ))
       return
     }
+    const idx = occ[0]
 
     const matchFrom = idx
     const matchTo = idx + beforeText.length
@@ -744,12 +749,14 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   }, [setAnnotations, getDecorationPosition])
 
   /** Locate a unique diff text in the document and flash it (used by the
-   *  annotation diff panel's locate buttons). Scrolls only if off-screen. */
-  const handleLocateDiff = useCallback((text) => {
+   *  annotation diff panel's locate buttons). `counterpart` is the diff's
+   *  other text: matches nested inside it don't count (see
+   *  findIndependentOccurrences). Scrolls only if off-screen. */
+  const handleLocateDiff = useCallback((text, counterpart) => {
     const view = viewRef.current
     if (!view || !text) return false
     const doc = view.state.doc.toString()
-    const occ = findAllOccurrences(doc, text)
+    const occ = findIndependentOccurrences(doc, text, counterpart)
     if (occ.length !== 1) return false
     const from = occ[0]
     const to = from + text.length

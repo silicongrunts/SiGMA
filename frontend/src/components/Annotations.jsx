@@ -4,7 +4,7 @@ import { Send, X, User, Bot, Check, MessageSquarePlus, Trash2, RotateCw, RotateC
 import { filesAPI } from '../api'
 import { InlineDiffViewer } from './DiffViewer'
 import { SideBySideDiffViewer } from './DiffViewer'
-import { findAllOccurrences } from '../utils/annotationMatching'
+import { computeDiffState } from '../utils/diffState'
 import { useStore } from '../store/useStore'
 import { createSSEStreamParser } from '../utils/sse'
 import { ThinkingProcess } from './ChatShared'
@@ -672,18 +672,16 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   const isModified = annotation.status === 'modified' || annotation.status === 'fuzzy'
   const isOrphan = annotation.status === 'orphan'
 
-  // Resolve the expanded diff's state against the live document using unique
-  // matching (consistent with backend validate_diffs). Three outcomes:
-  //   • canApply  — before found exactly once, after absent  → not yet applied
-  //   • canRevert — after found exactly once, before absent  → already applied
-  //   • neither   — ambiguous / both present / neither present → no action
+  // Resolve the expanded diff's state against the live document. Shared with
+  // the inline diff buttons (computeDiffState) so both always agree:
+  //   • canApply  — before uniquely present, no applied copy yet
+  //   • canRevert — applied copy uniquely present (before may still occur
+  //                 nested inside it, e.g. insertion-style diffs)
+  //   • blocked   — notFound / multipleOriginal / multipleApplied (ambiguous
+  //                 or missing text: no safe action)
   const diffState = useMemo(() => {
-    if (!expandedDiff) return { canApply: false, canRevert: false }
-    const beforeOcc = findAllOccurrences(editorContent, expandedDiff.before)
-    const afterOcc = findAllOccurrences(editorContent, expandedDiff.after)
-    const canApply = beforeOcc.length === 1 && afterOcc.length === 0
-    const canRevert = beforeOcc.length === 0 && afterOcc.length === 1
-    return { canApply, canRevert }
+    if (!expandedDiff) return { canApply: false, canRevert: false, blockedReason: null }
+    return computeDiffState(editorContent, expandedDiff.before, expandedDiff.after)
   }, [expandedDiff, editorContent])
 
   const handleApplyDiffFromPanel = () => {
@@ -822,8 +820,6 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
                       annotation={annotation}
                       message={msg}
                       messageIndex={i}
-                      onApplyDiff={onApplyDiff}
-                      onDeleteAnnotation={onDelete}
                       onExpandDiff={setExpandedDiff}
                       expandedDiff={expandedDiff}
                       editorContent={editorContent}
@@ -909,8 +905,6 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
               canApply={diffState.canApply}
               canRevert={diffState.canRevert}
               onLocate={onLocateDiff}
-              onAccept={handleApplyDiffFromPanel}
-              onReject={closeDiffPanel}
             />
           </div>
           <div className="p-3 border-t border-gray-100 dark:border-gray-800 bg-gray-50 dark:bg-gray-800 flex gap-2 flex-shrink-0">
@@ -930,7 +924,11 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
               </button>
             ) : (
               <div className="flex-1 flex items-center justify-center gap-1 py-2 bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400 text-xs font-bold rounded-lg cursor-not-allowed select-none">
-                {t('annotations.originalNotFound')}
+                {diffState.blockedReason === 'multipleOriginal'
+                  ? t('annotations.multipleOriginal')
+                  : diffState.blockedReason === 'multipleApplied'
+                  ? t('annotations.multipleApplied')
+                  : t('annotations.originalNotFound')}
               </div>
             )}
             <button

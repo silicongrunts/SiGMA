@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { Crosshair } from 'lucide-react'
 import { MarkdownContent } from './ChatShared'
 import { intraLineDiff } from '../utils/intraLineDiff'
+import { computeDiffState } from '../utils/diffState'
 
 /**
  * Parse diff tags from text
@@ -53,11 +54,13 @@ export function parseDiffs(text) {
  *   • canRevert → Suggested (after) is uniquely in the doc (diff applied)
  * Clicking the button scrolls the editor to that match and flashes it.
  */
-export function SideBySideDiffViewer({ before, after, onAccept, onReject, canApply = false, canRevert = false, onLocate }) {
+export function SideBySideDiffViewer({ before, after, canApply = false, canRevert = false, onLocate }) {
   const { t } = useTranslation()
-  const locateBtn = (active, target) => (active && onLocate) ? (
+  // onLocate receives the text to locate plus its counterpart, so the editor
+  // can ignore matches nested inside the counterpart (see findIndependentOccurrences).
+  const locateBtn = (active, target, counterpart) => (active && onLocate) ? (
     <button
-      onClick={() => onLocate(target)}
+      onClick={() => onLocate(target, counterpart)}
       className="ml-1 p-0.5 rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
       title={t('annotations.locate')}
     >
@@ -84,11 +87,11 @@ export function SideBySideDiffViewer({ before, after, onAccept, onReject, canApp
       <div className="flex border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
         <div className="flex-1 flex items-center text-xs font-bold text-red-700 dark:text-red-300 py-1 px-3 bg-red-50 dark:bg-red-900/30 border-r border-gray-200 dark:border-gray-700">
           <span>{t('diff.original')}</span>
-          {locateBtn(canApply, before)}
+          {locateBtn(canApply, before, after)}
         </div>
         <div className="flex-1 flex items-center text-xs font-bold text-green-700 dark:text-green-300 py-1 px-3 bg-green-50 dark:bg-green-900/30">
           <span>{t('diff.suggested')}</span>
-          {locateBtn(canRevert, after)}
+          {locateBtn(canRevert, after, before)}
         </div>
       </div>
 
@@ -117,7 +120,7 @@ export function SideBySideDiffViewer({ before, after, onAccept, onReject, canApp
 /**
  * Diff Viewer with inline expansion - simplified to only show buttons
  */
-export function InlineDiffViewer({ annotation, message, messageIndex = 0, onApplyDiff, onDeleteAnnotation, onExpandDiff, expandedDiff, editorContent, projectId = null }) {
+export function InlineDiffViewer({ annotation, message, messageIndex = 0, onExpandDiff, expandedDiff, editorContent, projectId = null }) {
   // Use message.content if message is given, otherwise use annotation text.
   const textToParse = message?.content || annotation.text
   const { diffs, parts } = parseDiffs(textToParse)
@@ -155,7 +158,10 @@ export function InlineDiffViewer({ annotation, message, messageIndex = 0, onAppl
         const isExpanded = expandedDiff
           && expandedDiff.messageIndex === messageIndex
           && expandedDiff.diffIndex === part.diffIndex
-        const found = editorContent?.includes(diff.before)
+        // Mirror the side panel's state (computeDiffState) so button color and
+        // panel verdict never disagree: blue = applicable, green = already
+        // applied (restorable), gray = blocked (missing or ambiguous).
+        const { canApply, canRevert } = computeDiffState(editorContent, diff.before, diff.afterText)
 
         return (
           <div key={i} className="my-0.5">
@@ -163,12 +169,14 @@ export function InlineDiffViewer({ annotation, message, messageIndex = 0, onAppl
               <button
                 onClick={() => handleExpand(part.diffIndex)}
                 className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-bold rounded transition-colors ${
-                  found
+                  canApply
                     ? 'bg-blue-100 hover:bg-blue-200 text-blue-700 dark:bg-blue-900/30 dark:hover:bg-blue-800/50 dark:text-blue-300'
+                    : canRevert
+                    ? 'bg-green-100 hover:bg-green-200 text-green-700 dark:bg-green-900/30 dark:hover:bg-green-800/50 dark:text-green-300'
                     : 'bg-gray-100 hover:bg-gray-200 text-gray-400 line-through dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-500'
                 }`}
               >
-                {t('diff.viewChanges', { preview: diff.before.slice(0, 20) })}
+                {t(canRevert ? 'diff.alreadyChanged' : 'diff.viewChanges', { preview: diff.before.slice(0, 20) })}
               </button>
             ) : (
               <button
