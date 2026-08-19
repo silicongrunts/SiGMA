@@ -242,8 +242,11 @@ export default function SynthesisTab({
                   editorCursorRafRef.current = requestAnimationFrame(() => {
                     storage.setEditorCursor(projectId, currentFile, cursor)
                   })
-                  if (currentFile.endsWith('.md') && useStore.getState().mdSyncScroll) {
-                    previewRef.current?.highlightLine(cursor.line)
+                  if (currentFile.endsWith('.md')) {
+                    // Highlight always follows the cursor; the sync-scroll toggle
+                    // only gates preview scrolling (both scrollToLine and the
+                    // highlight's own bring-into-view nudge).
+                    previewRef.current?.highlightLine(cursor.line, { ensureVisible: useStore.getState().mdSyncScroll })
                   }
                 }}
                 onAnnoNavScroll={onAnnoNavScroll}

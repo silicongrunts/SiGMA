@@ -645,7 +645,9 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
       if (n >= to.srcLine) { container.scrollTop = toTop; return }
       container.scrollTop = fromTop + ((n - from.srcLine) / lineRange) * (toTop - fromTop)
     },
-    highlightLine: (line) => {
+    // ensureVisible=false (sync scroll off) updates the highlight without the
+    // minimal bring-into-view scroll, so the preview stays where the user left it.
+    highlightLine: (line, { ensureVisible = true } = {}) => {
       currentHighlightLineRef.current = line
       // Clear previous highlights
       for (const el of highlightedElsRef.current) el.classList.remove('md-highlight')
@@ -662,7 +664,7 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
           if (n >= block.startLine && n <= block.endLine) {
             block.el.classList.add('md-highlight')
             highlightedElsRef.current = [block.el]
-            scrollIntoViewMinimal(container, block.el)
+            if (ensureVisible) scrollIntoViewMinimal(container, block.el)
             return
           }
         }
@@ -706,7 +708,7 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
 
       target.classList.add('md-highlight')
       highlightedElsRef.current = [target]
-      scrollIntoViewMinimal(container, target)
+      if (ensureVisible) scrollIntoViewMinimal(container, target)
     }
   }))
 
