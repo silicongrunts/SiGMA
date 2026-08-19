@@ -11,9 +11,10 @@
  * Solution: lift math out of the raw markdown before marked runs, substitute a
  * plain-text placeholder that marked treats as ordinary text (no markdown chars
  * → no interpretation, no `<br>` because the placeholder has no newline), then
- * stitch the original math back into the rendered HTML string. The browser HTML
- * parser collapses the literal `\n` inside the restored text to whitespace, so
- * each math block becomes ONE text node — exactly what auto-render needs.
+ * stitch the original math back (HTML-escaped — see restoreMath) into the
+ * rendered HTML string. The browser HTML parser collapses the literal `\n`
+ * inside the restored text to whitespace, so each math block becomes ONE text
+ * node — exactly what auto-render needs.
  *
  * Used by both ChatShared.MarkdownContent and Preview's markdown path so the
  * two render math identically.
@@ -86,15 +87,33 @@ export function extractMath(markdown) {
   return { text: out, map, spans }
 }
 
+// Escape the characters that change meaning inside HTML text content. Only
+// these three matter here: " and ' are significant in attribute values, and
+// math is always stitched back into element text, never into an attribute.
+const HTML_TEXT_ESCAPE_RE = /[&<>]/g
+const HTML_TEXT_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;' }
+
+function escapeHtmlText(text) {
+  return text.replace(HTML_TEXT_ESCAPE_RE, ch => HTML_TEXT_ESCAPES[ch])
+}
+
 /**
  * Inverse of extractMath: substitute the original math fragments back into the
- * HTML string produced by marked.parse. Placeholders are replaced with the raw
- * math text (including its literal newlines, which the HTML parser collapses to
- * whitespace — keeping each block a single text node for KaTeX auto-render).
+ * HTML string produced by marked.parse. Math is stitched back HTML-escaped: a
+ * formula like `$n<n_{\min}(q)$` carries a bare `<` that the HTML tokenizer
+ * (DOMPurify's parse and the final innerHTML assignment alike) reads as a tag
+ * opening — the tokenizer then swallows the rest of the paragraph into an
+ * invisible bogus tag name, deleting user content. `&lt;`-style entities decode
+ * back to the exact original characters in the text node, so KaTeX auto-render
+ * still sees the formula verbatim, and display-math newlines still collapse to
+ * one text node as before.
  */
 export function restoreMath(html, map) {
   if (!html || !map) return html
-  return html.replace(PH_RE, (full, id) => map.get(id) ?? full)
+  return html.replace(PH_RE, (full, id) => {
+    const math = map.get(id)
+    return math != null ? escapeHtmlText(math) : full
+  })
 }
 
 /**
