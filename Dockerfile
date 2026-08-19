@@ -46,12 +46,12 @@ RUN python -m venv /opt/venv-sigma \
     # ("operator torchvision::nms does not exist").
     && if [ "${TORCH_VARIANT}" = "gpu" ]; then \
         /opt/venv-sigma/bin/pip install --no-cache-dir \
-            torch==2.11.0 torchvision==0.26.0; \
+            torch==2.13.0 torchvision==0.28.0; \
        else \
         /opt/venv-sigma/bin/pip install --no-cache-dir \
             --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple \
-            torch==2.11.0 torchvision==0.26.0; \
+            torch==2.13.0 torchvision==0.28.0; \
        fi \
     && /opt/venv-sigma/bin/pip install --no-cache-dir \
         -r /tmp/requirements-sigma.txt
