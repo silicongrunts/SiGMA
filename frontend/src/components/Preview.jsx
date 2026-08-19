@@ -126,7 +126,7 @@ function scrollIntoViewMinimal(container, el) {
   }
 }
 
-const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
+const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine }, ref) => {
   const { t } = useTranslation()
   const currentProjectId = useStore(state => state.currentProject?.id)
   const previewSource = useStore(state => state.previewSource)
@@ -506,6 +506,18 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
 
         if (token.type === 'space') continue
 
+        // DOMPurify can strip a raw-HTML token's rendering entirely (e.g. a
+        // literal <script> line in the source): the token counts in the lexer
+        // output but produces no DOM block, so the count validation below
+        // would fail and silently disable the whole block map. Sanitize the
+        // fragment with the same default config the render path uses and skip
+        // tokens that come back without a single element.
+        if (token.type === 'html') {
+          const probe = document.createElement('div')
+          probe.innerHTML = DOMPurify.sanitize(raw)
+          if (!probe.firstElementChild) continue
+        }
+
         const domEl = topIdx < domBlocks.length ? domBlocks[topIdx] : null
         topIdx += 1
 
@@ -803,6 +815,21 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
     return () => el?.removeEventListener('wheel', handleWheel)
   }, [handleWheel])
 
+  // Double-clicking a markdown block jumps the editor to the source lines that
+  // produced it — the reverse of scrollToLine. The block map records list
+  // blocks per <li> (a descendant of the top-level <ul>), so the entry is
+  // located by containment from the click target rather than by identity with
+  // the top-level element. Links are excluded: their click already navigates
+  // (in-app for data-sigma-path, new tab for external), so a double click must
+  // not also move the editor. Documents whose block map failed validation
+  // simply get no jump.
+  const handleProseDoubleClick = useCallback((e) => {
+    if (!onJumpToLine) return
+    if (e.target.closest?.('a')) return
+    const block = blockMapRef.current.find(b => b.el.contains(e.target))
+    if (block) onJumpToLine(block.startLine + 1)  // block map lines are 0-indexed, gotoLine is 1-indexed
+  }, [onJumpToLine])
+
   // Pure derivation — title and content share the same source (previewSource),
   // so they cannot disagree by construction.
   const displayTitle = (() => {
@@ -940,6 +967,7 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
                         e.preventDefault()
                         onOpenPath(anchor.getAttribute('data-sigma-path'))
                     }}
+                    onDoubleClick={handleProseDoubleClick}
                     dangerouslySetInnerHTML={{ __html: (() => {
                         const md = String(mdContent ?? '')
                         const { text, map } = extractMath(md)

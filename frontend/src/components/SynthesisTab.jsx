@@ -105,6 +105,17 @@ export default function SynthesisTab({
   const editorCursorRafRef = useRef(0)
   const previewScrollRafRef = useRef(0)
 
+  // Echo guard for the bidirectional markdown sync: a preview double-click
+  // jumps the editor via gotoLine, which fires the same onCursorChange /
+  // onLineChange callbacks a user-driven move would, so the editor→preview
+  // sync would scroll the very pane the user just clicked. Raised just before
+  // gotoLine and released by the next real user interaction with the editor
+  // pane (capture-phase handlers on it) — the only reliable release point,
+  // because CodeMirror performs its scrollIntoView scroll asynchronously,
+  // after focus, which one-shot flags and time windows cannot cover.
+  const mdEchoGuardRef = useRef(false)
+  const releaseMdEchoGuard = useCallback(() => { mdEchoGuardRef.current = false }, [])
+
   useEffect(() => {
     return () => {
       cancelAnimationFrame(editorScrollRafRef.current)
@@ -169,7 +180,7 @@ export default function SynthesisTab({
             </div>
           </div>
         ) : (
-          <div className="h-full flex flex-col min-h-0">
+          <div className="h-full flex flex-col min-h-0" onPointerDownCapture={releaseMdEchoGuard} onKeyDownCapture={releaseMdEchoGuard} onWheelCapture={releaseMdEchoGuard}>
             <div className="h-8 border-b border-gray-100 dark:border-gray-800 px-4 flex items-center justify-between bg-white dark:bg-gray-900 flex-shrink-0">
               <div className="flex items-center min-w-0">
                 <FileText className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 mr-2 flex-shrink-0" />
@@ -234,7 +245,7 @@ export default function SynthesisTab({
                   })
                 }}
                 onLineChange={(l) => {
-                  if (currentFile?.endsWith('.md') && useStore.getState().mdSyncScroll) previewRef.current?.scrollToLine(l)
+                  if (currentFile?.endsWith('.md') && useStore.getState().mdSyncScroll && !mdEchoGuardRef.current) previewRef.current?.scrollToLine(l)
                 }}
                 onCursorChange={(cursor) => {
                   if (!currentFile) return
@@ -243,10 +254,11 @@ export default function SynthesisTab({
                     storage.setEditorCursor(projectId, currentFile, cursor)
                   })
                   if (currentFile.endsWith('.md')) {
-                    // Highlight always follows the cursor; the sync-scroll toggle
-                    // only gates preview scrolling (both scrollToLine and the
-                    // highlight's own bring-into-view nudge).
-                    previewRef.current?.highlightLine(cursor.line, { ensureVisible: useStore.getState().mdSyncScroll })
+                    // Highlight always follows the cursor; the sync-scroll
+                    // toggle and the echo guard only gate preview scrolling
+                    // (both scrollToLine and the highlight's own
+                    // bring-into-view nudge).
+                    previewRef.current?.highlightLine(cursor.line, { ensureVisible: useStore.getState().mdSyncScroll && !mdEchoGuardRef.current })
                   }
                 }}
                 onAnnoNavScroll={onAnnoNavScroll}
@@ -297,7 +309,19 @@ export default function SynthesisTab({
             previewScrollRafRef.current = requestAnimationFrame(() => {
               storage.setPreviewScroll(projectId, previewPath, ratio)
             })
-          }} onOpenPath={onOpenPath} />
+          }} onOpenPath={onOpenPath} onJumpToLine={(line) => {
+            // Line numbers only mean something in the file the editor has
+            // open. Opening another text file keeps the old markdown preview
+            // on screen, so a mismatched jump is silently ignored. The
+            // sync-scroll toggle gates the jump too: with it off, the panes
+            // are decoupled and double clicks do nothing.
+            if (useStore.getState().previewSource.path !== currentFile) return
+            if (!useStore.getState().mdSyncScroll) return
+            editorRef.current?.whenReady?.().then(() => {
+              mdEchoGuardRef.current = true
+              editorRef.current?.gotoLine(line)
+            }).catch(() => {})
+          }} />
         </aside>
       )}
     </ResizablePanels>
