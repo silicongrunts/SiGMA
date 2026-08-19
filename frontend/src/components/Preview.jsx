@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useImperativeHandle, forwardRef, memo } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, useImperativeHandle, forwardRef, memo } from 'react'
 import { useTranslation } from 'react-i18next'
 import * as pdfjsLib from 'pdfjs-dist'
 import { Marked } from 'marked'
@@ -177,6 +177,11 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
   const highlightedElsRef = useRef([])
   const currentHighlightLineRef = useRef(null) // last highlightLine() arg, re-applied after block-map rebuild
   const restoredScrollKeyRef = useRef('')
+  // Markdown zoom anchor: the top-level prose block under the zoom's anchor
+  // point (viewport top for the toolbar buttons, cursor for Ctrl/Cmd+wheel)
+  // when the current zoom step started. Set by captureMdZoomAnchor, consumed
+  // and cleared by the zoomLevel layout effect below.
+  const mdZoomAnchorRef = useRef(null)
   const previewLoadTokenRef = useRef(0)
   // Imperative handle exposed by <PdfPreview> (scrollToPage / goToPage / etc).
   const pdfApiRef = useRef(null)
@@ -712,17 +717,85 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
     }
   }))
 
+  // ── Markdown zoom viewport anchoring ─────────────────────────────────
+  // Zoom reflows the whole document (fontSize on .prose), so the pixel offset
+  // of every block changes while scrollTop stays fixed — without anchoring
+  // the viewport lands on a random paragraph. The anchor point is captured
+  // BEFORE the new font-size applies (captureMdZoomAnchor) and the scroll
+  // position is restored AFTER the new layout is committed (the zoomLevel
+  // layout effect below). Ctrl/Cmd+wheel anchors the paragraph under the
+  // mouse (like PdfPreview's cursor-anchored zoom); the toolbar buttons have
+  // no content under the mouse and anchor the viewport top instead.
+
+  // Snapshot the anchor for `anchorClientY` (viewport-space Y from the wheel
+  // event; null = viewport top for the toolbar buttons): the first top-level
+  // prose block whose bottom edge reaches past that point, how far the point
+  // sits into that block, and the point's viewport-relative position to pin.
+  const captureMdZoomAnchor = useCallback((anchorClientY = null) => {
+    const container = containerRef.current
+    const prose = container?.querySelector('.prose')
+    if (!container || !prose) { mdZoomAnchorRef.current = null; return }
+    const cRect = container.getBoundingClientRect()
+    const anchorY = Math.max(cRect.top, Math.min(anchorClientY ?? cRect.top, cRect.bottom))
+    let el = null
+    for (const child of prose.children) {
+      if (child.getBoundingClientRect().bottom > anchorY + 1) { el = child; break }
+    }
+    if (!el) el = prose.lastElementChild
+    if (!el) { mdZoomAnchorRef.current = null; return }
+    const rect = el.getBoundingClientRect()
+    mdZoomAnchorRef.current = {
+      el,
+      viewportY: anchorY - cRect.top,
+      offsetInBlock: Math.max(0, anchorY - rect.top),
+      blockHeight: rect.height,
+    }
+  }, [])
+
+  // All zoom entry points (toolbar buttons, Ctrl/Cmd+wheel) funnel through
+  // here. zoomLevel is read from the store rather than the closure so bursts
+  // of wheel events never compute steps from a stale base.
+  const changeZoom = useCallback((delta, anchorClientY = null) => {
+    if (type === 'markdown') captureMdZoomAnchor(anchorClientY)
+    setZoomLevel(Math.max(0.2, Math.min(4, useStore.getState().zoomLevel + delta)))
+  }, [type, captureMdZoomAnchor, setZoomLevel])
+
   // Ctrl/Cmd + wheel zooms the preview. For PDF this is handled inside
-  // PdfPreview (cursor-anchored, drawing-delayed). For markdown it adjusts the
-  // font-size factor (zoomLevel) on this scroll container.
+  // PdfPreview (cursor-anchored, drawing-delayed); for markdown it delegates
+  // to changeZoom with the cursor position as the anchor.
   const handleWheel = useCallback((e) => {
     if (type !== 'markdown') return
     if (e.ctrlKey || e.metaKey) {
         e.preventDefault(); e.stopPropagation();
-        const delta = e.deltaY > 0 ? -0.1 : 0.1
-        setZoomLevel(Math.max(0.2, Math.min(4, zoomLevel + delta)))
+        changeZoom(e.deltaY > 0 ? -0.1 : 0.1, e.clientY)
     }
-  }, [type, zoomLevel, setZoomLevel])
+  }, [type, changeZoom])
+
+  // Pin the captured anchor point back to its viewport position once the new
+  // font-size is committed and layout reflects it (viewport top for buttons,
+  // cursor line for wheel). The intra-block offset is scaled by the block's
+  // own height change, so a point mid-way through a long paragraph stays
+  // mid-way even though wrapping shifted. Runs before paint, so the
+  // reposition is invisible; scrollBehavior is forced to auto because the
+  // container's scroll-smooth class would otherwise animate it.
+  const prevZoomRef = useRef(zoomLevel)
+  useLayoutEffect(() => {
+    const prev = prevZoomRef.current
+    prevZoomRef.current = zoomLevel
+    const anchor = mdZoomAnchorRef.current
+    mdZoomAnchorRef.current = null
+    if (type !== 'markdown' || zoomLevel === prev || !anchor) return
+    const { el, viewportY, offsetInBlock, blockHeight } = anchor
+    const container = containerRef.current
+    if (!container || !el.isConnected) return
+    const cRect = container.getBoundingClientRect()
+    const eRect = el.getBoundingClientRect()
+    const elTop = eRect.top - cRect.top + container.scrollTop
+    const scale = blockHeight > 0 ? eRect.height / blockHeight : 1
+    container.style.scrollBehavior = 'auto'
+    container.scrollTop = elTop + offsetInBlock * scale - viewportY
+    container.style.scrollBehavior = ''
+  }, [zoomLevel, type])
 
   useEffect(() => {
     const el = containerRef.current
@@ -808,8 +881,8 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath }, ref) => {
 
       <div className="absolute bottom-8 right-8 z-30 flex flex-col gap-2 opacity-0 group-hover:opacity-100 transition-all duration-300 transform translate-y-2 group-hover:translate-y-0">
         <div className="bg-white/90 dark:bg-gray-800/90 backdrop-blur-xl border border-gray-200 dark:border-gray-700 shadow-2xl rounded-2xl p-1.5 flex flex-col gap-1 text-gray-800 dark:text-gray-200">
-            <button onClick={() => setZoomLevel(Math.min(4, zoomLevel + 0.1))} className="p-2.5 hover:bg-blue-50 dark:hover:bg-sigma-600/20 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-sigma-400 rounded-xl transition-all shadow-sm"><ZoomIn className="w-5 h-5" /></button>
-            <button onClick={() => setZoomLevel(Math.max(0.2, zoomLevel - 0.1))} className="p-2.5 hover:bg-blue-50 dark:hover:bg-sigma-600/20 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-sigma-400 rounded-xl transition-all shadow-sm"><ZoomOut className="w-5 h-5" /></button>
+            <button onClick={() => changeZoom(0.1)} className="p-2.5 hover:bg-blue-50 dark:hover:bg-sigma-600/20 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-sigma-400 rounded-xl transition-all shadow-sm"><ZoomIn className="w-5 h-5" /></button>
+            <button onClick={() => changeZoom(-0.1)} className="p-2.5 hover:bg-blue-50 dark:hover:bg-sigma-600/20 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-sigma-400 rounded-xl transition-all shadow-sm"><ZoomOut className="w-5 h-5" /></button>
             {type === 'pdf' && <button onClick={() => setZoomLevel(1.0)} className="p-2.5 hover:bg-blue-50 dark:hover:bg-sigma-600/20 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-sigma-400 rounded-xl transition-all shadow-sm" title={t('preview.fitWidth')}><Maximize2 className="w-5 h-5" /></button>}
             <div className="h-px bg-gray-100 dark:bg-gray-700 mx-2 my-1" />
             <button onClick={() => {
