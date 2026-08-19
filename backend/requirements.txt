@@ -7,7 +7,7 @@ fastapi==0.115.0
 uvicorn[standard]==0.32.0
 pydantic==2.13.3
 PyYAML==6.0.3
-python-multipart==0.0.12
+python-multipart==0.0.32
 aiofiles==24.1.0
 httpx==0.28.1
 websockets==14.1
@@ -39,10 +39,10 @@ numpy==2.4.4
 onnxruntime==1.25.1
 
 # LLM proxy
-litellm==1.81.16
+litellm==1.84.10
 
 # PDF processing
-docling==2.92.0
+docling==2.94.0
 modelscope==1.35.3
 
 # Database / migrations

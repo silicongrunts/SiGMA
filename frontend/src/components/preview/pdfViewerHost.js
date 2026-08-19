@@ -1,5 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist'
-import { PDFViewer, PDFLinkService, EventBus, LinkTarget } from 'pdfjs-dist/web/pdf_viewer.js'
+import { PDFViewer, PDFLinkService, EventBus, LinkTarget } from 'pdfjs-dist/web/pdf_viewer.mjs'
 
 // Path to pdf.js annotation/image icons, served from the bundle root.
 // cmaps and standard fonts are served by the vite pdfjsAssetsPlugin.
