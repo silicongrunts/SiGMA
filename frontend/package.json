@@ -45,7 +45,7 @@
     "lucide-react": "^0.300.0",
     "marked": "^11.1.1",
     "marked-highlight": "^2.2.4",
-    "pdfjs-dist": "^5.7.284",
+    "pdfjs-dist": "^6.2.108",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-i18next": "^17.0.8",
