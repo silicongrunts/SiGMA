@@ -10,6 +10,7 @@ from sqlalchemy import select, delete as sql_delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
+from app.core.utils import generate_id
 from app.database.models import Message
 from app.database.seq_utils import allocate_seq_with_retry, stage_seq_object
 
@@ -117,6 +118,51 @@ class MessageRepository:
             token_count=token_count, cached_tokens=cached_tokens,
             input_tokens=input_tokens, is_boundary=is_boundary,
         )
+
+    async def stage_copy_messages(
+        self,
+        messages: List[Message],
+        dst_session_id: str,
+        rewrite_pairs: List[Tuple[str, str]] | None = None,
+    ) -> List[Message]:
+        """Stage copies of the given rows under a new session, uncommitted.
+
+        Each copied row gets a fresh id and keeps the source seq (order and
+        compaction-boundary references stay valid in the destination session,
+        which is expected to be empty). ``rewrite_pairs`` applies plain
+        substring replacements to ``content``, ``tool_calls``, and
+        ``reasoning_content`` so session paths and agent session ids can be
+        remapped to the fork — reasoning is replayed to the LLM too, so it
+        must not keep pointing at the source session.
+        """
+        copies = []
+        for msg in messages:
+            content = msg.content or ""
+            tool_calls = msg.tool_calls
+            reasoning_content = msg.reasoning_content
+            for old, new in rewrite_pairs or []:
+                content = content.replace(old, new)
+                if tool_calls:
+                    tool_calls = tool_calls.replace(old, new)
+                if reasoning_content:
+                    reasoning_content = reasoning_content.replace(old, new)
+            copies.append(Message(
+                id=generate_id(),
+                session_id=dst_session_id,
+                role=msg.role,
+                content=content,
+                tool_calls=tool_calls,
+                tool_call_id=msg.tool_call_id,
+                reasoning_content=reasoning_content,
+                token_count=msg.token_count,
+                cached_tokens=msg.cached_tokens,
+                input_tokens=msg.input_tokens,
+                is_boundary=msg.is_boundary,
+                seq=msg.seq,
+                created_at=msg.created_at,
+            ))
+        self._session.add_all(copies)
+        return copies
 
     # ------------------------------------------------------------------
     # Read

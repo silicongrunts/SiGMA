@@ -11,7 +11,7 @@ from typing import AsyncGenerator, Dict, Any
 
 from sqlalchemy.exc import OperationalError
 
-from app.core.exceptions import TaskActiveError, SkillError, ValidationError
+from app.core.exceptions import SessionNotFoundError, TaskActiveError, SkillError, ValidationError
 from app.core.logging import get_logger
 from app.core.utils import generate_id, utcnow
 from app.core.task_status import (
@@ -43,6 +43,57 @@ PLAN_STATUS_INSTRUCTION = (
     "<system>IMPORTANT: The user requires planning precede execution. You **must call the plan agent** to "
     "create an implementation plan before proceeding.</system>"
 )
+
+
+def _resolve_fork_cutoff(messages: list, message_id: str) -> int:
+    """Return the seq up to which a fork copies messages (rows ordered by seq).
+
+    Forking from a user message copies that message and everything before it.
+    Forking from an assistant message copies its whole turn — through the last
+    row before the next user message — so tool calls stay paired with their
+    results and the copied prefix remains valid LLM history.
+    """
+    index = next((i for i, m in enumerate(messages) if m.id == message_id), None)
+    if index is None:
+        raise ValidationError(f"Message not found in this session: {message_id}")
+    target = messages[index]
+    if target.role not in ("user", "assistant"):
+        raise ValidationError("Fork is only allowed on user or assistant messages")
+    cutoff_seq = target.seq
+    if target.role == "assistant":
+        for msg in messages[index + 1:]:
+            if msg.role == "user":
+                break
+            cutoff_seq = msg.seq
+    return cutoff_seq
+
+
+def _collect_referenced_agent_ids(copied_messages: list, agent_session_ids: list) -> list:
+    """Filter agent session ids referenced by the copied message prefix.
+
+    An agent session is referenced when its id appears in a copied message's
+    content (the ``<resume_id>`` tag of a tool result) or tool_calls (the
+    resume_id argument of an Agent call). Agents spawned after the fork point
+    leave no reference in the prefix and are correctly left behind.
+    """
+    referenced = []
+    for agent_id in agent_session_ids:
+        for msg in copied_messages:
+            if agent_id in (msg.content or "") or agent_id in (msg.tool_calls or ""):
+                referenced.append(agent_id)
+                break
+    return referenced
+
+
+def _build_fork_rewrite_pairs(session_id_map: Dict[str, str]) -> list:
+    """Build substring rewrites that remap copied messages onto the fork.
+
+    Each mapped id is replaced verbatim. That single rule covers both
+    ``<resume_id>`` tags and tool-call arguments, and temp-storage path
+    prefixes as well — every ``.SiGMA/sessions/<id>/...`` path contains
+    the id itself, so no separate path rewrite is needed.
+    """
+    return list(session_id_map.items())
 
 
 class AIService:
@@ -91,18 +142,121 @@ class AIService:
                 await uow.sessions.update(session_id, **fields)
 
     async def delete_session(self, project_id: str, session_id: str) -> None:
-        """Delete a session and all its children, plus associated task state."""
+        """Delete a session, its agent children, their task state, and temp storage."""
         async with UnitOfWork(project_id) as uow:
+            # Descendants must be collected before the rows are deleted —
+            # their temp dirs need cleanup too, not just the root session's.
+            session_ids = await uow.sessions.collect_descendant_session_ids(session_id)
             await uow.sessions.delete(session_id)
             await uow.task_state.delete_by_session(session_id)
-        try:
-            session_temp_service.delete_session_dir(project_id, session_id)
-        except Exception:
-            logger.debug(
-                "Failed to delete session temporary storage for session %s",
-                session_id,
-                exc_info=True,
+        for sid in session_ids:
+            try:
+                session_temp_service.delete_session_dir(project_id, sid)
+            except Exception:
+                logger.debug(
+                    "Failed to delete session temporary storage for session %s",
+                    sid,
+                    exc_info=True,
+                )
+
+    async def fork_session(
+        self, project_id: str, session_id: str, message_id: str, title: str = "",
+    ) -> Dict:
+        """Create a new session copying everything up to and including a message.
+
+        Read-only with respect to the source session: it copies the message
+        prefix (attachment paths and resume_id references rewritten to the
+        fork) plus the agent sub-sessions that prefix references. Tasks,
+        runtime task state, and messages after the fork point are not copied.
+        """
+        async with UnitOfWork(project_id) as uow:
+            source = await uow.sessions.get_by_id(session_id)
+            if source is None:
+                raise SessionNotFoundError(session_id)
+            if source.session_kind != "chat":
+                raise ValidationError("Only chat sessions can be forked")
+            messages = await uow.messages.get_messages(session_id)
+            cutoff_seq = _resolve_fork_cutoff(messages, message_id)
+            copied_messages = [m for m in messages if m.seq <= cutoff_seq]
+            if not copied_messages:
+                raise ValidationError("Fork point precedes the first message")
+
+            descendant_ids = await uow.sessions.collect_descendant_session_ids(session_id)
+            agent_ids = [sid for sid in descendant_ids if sid != session_id]
+            referenced_ids = _collect_referenced_agent_ids(copied_messages, agent_ids)
+            agent_sessions = {}
+            for sid in referenced_ids:
+                agent = await uow.sessions.get_by_id(sid)
+                if agent is not None:  # deleted concurrently — drop it
+                    agent_sessions[sid] = agent
+            agent_messages = {
+                sid: await uow.messages.get_messages(sid) for sid in agent_sessions
+            }
+            fork_title = title or source.title
+
+        new_parent_id = generate_id()
+        session_id_map = {session_id: new_parent_id}
+        session_id_map.update(
+            {sid: generate_id() for sid in agent_sessions}
+        )
+        rewrite_pairs = _build_fork_rewrite_pairs(session_id_map)
+
+        async def _operation(uow):
+            await uow.sessions.stage_create(
+                project_id, session_id=new_parent_id, title=fork_title,
             )
+            for sid, agent in agent_sessions.items():
+                await uow.sessions.stage_create(
+                    project_id,
+                    session_id=session_id_map[sid],
+                    title=agent.title,
+                    session_kind=agent.session_kind,
+                    agent_type=agent.agent_type,
+                    parent_session_id=new_parent_id,
+                    parent_tool_call_id=agent.parent_tool_call_id,
+                )
+            await uow.messages.stage_copy_messages(
+                copied_messages, new_parent_id, rewrite_pairs,
+            )
+            for sid, msgs in agent_messages.items():
+                await uow.messages.stage_copy_messages(
+                    msgs, session_id_map[sid], rewrite_pairs,
+                )
+
+        try:
+            # Copy temp storage (attachments, caches) before committing rows
+            # so the paths referenced by rewritten messages already exist on
+            # disk. Inside the try so a mid-copy failure still runs the
+            # cleanup below instead of leaking half-copied directories.
+            for old_id, new_id in session_id_map.items():
+                session_temp_service.copy_session_dir(project_id, old_id, new_id)
+            await UnitOfWork.execute_atomic(project_id, _operation)
+        except Exception:
+            # Best-effort cleanup: a failed fork must not leave orphan rows or
+            # directories behind. Cleanup failures are tolerated (a leftover
+            # invisible row/dir is harmless and the user can retry the fork).
+            logger.warning("Fork of session %s failed; cleaning up", session_id, exc_info=True)
+            try:
+                async with UnitOfWork(project_id) as uow:
+                    await uow.sessions.delete(new_parent_id)
+            except Exception:
+                logger.warning(
+                    "Fork row cleanup failed for session %s", new_parent_id, exc_info=True,
+                )
+            for new_id in session_id_map.values():
+                try:
+                    session_temp_service.delete_session_dir(project_id, new_id)
+                except Exception:
+                    logger.warning(
+                        "Fork temp cleanup failed for session %s", new_id, exc_info=True,
+                    )
+            raise
+
+        async with UnitOfWork(project_id) as uow:
+            forked = await uow.sessions.get_by_id(new_parent_id)
+            if forked is None:
+                raise SessionNotFoundError(new_parent_id)
+            return forked.to_dict()
 
     async def generate_title(self, project_id: str, session_id: str) -> str:
         """Generate a title for a session based on its first exchange."""

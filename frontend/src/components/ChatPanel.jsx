@@ -9,7 +9,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { MarkdownContent, ThinkingProcess } from './ChatShared'
-import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2 } from 'lucide-react'
+import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2, GitBranch } from 'lucide-react'
 import { toastError, toastSuccess } from './Toast'
 import { ModalOverlay, ConfirmModal } from './Modal'
 import Toggle from './Toggle'
@@ -1242,6 +1242,17 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
     } catch (e) { toastError(t('chat.toast.createFailed')) }
   }
 
+  // Fork the session starting from message m: the new session receives m and
+  // everything before it, then becomes the active session.
+  async function forkFromMessage(m) {
+    const forkTitle = sessionTitle ? t('chat.forkTitlePrefix') + sessionTitle : ''
+    try {
+      const s = await chatAPI.forkSession(projectId, sessionId, m.id, forkTitle)
+      setShowDropdown(false)
+      switchToSession(s.id)
+    } catch (e) { toastError(t('chat.toast.forkFailed')) }
+  }
+
   // /clear: delete the current session and create a fresh one in its place.
   // Unlike confirmDeleteSession (which prefers a remaining sibling), clear
   // always starts a blank session.
@@ -2272,6 +2283,11 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
                     <button onClick={() => copyMessage(m)} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800" title={t('chat.copy')}>
                       {copiedMessageId === m.id ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3" />}
                     </button>
+                    {m.id && m.role === 'SiGMA' && !isStreaming && !awaiting && (
+                      <button onClick={() => forkFromMessage(m)} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800" title={t('chat.fork')}>
+                        <GitBranch className="w-3 h-3" />
+                      </button>
+                    )}
                     {m.role === 'user' && m.can_edit && !isStreaming && !awaiting && (
                       <button onClick={() => startEditMessage(m)} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800" title={t('common.edit')}>
                         <Pencil className="w-3 h-3" />

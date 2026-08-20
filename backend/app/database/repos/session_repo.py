@@ -10,7 +10,7 @@ from sqlalchemy import select, update, delete as sql_delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Session, Message, Task, TaskState
-from app.core.utils import utcnow
+from app.core.utils import generate_id, utcnow
 
 
 class SessionRepository:
@@ -38,6 +38,36 @@ class SessionRepository:
         self._session.add(db_session)
         await self._session.commit()
         await self._session.refresh(db_session)
+        return db_session
+
+    async def stage_create(
+        self,
+        project_id: str,
+        *,
+        session_id: str = "",
+        title: str = "",
+        session_kind: str = "chat",
+        agent_type: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+        parent_tool_call_id: Optional[str] = None,
+    ) -> Session:
+        """Stage a new session row without committing.
+
+        ``session_id`` may be supplied explicitly so callers can prepare
+        dependent state (files, id rewrites) before the atomic commit; the
+        ORM default id generator fills it otherwise. Unlike ``create``, no
+        Untitled fallback title is generated — the caller owns the title.
+        """
+        db_session = Session(
+            id=session_id or generate_id(),
+            project_id=project_id,
+            title=title,
+            session_kind=session_kind,
+            agent_type=agent_type,
+            parent_session_id=parent_session_id,
+            parent_tool_call_id=parent_tool_call_id,
+        )
+        self._session.add(db_session)
         return db_session
 
     async def get_by_id(self, session_id: str) -> Optional[Session]:
@@ -86,7 +116,7 @@ class SessionRepository:
         if root is None:
             return False
 
-        session_ids = await self._collect_descendant_session_ids(session_id)
+        session_ids = await self.collect_descendant_session_ids(session_id)
 
         # Delete children first.  This is explicit instead of relying on ORM/DB
         # cascades so async bulk deletes behave consistently across SQLite and
@@ -108,7 +138,7 @@ class SessionRepository:
         await self._session.commit()
         return True
 
-    async def _collect_descendant_session_ids(self, session_id: str) -> list[str]:
+    async def collect_descendant_session_ids(self, session_id: str) -> list[str]:
         """Return session_id plus all descendant agent sessions, children first."""
         ordered = [session_id]
         frontier = [session_id]

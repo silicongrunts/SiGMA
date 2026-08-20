@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.models.requests import EditChatMessageRequest, StreamChatRequest, UpdateSessionRequest
+from app.models.requests import EditChatMessageRequest, ForkSessionRequest, StreamChatRequest, UpdateSessionRequest
 from app.routes import chat
 
 
@@ -136,3 +136,29 @@ async def test_edit_chat_message_passes_replace_request(monkeypatch):
         "message": "replacement",
         "context": {"user_state": None, "attachments": [], "token_budget": 50},
     }
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_fork_session_passes_message_and_returns_session(monkeypatch):
+    calls = {}
+
+    async def fork_session(project_id, session_id, message_id, title=""):
+        calls["fork"] = (project_id, session_id, message_id, title)
+        return {"id": "fork-1", "title": "Forked"}
+
+    monkeypatch.setattr(
+        chat,
+        "ai_service",
+        SimpleNamespace(fork_session=fork_session),
+    )
+
+    result = await chat.fork_session(
+        "project-1",
+        "session-1",
+        ForkSessionRequest(message_id="msg-1", title="Forked"),
+    )
+
+    assert result["success"] is True
+    assert result["data"] == {"id": "fork-1", "title": "Forked"}
+    assert calls["fork"] == ("project-1", "session-1", "msg-1", "Forked")

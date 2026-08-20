@@ -40,6 +40,12 @@ class UpdateSessionRequest(BaseModel):
     is_archived: Optional[bool] = None
 
 
+class ForkSessionRequest(BaseModel):
+    """Request body for POST /chat/sessions/{project_id}/{session_id}/fork."""
+    message_id: str = Field(..., min_length=1)
+    title: str = Field("", max_length=500)
+
+
 # ---------------------------------------------------------------------------
 # Library
 # ---------------------------------------------------------------------------

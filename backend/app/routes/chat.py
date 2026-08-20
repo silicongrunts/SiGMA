@@ -4,7 +4,7 @@ from fastapi.responses import StreamingResponse
 from app.services.ai_service import ai_service
 from app.services.chat_attachments import save_chat_image
 from app.services.project_service import project_service
-from app.models.requests import StreamChatRequest, UpdateSessionRequest, EditChatMessageRequest, SkillLoadRequest
+from app.models.requests import StreamChatRequest, UpdateSessionRequest, EditChatMessageRequest, SkillLoadRequest, ForkSessionRequest
 from app.core.response import ok
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -149,6 +149,15 @@ async def delete_session(project_id: str, session_id: str):
     """Delete a session and all its messages."""
     await ai_service.delete_session(project_id, session_id)
     return ok(None)
+
+
+@router.post("/sessions/{project_id}/{session_id}/fork")
+async def fork_session(project_id: str, session_id: str, data: ForkSessionRequest):
+    """Create a new session copying everything up to and including a message."""
+    session = await ai_service.fork_session(
+        project_id, session_id, data.message_id, title=data.title,
+    )
+    return ok(session)
 
 
 @router.post("/sessions/{project_id}/{session_id}/generate-title")

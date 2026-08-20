@@ -43,6 +43,19 @@ class SessionTempService:
             return
         shutil.rmtree(target)
 
+    def copy_session_dir(self, project_id: str, src_session_id: str, dst_session_id: str) -> None:
+        """Copy one session's temp storage onto another session's directory.
+
+        No-op when the source has no directory yet (e.g. a session that never
+        received attachments). Existing files at the destination are kept, so
+        the call is idempotent for re-runs after a partial failure.
+        """
+        src = self.session_dir(project_id, src_session_id)
+        if not src.is_dir():
+            return
+        dst = self.ensure_session_dir(project_id, dst_session_id)
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+
     def ensure_child_dir(self, project_id: str, session_id: str, *parts: str) -> Path:
         root = self.ensure_session_dir(project_id, session_id)
         target = root.joinpath(*parts).resolve()

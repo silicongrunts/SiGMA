@@ -354,6 +354,13 @@ export const chatAPI = {
   deleteSession: (projectId, sessionId) =>
     request(`/chat/sessions/${projectId}/${sessionId}`, { method: 'DELETE' }),
 
+  /** Fork a session from a message: copy it and everything before it */
+  forkSession: (projectId, sessionId, messageId, title = '') =>
+    request(`/chat/sessions/${projectId}/${sessionId}/fork`, {
+      method: 'POST',
+      body: JSON.stringify({ message_id: messageId, title }),
+    }),
+
   /** Generate a title for a session using AI */
   generateTitle: (projectId, sessionId) =>
     request(`/chat/sessions/${projectId}/${sessionId}/generate-title`, { method: 'POST' }),
