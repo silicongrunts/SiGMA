@@ -372,18 +372,17 @@ class SettingsCheckService:
     # -----------------------------------------------------------------------
 
     def _check_required_fields(self, cfg: Settings) -> list[str]:
-        """Return a list of human-readable missing-field descriptions."""
+        """Return a list of human-readable missing-field descriptions.
+
+        Only the supervisor model is required. Optional roles (ra, vision,
+        draw, embedding, rerank) are never hard requirements: ``_should_skip``
+        reports them as "Not configured" when their model name is empty, even
+        if a provider was selected but left half-configured.
+        """
         missing = []
         supervisor = cfg.model_settings_for_role("supervisor")
         if not supervisor.model:
             missing.append("supervisor model")
-
-        # Draw, embedding, rerank are optional — only flag if provider is set
-        # but model is empty
-        for role in ("draw", "embedding", "rerank"):
-            ms = getattr(cfg.models, role, None)
-            if ms and ms.provider and not ms.model and not ms.reuse:
-                missing.append(f"{role} model")
 
         return missing
 

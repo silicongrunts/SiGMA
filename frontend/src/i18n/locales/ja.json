@@ -442,6 +442,7 @@
   "system.configureIndependently": "個別に設定",
   "system.provider": "プロバイダー",
   "system.providerLocal": "ローカル / モデルプレフィックス",
+  "system.providerNone": "未設定",
   "system.baseUrl": "Base URL",
   "system.baseUrlPlaceholder": "非公式エンドポイントのみ。通常 /v1 で終わります。末尾の / は不要",
   "system.apiKey": "API Key",

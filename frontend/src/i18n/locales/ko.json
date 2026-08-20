@@ -441,6 +441,7 @@
   "system.configureIndependently": "독립적으로 구성",
   "system.provider": "제공자",
   "system.providerLocal": "로컬 / 모델 접두사",
+  "system.providerNone": "미설정",
   "system.baseUrl": "Base URL",
   "system.baseUrlPlaceholder": "비공식 엔드포인트 전용, 일반적으로 /v1로 끝남, 후행 / 없음",
   "system.apiKey": "API Key",

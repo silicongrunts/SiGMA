@@ -441,6 +441,7 @@
   "system.configureIndependently": "独立配置",
   "system.provider": "提供商",
   "system.providerLocal": "本地 / 模型前缀",
+  "system.providerNone": "未配置",
   "system.baseUrl": "Base URL",
   "system.baseUrlPlaceholder": "仅用于非官方端点，通常以 /v1 结尾，不含尾部 /",
   "system.apiKey": "API Key",

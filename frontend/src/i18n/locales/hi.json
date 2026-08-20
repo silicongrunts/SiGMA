@@ -441,6 +441,7 @@
   "system.configureIndependently": "स्वतंत्र रूप से कॉन्फ़िगर करें",
   "system.provider": "प्रदाता",
   "system.providerLocal": "स्थानीय / मॉडल प्रीफिक्स",
+  "system.providerNone": "कॉन्फ़िगर नहीं",
   "system.baseUrl": "Base URL",
   "system.baseUrlPlaceholder": "केवल गैर-आधिकारिक एंडपॉइंट के लिए, आमतौर पर /v1 के साथ समाप्त, कोई अनुवर्ती / नहीं",
   "system.apiKey": "API Key",

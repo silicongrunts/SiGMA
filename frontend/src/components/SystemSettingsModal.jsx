@@ -489,10 +489,14 @@ function ModelRoleForm({
 
   const handleProviderChange = (nextProvider) => {
     if (nextProvider === '') {
-      // Switching to Local: clear cloud-only fields
+      // Empty option is Local for embedding/rerank and Not configured for
+      // other roles; either way the cloud-only fields are cleared.
       onChange(['models', role, 'provider'], '')
       onChange(['models', role, 'api_key'], '')
       onChange(['models', role, 'base_url'], '')
+      // Roles without local weights have no valid provider-less config;
+      // "not configured" also clears the model name so the role is skipped.
+      if (!canLocal) onChange(['models', role, 'model'], '')
       return
     }
     if (!roleConfig.provider) {
@@ -570,6 +574,7 @@ function ModelRoleForm({
               className="w-full appearance-none px-3 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg outline-none focus:ring-4 focus:ring-sigma-600/10 focus:border-sigma-600 text-sm"
             >
               {canLocal && <option value="">{t('system.providerLocal')}</option>}
+              {!canLocal && <option value="">{t('system.providerNone')}</option>}
               {roleProviders.map(provider => <option key={provider} value={provider}>{provider}</option>)}
             </select>
             <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />

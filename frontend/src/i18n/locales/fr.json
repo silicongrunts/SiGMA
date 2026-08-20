@@ -441,6 +441,7 @@
   "system.configureIndependently": "Configurer indépendamment",
   "system.provider": "Fournisseur",
   "system.providerLocal": "Local / préfixe de modèle",
+  "system.providerNone": "Non configuré",
   "system.baseUrl": "Base URL",
   "system.baseUrlPlaceholder": "Uniquement pour les points de terminaison non officiels, se terminant généralement par /v1, sans / final",
   "system.apiKey": "API Key",
