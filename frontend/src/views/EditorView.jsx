@@ -88,6 +88,14 @@ export default function EditorView() {
   const activeTab = useStore(s => s.activeTab)
   const showTerminal = useStore(s => s.showTerminal)
 
+  // ── Browser title: "<project name> - SiGMA"; restore on unmount ──
+  const projectName = currentProject?.name
+  useEffect(() => {
+    if (!projectName) return
+    document.title = `${projectName} - SiGMA`
+    return () => { document.title = 'SiGMA' }
+  }, [projectName])
+
   // ── LibraryActions context for Header ↔ LibraryBrowser ──
   const [libraryActions, setLibraryActions] = useState({
     onRefresh: null,
