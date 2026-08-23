@@ -199,7 +199,7 @@ function PermissionPrompt({
           ) : content && (
             <div>
               <div className="text-[10px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-1.5">{isNotebook ? t('permission.code') : t('permission.content')}</div>
-              <pre className="bg-gray-900 text-gray-100 rounded-xl px-4 py-3 text-xs font-mono leading-relaxed whitespace-pre-wrap break-all max-h-64 overflow-y-auto">
+              <pre className="bg-gray-900 text-gray-100 rounded-xl px-4 py-3 text-xs font-mono leading-relaxed whitespace-pre-wrap break-all max-h-[50vh] overflow-y-auto">
                 {content}
               </pre>
             </div>

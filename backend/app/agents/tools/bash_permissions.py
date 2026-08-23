@@ -122,7 +122,7 @@ def _needs_approval(
 ) -> BashPermissionResult:
     """Create a result indicating the command needs user approval."""
     if not content:
-        content = command[:800]
+        content = command
     if not path:
         path = _base_command(command)
     return BashPermissionResult(

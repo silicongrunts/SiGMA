@@ -237,7 +237,7 @@ async def _check_bash(
         tool_name="bash",
         path=result.path,
         operation=result.operation or "execute",
-        content=result.content or command[:800],
+        content=result.content or command,
         description=description,
     )
 
@@ -281,7 +281,7 @@ async def _check_notebook_run(
         tool_name="notebook_run_cell",
         path=notebook_path,
         operation="execute code in",
-        content=code[:2000] if code else f"(cell {cell_id})",
+        content=code or f"(cell {cell_id})",
     )
 
 
@@ -340,7 +340,7 @@ async def _check_write(
         tool_name=tool_name,
         path=target_path,
         operation=operation,
-        content=content[:2000] if content else "",
+        content=content or "",
         diff_lines=diff_lines,
         diff_truncated=diff_truncated,
     )

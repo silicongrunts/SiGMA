@@ -141,6 +141,22 @@ async def test_bash_non_readonly_raises_permission_pause():
 
 
 @pytest.mark.asyncio
+async def test_bash_pause_carries_full_command_as_content():
+    """The approval dialog must show the whole command: what the user reviews
+    is what gets executed, so content is never truncated for display."""
+    tool_def = _make_tool_def(is_read_only=False)
+    long_command = "python script.py " + " ".join(f"--opt{i}" for i in range(200))
+    with patch.object(permission_executor, "check_bash_permission",
+                      return_value=_BashResult(False, "needs approval")), \
+         _auto_approve_patch("p", {"bash": False}):
+        with pytest.raises(PermissionRequestPause) as exc_info:
+            await permission_executor.execute_with_permission(
+                "bash", {"command": long_command}, tool_def, project_id="p",
+            )
+    assert exc_info.value.content == long_command
+
+
+@pytest.mark.asyncio
 async def test_bash_empty_command_skips_check():
     """Empty command path is a degenerate case — no check, proceed to call."""
     tool_def = _make_tool_def(is_read_only=False)
@@ -175,6 +191,29 @@ async def test_notebook_run_reads_cell_source_as_content():
             )
     assert exc_info.value.tool == "notebook"
     assert "print('hi')" in exc_info.value.content
+
+
+@pytest.mark.asyncio
+async def test_notebook_run_pause_carries_full_cell_source():
+    """Cell source shown for approval must be complete, not a preview cut —
+    the user approves exactly the code that will run."""
+    tool_def = _make_tool_def(is_read_only=False)
+    long_source = "x = 1\n" + "y = 2\n" * 500
+    fake_notebook = {"cells": [{"id": "c1", "cell_type": "code",
+                                "source": [long_source]}]}
+    fake_location = MagicMock()
+    with patch("app.agents.tools.notebook_utils.read_notebook_json",
+               new=AsyncMock(return_value=(fake_notebook, fake_location))), \
+         patch("app.agents.tools.notebook_utils.find_cell_index",
+               return_value=0), \
+         _auto_approve_patch("p", {"notebook": False}):
+        with pytest.raises(PermissionRequestPause) as exc_info:
+            await permission_executor.execute_with_permission(
+                "notebook_run_cell",
+                {"notebook_path": "nb.ipynb", "cell_id": "c1"},
+                tool_def, project_id="p",
+            )
+    assert exc_info.value.content == long_source
 
 
 @pytest.mark.asyncio
@@ -242,6 +281,23 @@ async def test_write_outside_sandbox_raises_pause_with_external_category():
             )
     assert exc_info.value.tool == "file_external"
     assert exc_info.value.path == "/home/x.txt"
+
+
+@pytest.mark.asyncio
+async def test_write_pause_carries_full_content():
+    """Write content shown for approval must be complete: the user approves
+    exactly the bytes that will land on disk."""
+    tool_def = _make_tool_def(is_read_only=False)
+    long_content = "# report\n" + "data line\n" * 500
+    with patch.object(permission_executor.file_service, "check_write_allowed",
+                      return_value=PathAccessLevel.EXTERNAL), \
+         _auto_approve_patch("p", {"file_external": False}):
+        with pytest.raises(PermissionRequestPause) as exc_info:
+            await permission_executor.execute_with_permission(
+                "write", {"file_path": "/home/x.txt", "content": long_content},
+                tool_def, project_id="p",
+            )
+    assert exc_info.value.content == long_content
 
 
 @pytest.mark.asyncio
