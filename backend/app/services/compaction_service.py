@@ -123,8 +123,14 @@ class CompactionService:
         )
 
     def count_tokens_fallback(self, text: str) -> int:
-        """Count tokens with the project standard tokenizer."""
-        return len(self._encoding.encode(text or ""))
+        """Count tokens with the project standard tokenizer.
+
+        Text arriving here is untrusted model/tool output, which can contain
+        literal special tokens (e.g. "<|endoftext|>" from experiment datasets).
+        tiktoken refuses to encode those by default, so treat them as plain
+        text instead of crashing token estimation.
+        """
+        return len(self._encoding.encode(text or "", disallowed_special=()))
 
     def estimate_messages_tokens(
         self,

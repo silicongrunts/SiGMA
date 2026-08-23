@@ -389,3 +389,26 @@ def test_incremental_stats_has_correct_budget_fields(monkeypatch):
     assert d["max_context_length"] == 100_000
     assert d["compact_threshold"] == 80_000
     assert d["current_tokens"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Special-token safety (regression: literal "<|endoftext|>" in model/tool
+# output crashed token estimation and killed running chat tasks)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.regression
+def test_count_tokens_fallback_encodes_special_tokens_as_text():
+    """Literal special tokens must be counted, not rejected by tiktoken."""
+    assert compaction_service.count_tokens_fallback("done<|endoftext|>next") > 0
+    assert compaction_service.count_tokens_fallback("<|endofprompt|>") > 0
+    assert compaction_service.count_tokens_fallback("") == 0
+
+
+@pytest.mark.regression
+def test_estimate_messages_tokens_survives_special_tokens():
+    """Full estimation path over tool output containing special tokens."""
+    messages = [
+        {"role": "tool", "content": "experiment output <|endoftext|> tail"},
+        {"role": "assistant", "content": "summary <|endofprompt|> done"},
+    ]
+    assert compaction_service.estimate_messages_tokens(messages) > 0

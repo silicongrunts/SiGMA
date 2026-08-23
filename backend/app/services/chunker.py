@@ -27,14 +27,17 @@ def _get_encoding():
     return _encoding
 
 
+# Ingested documents regularly contain literal special tokens (e.g.
+# "<|endoftext|>" in LLM datasets); encode them as plain text instead of
+# raising tiktoken's ValueError.
 def count_content_units(text: str) -> int:
     """Count real tokens via tiktoken o200k_base."""
-    return len(_get_encoding().encode(text))
+    return len(_get_encoding().encode(text, disallowed_special=()))
 
 
 def custom_tokenizer(text: str) -> list:
     """Return token ID list (for SentenceSplitter tokenizer param)."""
-    return _get_encoding().encode(text)
+    return _get_encoding().encode(text, disallowed_special=())
 
 
 class SmartChunker:

@@ -686,7 +686,7 @@ class DocumentProcessingService:
         try:
             from app.services.chunker import _get_encoding
             encoding = _get_encoding()
-            tokens = encoding.encode(content)
+            tokens = encoding.encode(content, disallowed_special=())
             if len(tokens) <= max_tokens:
                 return content
             return encoding.decode(tokens[:max_tokens])
