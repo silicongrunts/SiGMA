@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict
 
@@ -99,10 +100,16 @@ class ProjectFileLock:
     lock file is deleted on release.
 
     Uses exclusive (blocking) lock so only one writer/reader at a time.
+    With ``timeout`` set, acquisition polls non-blockingly up to the deadline
+    and raises ``TimeoutError`` instead of blocking a thread forever — a
+    stuck previous holder must not wedge every later caller.
     """
 
-    def __init__(self, data_file: Path):
+    _POLL_INTERVAL_SEC = 0.1
+
+    def __init__(self, data_file: Path, timeout: float | None = None):
         self._data_file = data_file.resolve()
+        self._timeout = timeout
         lock_name = hashlib.sha256(str(self._data_file).encode()).hexdigest() + ".lock"
         sigma_dir = settings.SIGMA_DIR
         sigma_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +118,22 @@ class ProjectFileLock:
 
     def __enter__(self):
         self._fd = open(self._lock_path, "w")
-        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        deadline = None if self._timeout is None else time.monotonic() + self._timeout
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if deadline is None:
+                    fcntl.flock(self._fd, fcntl.LOCK_EX)
+                    break
+                if time.monotonic() >= deadline:
+                    self._fd.close()
+                    self._fd = None
+                    raise TimeoutError(
+                        f"File lock busy after {self._timeout}s: {self._data_file}"
+                    )
+                time.sleep(self._POLL_INTERVAL_SEC)
         return self
 
     def __exit__(self, _exc_type, _exc_val, _exc_tb):

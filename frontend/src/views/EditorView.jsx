@@ -19,6 +19,7 @@ import FileTree from '../components/FileTree'
 import HistoryPanel from '../components/HistoryPanel'
 import SynthesisTab from '../components/SynthesisTab'
 import ChatPanel from '../components/ChatPanel'
+import SnapshotHealthBanner from '../components/SnapshotHealthBanner'
 import BrowserVNC from '../components/BrowserVNC'
 import LibraryBrowser from '../components/LibraryBrowser'
 import AskUserQuestionModal from '../components/AskUserQuestionModal'
@@ -618,6 +619,8 @@ export default function EditorView() {
           onShowLogs={() => setShowLogModal(true)}
           onSave={handleSave}
         />
+
+        <SnapshotHealthBanner projectId={projectId} />
 
         <ResizablePanels
           key={projectId}

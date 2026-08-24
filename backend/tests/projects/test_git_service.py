@@ -1,6 +1,5 @@
 import json
 import os
-import subprocess
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -48,7 +47,7 @@ def test_commit_treats_no_changes_stdout_as_noop():
     service = GitService()
     calls = []
 
-    def fake_run_git(project_id, args, as_binary=False):
+    def fake_run_git(project_id, args, as_binary=False, timeout=None):
         calls.append(args)
         if args[:2] == ["config", "user.name"]:
             return "", "", 0
@@ -106,15 +105,15 @@ def test_snapshot_zip_uses_temp_file_outside_project_and_cleans_up(tmp_path, mon
         fd = os.open(archive_path, os.O_CREAT | os.O_RDWR)
         return fd, str(archive_path)
 
-    def fake_run(args, capture_output, timeout):
-        output_path = args[args.index("--output") + 1]
+    def fake_graceful_run(cmd, timeout):
+        output_path = cmd[cmd.index("--output") + 1]
         seen_output_paths.append(output_path)
         with open(output_path, "wb") as archive:
             archive.write(b"zip-data")
-        return subprocess.CompletedProcess(args, 0, b"", b"")
+        return b"", b"", 0
 
     monkeypatch.setattr(git_module.tempfile, "mkstemp", fake_mkstemp)
-    monkeypatch.setattr(git_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(git_module, "_run_subprocess_with_grace", fake_graceful_run)
 
     assert service.get_snapshot_zip("project1", "HEAD") == b"zip-data"
     assert seen_output_paths == [str(archive_path)]
@@ -192,7 +191,7 @@ def test_commit_files_reports_renamed_non_ascii_file_as_modified(tmp_path):
     parent = service.get_log(project_id, 1)[0]["hash"]
 
     (project_path / old_name).rename(project_path / new_name)
-    service.stage_all(project_id)
+    service._run_git_add(project_id, ["add", "-A"])
     message = service.build_staged_snapshot_message(project_id)
     assert service.commit(project_id, message)["success"] is True
 
@@ -220,7 +219,7 @@ def test_blob_falls_back_to_parent_for_file_deleted_in_commit(tmp_path):
     parent = service.get_log(project_id, 1)[0]["hash"]
 
     (project_path / chinese_name).unlink()
-    service.stage_all(project_id)
+    service._run_git_add(project_id, ["add", "-A"])
     assert service.commit(project_id, "delete file")["success"] is True
     commit = service.get_log(project_id, 1)[0]["hash"]
 

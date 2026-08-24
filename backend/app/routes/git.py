@@ -5,6 +5,7 @@ from typing import Optional
 
 from app.models.requests import CreateTagRequest
 from app.services.git_service import git_service
+from app.services.snapshot_service import snapshot_service
 from app.core.downloads import download_headers
 from app.core.response import ok
 
@@ -101,11 +102,25 @@ async def get_snapshot(
 async def manual_commit(project_id: str):
     """Commit the current working tree now, bypassing the snapshot interval.
 
-    Unlike the auto-snapshot checks, this runs off the event loop: the
-    stage/diff/commit chain can spawn several git subprocesses.
+    Outcome logging and health recording live in the service's worker thread
+    so a cancelled HTTP request can never swallow a snapshot failure.
     """
-    result = await asyncio.to_thread(git_service.create_snapshot_commit, project_id)
+    result = await snapshot_service.commit_now(project_id)
     return ok(result)
+
+
+@router.get("/{project_id}/health")
+async def snapshot_health(project_id: str):
+    """Snapshot protection health (last outcome, consecutive failures)."""
+    return ok(await snapshot_service.get_health(project_id))
+
+
+@router.post("/{project_id}/repair")
+async def repair_snapshot(project_id: str):
+    """Clear a stale git lock and retry the snapshot immediately."""
+    heal = await asyncio.to_thread(git_service.heal_stale_lock, project_id)
+    commit = await snapshot_service.commit_now(project_id)
+    return ok({"lock_removed": heal["lock_removed"], "commit": commit})
 
 
 @router.get("/{project_id}/tags")

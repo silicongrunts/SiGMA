@@ -90,6 +90,13 @@ async def startup_event():
     except Exception as e:
         logger.warning("Failed to initialize RAG service: %s", e, exc_info=True)
 
+    # ---- Git repo upkeep (stale index locks, generated .gitignore rules) ----
+    from app.services.git_service import git_service
+    try:
+        await asyncio.to_thread(git_service.startup_maintenance)
+    except Exception as e:
+        logger.warning("Git startup maintenance failed: %s", e, exc_info=True)
+
     # ---- Index builder ----
     from app.services.index_builder import index_builder
     index_builder.start()

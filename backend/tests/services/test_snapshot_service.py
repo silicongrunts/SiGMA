@@ -11,6 +11,8 @@ deduplicated per project, re-armed for new commit windows, and released on
 completion and shutdown (no task accumulation); a real-git end-to-end run.
 """
 
+import os
+import time
 from datetime import timedelta
 
 import pytest
@@ -56,7 +58,7 @@ class FakeGit:
     def get_project_path(self, project_id):
         return self._project_path
 
-    def create_snapshot_commit(self, project_id):
+    def create_snapshot_commit(self, project_id, defer_unstable=False):
         self.commits.append("Auto-snapshot")
         return {"success": True, "commit": "fakehash"}
 
@@ -203,6 +205,10 @@ async def test_trailing_snapshot_commits_real_repo_after_interval(
     assert service.init_git(project_id) is True  # creates the first commit
 
     (project_dir / "notes.md").write_text("v2 - final burst\n", encoding="utf-8")
+    # Auto snapshots defer while files are still fresh; settle the edit so
+    # the trailing fire finds a stable worktree and commits it.
+    settled = time.time() - 3600
+    os.utime(project_dir / "notes.md", (settled, settled))
     backdated = utcnow() - timedelta(seconds=59.95)
 
     class BackdatedGit:

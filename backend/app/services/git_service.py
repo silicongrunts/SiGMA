@@ -1,8 +1,10 @@
 import json
+import os
 import re
+import signal
 import subprocess
 import tempfile
-import os
+import time
 from urllib.parse import quote
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -19,6 +21,35 @@ logger = get_logger(__name__)
 
 SNAPSHOT_CATEGORY_ORDER = ("added", "deleted", "modified")
 SNAPSHOT_MESSAGE_PREFIX = "sigma:snapshot:v1:"
+
+# Read-side git commands (log, diff, blob) stay fast at this budget. Mutation
+# commands (add/commit) over multi-GB worktrees can legitimately need minutes,
+# so they get a separate, larger budget.
+GIT_READ_TIMEOUT_SEC = 30
+GIT_WRITE_TIMEOUT_SEC = 600
+
+# Kill escalation: SIGTERM first (git removes its own index.lock on SIGTERM),
+# SIGKILL after the grace period, then a bounded reap so a process stuck in
+# uninterruptible I/O cannot wedge the calling thread forever.
+_TERM_GRACE_SEC = 5.0
+_KILL_REAP_SEC = 10.0
+
+# A lock older than this with no live git process on the repo is a corpse
+# from a killed operation (SIGKILL skips git's own lock cleanup); leaving it
+# in place makes every later snapshot fail instantly, forever.
+STALE_LOCK_MIN_AGE_SEC = 60
+
+# Freshness gate (auto snapshots only): a file modified within this window
+# may still be mid-write (agent-side dataset downloads, builds), so the
+# worktree counts as unstable and the snapshot defers until writes settle.
+# SiGMA's own writes are atomic (temp + rename), but they land milliseconds
+# before the save-triggered check, so the auto path must wait out the
+# window; manual commits skip the gate and commit unconditionally.
+FRESH_FILE_SEC = 10.0
+
+# Wait longer than the longest git write so a queued legitimate snapshot
+# never times out behind a slow one; only a genuinely stuck holder does.
+SNAPSHOT_LOCK_WAIT_SEC = GIT_WRITE_TIMEOUT_SEC + 60
 
 # LaTeX build artifacts to keep out of snapshot history. These are regenerated
 # by every compile (``latexmk -jobname=output``), so versioning them bloats
@@ -52,6 +83,49 @@ def _validate_commit_hash(commit: str) -> str:
     return commit
 
 
+def _run_subprocess_with_grace(cmd: List[str], timeout: float) -> tuple:
+    """Run a subprocess with graceful kill escalation.
+
+    Returns (stdout_bytes, stderr_bytes, returncode). On timeout the process
+    group receives SIGTERM first — git removes its own index.lock on SIGTERM
+    — then SIGKILL after a grace period, so a timed-out mutation never leaks
+    git's lock file. Reaping is bounded: a process parked in uninterruptible
+    I/O must not block the caller indefinitely.
+    """
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return stdout, stderr, proc.returncode
+    except subprocess.TimeoutExpired:
+        logger.warning("Git command timed out after %.0fs: %s", timeout, cmd[:4])
+
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.terminate()
+    try:
+        proc.wait(timeout=_TERM_GRACE_SEC)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+
+    try:
+        # Drain the pipes and reap; on exotic states (uninterruptible I/O)
+        # give up after a bounded wait rather than hanging the caller.
+        proc.communicate(timeout=_KILL_REAP_SEC)
+    except subprocess.TimeoutExpired:
+        logger.error(
+            "Git process ignored SIGKILL (uninterruptible I/O?); abandoning: %s",
+            cmd[:4],
+        )
+    raise FileSystemError("Git command timed out", code="INTERNAL_ERROR")
+
+
 class GitService:
     def __init__(self):
         self.USERDATA_DIR = settings.USERDATA_DIR.resolve()
@@ -62,27 +136,24 @@ class GitService:
             raise ProjectNotFoundError(project_id)
         return path
 
-    def _run_git(self, project_id: str, args: List[str], as_binary=False) -> tuple:
+    def _run_git(self, project_id: str, args: List[str], as_binary=False,
+                 timeout: float = GIT_READ_TIMEOUT_SEC) -> tuple:
         """Run a git command. Returns (stdout, stderr, returncode).
         If as_binary=True, stdout is bytes instead of str.
         """
         project_path = self.get_project_path(project_id)
-        try:
-            result = subprocess.run(
-                # quotepath=false: git C-quotes non-ASCII paths by default
-                # (e.g. "gpt\347\273\231....md"); every caller needs the raw
-                # path so it can be passed back to git or shown to the user.
-                ["git", "-c", "core.quotepath=false",
-                 "--git-dir", str(project_path / ".git"),
-                 "-C", str(project_path)] + args,
-                capture_output=True, timeout=30
-            )
-            if as_binary:
-                return result.stdout, result.stderr.decode('utf-8', errors='replace'), result.returncode
-            else:
-                return result.stdout.decode('utf-8'), result.stderr.decode('utf-8', errors='replace'), result.returncode
-        except subprocess.TimeoutExpired:
-            raise FileSystemError("Git command timed out", code="INTERNAL_ERROR")
+        # quotepath=false: git C-quotes non-ASCII paths by default
+        # (e.g. "gpt\347\273\231....md"); every caller needs the raw
+        # path so it can be passed back to git or shown to the user.
+        stdout, stderr, rc = _run_subprocess_with_grace(
+            ["git", "-c", "core.quotepath=false",
+             "--git-dir", str(project_path / ".git"),
+             "-C", str(project_path)] + args,
+            timeout=timeout,
+        )
+        if as_binary:
+            return stdout, stderr.decode('utf-8', errors='replace'), rc
+        return stdout.decode('utf-8'), stderr.decode('utf-8', errors='replace'), rc
 
     def init_git(self, project_id: str) -> bool:
         """Initialize a git repo for a new project."""
@@ -101,43 +172,193 @@ class GitService:
                     "# SiGMA auto-generated\n"
                     ".SiGMA/\n"
                     ".upload_*\n"
+                    ".cache/\n"
                     f"# LaTeX build artifacts (regenerated on compile)\n"
                     f"{artifact_lines}\n",
                     encoding="utf-8",
                 )
 
-            self._run_git(project_id, ["add", "-A"])
-            self._run_git(project_id, ["commit", "-m", "Initial commit"])
+            self._run_git(project_id, ["add", "-A"], timeout=GIT_WRITE_TIMEOUT_SEC)
+            self._run_git(project_id, ["commit", "-m", "Initial commit"],
+                          timeout=GIT_WRITE_TIMEOUT_SEC)
             return True
         except FileSystemError:
             raise
         except Exception as e:
             raise FileSystemError(f"Git init failed: {e}", code="INTERNAL_ERROR")
 
-    def stage_all(self, project_id: str) -> bool:
-        """Stage all changes (git add -A). Used by auto-snapshot."""
-        try:
-            stdout, stderr, rc = self._run_git(project_id, ["add", "-A"])
-            if rc != 0:
-                raise FileSystemError(f"Git add -A failed: {stderr}", code="INTERNAL_ERROR")
+    def _run_git_add(self, project_id: str, args: List[str]) -> bool:
+        """Run a staging command, healing a stale index.lock once if it is
+        what made the command fail, then retrying."""
+        stdout, stderr, rc = self._run_git(project_id, args, timeout=GIT_WRITE_TIMEOUT_SEC)
+        if rc == 0:
             return True
-        except FileSystemError:
-            raise
-        except Exception as e:
-            raise FileSystemError(f"Stage all failed: {e}", code="INTERNAL_ERROR")
+        if "index.lock" in stderr and self._heal_stale_index_lock(
+                self.get_project_path(project_id)):
+            stdout, stderr, rc = self._run_git(project_id, args,
+                                               timeout=GIT_WRITE_TIMEOUT_SEC)
+        if rc != 0:
+            raise FileSystemError(f"Git add -A failed: {stderr}", code="INTERNAL_ERROR")
+        return True
 
-    def create_snapshot_commit(self, project_id: str) -> Dict[str, Any]:
+    def create_snapshot_commit(self, project_id: str,
+                               defer_unstable: bool = False) -> Dict[str, Any]:
         """Stage the working tree and commit it as one snapshot step.
 
         Shared by auto-snapshot and the manual-commit route. The index lock
         serializes overlapping callers (auto and manual, multiple tabs) so
-        staged changes and commit messages can never interleave.
+        staged changes and commit messages can never interleave; the wait is
+        bounded so a stuck holder cannot wedge every later caller.
+
+        With ``defer_unstable`` (auto snapshots), the commit is held while
+        non-ignored files were modified within the freshness window — they
+        may be mid-write (bulk transfers, builds), so the snapshot waits for
+        writes to settle. Manual commits pass False and commit
+        unconditionally: the user asked for a version right now.
         """
         project_path = self.get_project_path(project_id)
-        with ProjectFileLock(project_path / ".git" / "index"):
-            self.stage_all(project_id)
+        with ProjectFileLock(project_path / ".git" / "index",
+                             timeout=SNAPSHOT_LOCK_WAIT_SEC):
+            if defer_unstable and not self._worktree_is_stable(
+                    project_id, project_path):
+                return {
+                    "success": False,
+                    "reason": "deferred",
+                    "detail": "files still being written",
+                }
+            self._run_git_add(project_id, ["add", "-A"])
             message = self.build_staged_snapshot_message(project_id)
             return self.commit(project_id, message)
+
+    def _worktree_is_stable(self, project_id: str, project_path: Path) -> bool:
+        """True when no git-visible file was modified within the window.
+
+        Enumeration goes through ``git ls-files`` so user-managed ignore
+        rules are honoured exactly as ``git add -A`` sees them: writes into
+        an ignored directory (dataset scratch) must never block snapshots.
+        ``.SiGMA`` state is skipped unconditionally — its DB and WAL churn
+        on every save, so even an un-ignored copy would read as forever
+        unstable. Future mtimes (clock skew) count as old, or one skewed
+        file would defer snapshots forever.
+        """
+        stdout, stderr, rc = self._run_git(project_id, [
+            "ls-files", "-m", "-o", "--exclude-standard", "-z",
+        ], as_binary=True)
+        if rc != 0:
+            raise FileSystemError(
+                f"Git status check failed: {stderr}", code="INTERNAL_ERROR")
+        now = time.time()
+        for raw in stdout.split(b"\0"):
+            if not raw:
+                continue
+            path = raw.decode("utf-8", errors="replace")
+            if path == ".SiGMA" or path.startswith(".SiGMA/"):
+                continue
+            try:
+                mtime = os.lstat(project_path / path).st_mtime
+            except OSError:
+                continue
+            if 0 <= now - mtime < FRESH_FILE_SEC:
+                return False
+        return True
+
+    @staticmethod
+    def _git_process_alive(project_path: Path) -> bool:
+        """True when a live git process is operating on this repo.
+
+        SiGMA-side invocations carry the repo paths in their command line;
+        agent-run git only carries the worktree as its working directory
+        (possibly a subdirectory of it), so the process cwd is checked as
+        well.
+        """
+        git_dir_b = str(project_path / ".git").encode()
+        worktree_b = str(project_path).encode()
+        worktree = os.path.realpath(project_path)
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read()
+                if not cmd or not cmd.split(b"\0", 1)[0].endswith(b"git"):
+                    continue
+                if git_dir_b in cmd or worktree_b in cmd:
+                    return True
+                cwd = os.path.realpath(f"/proc/{pid}/cwd")
+                if cwd == worktree or cwd.startswith(worktree + os.sep):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _heal_stale_index_lock(self, project_path: Path) -> bool:
+        """Remove a stale ``.git/index.lock`` left by a killed git operation.
+
+        The lock qualifies only when it is older than the grace age AND no
+        live git process is operating on the repo: SIGKILLed git cannot clean
+        up after itself, and without this healing every later snapshot fails
+        instantly with "index.lock exists" — permanently, with no recovery.
+        """
+        lock_path = project_path / ".git" / "index.lock"
+        try:
+            age = time.time() - lock_path.stat().st_mtime
+        except OSError:
+            return False
+        if age < STALE_LOCK_MIN_AGE_SEC or self._git_process_alive(project_path):
+            return False
+        lock_path.unlink()
+        logger.warning(
+            "Removed stale git index.lock (age %.0fs, no live git process) for %s",
+            age, project_path.name,
+        )
+        return True
+
+    def heal_stale_lock(self, project_id: str) -> Dict[str, Any]:
+        """Repair entry: remove the repo's stale index lock if present."""
+        removed = self._heal_stale_index_lock(self.get_project_path(project_id))
+        return {"lock_removed": removed}
+
+    def _ensure_generated_gitignore(self, project_path: Path) -> bool:
+        """Extend SiGMA-generated .gitignore files with the .cache rule.
+
+        Only files carrying the SiGMA auto-generated header are touched;
+        user-authored .gitignore files are never modified.
+        """
+        gitignore = project_path / ".gitignore"
+        try:
+            content = gitignore.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        if ".cache" in content or not content.startswith("# SiGMA auto-generated"):
+            return False
+        gitignore.write_text(
+            content.replace(".upload_*\n", ".upload_*\n.cache/\n", 1),
+            encoding="utf-8",
+        )
+        return True
+
+    def startup_maintenance(self) -> Dict[str, int]:
+        """Boot-time per-repo upkeep: refresh generated .gitignore rules and
+        clear stale index locks (no SiGMA git operation is in flight yet)."""
+        counts = {"gitignore_updated": 0, "stale_locks_removed": 0}
+        try:
+            entries = list(self.USERDATA_DIR.iterdir())
+        except OSError:
+            return counts
+        for entry in entries:
+            if not entry.is_dir() or not (entry / ".git").exists():
+                continue
+            try:
+                counts["gitignore_updated"] += int(
+                    self._ensure_generated_gitignore(entry))
+                counts["stale_locks_removed"] += int(
+                    self._heal_stale_index_lock(entry))
+            except Exception:
+                logger.warning("Git startup maintenance failed for %s",
+                               entry.name, exc_info=True)
+        if any(counts.values()):
+            logger.info("Git startup maintenance: %s", counts)
+        return counts
 
     def get_snapshot_zip(self, project_id: str, commit: str) -> bytes:
         """Get a ZIP archive of the project at a specific commit using git archive.
@@ -146,19 +367,17 @@ class GitService:
         fd, zip_path = tempfile.mkstemp(prefix="sigma-snapshot-", suffix=".zip")
         os.close(fd)
         try:
-            result = subprocess.run(
+            stdout, stderr, rc = _run_subprocess_with_grace(
                 ["git", "--git-dir", str(project_path / ".git"),
                  "-C", str(project_path),
                  "archive", "--output", zip_path, commit],
-                capture_output=True, timeout=30
+                timeout=GIT_WRITE_TIMEOUT_SEC,
             )
-            if result.returncode != 0:
-                raise FileSystemError(f"Git archive failed: {result.stderr.decode('utf-8', errors='replace')}", code="INTERNAL_ERROR")
+            if rc != 0:
+                raise FileSystemError(f"Git archive failed: {stderr.decode('utf-8', errors='replace')}", code="INTERNAL_ERROR")
             with open(zip_path, "rb") as f:
                 zip_data = f.read()
             return zip_data
-        except subprocess.TimeoutExpired:
-            raise FileSystemError("Snapshot export timed out", code="INTERNAL_ERROR")
         except FileSystemError:
             raise
         except Exception as e:
@@ -177,7 +396,8 @@ class GitService:
             self._run_git(project_id, ["config", "user.name", author_name])
             self._run_git(project_id, ["config", "user.email", author_email])
 
-            stdout, stderr, rc = self._run_git(project_id, ["commit", "-m", message])
+            stdout, stderr, rc = self._run_git(project_id, ["commit", "-m", message],
+                                               timeout=GIT_WRITE_TIMEOUT_SEC)
             if rc != 0:
                 combined = f"{stdout}\n{stderr}".lower()
                 if "nothing to commit" in combined or "no changes" in combined:

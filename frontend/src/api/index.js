@@ -414,6 +414,8 @@ export const gitsAPI = {
     return `${API_BASE_URL}/git/${projectId}/snapshot?commit=${encodeURIComponent(commit)}`;
   },
   commitNow: (projectId) => request(`/git/${projectId}/commit`, { method: 'POST' }),
+  snapshotHealth: (projectId) => request(`/git/${projectId}/health`),
+  repairSnapshot: (projectId) => request(`/git/${projectId}/repair`, { method: 'POST' }),
   tags: (projectId) => request(`/git/${projectId}/tags`),
   createTag: (projectId, data) => request(`/git/${projectId}/tags`, { method: 'POST', body: JSON.stringify(data) }),
   deleteTag: (projectId, name) => request(`/git/${projectId}/tags/${encodeURIComponent(name)}`, { method: 'DELETE' }),

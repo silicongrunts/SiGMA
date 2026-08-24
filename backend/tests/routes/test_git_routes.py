@@ -88,15 +88,59 @@ async def test_tag_routes_delegate_to_service(monkeypatch):
 async def test_manual_commit_delegates_to_service(monkeypatch):
     calls = {}
 
-    def create_snapshot_commit(project_id):
+    async def commit_now(project_id):
         calls["commit"] = project_id
         return {"success": False, "reason": "no changes"}
 
-    monkeypatch.setattr(git, "git_service", SimpleNamespace(
-        create_snapshot_commit=create_snapshot_commit,
+    monkeypatch.setattr(git, "snapshot_service", SimpleNamespace(
+        commit_now=commit_now,
     ))
 
     result = await git.manual_commit("project-1")
 
     assert result["data"] == {"success": False, "reason": "no changes"}
     assert calls["commit"] == "project-1"
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_snapshot_health_returns_persisted_state(monkeypatch):
+    async def get_health(project_id):
+        return {"status": "error", "consecutive_failures": 2}
+
+    monkeypatch.setattr(git, "snapshot_service", SimpleNamespace(
+        get_health=get_health,
+    ))
+
+    result = await git.snapshot_health("project-1")
+
+    assert result["data"] == {"status": "error", "consecutive_failures": 2}
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_repair_heals_lock_then_commits(monkeypatch):
+    calls = []
+
+    def heal_stale_lock(project_id):
+        calls.append("heal")
+        return {"lock_removed": True}
+
+    async def commit_now(project_id):
+        calls.append("commit")
+        return {"success": True, "commit": "abc1234"}
+
+    monkeypatch.setattr(git, "git_service", SimpleNamespace(
+        heal_stale_lock=heal_stale_lock,
+    ))
+    monkeypatch.setattr(git, "snapshot_service", SimpleNamespace(
+        commit_now=commit_now,
+    ))
+
+    result = await git.repair_snapshot("project-1")
+
+    assert result["data"] == {
+        "lock_removed": True,
+        "commit": {"success": True, "commit": "abc1234"},
+    }
+    assert calls == ["heal", "commit"]  # healing happens before the retry
