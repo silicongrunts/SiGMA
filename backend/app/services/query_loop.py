@@ -456,7 +456,6 @@ class QueryLoop:
         return result.messages, events
 
     async def _get_active_tasks(self, session_id: str) -> list:
-        from app.services.task_service import task_to_dict
         async with UnitOfWork(self.project_id) as uow:
             tasks = await uow.tasks.list_active(session_id)
             return [task_to_dict(t) for t in tasks]

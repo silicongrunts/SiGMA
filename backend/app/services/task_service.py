@@ -9,12 +9,21 @@ tools and services (ai_service, query_loop).
 """
 
 import json
+import re
 from typing import Optional, List
 
 from app.core.logging import get_logger
 from app.database.unit_of_work import UnitOfWork
 
 logger = get_logger(__name__)
+
+
+TASK_REMINDER_HEADER = "This session still has unfinished tasks visible to the user:"
+
+_TASK_REMINDER_TAG_RE = re.compile(
+    r"\n?<status>\s*" + re.escape(TASK_REMINDER_HEADER) + r".*?</status>",
+    re.DOTALL,
+)
 
 
 def task_to_dict(task) -> dict:
@@ -37,6 +46,42 @@ def task_to_dict(task) -> dict:
         "status": task.status,
         "metadata": metadata_json,
     }
+
+
+async def unfinished_tasks(project_id: str, session_id: str) -> List[dict]:
+    """Unfinished task dicts for a session, ordered by seq.
+
+    Backs the reminder snapshotted onto a new user turn; completed and
+    soft-deleted tasks are excluded.
+    """
+    async with UnitOfWork(project_id) as uow:
+        tasks = await uow.tasks.list_active(session_id)
+        return [
+            task_to_dict(t) for t in tasks
+            if t.status in ("pending", "in_progress")
+        ]
+
+
+def format_task_reminder(tasks: List[dict]) -> str:
+    """Render the unfinished-task snapshot attached to a user turn."""
+    lines = [
+        TASK_REMINDER_HEADER,
+        *[f"- [{t['id']}] {t['subject']} ({t['status']})" for t in tasks],
+        "Continue them in ID order, or — if the user's new message changes "
+        "direction — update the task list (task_update / task_write) so "
+        "statuses match reality before responding.",
+    ]
+    return "\n".join(lines)
+
+
+def render_task_reminder_tag(tasks: List[dict]) -> str:
+    """Wrap the reminder in a <status> block for persisted user content."""
+    return f"\n<status>\n{format_task_reminder(tasks)}\n</status>"
+
+
+def strip_task_reminder(content: str) -> str:
+    """Remove the persisted task-reminder <status> block from user content."""
+    return _TASK_REMINDER_TAG_RE.sub("", content or "")
 
 
 class TaskService:

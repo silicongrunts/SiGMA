@@ -23,6 +23,7 @@ from app.core.utils import image_dimensions
 from app.core.logging import get_logger
 from app.database.unit_of_work import UnitOfWork
 from app.services.llm_service import llm_service
+from app.services.task_service import strip_task_reminder
 
 
 logger = get_logger(__name__)
@@ -106,6 +107,21 @@ class CompactionResult:
     messages: list[dict]
     stats: ContextStats
     usage: dict | None = None
+
+
+def _strip_user_reminder(entry: dict) -> dict:
+    """Copy a user entry with task-reminder text removed from its content."""
+    content = entry.get("content")
+    if isinstance(content, str):
+        return {**entry, "content": strip_task_reminder(content)}
+    if isinstance(content, list):
+        return {**entry, "content": [
+            {**part, "text": strip_task_reminder(part["text"])}
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+            else part
+            for part in content
+        ]}
+    return entry
 
 
 class CompactionService:
@@ -281,11 +297,15 @@ class CompactionService:
         # Strip any stale cache_control carried over from a prior turn so the
         # compaction call never creates a cache entry (it only reads). The
         # message dicts are shared with the caller's live list, so build new
-        # dicts instead of mutating in place.
-        compact_request = [
-            {k: v for k, v in m.items() if k != "cache_control"}
-            for m in messages
-        ]
+        # dicts instead of mutating in place. Task reminders are per-turn
+        # scaffolding, not conversation content — they must not leak into
+        # the boundary summary, which outlives the tasks it describes.
+        compact_request = []
+        for m in messages:
+            entry = {k: v for k, v in m.items() if k != "cache_control"}
+            if entry.get("role") == "user":
+                entry = _strip_user_reminder(entry)
+            compact_request.append(entry)
         compact_request.append({"role": "user", "content": COMPACT_PROMPT})
 
         summary, compact_usage = await llm_service.call_chat_text(

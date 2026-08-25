@@ -29,7 +29,11 @@ from app.services.query_loop import QueryLoop
 from app.services.project_service import project_service
 from app.database.unit_of_work import UnitOfWork
 from app.database.seq_utils import MAX_RETRIES, RETRY_DELAY
-from app.services.task_service import task_to_dict
+from app.services.task_service import (
+    render_task_reminder_tag,
+    task_to_dict,
+    unfinished_tasks,
+)
 from app.services.token_budget import TokenBudgetTracker
 from app.services.session_temp_service import session_temp_service
 
@@ -450,7 +454,9 @@ class AIService:
         # Persist user message immediately — survives refresh/worker crash.
         # /compact is a command, not conversation content.
         if message.strip() and session_id and not compact_only:
-            full_content = self._build_user_message_content(message, context)
+            full_content = await self._build_user_message_content(
+                message, context, project_id, session_id,
+            )
             await self._append_session_message(
                 project_id,
                 session_id,
@@ -516,7 +522,6 @@ class AIService:
                 ):
                     raise TaskActiveError(task_id=existing["task_id"])
 
-        full_content = self._build_user_message_content(message, context)
         task_id = generate_id()
 
         async with UnitOfWork(project_id) as uow:
@@ -535,6 +540,10 @@ class AIService:
                 raise ValidationError("Compressed messages cannot be edited")
 
             target_seq = target.seq
+
+        full_content = await self._build_user_message_content(
+            message, context, project_id, session_id,
+        )
 
         async def _operation(uow):
             await uow.messages.stage_truncate_from(session_id, target_seq)
@@ -703,8 +712,20 @@ class AIService:
         ):
             yield chunk
 
-    def _build_user_message_content(self, message: str, context: Dict[str, Any]) -> str:
-        """Build hidden status/citation blocks plus user-visible content."""
+    async def _build_user_message_content(
+        self,
+        message: str,
+        context: Dict[str, Any],
+        project_id: str,
+        session_id: str,
+    ) -> str:
+        """Build hidden status/citation/reminder blocks plus user-visible content.
+
+        The reminder snapshots the session's unfinished tasks at submit
+        time so the persisted content is final: message rows are written
+        once and never modified afterwards, keeping rebuilt request
+        prefixes byte-identical for prompt-cache hits.
+        """
         cleaned_message, plan_requested = self._strip_slash_command(message)
 
         def _format_value(v):
@@ -736,7 +757,11 @@ class AIService:
         status_block = "<status>\n" + "\n".join(status_lines) + "\n</status>"
         citation_block = f"\n<citation>{citation_text}</citation>" if citation_text else ""
         attachments_block = render_attachments_tag(attachments)
-        return f"{status_block}{citation_block}{attachments_block}\n{cleaned_message}"
+        reminder_block = ""
+        unfinished = await unfinished_tasks(project_id, session_id)
+        if unfinished:
+            reminder_block = render_task_reminder_tag(unfinished)
+        return f"{status_block}{citation_block}{attachments_block}{reminder_block}\n{cleaned_message}"
 
     @staticmethod
     def _strip_slash_command(message: str) -> tuple[str, bool]:

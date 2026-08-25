@@ -116,6 +116,70 @@ async def test_compact_messages_adds_usage_to_tracker(monkeypatch):
     assert tracker.usage.cached == 100
 
 
+@pytest.mark.asyncio
+async def test_compact_messages_strips_task_reminders_from_summary_input(monkeypatch):
+    from app.services.task_service import render_task_reminder_tag
+
+    captured = {}
+
+    async def fake_call_chat_text(**kwargs):
+        captured["messages"] = kwargs["messages"]
+        return (
+            "Current goal: finish the work.\nDone: step one.\nNext: step two.",
+            {"prompt_tokens": 10, "completion_tokens": 5,
+             "prompt_tokens_details": {"cached_tokens": 0}},
+        )
+
+    monkeypatch.setattr(
+        "app.services.compaction_service.llm_service.call_chat_text",
+        fake_call_chat_text,
+    )
+
+    reminder = render_task_reminder_tag([
+        {"id": "3", "subject": "Translate chapter 2", "status": "pending"},
+    ])
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "please continue" + reminder},
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    await compaction_service.compact_messages(
+        messages, model_role="supervisor", mode="passive", tools=[],
+    )
+
+    summarized_users = [
+        m["content"] for m in captured["messages"][:-1] if m["role"] == "user"
+    ]
+    assert summarized_users == ["please continue"]
+    # The caller's live list keeps the reminder — stripping is copy-on-write.
+    assert "please continue" in messages[1]["content"]
+    assert "unfinished tasks" in messages[1]["content"]
+
+
+def test_strip_user_reminder_handles_multipart_content():
+    from app.services.compaction_service import _strip_user_reminder
+    from app.services.task_service import render_task_reminder_tag
+
+    reminder = render_task_reminder_tag([
+        {"id": "1", "subject": "Caption figures", "status": "pending"},
+    ])
+    entry = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "what is this" + reminder},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+        ],
+    }
+
+    stripped = _strip_user_reminder(entry)
+
+    assert stripped["content"][0]["text"] == "what is this"
+    assert stripped["content"][1] == entry["content"][1]
+    # Original entry is untouched.
+    assert "unfinished tasks" in entry["content"][0]["text"]
+
+
 # ---------------------------------------------------------------------------
 # Image token estimation
 # ---------------------------------------------------------------------------
