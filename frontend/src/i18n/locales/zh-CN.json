@@ -63,6 +63,8 @@
   "projects.tryDifferentSearch": "尝试其他搜索词。",
   "projects.openTitle": "打开：{{name}}",
   "projects.downloadZip": "下载 ZIP",
+  "projects.exportOverlay.title": "正在打包项目…",
+  "projects.exportOverlay.hint": "打包完成后将自动开始下载，请勿关闭或刷新页面。",
   "projects.editDescription": "编辑描述",
   "projects.descriptionPlaceholder": "项目描述...",
   "projects.deleteTitle": "删除项目",

@@ -63,6 +63,8 @@
   "projects.tryDifferentSearch": "다른 검색어를 시도해 보세요.",
   "projects.openTitle": "열기: {{name}}",
   "projects.downloadZip": "ZIP 다운로드",
+  "projects.exportOverlay.title": "프로젝트 패키징 중…",
+  "projects.exportOverlay.hint": "패키징이 완료되면 다운로드가 자동으로 시작됩니다. 페이지를 닫거나 새로고침하지 마세요.",
   "projects.editDescription": "설명 편집",
   "projects.descriptionPlaceholder": "프로젝트 설명...",
   "projects.deleteTitle": "프로젝트 삭제",

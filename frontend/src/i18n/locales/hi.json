@@ -63,6 +63,8 @@
   "projects.tryDifferentSearch": "कोई और खोज शब्द आज़माएं।",
   "projects.openTitle": "खोलें: {{name}}",
   "projects.downloadZip": "ZIP डाउनलोड करें",
+  "projects.exportOverlay.title": "प्रोजेक्ट पैक की जा रही है…",
+  "projects.exportOverlay.hint": "पैकेजिंग पूरी होने पर डाउनलोड अपने आप शुरू हो जाएगा। कृपया इस पेज को बंद न करें या रीफ्रेश न करें।",
   "projects.editDescription": "विवरण संपादित करें",
   "projects.descriptionPlaceholder": "प्रोजेक्ट विवरण...",
   "projects.deleteTitle": "प्रोजेक्ट हटाएं",

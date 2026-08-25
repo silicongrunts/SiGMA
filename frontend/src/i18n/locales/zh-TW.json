@@ -63,6 +63,8 @@
   "projects.tryDifferentSearch": "嘗試其他搜尋詞。",
   "projects.openTitle": "開啟：{{name}}",
   "projects.downloadZip": "下載 ZIP",
+  "projects.exportOverlay.title": "正在打包專案…",
+  "projects.exportOverlay.hint": "打包完成後將自動開始下載，請勿關閉或重新整理頁面。",
   "projects.editDescription": "編輯描述",
   "projects.descriptionPlaceholder": "專案描述...",
   "projects.deleteTitle": "刪除專案",

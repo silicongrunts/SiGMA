@@ -63,6 +63,8 @@
   "projects.tryDifferentSearch": "Essayez un autre terme de recherche.",
   "projects.openTitle": "Ouvrir : {{name}}",
   "projects.downloadZip": "Télécharger ZIP",
+  "projects.exportOverlay.title": "Compression du projet en cours…",
+  "projects.exportOverlay.hint": "Le téléchargement démarrera automatiquement une fois l'opération terminée. Ne fermez pas et n'actualisez pas cette page.",
   "projects.editDescription": "Modifier la description",
   "projects.descriptionPlaceholder": "Description du projet...",
   "projects.deleteTitle": "Supprimer le projet",

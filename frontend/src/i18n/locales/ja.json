@@ -63,6 +63,8 @@
   "projects.tryDifferentSearch": "別の検索語を試してください。",
   "projects.openTitle": "開く：{{name}}",
   "projects.downloadZip": "ZIP をダウンロード",
+  "projects.exportOverlay.title": "プロジェクトをパッケージ化中…",
+  "projects.exportOverlay.hint": "パッケージ化が完了すると自動的にダウンロードが始まります。ページを閉じたり更新しないでください。",
   "projects.editDescription": "説明を編集",
   "projects.descriptionPlaceholder": "プロジェクトの説明...",
   "projects.deleteTitle": "プロジェクトを削除",

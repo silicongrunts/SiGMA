@@ -19,7 +19,7 @@ import { Spinner } from '../components/ui'
 import Toggle from '../components/Toggle'
 import { useTheme } from '../hooks/useTheme'
 import { useLanguage } from '../hooks/useLanguage'
-import { Folder, Plus, Search, Trash2, Download, Pencil, Clock, Check, X, Wrench, Settings, Sun, Moon, ChevronDown, Globe, FileText, FilePlus, UploadCloud } from 'lucide-react'
+import { Folder, Plus, Search, Trash2, Download, Pencil, Clock, Check, X, Wrench, Settings, Sun, Moon, ChevronDown, Globe, FileText, FilePlus, UploadCloud, Package } from 'lucide-react'
 
 function formatDate(dateStr, t) {
   if (!dateStr) return t('time.never')
@@ -48,6 +48,33 @@ async function downloadProjectZip(project, t) {
   } catch {
     toastError(t('projects.toast.downloadFailed'))
   }
+}
+
+/**
+ * Full-screen, non-dismissable mask shown while a project ZIP is being
+ * packaged server-side. It intercepts every click so the user cannot act on
+ * the rest of the page, and only unmounts once the browser download has been
+ * triggered (or the export request failed).
+ */
+function ExportOverlay({ projectName }) {
+  const { t } = useTranslation()
+  return (
+    <div className="fixed inset-0 z-[6000] flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-gray-900/50 dark:bg-black/70 backdrop-blur-md animate-in fade-in duration-300" />
+      <div className="relative flex flex-col items-center text-center animate-in zoom-in duration-300">
+        <div className="relative w-20 h-20 mb-6 flex items-center justify-center">
+          <span className="absolute inset-0 rounded-full bg-sigma-600/30 animate-ping" />
+          <span className="absolute inset-0 rounded-full bg-sigma-600/20 animate-ping [animation-delay:500ms]" />
+          <div className="relative w-16 h-16 rounded-full bg-blue-100 dark:bg-sigma-600/30 flex items-center justify-center">
+            <Package className="w-8 h-8 text-sigma-600 dark:text-blue-300 animate-bounce" />
+          </div>
+        </div>
+        <h2 className="text-lg font-bold text-white mb-1.5">{t('projects.exportOverlay.title')}</h2>
+        <p className="text-sm font-medium text-gray-200 max-w-xs truncate mb-2">{projectName}</p>
+        <p className="text-xs text-gray-400">{t('projects.exportOverlay.hint')}</p>
+      </div>
+    </div>
+  )
 }
 export default function ProjectsView() {
   const navigate = useNavigate()
@@ -78,7 +105,7 @@ export default function ProjectsView() {
   const [editingField, setEditingField] = useState({ projectId: null, field: null })
   const [nameEditValue, setNameEditValue] = useState('')
   const [descEditValue, setDescEditValue] = useState('')
-  const [exportingId, setExportingId] = useState(null)
+  const [exportingProject, setExportingProject] = useState(null)
   const [backendError, setBackendError] = useState(false)
   const nameEditRef = useRef(null)
   const descEditRef = useRef(null)
@@ -159,14 +186,16 @@ export default function ProjectsView() {
     setShowSystemSettings(false)
   }, [forceSettings, checkCriticalModels])
 
-  // Export a project as a ZIP. Disables the button per-project while the request is in flight.
+  // Export a project as a ZIP. While the request is in flight a full-screen
+  // overlay blocks every other interaction; it disappears only after the
+  // browser download has been triggered (or the request failed).
   const handleExport = async (project) => {
-    if (exportingId === project.id) return
-    setExportingId(project.id)
+    if (exportingProject) return
+    setExportingProject(project)
     try {
       await downloadProjectZip(project, t)
     } finally {
-      setExportingId(null)
+      setExportingProject(null)
     }
   }
 
@@ -591,12 +620,12 @@ export default function ProjectsView() {
                 >
                   <button
                     onClick={() => handleExport(project)}
-                    disabled={exportingId === project.id}
+                    disabled={!!exportingProject}
                     className={`p-2 rounded-lg transition-all disabled:cursor-not-allowed
-                      ${exportingId === project.id ? 'text-sigma-600 bg-sigma-50 dark:bg-sigma-600/20' : 'text-gray-400 dark:text-gray-500 hover:text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20'}`}
+                      ${exportingProject ? 'text-sigma-600 bg-sigma-50 dark:bg-sigma-600/20' : 'text-gray-400 dark:text-gray-500 hover:text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20'}`}
                     title={t('projects.downloadZip')}
                   >
-                    {exportingId === project.id ? <Spinner size="sm" /> : <Download className="w-4 h-4" />}
+                    {exportingProject ? <Spinner size="sm" /> : <Download className="w-4 h-4" />}
                   </button>
                   <button
                     onClick={() => setDeleteTarget({ id: project.id, name: project.name })}
@@ -636,6 +665,10 @@ export default function ProjectsView() {
 
       {backendError && (
         <BackendErrorOverlay onRetry={loadProjects} />
+      )}
+
+      {exportingProject && (
+        <ExportOverlay projectName={exportingProject.name} />
       )}
     </div>
   )
