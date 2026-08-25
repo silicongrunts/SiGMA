@@ -1,116 +1,107 @@
 # Security Rules
 
-Security-sensitive code should be centralized, testable, and boring. SiGMA is a
-single-user local app, but users may still provide invalid paths, unusual files,
-broken configuration, incompatible LLM APIs, or model-generated tool inputs. Do
-not duplicate security decisions in components, tools, or routes.
+Security-sensitive code is centralized, testable, and boring. SiGMA is
+single-user and local, but inputs can still be invalid: user paths, files,
+configuration, LLM APIs, and model-generated tool inputs. Do not duplicate
+security decisions in components, tools, or routes.
 
 ## Filesystem And Path Safety
 
-- Use shared path helpers for containment checks.
-- Resolve paths before permission decisions.
-- Never use string prefix checks for path containment.
-- Uploaded filenames must be sanitized by the shared filename sanitizer.
-- Reject path separators, traversal, empty names, and hidden names when a plain
-  filename is expected.
-- Symlink behavior must be considered when resolving user-supplied paths.
+- Shared path helpers for containment checks; never string prefix checks.
+  Resolve paths before permission decisions.
+- Consider symlink behavior when resolving user-supplied paths.
+- Uploaded filenames are sanitized by the shared filename sanitizer;
+  reject path separators, traversal, empty names, and hidden names where a
+  plain filename is expected.
+
+## Bounded Agent Filesystem Access
+
+Agent-driven reads are unrestricted by design (any absolute path); the
+bounds live on the work performed:
+
+- Traversal tools refuse virtual or self-referential roots (`/`, `/proc`,
+  `/sys`, `/dev`, `/run`).
+- Heavy traversal (glob, content search) runs in a killable subprocess
+  under a wall-clock deadline and output cap
+  (`file_tools._run_bounded_search` is the shared engine).
+- Whole-file reads for agent tools are stat-first, regular-files-only, and
+  size-capped (`file_service.check_readable`); oversized reads return an
+  actionable error suggesting targeted reads, not a partial or hanging
+  read.
 
 ## Filesystem Permission Model
 
-Agent file access follows the four-category model. Every non-exempt tool call
-passes through the shared permission executor before execution.
-
-- `file_external`: writes outside the project sandbox.
-- `file_internal`: writes inside the project sandbox.
-- `bash`: non-read-only shell commands.
-- `notebook`: executing code in a notebook cell.
-
-Each category has an auto-approve flag in `project_config`
-(`auto_approve.<category>`) read live per call — when on, the executor silently
-approves; when off, the frontend shows an approval dialog. Read-only tools and
-tools that mutate the project DB rather than the filesystem are exempt; see
-`permission_executor.py` for the authoritative list.
+Every non-exempt tool call passes through the shared permission executor.
+Categories: `file_external` (writes outside the sandbox), `file_internal`
+(writes inside), `bash` (non-read-only shell), `notebook` (cell
+execution). Each category's auto-approve flag lives in `project_config`
+and is read live per call; read-only tools and DB-only tools are exempt
+(`permission_executor.py` is the authoritative list).
 
 ## Uploads And Downloads
 
-- Validate filenames and content type expectations.
-- Do not trust client-provided paths.
-- Treat uploaded content as untrusted even in single-user deployments.
-- Downloads should resolve the requested path through the same path safety layer
-  used for reads.
-- Archive extraction must reject entries that escape the destination.
-- Document and gracefully reject unsupported, encrypted, corrupt, oversized, or
-  malformed documents.
+- Validate filenames and content-type expectations; never trust
+  client-provided paths; treat uploads as untrusted even single-user.
+- Downloads resolve paths through the same path safety layer used for
+  reads.
+- Archive extraction rejects entries that escape the destination.
+- Document and gracefully reject unsupported, encrypted, corrupt,
+  oversized, or malformed documents.
 
 ## User Content Rendering
 
-- Any HTML generated from Markdown, diffs, documents, model output, or user
-  files must be sanitized before `dangerouslySetInnerHTML`.
-- Prefer rendering structured content instead of raw HTML when practical.
-- Sanitization fallback paths must also sanitize.
+HTML generated from Markdown, diffs, documents, model output, or user
+files is sanitized before `dangerouslySetInnerHTML`; fallback paths also
+sanitize. Prefer structured rendering over raw HTML when practical.
 
 ## LLM And External Provider Calls
 
-- Non-streaming LLM calls go through `llm_service`.
-- Structured LLM responses should be parsed and validated before use.
-- Provider configuration errors should produce actionable user-facing errors,
-  not crashes or silent fallback to a different model.
-- OpenAI-compatible APIs may still differ in streaming format, tool-call shape,
-  reasoning fields, error schema, and timeout behavior. Handle these variations
+- Non-streaming LLM calls go through `llm_service`; structured responses
+  are parsed and validated before use.
+- OpenAI-compatible providers differ in streaming format, tool-call
+  shape, reasoning fields, error schema, and timeouts; handle variations
   defensively at the provider boundary.
-- External provider calls that are not LLM calls should live behind a small
-  client/service wrapper when they have retries, auth, rate limits, or response
-  parsing.
-- Do not log secrets, API keys, full prompts containing sensitive user data, or
-  raw provider responses unless explicitly needed and redacted.
+- Non-LLM external calls with retries, auth, rate limits, or response
+  parsing live behind a small client/service wrapper.
+- Never log secrets, API keys, sensitive prompts, or raw provider
+  responses unless explicitly needed and redacted.
 
 ## Shell And Browser Tools
 
-- Shell tools must run through the permission and safety layers.
-- Read-only command classification must be conservative.
-- Browser tools should avoid exposing raw privileged browser state unless the
-  caller has a clear need.
+- Shell tools run through the permission and safety layers; read-only
+  command classification stays conservative.
+- Browser tools avoid exposing raw privileged browser state without a
+  clear need.
 - Tool inputs are untrusted even when produced by an LLM.
+- The backend may run as root: every signal-sending path (`os.kill`,
+  `os.killpg`, `proc.kill`) validates its target pid first
+  (`bash._kill_process_group` is the reference guard).
 
 ## Configuration And Secrets
 
-- Backend configuration and all environment-variable access go through
-  `core/config.py`; never read `os.environ` or `os.getenv()` directly elsewhere.
-- Secrets should live in `settings.yaml`, not hardcoded constants.
-- Logs must not include secrets.
+Configuration and all environment-variable access go through
+`core/config.py` — never `os.environ`/`os.getenv()` elsewhere. Secrets
+live in `settings.yaml`, never hardcoded. Logs never contain secrets.
 
 ## Access Password And Session Cookies
 
-- `settings.yaml` stores only the bcrypt hash under `security.password_hash`;
-  the plaintext is never persisted or logged.
-- The hash is written only by `/auth/password`. `PUT /system/settings` re-injects
-  the persisted hash server-side; `GET` returns it (not reversible to
-  plaintext); `PUT`/`check`/`validate` always discard any client-supplied hash.
-- Session cookies are HMAC tokens keyed by a random signing secret in
-  `userdata/.SiGMA/auth_secret.key` (0600). The secret rotates on every password
-  change, invalidating all outstanding cookies — including the changer's own.
-  Cookies are `HttpOnly` + `SameSite=Lax`; `Secure` is set over HTTPS.
-- Enforcement is a reject-by-default pure-ASGI middleware (`AuthMiddleware`)
-  covering HTTP and WebSocket alike; unauthenticated WebSocket handshakes are
-  denied before any handler runs (`websocket.close` code 4401). The public
-  allow-list (`AUTH_PUBLIC_PATHS`) must stay narrow — every entry widens the
+- `settings.yaml` stores only the bcrypt hash under
+  `security.password_hash`; plaintext is never persisted or logged. The
+  hash is written only by `/auth/password` and the offline
+  `backend/scripts/reset_password.py`; settings endpoints always discard
+  client-supplied hashes.
+- Session cookies are HMAC tokens keyed by a 0600 secret file
+  (`userdata/.SiGMA/auth_secret.key`) that rotates on every password
+  change, invalidating all outstanding cookies. Cookies are `HttpOnly` +
+  `SameSite=Lax`, `Secure` over HTTPS.
+- Enforcement is a reject-by-default pure-ASGI middleware covering HTTP
+  and WebSocket (unauthenticated handshakes closed with 4401). The public
+  allow-list (`AUTH_PUBLIC_PATHS`) stays narrow — every entry widens the
   unauthenticated surface.
-- `backend/scripts/reset_password.py` is an offline recovery tool that performs
-  the same hash/rotate/persist steps as `/auth/password`. Anyone able to run it
-  already has shell + filesystem access to `userdata/` and is fully trusted; the
-  gate protects network access only, not local access.
 
 ## Security Review Checklist
 
-For security-sensitive changes, check:
-
-- Can user input alter a path, URL, command, selector, prompt, or rendered HTML?
-- Is validation centralized?
-- Is the failure mode reject-by-default?
-- Are symlinks, traversal, separators, empty names, and hidden names handled?
-- Are errors informative without leaking secrets?
-
-## Rule Maintenance
-
-When path, permission, rendering, provider, tool, or secret-handling rules
-change, update this file in the same change and mention it in the handoff or PR.
+Can user input alter a path, URL, command, selector, prompt, or rendered
+HTML? Is validation centralized and reject-by-default? Are symlinks,
+traversal, separators, empty names, and hidden names handled? Are errors
+informative without leaking secrets?

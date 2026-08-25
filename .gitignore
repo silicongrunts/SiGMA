@@ -1,5 +1,6 @@
 .env
 .claude/
+.zcode/
 userdata/*
 !userdata/.gitkeep
 __pycache__/

@@ -5,6 +5,7 @@ Library tools — search, browse, and manage the project knowledge base.
          library_mv, library_update, library_get, library_rm.
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -478,7 +479,9 @@ async def _library_new(project_id: str, content_type: str, content: str,
         library_dir.mkdir(parents=True, exist_ok=True)
 
         stem = file_path.stem
-        target_path = _copy_unique_file(file_path, library_dir / f"{stem}{file_path.suffix}")
+        # Streaming copy, but still blocking I/O — keep it off the event loop.
+        target_path = await asyncio.to_thread(
+            _copy_unique_file, file_path, library_dir / f"{stem}{file_path.suffix}")
         file_path_to_save = str(target_path)
 
     elif content_type == "tab":

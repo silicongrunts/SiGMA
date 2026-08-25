@@ -10,6 +10,7 @@ Covers:
 
 import asyncio
 import inspect
+import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -152,13 +153,17 @@ async def test_run_bash_failure_returns_nonzero_exit_code():
 
 @pytest.mark.asyncio
 async def test_run_bash_timeout_kills_and_returns_timeout_note():
-    """On timeout: proc.kill() must be called and the unified format must be
-    returned with the timeout note. The post-kill path no longer drains
-    pipes (it uses proc.wait()), so partial output is intentionally not
-    captured — see test_run_bash_timeout_returns_within_timeout_not_command_duration
+    """On timeout: the process group must be SIGKILLed (os.killpg, because
+    the shell is spawned with start_new_session=True so its group id equals
+    its pid) with a fallback to proc.kill() when the group is already gone.
+    The unified format must be returned with the timeout note. The
+    post-kill path no longer drains pipes (it uses proc.wait()), so partial
+    output is intentionally not captured — see
+    test_run_bash_timeout_returns_within_timeout_not_command_duration
     for the wall-clock regression test."""
 
     captured_signals = {"killed": False}
+    killpg_targets = []
 
     async def slow_communicate():
         # Simulate a long-running process; wait_for will cancel this
@@ -167,18 +172,30 @@ async def test_run_bash_timeout_kills_and_returns_timeout_note():
 
     def kill_side_effect():
         captured_signals["killed"] = True
+        # The fallback direct kill reaps the process: the kernel reports
+        # SIGKILL (-9) from here on, before _format_output reads it.
+        mock_proc.returncode = -9
 
     mock_proc = MagicMock()
     mock_proc.communicate = slow_communicate
-    mock_proc.returncode = -9
+    mock_proc.pid = 4242  # real int: never rely on MagicMock's __index__
+    mock_proc.returncode = None
     mock_proc.kill = MagicMock(side_effect=kill_side_effect)
+    mock_proc.wait = AsyncMock(return_value=None)
+
+    def killpg_side_effect(pgid, sig):
+        killpg_targets.append((pgid, sig))
+        raise ProcessLookupError()  # group already gone → fallback path
 
     with patch("app.agents.tools.bash.asyncio.create_subprocess_shell",
                return_value=mock_proc), \
          patch("app.agents.tools.bash.asyncio.wait_for",
-               new=_raise_timeout):
+               new=_raise_timeout), \
+         patch("app.agents.tools.bash.os.killpg",
+               side_effect=killpg_side_effect):
         result = await _run_bash("proj", "ping x", timeout=2)
 
+    assert killpg_targets == [(4242, signal.SIGKILL)]
     assert captured_signals["killed"] is True
     assert "exit code: -9  (Command timed out after 2s)" in result
     assert "stdout: " in result  # empty stdout section present
@@ -193,6 +210,7 @@ async def test_run_bash_timeout_returns_even_if_wait_raises():
     mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
     # wait() raises when the reap is attempted after SIGKILL
     mock_proc.wait = AsyncMock(side_effect=RuntimeError("reap failed"))
+    mock_proc.pid = 4242  # real int: never rely on MagicMock's __index__
     mock_proc.returncode = None
     mock_proc.kill = MagicMock()
 
@@ -201,7 +219,9 @@ async def test_run_bash_timeout_returns_even_if_wait_raises():
     with patch("app.agents.tools.bash.asyncio.create_subprocess_shell",
                return_value=mock_proc), \
          patch("app.agents.tools.bash.asyncio.wait_for",
-               new=_raise_timeout_first_call()):
+               new=_raise_timeout_first_call()), \
+         patch("app.agents.tools.bash.os.killpg",
+               side_effect=ProcessLookupError):
         result = await _run_bash("proj", "ping x", timeout=1)
 
     assert "Command timed out after 1s" in result

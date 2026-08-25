@@ -4,8 +4,10 @@ File operation tools — read, write, edit, glob, grep, list_files.
 
 import asyncio
 import base64
+import fnmatch
 import os
 import re
+import time
 from pathlib import Path
 
 from app.agents.tools.base import ToolDefinition
@@ -28,10 +30,22 @@ from app.core.utils import (
 )
 from app.core.logging import get_logger
 from app.core.model_config import model_role_accepts_images
-from app.core.chat_attachments import render_image_refs_tag
-from app.services.file_service import file_service
+from app.core.chat_attachments import MAX_CHAT_IMAGE_BYTES, render_image_refs_tag
+from app.services.file_service import (
+    MAX_TOOL_READ_BYTES, check_readable, decode_text_bytes, file_service,
+)
 
 logger = get_logger(__name__)
+
+# Soft dependency for image downsampling: images larger than the dimension
+# cap are downscaled for viewing instead of rejected when Pillow is
+# available (the production image ships Pillow). Without it the rejection
+# error is returned.
+try:
+    from PIL import Image as _PILImage
+    _PIL_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only in Pillow-less envs
+    _PIL_AVAILABLE = False
 
 # ── Constants ──
 _DEFAULT_READ_LIMIT = 200  # Default max lines returned when no limit specified
@@ -71,15 +85,23 @@ def _read_state_key(project_id: str, file_path: str) -> str:
 def _record_read(
     project_id: str, session_id: str, file_path: str,
     content: str, is_partial: bool,
+    window: tuple[int, int] | None = None,
 ) -> None:
-    """Record a read in the per-session cache (must-read-first enforcement)."""
+    """Record a read in the per-session cache (must-read-first enforcement).
+
+    ``window`` is the 0-indexed [start, end) line range the LLM actually saw
+    (``None`` = the whole file). The cache accumulates windows across reads
+    of the same file state; the edit tool refuses edits outside that
+    accumulated coverage.
+    """
     try:
         record_path_read(
-            session_id, _resolve_file_path(project_id, file_path), content, is_partial,
+            session_id, _resolve_file_path(project_id, file_path), content,
+            is_partial, window,
         )
     except (OSError, ProjectNotFoundError, FileSystemError):
         read_state_cache.record_read(
-            session_id, file_path, content, 0.0, is_partial,
+            session_id, file_path, content, 0.0, is_partial, window,
         )
 
 
@@ -127,25 +149,52 @@ async def _read_file(
     # ── Text path ──
     content = None
 
+    # Route big files to the streaming range reader: the whole-file cap
+    # (MAX_TOOL_READ_BYTES) no longer makes a file unreadable — only the
+    # requested line window is read into memory. Small files keep the
+    # whole-read path with its exact line totals.
+    try:
+        if filename.startswith('/'):
+            big_path = Path(filename).resolve()
+        else:
+            big_path = _resolve_file_path(project_id, filename)
+        big_stat = check_readable(big_path, filename, None)
+    except FileMissingError:
+        return f"Error: File not found: {filename}"
+    except FileSystemError as exc:
+        return f"Error: {exc}"
+    except OSError as exc:
+        return f"Error: {exc}"
+
+    if big_stat.st_size > MAX_TOOL_READ_BYTES:
+        return await _read_file_range(
+            project_id, session_id, filename, offset, limit)
+
     # Absolute host path: read directly. Binary errors are surfaced as-is —
     # falling through to sandbox resolution produced misleading "not found"
     # errors when the binary file actually existed on the host.
     if filename.startswith('/'):
         try:
-            content = file_service.read_file_absolute(filename)
+            content = await file_service.read_file_absolute(
+                filename, max_bytes=MAX_TOOL_READ_BYTES)
         except FileMissingError:
             return f"Error: File not found: {filename}"
         except BinaryFileError:
             return f"Error: File is binary: {filename}"
+        except FileSystemError as exc:
+            return f"Error: {exc}"
 
     # Relative path: resolve via project sandbox.
     if content is None:
         try:
-            content = await file_service.read_file(project_id, filename)
+            content = await file_service.read_file(
+                project_id, filename, max_bytes=MAX_TOOL_READ_BYTES)
         except FileMissingError:
             return f"Error: File not found: {filename}"
         except BinaryFileError:
             return f"Error: File is binary: {filename}"
+        except FileSystemError as exc:
+            return f"Error: {exc}"
         # Empty string is valid — the file exists but is empty
 
     return _slice_and_record(
@@ -173,29 +222,88 @@ def _slice_and_record(
         return f"Error: offset must be >= 0, got {offset}"
 
     is_partial = offset is not None or limit is not None
-    _record_read(project_id, session_id, file_path, content, is_partial=is_partial)
-
+    # A trailing newline terminates the last line rather than opening a new
+    # one — drop the phantom "" split() yields so totals match the streaming
+    # range reader (and real editors) across the size boundary.
     lines = content.split("\n")
+    total = len(lines) - 1 if content.endswith("\n") else len(lines)
     # Empty content: return "" so the LLM does not see a misleading "1\t"
     # prefix implying the file has a line.
     if not content:
+        _record_read(project_id, session_id, file_path, content,
+                     is_partial=False, window=(0, 0))
         return ""
     if limit is not None and limit < 0:
-        start_idx = max(0, len(lines) + limit)
-        end_idx = len(lines)
+        start_idx = max(0, total + limit)
+        end_idx = total
     else:
         start_idx = max(0, offset) if offset else 0
         if limit is None or limit == 0:
-            end_idx = min(len(lines), start_idx + _DEFAULT_READ_LIMIT)
+            end_idx = min(total, start_idx + _DEFAULT_READ_LIMIT)
         else:
-            end_idx = min(len(lines), start_idx + limit)
+            end_idx = min(total, start_idx + limit)
+
+    _record_read(project_id, session_id, file_path, content,
+                 is_partial=is_partial, window=(start_idx, end_idx))
 
     # 1-indexed line numbers (i+1) so paginated output stays absolutely located.
     numbered = [f"{i + 1}\t{lines[i]}" for i in range(start_idx, end_idx)]
     result = "\n".join(numbered)
     result += format_range_footer(
-        start_idx + 1, end_idx, len(lines), unit="lines",
+        start_idx + 1, end_idx, total, unit="lines",
     )
+    return result
+
+
+async def _read_file_range(
+    project_id: str, session_id: str, filename: str,
+    offset: int | None, limit: int | None,
+) -> str:
+    """Windowed read of a file larger than ``MAX_TOOL_READ_BYTES``.
+
+    Mirrors ``_slice_and_record``'s offset/limit semantics (0-indexed offset;
+    limit 0/None → default 200; negative → last abs(limit) lines) but only
+    the requested window is ever read into memory.
+    """
+    if (limit is None or limit >= 0) and offset is not None and offset < 0:
+        return f"Error: offset must be >= 0, got {offset}"
+
+    if limit is not None and limit < 0:
+        tail, count = abs(limit), None
+    else:
+        tail, count = None, (limit or _DEFAULT_READ_LIMIT)
+
+    try:
+        if filename.startswith('/'):
+            r = await file_service.read_text_range_absolute(
+                filename, offset=offset or 0, limit=count, tail=tail)
+        else:
+            r = await file_service.read_text_range(
+                project_id, filename, offset=offset or 0, limit=count, tail=tail)
+    except FileMissingError:
+        return f"Error: File not found: {filename}"
+    except BinaryFileError:
+        return f"Error: File is binary: {filename}"
+    except FileSystemError as exc:
+        return f"Error: {exc}"
+
+    _record_read(project_id, session_id, filename, "\n".join(r.lines),
+                 is_partial=True, window=(r.start_idx, r.end_idx))
+
+    numbered = [f"{r.start_idx + i + 1}\t{line}" for i, line in enumerate(r.lines)]
+    result = "\n".join(numbered)
+    if r.total_lines is None:
+        # Scan budget hit before EOF: the window is valid but the total is
+        # not — say so instead of inventing one.
+        if r.lines:
+            result += (
+                f"\n\n... (showing lines {r.start_idx + 1}-{r.end_idx}; file "
+                "too large to count the remaining lines — continue with "
+                f"offset={r.end_idx})"
+            )
+    else:
+        result += format_range_footer(
+            r.start_idx + 1, r.end_idx, r.total_lines, unit="lines")
     return result
 
 
@@ -268,17 +376,17 @@ async def _read_image(
     on success.  The loop runner's ``_normalize_tool_result`` converts the
     dict into an ephemeral multimodal message injected into the LLM context.
     """
-    # Read raw bytes — absolute or sandbox path
+    # Read raw bytes — absolute or sandbox path. stat-first: the byte cap
+    # and regular-file check run before any byte is read, so an oversized
+    # "image" or a device file never enters memory.
     try:
         if filename.startswith('/'):
             p = Path(filename).resolve()
-            if not p.exists():
-                return f"Error: File not found: {filename}"
-            if not p.is_file():
-                return f"Error: Not a file: {filename}"
-            raw = p.read_bytes()
+            check_readable(p, filename, MAX_CHAT_IMAGE_BYTES)
+            raw = await asyncio.to_thread(p.read_bytes)
         else:
-            raw = await file_service.read_file_binary(project_id, filename)
+            raw = await file_service.read_file_binary(
+                project_id, filename, max_bytes=MAX_CHAT_IMAGE_BYTES)
     except FileMissingError:
         return f"Error: File not found: {filename}"
     except FileSystemError as exc:
@@ -301,29 +409,73 @@ async def _read_image(
     if dims is None:
         return f"Error: Cannot read image dimensions from {filename}. The file may be corrupted or not a valid image."
     w, h = dims
+    note = ""
     if w > _MAX_IMAGE_DIMENSION or h > _MAX_IMAGE_DIMENSION:
-        return (
-            f"Error: Image resolution {w}\u00d7{h} exceeds the "
-            f"{_MAX_IMAGE_DIMENSION}\u00d7{_MAX_IMAGE_DIMENSION} limit. "
-            "Please resize the image."
-        )
+        if not _PIL_AVAILABLE:
+            return (
+                f"Error: Image resolution {w}\u00d7{h} exceeds the "
+                f"{_MAX_IMAGE_DIMENSION}\u00d7{_MAX_IMAGE_DIMENSION} limit. "
+                "Please resize the image."
+            )
+        try:
+            raw, scaled = await asyncio.to_thread(
+                _downscale_image, raw, w, h, media_type)
+            # Header shows the final size; the note carries the original.
+            note = f" (downscaled from {w}\u00d7{h} for viewing)"
+            w, h = scaled
+        except Exception:
+            logger.warning("image downscale failed for %s", filename,
+                           exc_info=True)
+            return (
+                f"Error: Image resolution {dims[0]}\u00d7{dims[1]} exceeds "
+                f"the {_MAX_IMAGE_DIMENSION}\u00d7{_MAX_IMAGE_DIMENSION} "
+                "limit and could not be downscaled. Please resize the image."
+            )
 
     # Images are read as one unit — no offset/limit applies.
     _record_read(project_id, session_id, filename, content="", is_partial=False)
 
+    image_base64 = await asyncio.to_thread(
+        lambda: base64.b64encode(raw).decode("ascii"))
+    text = f"Image file: {filename} ({w}\u00d7{h}){note}"
     return {
         "type": "image",
-        "image_base64": base64.b64encode(raw).decode("ascii"),
+        "image_base64": image_base64,
         "media_type": media_type,
-        "text": f"Image file: {filename} ({w}\u00d7{h})",
+        "text": text,
         "image_ref": {
             "path": filename,
             "mime_type": media_type,
             "name": Path(filename).name,
             "source": "read",
-            "text": f"Image file: {filename} ({w}\u00d7{h})",
+            "text": text,
         },
     }
+
+
+def _downscale_image(raw: bytes, w: int, h: int, media_type: str):
+    """Resize an over-dimension image to fit the cap; returns (bytes, (w, h)).
+
+    Runs in a worker thread via ``asyncio.to_thread`` — decode/resize is
+    pure CPU and must stay off the event loop.
+    """
+    import io
+
+    img = _PILImage.open(io.BytesIO(raw))
+    img.load()
+    scale = _MAX_IMAGE_DIMENSION / max(w, h)
+    new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    img = img.resize(new_size, _PILImage.LANCZOS)
+    buf = io.BytesIO()
+    if media_type == "image/jpeg":
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.save(buf, format="JPEG", quality=85)
+    else:
+        if img.mode not in ("RGB", "RGBA", "L"):
+            img = img.convert("RGBA")
+        img.save(buf, format="PNG")
+    return buf.getvalue(), img.size
 
 
 async def _write_file(
@@ -364,30 +516,63 @@ async def _edit_file(
     fails unless ``replace_all=True``.
 
     Must-read-first: like ``_write_file``, requires a prior read in this
-    conversation segment.
+    conversation segment, and the read must cover the region being edited
+    (``replace_all`` additionally requires a whole-file read).
+
+    Line-ending/encoding robustness: matching happens on CRLF-normalized
+    text so ``old_string`` copied from read output always matches, and the
+    write-back preserves the file's dominant line endings, BOM, and
+    encoding (UTF-8 / BOM'd UTF-16).
     """
     if old_string == new_string:
         return "Error: old_string and new_string are identical. No changes needed."
+
+    if file_path.lower().endswith(".ipynb"):
+        return ("Error: file is a Jupyter notebook — use the notebook_edit "
+                "tool to edit cells.")
+
+    if not old_string:
+        return ("Error: old_string must be non-empty. Use the write tool to "
+                "create a file or replace its whole content.")
 
     err = _must_read_first_error_for(project_id, session_id, file_path, op="edit")
     if err:
         return err
 
-    # Read file content — supports absolute and relative paths.
-    content = None
+    # Read the raw bytes: matching needs CRLF normalization and the write
+    # -back needs the original encoding/BOM. The whole file must fit in
+    # memory for exact-match replacement, so the whole-read cap applies;
+    # oversized files get a targeted-edit suggestion.
     if file_path.startswith('/'):
         try:
-            content = file_service.read_file_absolute(file_path)
-        except (FileMissingError, BinaryFileError):
-            pass
-
-    if content is None:
-        try:
-            content = await file_service.read_file(project_id, file_path)
+            raw = await file_service.read_file_absolute_bytes(
+                file_path, max_bytes=MAX_TOOL_READ_BYTES)
         except FileMissingError:
             return f"Error: File not found: {file_path}"
-        except BinaryFileError:
-            return f"Error: File is binary: {file_path}"
+        except FileSystemError as exc:
+            if exc.code == "FILE_TOO_LARGE":
+                return f"Error: {exc} (bash `sed -i` handles targeted edits on large files)"
+            return f"Error: {exc}"
+    else:
+        try:
+            raw = await file_service.read_file_binary(
+                project_id, file_path, max_bytes=MAX_TOOL_READ_BYTES)
+        except FileMissingError:
+            return f"Error: File not found: {file_path}"
+        except FileSystemError as exc:
+            if exc.code == "FILE_TOO_LARGE":
+                return f"Error: {exc} (bash `sed -i` handles targeted edits on large files)"
+            return f"Error: {exc}"
+
+    info = decode_text_bytes(raw)
+    if info.encoding == "utf-8" and b"\x00" in raw[:8192]:
+        return f"Error: File is binary: {file_path}"
+
+    # CRLF is invisible in read output — normalize everything, restore the
+    # dominant ending on write-back below.
+    content = info.text.replace("\r\n", "\n")
+    old_string = old_string.replace("\r\n", "\n")
+    new_string = new_string.replace("\r\n", "\n")
 
     count = content.count(old_string)
     if count == 0:
@@ -395,13 +580,60 @@ async def _edit_file(
     if count > 1 and not replace_all:
         return f"Error: old_string appears {count} times in {file_path}. Use replace_all=true or provide more context."
 
+    # Region gate: refuse edits to lines the model has not read. Blind edits
+    # on huge files are how stale-assumption bugs sneak in. Any read window
+    # recorded against the current file state counts (read output defaults
+    # to a 200-line window, so a large file may need several windowed reads;
+    # coverage resets when the file changes on disk).
+    entry = read_state_cache.get(
+        session_id, _read_state_key(project_id, file_path))
+    if entry is not None and entry.coverage is not None:
+        read_desc = ", ".join(f"{s + 1}-{e}" for s, e in entry.coverage)
+        # Same trailing-newline normalization as _slice_and_record's totals.
+        total_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+        full_read = (len(entry.coverage) == 1
+                     and entry.coverage[0][0] == 0
+                     and entry.coverage[0][1] >= total_lines)
+        if replace_all and not full_read:
+            return (
+                f"Error: replace_all requires reading the whole file first "
+                f"(lines {read_desc} of {total_lines} "
+                "were read). Re-read with a larger limit, or edit each "
+                "occurrence individually."
+            )
+        if not replace_all:
+            pos = content.find(old_string)
+            line_no = content.count("\n", 0, pos)
+            if not any(s <= line_no < e for s, e in entry.coverage):
+                return (
+                    f"Error: old_string is at line {line_no + 1}, outside "
+                    f"the lines read ({read_desc}). Read that region "
+                    f"first, e.g. read with offset={max(0, line_no - 20)}."
+                )
+
     new_content = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
+
+    # Restore dominant line endings and the original encoding/BOM.
+    if info.crlf:
+        new_content = new_content.replace("\n", "\r\n")
+    encoding = info.encoding
+    if info.had_bom:
+        if encoding == "utf-8":
+            # The utf-8-sig codec prepends the BOM itself.
+            encoding = "utf-8-sig"
+        else:
+            # utf-16-le/-be codecs write no BOM — prepend it as a character
+            # and keep the file's original byte order (the plain "utf-16"
+            # codec would silently flip it to the machine's native order).
+            new_content = "\ufeff" + new_content
 
     # Write back — permission already checked by permission_executor._check_write
     if file_path.startswith('/'):
-        await file_service.write_file_absolute(project_id, file_path, new_content)
+        await file_service.write_file_absolute(
+            project_id, file_path, new_content, encoding=encoding)
     else:
-        await file_service.write_file(project_id, file_path, new_content)
+        await file_service.write_file(
+            project_id, file_path, new_content, encoding=encoding)
 
     # Refresh cache so further edits in the same turn pass the staleness check.
     _record_read(project_id, session_id, file_path, new_content, is_partial=False)
@@ -425,6 +657,41 @@ def _must_read_first_error_for(
     return must_read_first_error(session_id, resolved, op=op)
 
 
+# list_files caps every listing mode (single directory or rendered tree);
+# larger listings report the remainder instead of flooding the model context.
+_MAX_LIST_ENTRIES = 2000
+
+
+async def _ls_scan(target: Path, label: str) -> str:
+    """List *target*'s children (dirs first, hidden filtered) in a worker
+    thread, capped at ``_MAX_LIST_ENTRIES`` entries."""
+
+    def _scan() -> tuple[list[str], int]:
+        entries = sorted(
+            target.iterdir(),
+            key=lambda x: (not x.is_dir(), x.name.lower()),
+        )
+        lines = [
+            f"{e.name}{'/' if e.is_dir() else ''}"
+            for e in entries
+            if not e.name.startswith('.')
+        ]
+        shown = lines[:_MAX_LIST_ENTRIES]
+        return shown, len(lines) - len(shown)
+
+    try:
+        lines, more = await asyncio.to_thread(_scan)
+    except FileNotFoundError:
+        return f"Directory not found: {label}"
+    except NotADirectoryError:
+        return f"Not a directory: {label}"
+    if not lines:
+        return "(empty directory)"
+    if more:
+        lines.append(f"... +{more} more entries not shown (use a more specific path)")
+    return "\n".join(lines)
+
+
 async def _list_files(project_id: str, dirname: str = "") -> str:
     """List files in the project directory."""
     try:
@@ -435,26 +702,13 @@ async def _list_files(project_id: str, dirname: str = "") -> str:
                 return f"Directory not found: {dirname}"
             if not target.is_dir():
                 return f"Not a directory: {dirname}"
-            entries = sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-            lines = []
-            for e in entries:
-                if e.name.startswith('.'):
-                    continue
-                suffix = "/" if e.is_dir() else ""
-                lines.append(f"{e.name}{suffix}")
-            return "\n".join(lines) if lines else "(empty directory)"
+            return await _ls_scan(target, dirname)
 
-        # Relative path or empty — browse project sandbox
+        # Relative path — browse project sandbox (safe_join keeps containment)
         if dirname:
-            result = await file_service.get_children(project_id, dirname)
-            children = result.get("children", [])
-            if not children:
-                return "(empty directory)"
-            lines = []
-            for c in children:
-                suffix = "/" if c["type"] == "directory" else ""
-                lines.append(f"{c['name']}{suffix}")
-            return "\n".join(lines)
+            target = file_service.safe_join(
+                file_service.get_project_path(project_id), dirname)
+            return await _ls_scan(target, dirname)
 
         # Project root tree
         tree = await file_service.get_project_tree(project_id)
@@ -467,7 +721,14 @@ async def _list_files(project_id: str, dirname: str = "") -> str:
                     lines.extend(_fmt(child, prefix + "  "))
             return lines
         lines = _fmt(tree.get("root", {}))
-        return "\n".join(lines) if lines else "(empty project)"
+        if not lines:
+            return "(empty project)"
+        if len(lines) > _MAX_LIST_ENTRIES:
+            more = len(lines) - _MAX_LIST_ENTRIES
+            lines = lines[:_MAX_LIST_ENTRIES]
+            lines.append(
+                f"... +{more} more entries not shown (use a more specific path)")
+        return "\n".join(lines)
     except FileMissingError:
         return f"Directory not found: {dirname}"
     except FileSystemError as e:
@@ -497,6 +758,215 @@ def _expand_braces(pattern: str) -> list[str]:
 
 _GLOB_MAX_RESULTS = 100
 
+# Bounded-search budgets. The glob/grep subprocesses are the traversal
+# engine: they run in a killable process (a walk can never wedge the worker's
+# event loop), with a wall-clock deadline and an output-size cap. 20 MB of
+# paths is already pathological (~200k entries) and stops the collection
+# before sorting/stat-ing floods memory.
+_GLOB_TIMEOUT_SECONDS = 20
+_SEARCH_MAX_OUTPUT_BYTES = 20 * 1024 * 1024
+_SEARCH_KILL_GRACE_SEC = 5.0
+_GLOB_MAX_MATCHES = 10_000
+# Fallback (rg missing) walks in-process; it must be independently bounded.
+_GLOB_FALLBACK_DEADLINE_SEC = 10.0
+_GLOB_FALLBACK_MAX_MATCHES = 1_000
+
+
+class SearchProcessError(Exception):
+    """The search binary exited with a real error (not 0/1 = match/no-match).
+
+    Without this classification a bad regex, a missing path, or a resource
+    error is indistinguishable from "no results" — the LLM would reason on a
+    false premise instead of fixing its input.
+    """
+
+    def __init__(self, returncode: int | None, stderr: bytes):
+        lines = [l for l in
+                 stderr.decode("utf-8", errors="replace").strip().splitlines()
+                 if l.strip()]
+        message = lines[0] if lines else f"exited with code {returncode}"
+        # rg splits regex diagnostics across lines ("regex parse error:" …
+        # "error: unclosed character class"); surface the summary line too.
+        for later in lines[1:6]:
+            if later.strip().startswith("error:"):
+                message = f"{message} {later.strip()}"
+                break
+        super().__init__(message)
+        self.returncode = returncode
+
+
+class _SearchRun:
+    """Outcome of one bounded search subprocess run."""
+
+    __slots__ = ("stdout", "stderr", "returncode", "bound_exceeded")
+
+    def __init__(self, stdout: bytes, stderr: bytes,
+                 returncode: int | None, bound_exceeded: bool):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        self.bound_exceeded = bound_exceeded
+
+
+def _is_eagain(stderr: bytes) -> bool:
+    """rg failed to spawn its thread pool (Docker/CI ulimits, os error 11)."""
+    return (b"os error 11" in stderr
+            or b"Resource temporarily unavailable" in stderr)
+
+
+async def _run_bounded_search(
+    cmd: list[str], *, cwd: str | None, timeout: float,
+) -> _SearchRun:
+    """Run a search subprocess under a hard wall-clock + output budget.
+
+    Returns the collected stdout plus the process's stderr and exit code so
+    callers can tell "no matches" (0/1) from failure (anything else) — a
+    classification the raw byte stream cannot provide. On timeout or
+    output-cap the process is SIGKILLed (rg keeps no state worth a graceful
+    SIGTERM) and whatever stdout was collected is returned so callers can
+    surface partial results. stdout is read incrementally in bounded chunks;
+    stderr is drained by a concurrent task (a full stderr pipe would
+    deadlock the stdout loop).
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    stderr_task = asyncio.create_task(proc.stderr.read())
+    chunks: list[bytes] = []
+    total = 0
+    bound_exceeded = False
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                bound_exceeded = True
+                break
+            try:
+                chunk = await asyncio.wait_for(
+                    proc.stdout.read(65536), timeout=remaining)
+            except asyncio.TimeoutError:
+                bound_exceeded = True
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= _SEARCH_MAX_OUTPUT_BYTES:
+                bound_exceeded = True
+                break
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_SEARCH_KILL_GRACE_SEC)
+        except asyncio.TimeoutError:
+            logger.warning("search subprocess did not exit after SIGKILL: %s",
+                           cmd[:2])
+        stderr = b""
+        try:
+            stderr = await asyncio.wait_for(
+                stderr_task, timeout=_SEARCH_KILL_GRACE_SEC)
+        except Exception:
+            stderr_task.cancel()
+        _close_search_pipes(proc)
+    return _SearchRun(b"".join(chunks), stderr or b"",
+                      proc.returncode, bound_exceeded)
+
+
+async def _run_rg_search(
+    cmd: list[str], *, cwd: str | None, timeout: float,
+) -> _SearchRun:
+    """``_run_bounded_search`` for rg commands, with the EAGAIN retry.
+
+    In containers with low thread limits rg can fail to spawn its worker
+    pool ("Resource temporarily unavailable"). One retry in single-threaded
+    mode (``-j 1``) fixes it; the flag applies to that call only, never
+    globally — persistent single-threading slows large-repo searches.
+    """
+    run = await _run_bounded_search(cmd, cwd=cwd, timeout=timeout)
+    if (run.returncode not in (0, 1) and not run.bound_exceeded
+            and _is_eagain(run.stderr)):
+        logger.info("rg hit EAGAIN; retrying single-threaded (-j 1)")
+        run = await _run_bounded_search(
+            [cmd[0], "-j", "1", *cmd[1:]], cwd=cwd, timeout=timeout)
+    return run
+
+
+def _close_search_pipes(proc: asyncio.subprocess.Process) -> None:
+    """Release the stdout/stderr pipe transports after the bounded-read loop.
+
+    ``proc.communicate()`` normally closes transports; this loop reads
+    incrementally and may abort before EOF, so close explicitly.
+    """
+    for stream in (proc.stdout, proc.stderr):
+        transport = getattr(stream, "_transport", None)
+        if transport is not None and not transport.is_closing():
+            transport.close()
+
+# Virtual or self-referential filesystem roots. A recursive walk from / or
+# /proc never terminates (/proc/<pid>/root is a symlink back to /), so glob
+# and grep refuse these roots outright instead of relying on the timeout to
+# kill the walk.
+_VIRTUAL_FS_ROOTS = ("/proc", "/sys", "/dev", "/run")
+
+
+def _is_virtual_fs_root(root: Path) -> bool:
+    """True when *root* is ``/`` itself or one of the virtual FS trees."""
+    if str(root) == "/":
+        return True
+    return any(root == Path(v) or Path(v) in root.parents for v in _VIRTUAL_FS_ROOTS)
+
+
+def _virtual_root_refusal(project_id: str, root) -> str:
+    hint = ""
+    try:
+        if project_id:
+            hint = f", e.g. {file_service.get_project_path(project_id)}"
+    except Exception:
+        pass
+    return (
+        f"Error: refusing to search from '{root}' — virtual filesystem roots "
+        f"never finish walking. Search a concrete directory instead{hint}."
+    )
+
+
+def _split_absolute_pattern(pattern: str) -> tuple[Path, str]:
+    """Split an absolute glob pattern into a literal base dir + relative glob.
+
+    ``/etc/**/*.conf`` → ``/etc`` + ``**/*.conf``. The final segment always
+    stays in the pattern (it matches literally against itself), so
+    ``/etc/hosts`` → ``/etc`` + ``hosts``. A pattern whose first segment is
+    already a wildcard has no literal base and lands on ``/`` — which the
+    caller refuses.
+    """
+    parts = pattern.lstrip("/").split("/")
+    base_parts: list[str] = []
+    for seg in parts[:-1]:
+        if any(c in seg for c in "*?[{"):
+            break
+        base_parts.append(seg)
+    base = Path("/" + "/".join(base_parts)) if base_parts else Path("/")
+    rel = "/".join(parts[len(base_parts):])
+    return base, rel
+
+
+def _translate_glob_for_rg(pattern: str) -> str:
+    """Adapt a Python-glob pattern to ripgrep ``--glob`` semantics.
+
+    - Patterns without ``/`` match only the top level in Python glob, but a
+      bare rg glob matches basenames at any depth — anchor with a leading ``/``.
+    - A pattern segment that explicitly starts with ``.`` must be allowed to
+      match hidden entries (rg skips them unless ``--hidden``; the flag is
+      added by the caller in that case).
+    """
+    if "/" not in pattern:
+        return "/" + pattern
+    return pattern
+
 
 async def _glob_search(project_id: str = "", pattern: str = "", path: str = ".") -> str:
     """Find files matching a glob pattern.
@@ -506,40 +976,222 @@ async def _glob_search(project_id: str = "", pattern: str = "", path: str = ".")
     paths are still relative to the project root (so the LLM can pass them
     directly to ``read``); when ``path`` is absolute, returned paths are
     absolute.
+
+    The walk runs in a ripgrep subprocess under a wall-clock deadline and an
+    output cap, so no pattern — however broad — can wedge the worker's event
+    loop. Virtual filesystem roots are refused outright; rg additionally
+    never follows directory symlinks.
     """
-    import glob as glob_mod
+    if not (pattern or "").strip():
+        return "Error: pattern is required"
 
-    search_dir = path if os.path.isabs(path) else os.path.join(
-        str(file_service.get_project_path(project_id)) if project_id else ".", path
-    )
+    # Absolute patterns carry their own search root (`/etc/**/*.conf`).
+    if pattern.startswith("/"):
+        base, rel = _split_absolute_pattern(pattern)
+        if _is_virtual_fs_root(base):
+            return _virtual_root_refusal(project_id, base)
+        search_dir, sub_patterns, path_is_absolute = base, _expand_braces(rel), True
+    else:
+        search_dir = Path(path if os.path.isabs(path) else os.path.join(
+            str(file_service.get_project_path(project_id)) if project_id else ".", path,
+        ))
+        if _is_virtual_fs_root(search_dir.resolve()):
+            return _virtual_root_refusal(project_id, search_dir)
+        sub_patterns, path_is_absolute = _expand_braces(pattern), os.path.isabs(path)
 
-    path_is_absolute = os.path.isabs(path)
-    # For relative subdirectory ``path`` (e.g. "src"), glob returns paths
-    # relative to search_dir (e.g. "foo.ts"); prepend the subdirectory so the
-    # LLM sees project-relative paths ("src/foo.ts").
-    rel_prefix = "" if (path_is_absolute or path in (".", "", "./")) else path.rstrip("/") + "/"
+    # Existence up front: a missing directory must be an error, not a
+    # silent "no files matching".
+    if not search_dir.is_dir():
+        return f"Error: Directory does not exist: {search_dir}"
 
-    # Expand brace patterns and collect deduplicated results
+    # ``path`` relative subdirectory (e.g. "src"): rg echoes paths relative to
+    # the search dir ("foo.ts"); prepend the subdirectory so the LLM sees
+    # project-relative paths ("src/foo.ts").
+    rel_prefix = "" if (path_is_absolute or path in (".", "", "./")) \
+        else path.rstrip("/") + "/"
+
+    try:
+        raw, bound_exceeded, match_capped = await _glob_via_rg(
+            search_dir, sub_patterns)
+    except FileNotFoundError:
+        raw, bound_exceeded = await asyncio.to_thread(
+            _glob_fallback_walk, search_dir, sub_patterns)
+        # The fallback walk genuinely stops at its own match cap, so its
+        # budget flag already covers that case.
+        match_capped = False
+    except SearchProcessError as exc:
+        return f"Error: glob search failed: {exc}"
+
     seen: set[str] = set()
     matches: list[str] = []
-    for sub_pattern in _expand_braces(pattern):
-        for m in glob_mod.glob(sub_pattern, root_dir=search_dir, recursive=True):
-            if os.path.isabs(m):
-                # An absolute pattern ignores root_dir; results are already absolute.
-                full = m
-            elif path_is_absolute:
-                full = os.path.normpath(os.path.join(search_dir, m))
-            else:
-                full = rel_prefix + m
-            if full not in seen:
-                seen.add(full)
-                matches.append(full)
+    for m in raw:
+        # Both engines (rg and the fallback walker) return paths relative to
+        # search_dir; rejoin for absolute-output searches.
+        full = (os.path.normpath(os.path.join(str(search_dir), m))
+                if path_is_absolute else rel_prefix + m)
+        if full not in seen:
+            seen.add(full)
+            matches.append(full)
 
     if not matches:
+        if bound_exceeded:
+            return (f"Error: glob for '{pattern}' exceeded its search budget "
+                    "without finding anything. Use a more specific path or "
+                    "pattern.")
         return f"No files matching '{pattern}'"
 
-    # Sort by mtime desc, then alphabetically. Best-effort: stat failures fall
-    # back to mtime=0 (oldest).
+    matches = await asyncio.to_thread(
+        _sort_by_mtime, matches, path_is_absolute, project_id)
+
+    shown = matches[:_GLOB_MAX_RESULTS]
+    result = "\n".join(shown)
+    notes = []
+    if len(matches) > len(shown):
+        notes.append(f"{len(matches) - len(shown)} more matches not shown")
+    if match_capped:
+        # The search itself finished; only the collected list was truncated.
+        notes.append(f"results capped at {_GLOB_MAX_MATCHES:,} matches; "
+                     "use a more specific path or pattern")
+    if bound_exceeded:
+        notes.append("search stopped early — time or output budget exceeded; "
+                     "use a more specific path or pattern")
+    if notes:
+        # Leading "\n\n" matches the read truncation suffix style.
+        result += "\n\n... (" + "; ".join(notes) + ")"
+    return result
+
+
+async def _glob_via_rg(search_dir, sub_patterns: list[str]) -> tuple[list[str], bool, bool]:
+    """Run ``rg --files`` for the patterns; returns (relative paths,
+    budget_exceeded, match_capped).
+
+    Paths come back relative to *search_dir* (no ``./`` prefix); callers
+    rejoin the prefix for absolute-output searches. The process always runs
+    with ``cwd=search_dir`` and a ``.`` argument: rg resolves a leading-``/``
+    glob (see ``_translate_glob_for_rg``) against the *cwd*, so passing an
+    absolute search argument instead would anchor against the wrong root and
+    silently match nothing. ``-0`` (NUL-separated) is the only path-safe
+    framing: paths may contain newlines.
+    """
+    cmd = ["rg", "--files", "-0", "--no-ignore"]
+    # rg skips hidden entries by default, mirroring Python glob; explicit
+    # dot-prefixed pattern segments opt in (same rule as the fallback
+    # walker's `want` below).
+    if any(seg.startswith(".") for p in sub_patterns for seg in p.split("/")):
+        cmd.append("--hidden")
+    for p in sub_patterns:
+        cmd += ["--glob", _translate_glob_for_rg(p)]
+    cmd.append(".")
+
+    run = await _run_rg_search(
+        cmd, cwd=str(search_dir),
+        timeout=_GLOB_TIMEOUT_SECONDS)
+    # Exit 0/1 = matched/no-match. Anything else with no output is a real
+    # failure (bad pattern, resource error) — raising lets the caller report
+    # it instead of a false "No files matching"; partial output still wins.
+    # A killed run (timeout/output cap) is a budget report, not an error.
+    if (not run.bound_exceeded and run.returncode not in (0, 1)
+            and not run.stdout):
+        raise SearchProcessError(run.returncode, run.stderr)
+    entries = [e.decode("utf-8", errors="replace")
+               for e in run.stdout.split(b"\0") if e]
+    # rg echoes "./name" for a "." search; callers expect paths relative to
+    # the search dir without the prefix.
+    entries = [e[2:] if e.startswith("./") else e for e in entries]
+    if run.bound_exceeded and entries:
+        # The process was killed mid-stream: the last entry may be a partial
+        # path, so drop it rather than return a corrupt name.
+        entries.pop()
+    match_capped = len(entries) > _GLOB_MAX_MATCHES
+    return entries[:_GLOB_MAX_MATCHES], run.bound_exceeded, match_capped
+
+
+def _glob_fallback_walk(search_dir, sub_patterns: list[str]) -> tuple[list[str], bool]:
+    """In-process bounded glob, used only when the rg binary is missing.
+
+    Follows Python glob segment semantics but never descends into symlinked
+    directories — the self-reference hazard rg already avoids — and enforces
+    a deadline plus a match cap. Returns (relative paths, budget_exceeded).
+    """
+    deadline = time.monotonic() + _GLOB_FALLBACK_DEADLINE_SEC
+    matches: list[str] = []
+    exceeded = [False]
+
+    def want(name: str, seg: str) -> bool:
+        # Python glob: '*' does not match leading-dot names unless the
+        # pattern segment itself starts with a dot.
+        if not seg.startswith(".") and name.startswith("."):
+            return False
+        return fnmatch.fnmatchcase(name, seg)
+
+    def walk(dir_path: Path, segs: tuple[str, ...], rel: str) -> None:
+        if exceeded[0] or len(matches) >= _GLOB_FALLBACK_MAX_MATCHES:
+            exceeded[0] = True
+            return
+        if time.monotonic() > deadline:
+            exceeded[0] = True
+            return
+        try:
+            entries = list(os.scandir(dir_path))
+        except OSError:
+            return
+        if not segs:
+            return
+        seg, rest = segs[0], segs[1:]
+        allow_hidden = any(s.startswith(".") for s in segs)
+        if seg == "**":
+            if not rest:
+                # A trailing '**' matches everything below this point.
+                walk_all(dir_path, rel, allow_hidden)
+                return
+            walk(dir_path, rest, rel)  # '**' may match zero directories
+            for e in entries:
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+                if e.name.startswith(".") and not allow_hidden:
+                    continue
+                walk(Path(e.path), segs, _join_rel(rel, e.name))
+        elif not rest:
+            for e in entries:
+                if want(e.name, seg):
+                    matches.append(_join_rel(rel, e.name))
+        else:
+            for e in entries:
+                if e.is_dir(follow_symlinks=False) and want(e.name, seg):
+                    walk(Path(e.path), rest, _join_rel(rel, e.name))
+
+    def walk_all(dir_path: Path, rel: str, allow_hidden: bool) -> None:
+        if exceeded[0] or len(matches) >= _GLOB_FALLBACK_MAX_MATCHES:
+            exceeded[0] = True
+            return
+        if time.monotonic() > deadline:
+            exceeded[0] = True
+            return
+        try:
+            entries = list(os.scandir(dir_path))
+        except OSError:
+            return
+        for e in entries:
+            # Same hidden-entry rule as `want`/the '**' descent above.
+            if e.name.startswith(".") and not allow_hidden:
+                continue
+            matches.append(_join_rel(rel, e.name))
+            if e.is_dir(follow_symlinks=False):
+                walk_all(Path(e.path), _join_rel(rel, e.name), allow_hidden)
+
+    for p in sub_patterns:
+        walk(Path(search_dir), tuple(s for s in p.split("/") if s), "")
+    return matches, exceeded[0]
+
+
+def _join_rel(rel: str, name: str) -> str:
+    return f"{rel}/{name}" if rel else name
+
+
+def _sort_by_mtime(matches: list[str], path_is_absolute: bool,
+                   project_id: str) -> list[str]:
+    """Sort by mtime desc, then alphabetically. Best-effort: stat failures
+    fall back to mtime=0 (oldest)."""
     def _mtime_key(p: str) -> tuple[float, str]:
         try:
             if path_is_absolute:
@@ -548,14 +1200,7 @@ async def _glob_search(project_id: str = "", pattern: str = "", path: str = ".")
             return (-(base / p).stat().st_mtime, p)
         except OSError:
             return (0.0, p)
-    matches.sort(key=_mtime_key)
-
-    shown = matches[:_GLOB_MAX_RESULTS]
-    result = "\n".join(shown)
-    if len(matches) > _GLOB_MAX_RESULTS:
-        # Leading "\n\n" matches the read/library_read truncation suffix style.
-        result += f"\n\n... ({len(matches) - _GLOB_MAX_RESULTS} more matches not shown)"
-    return result
+    return sorted(matches, key=_mtime_key)
 
 
 # ── grep (ripgrep-backed content search) ────────────────────────────
@@ -584,6 +1229,9 @@ def _build_rg_command(
     parsed as flags.
     """
     cmd: list[str] = ["rg", "--no-heading"]
+    # Long lines (minified JS, base64 blobs) are omitted instead of flooding
+    # the tool result; rg prints "[Omitted long matching line]".
+    cmd.extend(["--max-columns", "500"])
     if output_mode == "files_with_matches":
         cmd.append("-l")
     elif output_mode == "count":
@@ -682,6 +1330,18 @@ async def _grep_search(
         cwd = str(file_service.get_project_path(project_id)) if project_id else "."
         search_arg = "." if path in ("", ".", "./") else path
 
+    # Existence up front: a typo'd path must be an error, not a silent
+    # "No matches". A directory search rooted at a virtual filesystem tree
+    # (/proc, /sys, ...) is refused outright like glob — the timeout would
+    # bound it, but a walk that can never usefully finish is an error, not a
+    # slow search. Single files inside those trees stay allowed.
+    probe = Path(search_arg) if cwd is None else Path(cwd) / search_arg
+    if not probe.exists():
+        return f"Error: Path does not exist: {path}"
+    if probe.is_dir() and _is_virtual_fs_root(probe.resolve()):
+        return _virtual_root_refusal(project_id, probe.resolve())
+
+    timeout = _GREP_TIMEOUT_SECONDS
     cmd = _build_rg_command(
         pattern, search_arg,
         output_mode=output_mode, glob_filter=glob_filter, type_filter=type_filter,
@@ -691,22 +1351,34 @@ async def _grep_search(
     )
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_GREP_TIMEOUT_SECONDS)
+        # Bounded search: on timeout the rg process is killed and partial
+        # output is still surfaced. Exit-code classification separates
+        # "no matches" from real failures (bad regex, resource errors) so
+        # the LLM never reasons on a false "no matches".
+        run = await _run_rg_search(cmd, cwd=cwd, timeout=timeout)
+        stdout, bound_exceeded = run.stdout, run.bound_exceeded
         output = stdout.decode("utf-8", errors="replace").strip()
         if output and search_arg == ".":
             output = _strip_leading_dot_slash(output)
+        output = _strip_trailing_cr(output)
+        if bound_exceeded and output:
+            # Killed mid-stream: the final line may be truncated mid-write.
+            lines = output.split("\n")
+            output = "\n".join(lines[:-1]) if len(lines) > 1 else ""
         if not output:
+            if bound_exceeded:
+                return f"grep error: search timed out after {timeout:g}s"
+            if run.returncode not in (0, 1):
+                raise SearchProcessError(run.returncode, run.stderr)
             return f"No matches for '{pattern}'"
-        return _format_grep_output(
+        formatted = _format_grep_output(
             output,
             head_limit=head_limit, offset=offset,
         ) or f"No matches for '{pattern}'"
+        if bound_exceeded:
+            formatted += ("\n\n... (search stopped early — time or output "
+                          "budget exceeded; use a more specific path or pattern)")
+        return formatted
     except FileNotFoundError:
         # rg missing — fall back to grep with reduced feature set
         return await _grep_fallback(
@@ -717,8 +1389,8 @@ async def _grep_search(
             type_filter=type_filter,
             head_limit=head_limit, offset=offset,
         )
-    except asyncio.TimeoutError:
-        return f"grep error: search timed out after {_GREP_TIMEOUT_SECONDS}s"
+    except SearchProcessError as exc:
+        return f"grep error: {exc}"
     except Exception as e:
         logger.exception("grep failed")
         return f"grep error: {e}"
@@ -728,6 +1400,14 @@ def _strip_leading_dot_slash(output: str) -> str:
     """Remove the "./" prefix rg/grep put on every path for a "." search."""
     return "\n".join(
         line[2:] if line.startswith("./") else line
+        for line in output.split("\n")
+    )
+
+
+def _strip_trailing_cr(output: str) -> str:
+    """Drop the \\r rg echoes for CRLF files."""
+    return "\n".join(
+        line[:-1] if line.endswith("\r") else line
         for line in output.split("\n")
     )
 
@@ -779,25 +1459,30 @@ async def _grep_fallback(
     # ``-e`` keeps patterns starting with ``-`` from being parsed as flags.
     cmd.extend(["-e", pattern, search_arg])
 
+    timeout = _GREP_TIMEOUT_SECONDS
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_GREP_TIMEOUT_SECONDS)
-        output = stdout.decode("utf-8", errors="replace").strip()
-    except asyncio.TimeoutError:
-        return f"grep error: search timed out after {_GREP_TIMEOUT_SECONDS}s"
-    except Exception as e:
-        logger.exception("grep subprocess failed")
-        return f"grep error: {e}"
-
-    if root_search and output:
+        run = await _run_bounded_search(cmd, cwd=cwd, timeout=timeout)
+    except FileNotFoundError:
+        return "grep error: neither ripgrep nor grep is available"
+    output = run.stdout.decode("utf-8", errors="replace").strip()
+    if output and root_search:
         output = _strip_leading_dot_slash(output)
-
+    if output:
+        output = _strip_trailing_cr(output)
+    if run.bound_exceeded and output:
+        # Killed mid-stream: the final line may be truncated mid-write.
+        lines = output.split("\n")
+        output = "\n".join(lines[:-1]) if len(lines) > 1 else ""
     if not output:
+        if run.bound_exceeded:
+            return f"grep error: search timed out after {timeout:g}s"
+        # grep exits 2 on usage/regex errors — classify like the rg path so
+        # a broken pattern is never reported as "No matches".
+        if run.returncode == 2:
+            first = run.stderr.decode(
+                "utf-8", errors="replace").strip().splitlines()
+            detail = first[0] if first else f"grep exited with code {run.returncode}"
+            return f"grep error: {detail}"
         return f"No matches for '{pattern}'"
 
     if effective_mode == "files_with_matches":
@@ -818,8 +1503,11 @@ async def _grep_fallback(
         )
 
     suffix = ""
+    if run.bound_exceeded:
+        suffix = ("\n\n... (search stopped early — time or output "
+                  "budget exceeded; use a more specific path or pattern)")
     if ignored:
-        suffix = f"\n\n(rg not available; {', '.join(ignored)} ignored)"
+        suffix += f"\n\n(rg not available; {', '.join(ignored)} ignored)"
     return body + suffix if body else f"No matches for '{pattern}'{suffix}"
 
 
@@ -844,6 +1532,12 @@ async def _edit_preflight(
 ) -> str | None:
     if old_string == new_string:
         return "Error: old_string and new_string are identical. No changes needed."
+    if file_path.lower().endswith(".ipynb"):
+        return ("Error: file is a Jupyter notebook — use the notebook_edit "
+                "tool to edit cells.")
+    if not old_string:
+        return ("Error: old_string must be non-empty. Use the write tool to "
+                "create a file or replace its whole content.")
     return _must_read_first_error_for(
         project_id, session_id, file_path, op="edit",
     )
@@ -899,7 +1593,7 @@ tool_registry.register(ToolDefinition(
         "type": "object",
         "properties": {
             "file_path": {"type": "string", "description": "Absolute or project-relative path"},
-            "old_string": {"type": "string", "description": "The text to replace"},
+            "old_string": {"type": "string", "minLength": 1, "description": "The text to replace"},
             "new_string": {"type": "string", "description": "The text to replace it with (must be different from old_string)"},
             "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false)", "default": False},
         },

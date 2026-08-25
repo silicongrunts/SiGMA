@@ -6,6 +6,8 @@ per the project architecture rule.
 """
 
 import asyncio
+import os
+import signal
 
 from app.agents.tools.base import ToolDefinition
 from app.agents.tools.registry import tool_registry
@@ -41,6 +43,36 @@ def _format_output(stdout: bytes, stderr: bytes, exit_code, *, note: str = "") -
         f"-----\n"
         f"{code_line}"
     )
+
+
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the command's whole process group.
+
+    ``create_subprocess_shell`` runs ``/bin/sh -c <cmd>``; killing only the
+    shell orphans its children (``sh -c 'sleep 300; echo x'`` leaves the
+    sleep running past both timeout and cancellation). The shell is spawned
+    with ``start_new_session=True`` so its group id equals its pid and the
+    kill cannot touch SiGMA's own workers.
+
+    The pid guard is load-bearing: ``os.killpg(pgid, sig)`` translates to
+    ``kill(-pgid, sig)``, so a pid of exactly 1 (or any non-int) becomes
+    ``kill(-1)`` — SIGKILL to every process on the system when the backend
+    runs as root. A real child's pid is always an int ≥ 2; anything else
+    must be refused outright rather than coerced.
+    """
+    pid = proc.pid
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        logger.warning("refusing to kill process group for bogus pid %r", pid)
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        # Group already gone (or not a leader) — fall back to a direct kill.
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
 
 def _close_pipes(proc: asyncio.subprocess.Process) -> None:
@@ -99,13 +131,16 @@ async def _run_bash(project_id: str, command: str, timeout: int = 120) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(project_path),
+            # Own process group so a timeout/cancel can killpg the whole
+            # command tree, not just the shell (see _kill_process_group).
+            start_new_session=True,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout,
             )
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_process_group(proc)
             # Reap without re-entering communicate(): a second communicate()
             # blocks until pipe EOF (the command's full runtime), which is the
             # bug this path fixes.
@@ -115,6 +150,16 @@ async def _run_bash(project_id: str, command: str, timeout: int = 120) -> str:
                 b"", b"", proc.returncode,
                 note=f"Command timed out after {timeout}s",
             )
+        except asyncio.CancelledError:
+            # The task was cancelled (user pressed stop; the loop runner
+            # cancels in-flight tool calls). Without this handler the
+            # cancellation would propagate and leave the command running
+            # with open pipes — a leaked process that keeps consuming
+            # resources until its own timeout.
+            _kill_process_group(proc)
+            await _reap_after_kill(proc)
+            _close_pipes(proc)
+            raise
 
         return _format_output(stdout, stderr, proc.returncode)
     except Exception as e:

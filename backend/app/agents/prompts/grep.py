@@ -17,4 +17,4 @@ Usage:
 - Searches time out after 15 seconds (reported in the output). If ripgrep is not installed, the tool falls back to GNU grep: output_mode=count, multiline, context flags, and type are unsupported (reported as ignored in the output), and files_with_matches results are not paginated.
 - For open-ended searches needing multiple rounds of globbing and grepping, use the agent tool instead.
 
-Output: matching lines or file paths; "No matches for '{pattern}'" if nothing matched."""
+Output: matching lines or file paths; "No matches for '{pattern}'" if nothing matched; an "Error: ..." string on failure (nonexistent path, invalid regex, or a directory search refused at a virtual-filesystem root such as / or /proc)."""

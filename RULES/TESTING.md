@@ -1,114 +1,73 @@
 # Testing And Verification Rules
 
-Testing should scale with risk. Do not add heavy test machinery for tiny changes,
-but do not ship security, concurrency, or cross-layer changes without meaningful
-verification.
-
-Backend tests live under `backend/tests/` by product/domain capability. New or
-moved tests must make directory, marker, and entrypoint ownership obvious. Test
-code follows the same clarity, ownership, dead-code, comment, and cleanup rules
-as application code.
+Testing scales with risk: no heavy machinery for tiny changes, but
+security, concurrency, and cross-layer changes never ship without
+meaningful verification. Tests live under `backend/tests/` by product or
+domain capability; directory, marker, and entrypoint ownership must stay
+obvious. Test code follows the same clarity, dead-code, comment, and
+cleanup rules as application code.
 
 ## Minimum Expectations
 
 - Pure utility changes: focused unit tests.
-- Service changes: service-level tests with mocked external dependencies where
-  practical.
-- Route changes: API tests for request/response shape, validation, and error
-  translation.
+- Service changes: service-level tests with mocked externals.
+- Route changes: API tests for request/response shape, validation, and
+  error translation.
 - Agent tool changes: contract tests for success, invalid inputs,
-  permission/config failures, and exceptions that must not escape the loop.
-- Repository/database changes: tests against migrated SQLite schema, not
-  `Base.metadata.create_all()`.
-- Worker/stream changes: tests for retry, resume, cancellation, stale state, or
-  final failure behavior as applicable.
-- Frontend hooks/utilities: unit tests.
-- Frontend workflows: component or browser-level tests when behavior spans
-  components.
-- New or changed behavior: add or update automated tests. Doc/comment-only and
-  mechanical rename changes may skip tests if the handoff says why.
-- Security, concurrency, task-recovery, and data-loss fixes: regression tests,
-  unless a deferred test is recorded with rationale.
+  permission/config failures, and exceptions that must not escape the
+  loop.
+- Repository/database changes: tests against the migrated SQLite schema,
+  not `Base.metadata.create_all()`.
+- Worker/stream changes: tests for retry, resume, cancellation, stale
+  state, and final failure as applicable.
+- Frontend changes: unit tests for hooks/utilities; component or
+  browser-level tests when behavior spans components.
+- New or changed behavior gets automated tests; doc-only and mechanical
+  renames may skip them if the handoff says why.
+- Security, concurrency, task-recovery, and data-loss fixes get regression
+  tests. A deferral records the bug, recurrence risk, manual verification,
+  and the test to add later.
 
 ## What To Test
 
-Prefer edge cases over happy-path-only tests:
-
-- Empty input.
-- Missing resources.
-- Invalid IDs.
-- Invalid user configuration.
-- Unsupported or malformed uploaded files.
-- Incompatible or malformed LLM API responses.
-- Permission denied.
-- Path traversal and symlink-like cases.
-- Duplicate requests.
-- Retry/resume behavior.
-- Client disconnect/reconnect.
-- Concurrent writes to the same owner.
-- Timeout, cancellation, stale hashes, stale heartbeats, and stale task state.
-- Cleanup after success and failure.
-- Malformed provider responses, tool calls, and usage payloads.
-
-For SiGMA's single-user deployment, prioritize tests that protect user work and
-recovery paths over synthetic high-throughput benchmarks.
+Prefer edge cases over happy paths: empty input; missing resources;
+invalid IDs, configuration, and permissions; malformed uploads and LLM
+responses; path traversal and symlink cases; duplicate requests;
+retry/resume; disconnect/reconnect; concurrent writes to the same owner;
+timeouts, cancellations, stale hashes, heartbeats, and task state;
+cleanup after success and failure; malformed tool calls and usage
+payloads. Prioritize tests that protect user work and recovery paths over
+synthetic throughput benchmarks.
 
 ## Test Isolation
 
-Write files under `tmp_path` or an isolated fixture; never write real user data,
-real `.SiGMA`, home, or repository-root artifacts. Monkeypatch project, sigma,
-settings, and user-data paths to temporary roots. `NamedTemporaryFile(delete=False)`,
-`mkdtemp()`, subprocesses, threads, engines, caches, and read-state fixtures
-must be cleaned up explicitly. A full backend test run must leave no project
-folders, `.SiGMA` trees, databases, zips, caches, or other business artifacts
-outside temporary directories.
+Write files under `tmp_path` or an isolated fixture; never write real user
+data, real `.SiGMA`, home, or repository-root artifacts. Monkeypatch
+project, sigma, settings, and user-data paths to temporary roots. Clean up
+subprocesses, threads, engines, caches, and read-state fixtures
+explicitly; a full test run leaves no business artifacts outside temporary
+directories.
+
+The suite runs as root: a mock that can reach a timeout/cancel kill path
+gets a real integer `pid` (with `os.killpg` patched) — a bare `MagicMock`
+pid coerces to 1 and `os.killpg(1, SIGKILL)` is `kill(-1)`. Never let a
+mock reach a signal syscall with an unvalidated target.
 
 ## Static Checks
 
-The project should maintain checks for:
-
-- Route-to-database boundary violations.
-- Tool-to-database boundary violations.
-- Direct frontend `fetch()` outside API helpers, except documented exceptions.
-- Direct `localStorage` outside storage utilities.
-- Direct environment-variable access (`os.environ`, `os.getenv()`) outside config.
-- Hand-written SSE parsers outside `utils/sse.js`.
-- Native `alert()`, `confirm()`, or `prompt()` in product UI.
-- Repeated UI markup that should use an existing shared or feature-local
-  component.
-- Bare `except:` and unexplained `except Exception: pass`.
-- Test pollution that leaves business artifacts outside temporary directories.
-- Large files crossing review thresholds. This check should flag for review,
-  not fail automatically on line count alone.
-
-These checks may be implemented with lint rules, small scripts, or CI jobs.
+Maintain checks for: route-to-database and tool-to-database boundary
+violations; frontend `fetch()` outside API helpers and `localStorage`
+outside storage utilities; environment-variable access outside config;
+hand-written SSE parsers outside `utils/sse.js`; native
+`alert()/confirm()/prompt()` in product UI; repeated UI markup that should
+use a shared or feature-local component; bare `except:` and unexplained
+`except Exception: pass`; test pollution leaving business artifacts; large
+files crossing review thresholds (flag, do not auto-fail). These may be
+lint rules, scripts, or CI jobs.
 
 ## Verification Notes
 
-When finishing a change, state what was run. If a check cannot be run because
-dependencies or tooling are missing, state that clearly instead of implying the
-change is fully verified. If sandboxing causes timeouts, permission failures, or
-false negatives, rerun outside the sandbox when allowed; otherwise report the
-limitation.
-
-## Regression Tests
-
-Every fixed bug must get a regression test unless it is not practical
-immediately. If deferred, record:
-
-- The exact bug.
-- The risk of recurrence.
-- The manual verification performed.
-- What automated test should be added later.
-
-## Migration Integrity
-
-`backend/tests/database/test_migration_integrity.py` verifies that `alembic
-upgrade head` produces a schema matching `Base.metadata`. If the test is moved,
-update this file and mention the move in the handoff or PR. Any model change
-without a matching migration must fail this check before merge.
-
-## Rule Maintenance
-
-When test layout, markers, isolation policy, or required coverage changes,
-update this file in the same change and mention the update in the handoff or PR.
+When finishing a change, state what was run. If a check cannot run because
+dependencies or tooling are missing, say so explicitly instead of implying
+full verification. If sandboxing blocks a check, rerun outside the sandbox
+when allowed or report the limitation.

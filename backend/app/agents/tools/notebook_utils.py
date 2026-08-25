@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import os
 from dataclasses import dataclass
@@ -10,12 +11,20 @@ from pathlib import Path
 
 from app.core.atomic_file import atomic_write_text
 from app.core.config import settings
+from app.core.exceptions import FileSystemError, FileMissingError
 from app.core.utils import generate_id, is_within
+from app.services.file_service import check_readable
 from app.services.jupyter_service import get_jupyter
 
 
 class NotebookToolError(Exception):
     """Raised for user-facing notebook tool failures."""
+
+
+# Bound on notebook JSON handled by the filesystem fallback paths. Notebooks
+# are stat-checked before reading so an oversized (or non-regular) file is
+# rejected before any byte enters memory.
+_MAX_NOTEBOOK_BYTES = 50 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -139,14 +148,24 @@ async def read_notebook_json(
         if notebook is not None:
             return notebook, location
 
+    # Filesystem fallback (Jupyter unavailable): stat-first size/regular-file
+    # check, then read and parse off the event loop.
     try:
-        content_raw = location.absolute_path.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
+        check_readable(location.absolute_path, notebook_path, _MAX_NOTEBOOK_BYTES)
+    except FileMissingError as exc:
         raise NotebookToolError(f"Notebook not found: {notebook_path}") from exc
-    except UnicodeDecodeError as exc:
-        raise NotebookToolError(f"Notebook is not valid UTF-8: {notebook_path}") from exc
-    except OSError as exc:
-        raise NotebookToolError(f"Could not read notebook: {exc}") from exc
+    except FileSystemError as exc:
+        raise NotebookToolError(str(exc)) from exc
+
+    def _read_notebook_text() -> str:
+        try:
+            return location.absolute_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise NotebookToolError(f"Notebook is not valid UTF-8: {notebook_path}") from exc
+        except OSError as exc:
+            raise NotebookToolError(f"Could not read notebook: {exc}") from exc
+
+    content_raw = await asyncio.to_thread(_read_notebook_text)
 
     try:
         notebook = _json.loads(content_raw)
@@ -165,15 +184,18 @@ async def save_notebook_json(location: NotebookLocation, notebook: dict) -> bool
         if saved:
             return True
 
-    try:
-        location.absolute_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(
-            location.absolute_path,
-            _json.dumps(notebook, indent=1, ensure_ascii=False),
-        )
-        return True
-    except OSError:
-        return False
+    def _write_notebook() -> bool:
+        try:
+            location.absolute_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(
+                location.absolute_path,
+                _json.dumps(notebook, indent=1, ensure_ascii=False),
+            )
+            return True
+        except OSError:
+            return False
+
+    return await asyncio.to_thread(_write_notebook)
 
 
 def _xml_escape(text: str) -> str:

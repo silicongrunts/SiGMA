@@ -525,10 +525,13 @@ class LLMLoopRunner:
 
                 # Execute the tool (via hook or default)
                 try:
-                    if ctx.execute_tool:
-                        tool_result = await ctx.execute_tool(tool_name, tool_args)
-                    else:
-                        tool_result = await self.execute_tool_default(tool_name, tool_args)
+                    tool_coro = (
+                        ctx.execute_tool(tool_name, tool_args)
+                        if ctx.execute_tool
+                        else self.execute_tool_default(tool_name, tool_args)
+                    )
+                    tool_result = await self._execute_tool_cancellable(
+                        ctx, tool_coro)
                 except Exception as exc:
                     # PermissionRequestPause is raised by execute_with_permission
                     # when a write/bash/notebook tool needs user approval. Handle
@@ -1057,6 +1060,49 @@ class LLMLoopRunner:
     # ------------------------------------------------------------------
     # Default tool execution
     # ------------------------------------------------------------------
+
+    async def _execute_tool_cancellable(self, ctx, tool_coro):
+        """Run a tool call, cancelling it the moment the user cancels.
+
+        Cancelling the tool's asyncio task is how a user stop reaches
+        in-flight work — subprocess-based tools (bash, glob, grep) kill
+        their children in CancelledError cleanup. Without this, a cancelled
+        task keeps waiting on the tool until its own timeout. Exceptions
+        from the tool (including PermissionRequestPause) propagate
+        unchanged; on cancellation a "Tool cancelled by user." result keeps
+        the tool_call/tool_result pairing intact.
+        """
+        if ctx.cancel_event is None:
+            return await tool_coro
+        tool_task = asyncio.ensure_future(tool_coro)
+        cancel_task = asyncio.create_task(ctx.cancel_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {tool_task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if tool_task in done:
+                return tool_task.result()
+            tool_task.cancel()
+            try:
+                await tool_task
+            except asyncio.CancelledError:
+                # Expected: the tool_task we just cancelled. But if our own
+                # task has a pending outer cancellation, that delivery must
+                # not be swallowed — the finally below still cleans up.
+                if asyncio.current_task().cancelling():
+                    raise
+            except Exception:
+                logger.debug(
+                    "tool cleanup during cancellation raised", exc_info=True)
+            return "Tool cancelled by user."
+        finally:
+            cancel_task.cancel()
+            # An outer cancellation (worker shutdown, task revoke) must not
+            # orphan the in-flight tool — its CancelledError handler is what
+            # kills the tool's subprocesses.
+            if not tool_task.done():
+                tool_task.cancel()
 
     @staticmethod
     async def execute_tool_default(tool_name: str, tool_args: dict) -> str:

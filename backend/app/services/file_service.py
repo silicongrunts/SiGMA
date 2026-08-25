@@ -1,3 +1,4 @@
+import asyncio
 import os
 import hashlib
 import difflib
@@ -27,6 +28,231 @@ logger = get_logger(__name__)
 
 MAX_TREE_DEPTH = 64
 MAX_TREE_NODES = 10000
+
+# Whole-file read cap for agent tools. Agent-chosen paths can point at
+# multi-GB datasets inside (or outside) the sandbox; reads stay unrestricted
+# by design, but the *amount read in one call* is bounded. UI routes keep the
+# historical uncapped behaviour by not passing ``max_bytes``. Larger files
+# stay readable through the streaming range reader (``read_text_range``),
+# which only accumulates the requested line window.
+MAX_TOOL_READ_BYTES = 10 * 1024 * 1024
+
+# Range-read budgets: a windowed read may scan the file to count lines, but
+# the scan itself is bounded (a multi-TB file must not occupy a worker thread
+# forever); the accumulated window bytes share the whole-read cap.
+_RANGE_SCAN_MAX_BYTES = 1 << 30  # 1 GiB
+_RANGE_CHUNK_BYTES = 1 << 20     # 1 MiB
+
+
+def check_readable(p: Path, path_label: str, max_bytes: int | None) -> os.stat_result:
+    """Validate a file before reading it on behalf of an agent tool.
+
+    ``stat`` first, and only regular files pass: devices and fifos report
+    size 0 yet never reach EOF (``/dev/zero``), so a byte cap alone cannot
+    bound them. The size cap then bounds real files. Returns the stat result
+    so callers avoid a second ``stat``. Error wording stays generic — the
+    actionable "use offset/limit or bash sed" guidance is caller-specific and
+    appended by the tool layer.
+    """
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        raise FileMissingError(path_label)
+    except OSError as e:
+        raise FileSystemError(f"Cannot access file: {e}", code="INVALID_REQUEST")
+    if not stat.S_ISREG(st.st_mode):
+        raise FileSystemError(
+            "Not a regular file (directories, devices, and special files "
+            "are not readable)",
+            code="INVALID_REQUEST",
+        )
+    if max_bytes is not None and st.st_size > max_bytes:
+        raise FileSystemError(
+            f"File is too large to read whole ({st.st_size:,} bytes exceeds the "
+            f"{max_bytes:,}-byte cap)",
+            code="FILE_TOO_LARGE",
+        )
+    return st
+
+
+class TextFileContent:
+    """Decoded text plus the encoding facts needed to write it back intact."""
+
+    __slots__ = ("text", "encoding", "had_bom", "crlf")
+
+    def __init__(self, text: str, encoding: str, had_bom: bool, crlf: bool):
+        self.text = text
+        self.encoding = encoding
+        self.had_bom = had_bom
+        self.crlf = crlf
+
+
+def decode_text_bytes(raw: bytes) -> TextFileContent:
+    """Decode file bytes BOM-aware, so UTF-16/UTF-8-sig text is readable.
+
+    UTF-16 text is full of NUL bytes and would otherwise trip the binary
+    check. Only BOM-marked UTF-16 is handled: BOM-less UTF-16 decodes as
+    UTF-8 with replacement, same as before.
+    """
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        endian = "le" if raw.startswith(b"\xff\xfe") else "be"
+        text = raw.decode(f"utf-16-{endian}", errors="replace")
+        # The BOM decodes to a stray \ufeff at the start of line 1.
+        if text.startswith("\ufeff"):
+            text = text[1:]
+        encoding = f"utf-16-{endian}"
+        had_bom = True
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        text = raw[3:].decode("utf-8", errors="replace")
+        encoding = "utf-8"
+        had_bom = True
+    else:
+        text = raw.decode("utf-8", errors="replace")
+        encoding = "utf-8"
+        had_bom = False
+    # Count on the decoded text: UTF-16's raw bytes never contain "\r\n" as
+    # a contiguous pair, so a raw-byte heuristic misclassifies UTF-16 CRLF.
+    crlf_count = text.count("\r\n")
+    crlf = crlf_count > (text.count("\n") - crlf_count)
+    return TextFileContent(text, encoding, had_bom, crlf)
+
+
+class TextRange:
+    """A windowed read of a text file: the selected lines plus their range.
+
+    ``total_lines`` is ``None`` when the scan budget was hit before EOF — the
+    window is valid but the caller cannot claim an exact total.
+    """
+
+    __slots__ = ("lines", "start_idx", "end_idx", "total_lines")
+
+    def __init__(self, lines: list, start_idx: int, end_idx: int,
+                 total_lines: Optional[int]):
+        self.lines = lines
+        self.start_idx = start_idx
+        self.end_idx = end_idx
+        self.total_lines = total_lines
+
+
+def _read_text_range_sync(full_path: Path, offset: int, limit: int,
+                          tail: Optional[int],
+                          max_window_bytes: int) -> TextRange:
+    """Streaming line-range read: only the requested window is accumulated.
+
+    Files larger than ``MAX_TOOL_READ_BYTES`` stay readable through this
+    path (whole-file reads would exceed the cap); lines outside the window
+    are counted but discarded, so memory tracks the window, not the file.
+    The scan stops at ``_RANGE_SCAN_MAX_BYTES`` even without reaching EOF —
+    a hard bound on worker-thread occupancy.
+    """
+    with open(full_path, "rb") as f:
+        header = f.read(8192)
+        f.seek(0)
+        header_info = decode_text_bytes(header)
+        if header_info.encoding == "utf-8" and b"\x00" in header:
+            raise BinaryFileError(str(full_path))
+        strip_bom = header_info.had_bom
+        # BOM-marked UTF-16: the newline is a 2-byte unit (\n\x00 / \x00\n);
+        # splitting on the raw \n byte would cut between code units.
+        utf16 = header_info.encoding != "utf-8"
+        sep = (b"\n\x00" if header_info.encoding == "utf-16-le"
+               else b"\x00\n") if utf16 else b"\n"
+        sep_len = len(sep)
+
+        def decode_line(line: bytes, idx: int) -> str:
+            text = line.decode(
+                header_info.encoding if utf16 else "utf-8",
+                errors="replace")
+            if idx == 0 and strip_bom and text.startswith("\ufeff"):
+                text = text[1:]
+            return text
+
+        window: list = []
+        window_bytes = 0
+        tail_lines: list = []
+        tail_lens: list = []
+        line_idx = 0
+        scanned = 0
+        budget_hit = False
+        eof = False
+        buf = b""
+
+        def take_line(payload: bytes, idx: int) -> None:
+            nonlocal window_bytes
+            line = decode_line(payload, idx)
+            if tail is None:
+                window.append(line)
+            else:
+                tail_lines.append(line)
+                # Track payload byte lengths: the decoded string's length
+                # differs from the byte count (UTF-16, multibyte UTF-8).
+                tail_lens.append(len(payload) + sep_len)
+            window_bytes += len(payload) + sep_len
+            if tail is not None:
+                while len(tail_lines) > tail:
+                    window_bytes -= tail_lens.pop(0)
+                    tail_lines.pop(0)
+            if window_bytes > max_window_bytes:
+                raise FileSystemError(
+                    f"Requested line window exceeds the {max_window_bytes:,}-byte "
+                    "cap — narrow the range (smaller limit), or use bash grep "
+                    "to locate content first",
+                    code="FILE_TOO_LARGE",
+                )
+
+        while not eof:
+            chunk = f.read(_RANGE_CHUNK_BYTES)
+            if not chunk:
+                eof = True
+            else:
+                scanned += len(chunk)
+            buf += chunk
+            while True:
+                nl = buf.find(sep)
+                if nl < 0:
+                    break
+                payload = buf[:nl]
+                buf = buf[nl + sep_len:]
+                in_window = (
+                    offset <= line_idx < offset + limit if tail is None
+                    else True
+                )
+                if in_window:
+                    take_line(payload, line_idx)
+                line_idx += 1
+            if not eof and scanned > _RANGE_SCAN_MAX_BYTES:
+                budget_hit = True
+                break
+        if eof and buf:
+            in_window = (
+                offset <= line_idx < offset + limit if tail is None else True
+            )
+            if in_window:
+                take_line(buf, line_idx)
+            line_idx += 1
+
+    if tail is not None:
+        if budget_hit:
+            # The collected lines are a prefix window, not the file tail.
+            raise FileSystemError(
+                f"File is too large to read its last lines (scan budget "
+                f"exceeded at {_RANGE_SCAN_MAX_BYTES:,} bytes). Use an "
+                "explicit offset window, or bash grep to locate content",
+                code="FILE_TOO_LARGE",
+            )
+        start_idx = line_idx - len(tail_lines)
+        return TextRange(list(tail_lines), start_idx, line_idx, line_idx)
+
+    total = line_idx if not budget_hit else None
+    if budget_hit and not window:
+        # Never even reached the window start — nothing useful to return.
+        raise FileSystemError(
+            f"Requested lines start beyond the scan budget (first "
+            f"{_RANGE_SCAN_MAX_BYTES:,} bytes). Use bash grep to locate the "
+            "content, then read a narrower window",
+            code="FILE_TOO_LARGE",
+        )
+    return TextRange(window, offset, offset + len(window), total)
 
 
 def compute_diff_lines(old_text: str, new_text: str) -> list:
@@ -121,17 +347,45 @@ class FileService:
     def check_write_allowed(self, project_id: str, path: str) -> PathAccessLevel:
         return self.classify_path(project_id, path)
 
-    def read_file_absolute(self, path: str) -> str:
-        """Read a file from an absolute host path (bypasses sandbox)."""
-        p = Path(path).resolve()
-        if not p.is_file():
-            raise FileMissingError(path)
-        raw = p.read_bytes()
-        if b'\x00' in raw[:8192]:
-            raise BinaryFileError(path)
-        return raw.decode(encoding='utf-8', errors='replace')
+    async def read_file_absolute(self, path: str,
+                                 max_bytes: int | None = None) -> str:
+        """Read a file from an absolute host path (bypasses sandbox).
 
-    async def write_file_absolute(self, project_id: str, path: str, content: str) -> dict:
+        ``max_bytes`` bounds agent-driven whole-file reads; the actual read
+        runs off the event loop. BOM-marked UTF-16/UTF-8 files decode
+        correctly via ``decode_text_bytes``.
+        """
+        p = Path(path).resolve()
+        check_readable(p, path, max_bytes)
+        raw = await asyncio.to_thread(p.read_bytes)
+        info = decode_text_bytes(raw)
+        if info.encoding == "utf-8" and b'\x00' in raw[:8192]:
+            raise BinaryFileError(path)
+        return info.text
+
+    async def read_file_absolute_bytes(self, path: str,
+                                       max_bytes: int | None = None) -> bytes:
+        """Raw whole-file read from an absolute host path (BOM/binary checks
+        are the caller's concern); bounded like ``read_file_absolute``."""
+        p = Path(path).resolve()
+        check_readable(p, path, max_bytes)
+        return await asyncio.to_thread(p.read_bytes)
+
+    async def read_text_range_absolute(
+        self, path: str, *, offset: int = 0, limit: Optional[int] = None,
+        tail: Optional[int] = None,
+        max_window_bytes: int = MAX_TOOL_READ_BYTES,
+    ) -> TextRange:
+        """Windowed read of a text file on the host (see TextRange)."""
+        p = Path(path).resolve()
+        check_readable(p, path, None)
+        return await asyncio.to_thread(
+            _read_text_range_sync, p, offset, limit or 1, tail,
+            max_window_bytes,
+        )
+
+    async def write_file_absolute(self, project_id: str, path: str,
+                                  content: str, encoding: str = "utf-8") -> dict:
         """Write content to an absolute host path.
 
         The caller is responsible for ensuring the path passes the filesystem
@@ -144,7 +398,7 @@ class FileService:
         sandbox (e.g. to ``/tmp``) do not trigger snapshot.
         """
         p = Path(path).resolve()
-        atomic_write_text(p, content)
+        atomic_write_text(p, content, encoding)
 
         # If the absolute path resolves inside the project sandbox, trigger
         # auto-snapshot so the edit is tracked.
@@ -190,16 +444,21 @@ class FileService:
             raise FileMissingError(path)
         if not target.is_dir():
             raise FileSystemError("Not a directory", code="INVALID_REQUEST")
-        children = []
-        for child in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-            if child.name.startswith('.'):
-                continue
-            rel_path = str(child.relative_to(root))
-            children.append({
-                "name": child.name,
-                "path": rel_path,
-                "type": "directory" if child.is_dir() else "file",
-            })
+
+        def _scan() -> list:
+            children = []
+            for child in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                if child.name.startswith('.'):
+                    continue
+                rel_path = str(child.relative_to(root))
+                children.append({
+                    "name": child.name,
+                    "path": rel_path,
+                    "type": "directory" if child.is_dir() else "file",
+                })
+            return children
+
+        children = await asyncio.to_thread(_scan)
         return {"children": children, "parent": path}
 
     async def get_project_tree(self, project_id: str) -> Dict[str, Any]:
@@ -259,7 +518,10 @@ class FileService:
                     break
                 item["children"].append(build_tree(child, depth + 1))
             return item
-        return {"root": build_tree(root_path)}
+
+        # The recursive stat walk is blocking I/O — keep it off the event loop.
+        root = await asyncio.to_thread(build_tree, root_path)
+        return {"root": root}
 
     @staticmethod
     def _is_plain_directory(path: Path) -> bool:
@@ -286,24 +548,38 @@ class FileService:
     # File read/write
     # ------------------------------------------------------------------
 
-    async def read_file(self, project_id: str, path: str) -> str:
+    async def read_file(self, project_id: str, path: str,
+                        max_bytes: int | None = None) -> str:
         root = self.get_project_path(project_id)
         full_path = self.safe_join(root, path)
-        if not full_path.exists(): raise FileMissingError(path)
-        raw = full_path.read_bytes()
-        if b'\x00' in raw[:8192]:
+        check_readable(full_path, path, max_bytes)
+        raw = await asyncio.to_thread(full_path.read_bytes)
+        info = decode_text_bytes(raw)
+        if info.encoding == "utf-8" and b'\x00' in raw[:8192]:
             raise BinaryFileError(path)
-        return raw.decode(encoding='utf-8', errors='replace')
+        return info.text
 
-    async def read_file_binary(self, project_id: str, path: str) -> bytes:
+    async def read_text_range(
+        self, project_id: str, path: str, *, offset: int = 0,
+        limit: Optional[int] = None, tail: Optional[int] = None,
+        max_window_bytes: int = MAX_TOOL_READ_BYTES,
+    ) -> TextRange:
+        """Windowed read of a sandbox text file (see TextRange)."""
+        root = self.get_project_path(project_id)
+        full_path = self.safe_join(root, path)
+        check_readable(full_path, path, None)
+        return await asyncio.to_thread(
+            _read_text_range_sync, full_path, offset, limit or 1, tail,
+            max_window_bytes,
+        )
+
+    async def read_file_binary(self, project_id: str, path: str,
+                               max_bytes: int | None = None) -> bytes:
         """Read a file as raw bytes (for images and other binary formats)."""
         root = self.get_project_path(project_id)
         full_path = self.safe_join(root, path)
-        if not full_path.exists():
-            raise FileMissingError(path)
-        if not full_path.is_file():
-            raise FileSystemError("Not a file", code="INVALID_REQUEST")
-        return full_path.read_bytes()
+        check_readable(full_path, path, max_bytes)
+        return await asyncio.to_thread(full_path.read_bytes)
 
     async def get_project_file_path(self, project_id: str, path: str) -> Path:
         """Resolve a project-relative file path for inline serving/download."""
@@ -317,7 +593,8 @@ class FileService:
 
     async def write_file(self, project_id: str, path: str, content: str,
                          force: bool = False, expected_hash: Optional[str] = None,
-                         require_expected_hash: bool = False) -> dict:
+                         require_expected_hash: bool = False,
+                         encoding: str = "utf-8") -> dict:
         root = self.get_project_path(project_id)
         full_path = self.safe_join(root, path)
 
@@ -343,7 +620,7 @@ class FileService:
                     raise FileSystemError("Could not verify file version before saving", code="CONFLICT", status_code=409)
 
             full_path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_replace_bytes(full_path, content.encode('utf-8'))
+            atomic_replace_bytes(full_path, content.encode(encoding))
 
         await self._after_file_mutation(project_id)
         return {"conflict": False, "hash": self.compute_hash(content)}

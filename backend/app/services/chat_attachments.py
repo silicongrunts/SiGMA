@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import mimetypes
 from pathlib import Path
@@ -22,7 +23,7 @@ from app.core.chat_attachments import (
     MAX_CHAT_IMAGE_BYTES,
     SUPPORTED_IMAGE_MIME_TYPES,
 )
-from app.services.file_service import file_service
+from app.services.file_service import check_readable, file_service
 from app.services.session_temp_service import session_temp_service
 
 
@@ -103,18 +104,17 @@ async def read_image_path_base64(project_id: str, path: str) -> tuple[str, str]:
     if not path.strip():
         raise FileSystemError("Image path is required", code="INVALID_REQUEST", status_code=422)
 
+    # stat-first: the size cap and regular-file check run before any byte
+    # is read, so an oversized "image" or a device file never enters memory.
     if path.startswith("/"):
         full_path = Path(path).resolve()
-        if not full_path.is_file():
-            raise FileSystemError("Image not found", code="NOT_FOUND", status_code=404)
-        data = full_path.read_bytes()
+        check_readable(full_path, path, MAX_CHAT_IMAGE_BYTES)
+        data = await asyncio.to_thread(full_path.read_bytes)
         filename = full_path.name
     else:
-        data = await file_service.read_file_binary(project_id, path)
+        data = await file_service.read_file_binary(
+            project_id, path, max_bytes=MAX_CHAT_IMAGE_BYTES)
         filename = Path(path).name
-
-    if len(data) > MAX_CHAT_IMAGE_BYTES:
-        raise FileSystemError("Image is too large", code="INVALID_REQUEST", status_code=413)
 
     mime_type = _detect_image_media_type(data)
     if mime_type is None:
@@ -127,4 +127,5 @@ async def read_image_path_base64(project_id: str, path: str) -> tuple[str, str]:
     if mime_type != "image/webp" and image_dimensions(data) is None:
         raise FileSystemError("Cannot read image dimensions", code="INVALID_REQUEST", status_code=422)
 
-    return base64.b64encode(data).decode("ascii"), mime_type
+    encoded = await asyncio.to_thread(lambda: base64.b64encode(data).decode("ascii"))
+    return encoded, mime_type

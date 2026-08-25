@@ -38,6 +38,31 @@ class ReadStateEntry:
     content: str
     mtime: float
     is_partial: bool  # True if the read used offset/limit; informational only.
+    # Accumulated 0-indexed [start, end) line ranges the LLM has seen, merged
+    # into disjoint intervals; ``None`` means the whole file was read. Reads
+    # against the same mtime accumulate; any change on disk resets coverage
+    # to the newest read's window. The edit tool refuses edits whose
+    # old_string lives outside this coverage.
+    coverage: Optional[list] = None
+
+
+def _merge_coverage(prev, window):
+    """Merge one [start, end) window into accumulated coverage.
+
+    ``None`` anywhere means a whole-file read, which absorbs everything.
+    Adjacent intervals collapse so contiguous full coverage reduces to a
+    single interval — the edit tool's whole-file check relies on that.
+    """
+    if prev is None or window is None:
+        return None
+    intervals = sorted(list(prev) + [window])
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 class ReadStateCache:
@@ -59,12 +84,25 @@ class ReadStateCache:
         content: str,
         mtime: float,
         is_partial: bool,
+        window: Optional[tuple] = None,
     ) -> None:
-        """Record (or refresh) a read of *file_path* in *session_id*."""
+        """Record (or refresh) a read of *file_path* in *session_id*.
+
+        ``window`` is the [start, end) line range of this read (``None`` =
+        whole file). Coverage accumulates while the file's mtime is
+        unchanged; a changed mtime means the prior coverage describes stale
+        content, so it is discarded and only this read's window counts.
+        """
+        prev = self._store.get(session_id, {}).get(file_path)
+        if prev is not None and prev.mtime == mtime:
+            coverage = _merge_coverage(prev.coverage, window)
+        else:
+            coverage = None if window is None else [window]
         self._store.setdefault(session_id, {})[file_path] = ReadStateEntry(
             content=content,
             mtime=mtime,
             is_partial=is_partial,
+            coverage=coverage,
         )
 
     def was_read_full(self, session_id: str, file_path: str) -> bool:
@@ -106,6 +144,7 @@ def record_path_read(
     path: str | Path,
     content: str,
     is_partial: bool = False,
+    window: Optional[tuple] = None,
 ) -> None:
     """Record that a session has read a filesystem path."""
     mtime = path_mtime(path)
@@ -115,6 +154,7 @@ def record_path_read(
         content,
         mtime if mtime is not None else 0.0,
         is_partial,
+        window,
     )
 
 

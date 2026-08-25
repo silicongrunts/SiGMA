@@ -135,23 +135,44 @@ async def test_read_image_directory_returns_tool_error(tmp_path, monkeypatch):
 
     result = await _read_image("proj", "sess","folder.png", ".png")
     assert isinstance(result, str)
-    assert "not a file" in result.lower()
+    assert "not a regular file" in result.lower()
+
+
+def _real_png_bytes(width: int, height: int) -> bytes:
+    """Decodable PNG (PIL-generated) for tests that exercise downscaling."""
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), color=(90, 120, 30)).save(
+        buf, format="PNG")
+    return buf.getvalue()
 
 
 @pytest.mark.asyncio
 async def test_read_image_exceeds_4k(tmp_path, monkeypatch):
-    """Image larger than 3840 in either dimension returns error."""
-    img = _png_bytes(4000, 3000)  # width exceeds 3840
+    """Images over the dimension cap are downscaled when Pillow is
+    available, and rejected with an error otherwise."""
     p = tmp_path / "big.png"
-    p.write_bytes(img)
 
     from app.services.file_service import file_service
     monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
 
-    result = await _read_image("proj", "sess","big.png", ".png")
-    assert isinstance(result, str)
-    assert "4000" in result
-    assert "3840" in result
+    from app.agents.tools import file_tools
+    if file_tools._PIL_AVAILABLE:
+        p.write_bytes(_real_png_bytes(4000, 3000))  # width exceeds 3840
+        result = await _read_image("proj", "sess", "big.png", ".png")
+        assert isinstance(result, dict), result
+        assert result["type"] == "image"
+        assert "downscaled from 4000×3000" in result["text"]
+    else:
+        # Header-only stub: enough for the dimension check, never decoded.
+        p.write_bytes(_png_bytes(4000, 3000))
+        result = await _read_image("proj", "sess", "big.png", ".png")
+        assert isinstance(result, str)
+        assert "4000" in result
+        assert "3840" in result
 
 
 @pytest.mark.asyncio

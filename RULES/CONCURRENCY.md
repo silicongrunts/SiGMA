@@ -1,123 +1,124 @@
 # Concurrency And State Consistency Rules
 
-SiGMA is locally deployed for a single user, but concurrency still exists:
-the user may open multiple browser tabs, refresh during a stream, start another
-task while one is running, upload files during indexing, or reconnect after a
-worker crash. Treat concurrency as a correctness issue when it can affect
-persistent data, permissions, task recovery, or user work.
-
-Do not design for multi-tenant SaaS scale unless the deployment model changes.
-Prefer simple local-first mechanisms that make the important state safe.
+SiGMA is single-user, but concurrency still exists: multiple tabs, refresh
+during a stream, a new task while one runs, uploads during indexing,
+reconnect after a worker crash. Treat concurrency as a correctness issue
+whenever it can affect persistent data, permissions, task recovery, or
+user work. Do not design for multi-tenant scale; prefer simple local-first
+mechanisms.
 
 ## Risk Model
 
-Acceptable if documented:
+Acceptable when documented and fixed by refresh/retry/rebuild: transient
+UI races, duplicate non-destructive refreshes, auto-rebuilt cache
+inconsistency, bounded polling.
 
-- A transient UI race that a page refresh or retry reliably fixes.
-- Duplicate non-destructive refreshes or status fetches.
-- Local cache inconsistency that is automatically rebuilt.
-- Bounded polling for browser/VNC/readiness state.
+Never acceptable:
 
-Not acceptable:
-
-- Corrupting project files, databases, snapshots, notebooks, or library indexes.
-- Losing project metadata or user-written content silently.
-- Duplicating or reordering persisted messages/tasks in a way that breaks resume.
-- Bypassing file write permissions.
-- Leaving a long-running task permanently stuck without a visible recovery path.
+- Corruption of project files, databases, snapshots, notebooks, or library
+  indexes.
+- Silent loss of project metadata or user-written content.
+- Persisted message/task duplication or reordering that breaks resume.
+- Write-permission bypass.
+- A long-running task stuck without a visible recovery path.
 - Treating an invalid LLM/provider response as valid internal state.
 
 ## Core Rules
 
-- Shared mutable state must have an owner.
-- Correctness for persistent state must not depend only on process-local locks
-  when multiple web tabs, async tasks, or worker threads can touch the same
-  state.
-- Read-modify-write operations need a transaction, lock, compare-and-swap,
-  unique constraint with retry, or another documented consistency mechanism.
-- State transitions should be idempotent where retry is possible.
-- Crashes between steps should leave recoverable state.
+- Shared mutable state has an owner.
+- Persistent-state correctness never depends only on process-local locks
+  when tabs, async tasks, or worker threads can touch the same state.
+- Read-modify-write uses a transaction, lock, compare-and-swap, unique
+  constraint with retry, or another documented mechanism.
+- State transitions are idempotent where retry is possible.
+- Crashes between steps leave recoverable state.
 
 ## Forbidden For Correctness
 
-Do not use these patterns for correctness-critical persistent logic:
+Never use for correctness-critical persistent logic:
 
 - `max(seq) + 1` without a database constraint and retry strategy.
-- Direct read-modify-write of JSON metadata files without file locking and
-  atomic replacement.
-- Process-local `asyncio.Lock` or `threading.Lock` as the only protection for
-  state shared across worker threads/processes or browser tabs.
-- Mutable module globals as the source of truth for task, browser, stream, or
-  project state.
+- Read-modify-write of JSON metadata files without file locking and atomic
+  replacement.
+- Process-local locks as the only protection for state shared across
+  threads, processes, or tabs.
+- Mutable module globals as the source of truth for task, browser, stream,
+  or project state.
 - Arbitrary sleeps to wait for a state transition.
 
-## Acceptable Uses Of Local Locks
-
-Process-local locks are acceptable for:
-
-- In-memory caches.
-- Deduplicating local initialization.
-- Protecting objects that are guaranteed to be used only inside one process.
-- UI or service coordination where a missed lock cannot corrupt persistent
-  state.
-- Serializing local single-process work when the documented failure mode is
-  refresh/retry/rebuild, not data loss.
-
-When using a local lock, document whether it is a correctness lock or only a
-local coordination/cache lock.
+Process-local locks are acceptable for in-memory caches, local
+initialization dedup, single-process objects, and coordination whose
+documented failure mode is refresh/retry/rebuild. Document whether each
+lock is a correctness lock or a coordination/cache lock.
 
 ## Database Ordering
 
-If order matters under concurrent writes:
-
-- Prefer database-enforced uniqueness.
-- Prefer transactional counters or append-only records with stable ordering.
-- Add unique indexes for `(owner_id, seq)` when `seq` is meaningful.
-- Retry on uniqueness conflicts if concurrent writers are expected.
+- When order matters under concurrent writes, prefer database-enforced
+  uniqueness; unique indexes on `(owner_id, seq)` when order is meaningful.
+- Prefer transactional counters or append-only records with stable
+  ordering; retry on uniqueness conflicts when concurrent writers exist.
 
 ## File Writes
 
-Persistent file writes should:
-
 - Resolve and validate paths before writing.
-- Write to a temporary file when replacing whole-file metadata.
-- Atomically replace the destination where possible.
+- Write to a temporary file and atomically replace for whole-file metadata.
 - Use a file lock when multiple processes may write the same file.
-- Avoid partial writes being visible as valid state.
+- Never expose partial writes as valid state.
+
+## Blocking Work In Agent Tools
+
+Agent tools run on the shared worker event loop; one blocking or spinning
+tool call wedges every task in the instance.
+
+- Blocking I/O (file reads, copies, listing/sorting large directories) and
+  pure-CPU work (parsing, diffing, base64) run in `asyncio.to_thread` or a
+  subprocess — never inline on the loop.
+- Unbounded work (recursive walks, content search) runs in a killable
+  subprocess under a wall-clock deadline and an output cap; threads cannot
+  be killed mid-computation.
+- Every tool has a bound — time, output size, or work units. On hitting a
+  bound, return partial results with an actionable note or a clean error
+  suggesting a narrower path.
+- Subprocess pipes are drained concurrently (or closed) before/while
+  waiting; a full pipe with a stopped writer deadlocks the awaiter.
+
+## Subprocess Kills And Cancellation
+
+- Spawn shell commands with their own session (`start_new_session=True`)
+  so timeout or cancellation kills the whole command tree via
+  `os.killpg`; killing only the shell orphans children.
+- Never signal an unvalidated pid: `os.killpg(pgid, sig)` is
+  `kill(-pgid, sig)`, and a pid of 1 as root is a system-wide SIGKILL.
+  Validate `isinstance(pid, int) and pid > 1` first
+  (`bash._kill_process_group` is the reference guard).
+- Cancelled tool calls clean up their subprocesses in a `CancelledError`
+  handler (kill group, bounded reap, close pipes) before re-raising.
+- Escalate SIGTERM -> grace -> SIGKILL only when the child handles SIGTERM
+  meaningfully; stateless children (rg, ad-hoc commands) may be SIGKILLed
+  directly. Always finish with a bounded reap — never an unbounded wait on
+  a killed process.
 
 ## Worker And Stream State
 
-- Worker tasks should be safe to retry or resume where practical.
-- Stream state should tolerate client disconnect/reconnect.
-- Heartbeats and task status updates should be monotonic or explicitly
+- Worker tasks are safe to retry or resume where practical; stream state
+  tolerates client disconnect/reconnect.
+- Heartbeats and task status updates are monotonic or explicitly
   transition-checked.
-- Permission requests use the same DB-backed ``awaiting_input`` pause/resume
-  mechanism as interactive tools (``ask_user_question``, plan approval). The
-  worker does not block on an in-memory wait; it parks the task and exits. The
-  user's response arrives via the resume path (``POST /chat/stream`` with
-  ``resume=true``), which spawns a new worker task. This makes permission
-  pauses crash-safe: a worker restart or page refresh does not lose the pending
-  request because it is persisted in ``interaction_state``.
+- Permission and interactive pauses persist through the DB-backed
+  `awaiting_input` pause/resume mechanism; workers never block on
+  in-memory waits.
 
 ## Browser And Terminal State
 
-- Browser tab ownership and terminal session ownership must be explicit.
-- Reconnect logic must distinguish intentional takeover from transient failure.
-- Polling is allowed only with a bounded interval, cleanup, and an observable
+- Browser tab and terminal session ownership is explicit.
+- Reconnect logic distinguishes intentional takeover from transient
+  failure.
+- Polling only with a bounded interval, cleanup, and an observable
   success/failure condition.
 
 ## Review Checklist
 
-Before accepting a change that touches shared state, answer:
-
-- What owns this state?
-- Can two requests/workers update it at the same time?
-- What prevents lost updates?
-- What happens if the process crashes halfway through?
-- What happens if the same operation is retried?
-- Is the lock local-only or cross-process?
-
-## Rule Maintenance
-
-When shared-state ownership, locking, retry, ordering, or recovery rules change,
-update this file in the same change and mention it in the handoff or PR.
+Before accepting a change that touches shared state: What owns this state?
+Can two requests or workers update it simultaneously? What prevents lost
+updates? What happens on a crash halfway through, or on retry? Is the lock
+local-only or cross-process?
