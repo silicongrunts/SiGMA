@@ -1028,6 +1028,13 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
         effects: languageConf.reconfigure([]),
         annotations: Transaction.addToHistory.of(false)
       })
+      // A whole-document replacement maps the selection without setting it,
+      // so the selectionSet listener never fires and cursorRef would keep the
+      // previous file's line number. Re-derive it from the mapped selection;
+      // onFileReady may still restore the per-file cursor afterwards.
+      const mappedPos = viewRef.current.state.selection.main.head
+      const mappedLine = viewRef.current.state.doc.lineAt(mappedPos)
+      cursorRef.current = { line: mappedLine.number, column: mappedPos - mappedLine.from }
       setFileHash(data?.hash ?? null)
 
       // Language support is loaded async by extension (first use dynamically
@@ -1103,10 +1110,11 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     getCursorContext: (charCount = 50) => {
       if (!viewRef.current || !isEditorReady) return null
       const view = viewRef.current
-      const cursor = cursorRef.current
       const doc = view.state.doc
-      const line = doc.line(cursor.line)
-      const pos = line.from + cursor.column
+      // Read the live selection instead of cursorRef: it is always valid in
+      // the current document, so a stale line number can never throw here.
+      const pos = view.state.selection.main.head
+      const line = doc.lineAt(pos)
 
       const startPos = Math.max(0, pos - charCount)
       const endPos = Math.min(doc.length, pos + charCount)
@@ -1115,8 +1123,8 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       const after = doc.sliceString(pos, endPos).replace(/\s/g, '')
 
       return {
-        line: cursor.line,
-        column: cursor.column,
+        line: line.number,
+        column: pos - line.from,
         before: before.slice(-charCount),
         after: after.slice(0, charCount)
       }
