@@ -392,6 +392,8 @@
   "chat.toast.stopStillRunning": "No se pudo confirmar que la tarea se detuvo. Intenta detenerla de nuevo.",
   "chat.toast.imageUploadFailed": "Error al subir la imagen",
   "chat.toast.chatNotReady": "El chat aún se está iniciando. Inténtalo de nuevo en un momento.",
+  "filetree.modified": "Modificado",
+  "filetree.size": "Tamaño",
   "filetree.uploadFile": "Subir archivo",
   "filetree.refreshTree": "Actualizar árbol",
   "filetree.extractHere": "Extraer aquí",

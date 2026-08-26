@@ -3,6 +3,8 @@ import { createPortal } from 'react-dom'
 import { useStore } from '../store/useStore'
 import { filesAPI, projectsAPI } from '../api'
 import { storage } from '../utils/storage'
+import { formatBytes } from '../utils/formatBytes'
+import { formatTimestamp } from '../utils/formatTimestamp'
 import {
    File, FilePlus, FolderPlus, Upload, ChevronRight, ChevronDown,
    FileText, FileCode, FolderOpen, Folder, Edit3, Trash2, Download, RefreshCw, Package, History
@@ -112,6 +114,67 @@ function pathMatchesOrIsChild(path, parentPath) {
   ))
 }
 
+/** Format a backend epoch-seconds mtime as the shared timestamp shape. */
+function formatTreeMtime(epochSeconds) {
+  if (typeof epochSeconds !== 'number' || !Number.isFinite(epochSeconds)) return null
+  return formatTimestamp(new Date(epochSeconds * 1000).toISOString())
+}
+
+/**
+ * Hover-tooltip state for tree rows: delayed show, quick hide, positioned
+ * next to the cursor and clamped to the viewport (same clamping approach as
+ * ContextMenu and LibraryBrowser's PathBadge).
+ */
+function useMetaTooltip(showDelayMs = 400) {
+  const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState({ x: 0, y: 0 })
+  const showTimer = useRef(null)
+  const hideTimer = useRef(null)
+
+  const cancelTimers = useCallback(() => {
+    clearTimeout(showTimer.current)
+    clearTimeout(hideTimer.current)
+    showTimer.current = null
+    hideTimer.current = null
+  }, [])
+
+  // Place the bubble to the bottom-right of the cursor, flipping either axis
+  // when it would overflow the viewport.
+  const placeAt = useCallback((cursorX, cursorY) => {
+    const TOOLTIP_W_EST = 320
+    const TOOLTIP_H_EST = 64
+    const GAP = 14
+    let x = cursorX + GAP
+    let y = cursorY + GAP
+    if (x + TOOLTIP_W_EST > window.innerWidth) x = Math.max(8, cursorX - TOOLTIP_W_EST - GAP)
+    if (y + TOOLTIP_H_EST > window.innerHeight) y = Math.max(8, cursorY - TOOLTIP_H_EST - GAP)
+    setPos({ x, y })
+  }, [])
+
+  const onMouseEnter = useCallback((e) => {
+    // Skip while a button is held (rubber-band selection or dragging rows):
+    // hovering mid-gesture should not pop metadata bubbles.
+    if (e.buttons !== 0) return
+    cancelTimers()
+    placeAt(e.clientX, e.clientY)
+    showTimer.current = setTimeout(() => setOpen(true), showDelayMs)
+  }, [cancelTimers, placeAt, showDelayMs])
+
+  // Track the cursor so the bubble stays next to it while it waits or shows.
+  const onMouseMove = useCallback((e) => {
+    if (e.buttons === 0) placeAt(e.clientX, e.clientY)
+  }, [placeAt])
+
+  const onMouseLeave = useCallback(() => {
+    cancelTimers()
+    hideTimer.current = setTimeout(() => setOpen(false), 120)
+  }, [cancelTimers])
+
+  useEffect(() => () => cancelTimers(), [cancelTimers])
+
+  return { open, pos, onMouseEnter, onMouseMove, onMouseLeave }
+}
+
 function collectFilePathsFromTree(root) {
   const paths = []
   let truncated = false
@@ -155,6 +218,10 @@ function TreeNode({ node, projectId, level = 0, onFileClick, currentFile, onRefr
   const isFolder = node.type === 'directory'
   const isActive = currentFile === node.path
   const [isDragOver, setIsDragOver] = useState(false)
+  // Files show size + modified time; folders only modified time.
+  const metaSize = isFolder ? null : formatBytes(node.size)
+  const metaMtime = formatTreeMtime(node.mtime)
+  const metaTip = useMetaTooltip()
   const childNodes = isFolder ? childrenCache[node.path] : undefined
   const isLoadingChildren = isFolder && loadingPaths.has(node.path)
   const hasLoadedChildren = childNodes !== undefined
@@ -202,6 +269,9 @@ function TreeNode({ node, projectId, level = 0, onFileClick, currentFile, onRefr
         onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); if (isFolder) setIsDragOver(true); }} onDragLeave={() => setIsDragOver(false)} onDrop={handleDrop}>
       <div
         draggable={node.path !== ""}
+        onMouseEnter={(e) => { if (metaSize || metaMtime) metaTip.onMouseEnter(e) }}
+        onMouseMove={metaTip.onMouseMove}
+        onMouseLeave={metaTip.onMouseLeave}
         onDragStart={(e) => {
           if (selectedPaths && selectedPaths.size > 1 && selectedPaths.has(node.path)) {
             e.dataTransfer.setData('application/json', JSON.stringify([...selectedPaths]))
@@ -237,6 +307,25 @@ function TreeNode({ node, projectId, level = 0, onFileClick, currentFile, onRefr
         <FileIcon filename={node.name} isOpen={isFolder ? isExpanded : undefined} />
         <span className="text-sm truncate flex-1">{node.name}</span>
       </div>
+      {metaTip.open && createPortal(
+        <div
+          role="tooltip"
+          style={{ left: metaTip.pos.x, top: metaTip.pos.y }}
+          className="pointer-events-none fixed z-[1000] w-max max-w-xs break-words rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-800 dark:bg-gray-900 text-gray-100 shadow-2xl px-3 py-2 text-[11px] leading-relaxed"
+        >
+          {metaSize && (
+            <div className="whitespace-nowrap">
+              <span className="text-gray-400 dark:text-gray-500">{t('filetree.size')}: </span>{metaSize}
+            </div>
+          )}
+          {metaMtime && (
+            <div className="whitespace-nowrap">
+              <span className="text-gray-400 dark:text-gray-500">{t('filetree.modified')}: </span>{metaMtime}
+            </div>
+          )}
+        </div>,
+        document.body
+      )}
       {isFolder && isExpanded && (
         (!hasLoadedChildren || isLoadingChildren) ? (
           <div className="flex items-center gap-2 py-1.5 text-gray-400" style={{ paddingLeft: `${(level + 1) * 12 + 12}px` }}>

@@ -463,13 +463,15 @@ class FileService:
                     "path": rel_path,
                     "type": "directory" if child.is_dir() else "file",
                 }
-                if node["type"] == "file":
-                    try:
-                        node["size"] = child.stat().st_size
-                    except OSError:
-                        # Vanished or became unreadable mid-scan; size is
-                        # display-only, so omit it rather than fail the listing.
-                        pass
+                try:
+                    stat_result = child.stat()
+                    node["mtime"] = stat_result.st_mtime
+                    if node["type"] == "file":
+                        node["size"] = stat_result.st_size
+                except OSError:
+                    # Vanished or became unreadable mid-scan; mtime/size are
+                    # display-only, so omit them rather than fail the listing.
+                    pass
                 children.append(node)
             return children
 
@@ -498,6 +500,7 @@ class FileService:
                 "path": rel_path,
                 "type": "directory" if is_dir else "file",
                 "children": [],
+                "mtime": stat_result.st_mtime,
             }
             if is_symlink:
                 item["symlink"] = True
