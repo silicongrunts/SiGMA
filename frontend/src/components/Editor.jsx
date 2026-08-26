@@ -25,6 +25,8 @@ import { storage } from '../utils/storage'
 import { matchAnnotation } from '../utils/annotationMatching'
 import { findIndependentOccurrences } from '../utils/diffState'
 import { formatTimestamp } from '../utils/formatTimestamp'
+import { MAX_CITATIONS } from '../utils/citations'
+import { toastError } from './Toast'
 import { AnnotationPopup } from './Annotations'
 import ContextMenu from './ContextMenu'
 
@@ -396,7 +398,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   const deleteAnnotation = useStore(s => s.deleteAnnotation)
   const activeAnnotationId = useStore(s => s.activeAnnotationId)
   const setActiveAnnotationId = useStore(s => s.setActiveAnnotationId)
-  const setPendingCitation = useStore(s => s.setPendingCitation)
+  const addPendingCitation = useStore(s => s.addPendingCitation)
   const setLeftTab = useStore(s => s.setLeftTab)
   const setAnnotations = useStore(s => s.setAnnotations)
   const compileDiagnostics = useStore(s => s.compileDiagnostics)
@@ -1258,7 +1260,11 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       label: t('editor.citeInChat'),
       action: () => {
         const text = viewRef.current.state.doc.sliceString(ctxMenu.from, ctxMenu.to)
-        setPendingCitation({ text: text.split('\n')[0] + (text.includes('\n') ? '...' : ''), fullText: text })
+        const added = addPendingCitation({
+          text: text.split('\n')[0] + (text.includes('\n') ? '...' : ''),
+          fullText: text,
+        })
+        if (!added) toastError(t('chat.citationLimit', { count: MAX_CITATIONS }))
         setLeftTab('chat')
       },
     },

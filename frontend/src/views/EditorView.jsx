@@ -34,6 +34,7 @@ import { useAutoCompile } from '../hooks/useAutoCompile'
 import FileConflictModal from '../components/FileConflictModal'
 import TerminalPanel from '../components/TerminalPanel'
 import { storage } from '../utils/storage'
+import { joinCitationTexts } from '../utils/citations'
 import { toastError } from '../components/Toast'
 import { RotateCw, AlertTriangle, Database, ArrowLeft, Loader } from 'lucide-react'
 
@@ -77,8 +78,9 @@ export default function EditorView() {
   const compileLogs = useStore(s => s.compileLogs)
   const compileFailed = useStore(s => s.compileFailed)
   const compileDiagnostics = useStore(s => s.compileDiagnostics)
-  const pendingCitation = useStore(s => s.pendingCitation)
-  const clearCitation = useStore(s => s.clearCitation)
+  const pendingCitations = useStore(s => s.pendingCitations)
+  const removePendingCitation = useStore(s => s.removePendingCitation)
+  const clearPendingCitations = useStore(s => s.clearPendingCitations)
   const setActiveTab = useStore(s => s.setActiveTab)
   const setLeftTab = useStore(s => s.setLeftTab)
   const setPendingAutoMessage = useStore(s => s.setPendingAutoMessage)
@@ -173,11 +175,16 @@ export default function EditorView() {
   }, [projectId, handleCompile, t])
 
   // ── Build user_state for LLM status context ──
+  // Pending citations ride along on every tab: they are global pre-send
+  // state (editor selection or library item), so they must survive a tab
+  // switch between queueing and sending.
   const getUserState = useCallback(() => {
     const state = useStore.getState()
-    if (activeTab === 'explore') return { active_tab: 'explore' }
-    if (activeTab === 'library') {
-      const userState = { active_tab: 'library' }
+    let userState
+    if (activeTab === 'explore') {
+      userState = { active_tab: 'explore' }
+    } else if (activeTab === 'library') {
+      userState = { active_tab: 'library' }
       if (libraryActions.selectedDocId) {
         userState.viewing_document = {
           id: libraryActions.selectedDocId,
@@ -194,26 +201,25 @@ export default function EditorView() {
           userState.indexing_status = indexingStatus
         }
       }
-      return userState
-    }
-
-    const userState = { active_tab: 'synthesis' }
-    if (state.currentFile) userState.editor_file = state.currentFile
-    if (state.previewSource.path) userState.preview_file = state.previewSource.path
-    // Notebook-specific context
-    if (state.currentFile?.endsWith('.ipynb')) {
-      userState.notebook_mode = true
-      if (state.activeKernels?.length > 0) {
-        userState.active_kernels = state.activeKernels.map(k => ({
-          id: k.id,
-          display_name: k.display_name,
-          execution_state: k.execution_state,
-        }))
+    } else {
+      userState = { active_tab: 'synthesis' }
+      if (state.currentFile) userState.editor_file = state.currentFile
+      if (state.previewSource.path) userState.preview_file = state.previewSource.path
+      // Notebook-specific context
+      if (state.currentFile?.endsWith('.ipynb')) {
+        userState.notebook_mode = true
+        if (state.activeKernels?.length > 0) {
+          userState.active_kernels = state.activeKernels.map(k => ({
+            id: k.id,
+            display_name: k.display_name,
+            execution_state: k.execution_state,
+          }))
+        }
       }
+      const cursor = editorRef.current?.getCursorContext?.(50)
+      if (cursor) userState.cursor = cursor
     }
-    const cursor = editorRef.current?.getCursorContext?.(50)
-    if (cursor) userState.cursor = cursor
-    if (state.pendingCitation?.fullText) userState.citation = state.pendingCitation.fullText
+    if (state.pendingCitations.length > 0) userState.citation = joinCitationTexts(state.pendingCitations)
     return userState
   }, [activeTab, libraryActions])
 
@@ -650,8 +656,9 @@ export default function EditorView() {
               <ChatPanel
                 projectId={projectId}
                 placeholder={chatPlaceholder}
-                citation={pendingCitation}
-                onClearCitation={clearCitation}
+                citations={pendingCitations}
+                onClearCitations={clearPendingCitations}
+                onRemoveCitation={removePendingCitation}
                 onFileChanged={handleFileChanged}
                 onAnnotationChanged={handleAnnotationChanged}
                 getUserState={getUserState}

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { devtools } from 'zustand/middleware'
 import { storage } from '../utils/storage'
+import { MAX_CITATIONS } from '../utils/citations'
 import { permissionsAPI } from '../api'
 
 const initialState = {
@@ -36,7 +37,7 @@ const initialState = {
   annotations: [],
   activeAnnotationId: null,
   isAnnotationsLoaded: false,
-  pendingCitation: null,
+  pendingCitations: [],
   siGMADOProcessingAnnotationId: null,
 
   // AI & Chat
@@ -156,8 +157,18 @@ const actions = (set, get) => ({
     isAnnotationsLoaded: true
   })),
 
-  setPendingCitation: (cite) => set({ pendingCitation: cite }),
-  clearCitation: () => set({ pendingCitation: null }),
+  addPendingCitation: (cite) => {
+    const current = get().pendingCitations
+    // Re-citing identical content is an idempotent no-op, not a limit miss.
+    if (current.some(c => c.fullText === cite.fullText)) return true
+    if (current.length >= MAX_CITATIONS) return false
+    set({ pendingCitations: [...current, cite] })
+    return true
+  },
+  removePendingCitation: (index) => set(s => ({
+    pendingCitations: s.pendingCitations.filter((_, i) => i !== index)
+  })),
+  clearPendingCitations: () => set({ pendingCitations: [] }),
   setSiGMADOProcessingAnnotationId: (id) => set({ siGMADOProcessingAnnotationId: id }),
 
   // Chat

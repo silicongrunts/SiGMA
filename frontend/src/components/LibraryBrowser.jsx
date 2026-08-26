@@ -7,7 +7,7 @@ import { useState, useEffect, useCallback, useRef, useContext, useLayoutEffect }
 import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import { useClickOutside } from '../hooks/useClickOutside'
-import { FileText, Trash2, Edit3, X, Upload, Tag, AlertCircle, File, CheckCircle, Loader, ScrollText, Redo2, Download, Pencil, Check, Sparkles, Folder, ChevronRight, FolderPlus, Move, ChevronDown, ArrowLeft } from 'lucide-react'
+import { FileText, Trash2, Edit3, X, Upload, Tag, AlertCircle, File, CheckCircle, Loader, ScrollText, Redo2, Download, Pencil, Check, Sparkles, Folder, ChevronRight, FolderPlus, Move, ChevronDown, ArrowLeft, Quote } from 'lucide-react'
 import { libraryAPI } from '../api'
 import { toastError, toastSuccess } from './Toast'
 import { MarkdownContent } from './ChatShared'
@@ -20,6 +20,8 @@ import { LoadingOverlay, Spinner, LoadingButton } from './ui'
 import { HighlightText } from './Highlight'
 import ContextMenu from './ContextMenu'
 import { storage } from '../utils/storage'
+import { buildLibraryCitation, MAX_CITATIONS } from '../utils/citations'
+import { useStore } from '../store/useStore'
 
 const MOVE_FOLDER_PAGE_SIZE = 500
 const EMBEDDING_MODEL_CHANGED_TEXT = 'Embedding model changed'
@@ -204,6 +206,7 @@ function MoveToFolderModal({ isOpen, onClose, projectId, onConfirm }) {
 
 export default function LibraryBrowser({ projectId }) {
   const { t } = useTranslation()
+  const addPendingCitation = useStore(s => s.addPendingCitation)
   const rootBreadcrumb = useCallback(() => [{ id: null, name: t('library.root') }], [t])
   const getStoredLibraryState = useCallback(() => storage.getLibrary(projectId), [projectId])
   const [documents, setDocuments] = useState([])
@@ -1002,6 +1005,18 @@ export default function LibraryBrowser({ projectId }) {
     }
   }, [])
 
+  // Context-menu action: queue a library item as a chat citation. Search
+  // hits carry their real folder_path from the backend; while browsing, the
+  // breadcrumb trail (minus the root crumb) is the containing folder.
+  const citeToChat = (item) => {
+    const folderPath = isSearchResult
+      ? (item.folder_path || '')
+      : breadcrumbs.slice(1).map(b => b.name).join(' / ')
+    if (!addPendingCitation(buildLibraryCitation(item, folderPath))) {
+      toastError(t('chat.citationLimit', { count: MAX_CITATIONS }))
+    }
+  }
+
   // Build context menu options
   const getContextMenuOptions = () => {
     if (!contextMenu) return []
@@ -1025,6 +1040,7 @@ export default function LibraryBrowser({ projectId }) {
     if (item.is_folder) {
       return [
         { label: t('library.open'), icon: <Folder className="w-4 h-4" />, action: () => navigateToFolder(item.id, item.title) },
+        { label: t('library.citeInChat'), icon: <Quote className="w-4 h-4" />, action: () => citeToChat(item) },
         { label: t('common.rename'), icon: <Edit3 className="w-4 h-4" />, action: () => startRename(item.id, item.title) },
         { separator: true },
         { label: t('library.deleteFolder'), icon: <Trash2 className="w-4 h-4" />, danger: true, action: () => handleDelete(item.id) },
@@ -1033,6 +1049,7 @@ export default function LibraryBrowser({ projectId }) {
 
     const opts = [
       { label: t('library.viewDetails'), icon: <FileText className="w-4 h-4" />, action: () => selectDocument(item.id) },
+      { label: t('library.citeInChat'), icon: <Quote className="w-4 h-4" />, action: () => citeToChat(item) },
       { label: t('common.rename'), icon: <Edit3 className="w-4 h-4" />, action: () => startRename(item.id, item.title) },
       { separator: true },
       { label: t('library.moveTo'), icon: <Move className="w-4 h-4" />, action: () => openMoveModal([item.id]) },
