@@ -408,6 +408,7 @@
   "preview.cannotPreview": "プレビューできません",
   "preview.cannotPreviewDesc": "このファイル形式はプレビューまたは直接編集できません。",
   "preview.downloadName": "{{name}} をダウンロード",
+  "preview.downloadNameSize": "{{name}} ({{size}}) をダウンロード",
   "preview.noPreview": "プレビューが見つかりません",
   "preview.jumpToPage": "クリックしてページにジャンプ",
   "preview.fitWidth": "幅に合わせる",

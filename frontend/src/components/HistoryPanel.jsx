@@ -4,6 +4,7 @@ import { useStore } from '../store/useStore'
 import { gitsAPI, fetchBlob } from '../api'
 import { toastError, toastSuccess, toastInfo } from './Toast'
 import { copyToClipboard } from '../utils/clipboard'
+import { formatBytes } from '../utils/formatBytes'
 import DiffView from './DiffView'
 import ContextMenu from './ContextMenu'
 import { InputModal, ConfirmModal } from './Modal'
@@ -196,12 +197,6 @@ function CommitModal({ isOpen, onClose, commit, parentHash, projectId, onDownloa
     URL.revokeObjectURL(url)
   }
 
-  const formatFileSize = (bytes) => {
-    if (bytes < 1024) return bytes + ' B'
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
-  }
-
   const renderFileEntry = (file, idx) => {
     const isExp = expanded.has(file.path)
     const currentMode = viewMode[file.path] || 'view'
@@ -243,7 +238,7 @@ function CommitModal({ isOpen, onClose, commit, parentHash, projectId, onDownloa
                 <Code className="w-3.5 h-3.5" />{t('history.diff')}
               </button>
               <div className="flex-1" />
-              <span className="text-[10px] text-gray-400 dark:text-gray-500">{blobData && blobData.size ? formatFileSize(blobData.size) : ''}</span>
+              <span className="text-[10px] text-gray-400 dark:text-gray-500">{blobData && blobData.size ? formatBytes(blobData.size) : ''}</span>
               <button onClick={() => handleDownload(file)} disabled={downloading}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors
                   ${downloading ? 'text-gray-300 dark:text-gray-600 cursor-not-allowed' : 'text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/20'}`}>
@@ -275,7 +270,7 @@ function CommitModal({ isOpen, onClose, commit, parentHash, projectId, onDownloa
                       <p className="text-xs text-gray-400 dark:text-gray-500 mb-4 max-w-xs">{t('history.binaryDesc')}</p>
                       <div className="flex items-center gap-4 text-[11px] text-gray-500 dark:text-gray-400 mb-4">
                         <span>{t('history.fileLabel')} <strong className="text-gray-700 dark:text-gray-300">{blobData.name || file.name}</strong></span>
-                        <span>{t('history.sizeLabel')} <strong className="text-gray-700 dark:text-gray-300">{formatFileSize(blobData.size)}</strong></span>
+                        <span>{t('history.sizeLabel')} <strong className="text-gray-700 dark:text-gray-300">{formatBytes(blobData.size)}</strong></span>
                       </div>
                       <button onClick={() => handleDownload(file)} className="flex items-center gap-2 px-5 py-2.5 bg-sigma-600 text-white rounded-xl hover:bg-sigma-700 transition-all text-sm font-medium shadow-sm">
                         <Download className="w-4 h-4" />{t('common.download')}

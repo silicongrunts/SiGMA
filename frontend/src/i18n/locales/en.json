@@ -407,6 +407,7 @@
   "preview.cannotPreview": "Cannot Preview",
   "preview.cannotPreviewDesc": "This file type cannot be previewed or edited directly.",
   "preview.downloadName": "Download {{name}}",
+  "preview.downloadNameSize": "Download {{name}} ({{size}})",
   "preview.noPreview": "No Preview Found",
   "preview.jumpToPage": "Click to jump to page",
   "preview.fitWidth": "Fit Width",

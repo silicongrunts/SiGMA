@@ -407,6 +407,7 @@
   "preview.cannotPreview": "미리보기 불가",
   "preview.cannotPreviewDesc": "이 파일 형식은 미리보기나 직접 편집할 수 없습니다.",
   "preview.downloadName": "{{name}} 다운로드",
+  "preview.downloadNameSize": "{{name}} ({{size}}) 다운로드",
   "preview.noPreview": "미리보기를 찾을 수 없음",
   "preview.jumpToPage": "클릭하여 페이지로 이동",
   "preview.fitWidth": "너비에 맞춤",

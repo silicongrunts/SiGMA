@@ -407,6 +407,7 @@
   "preview.cannotPreview": "無法預覽",
   "preview.cannotPreviewDesc": "此檔案類型無法直接預覽或編輯。",
   "preview.downloadName": "下載 {{name}}",
+  "preview.downloadNameSize": "下載 {{name}} ({{size}})",
   "preview.noPreview": "找不到預覽",
   "preview.jumpToPage": "點選跳至頁面",
   "preview.fitWidth": "符合寬度",

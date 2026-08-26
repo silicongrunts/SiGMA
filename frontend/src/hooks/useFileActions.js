@@ -98,7 +98,7 @@ export function useFileActions({ projectId, editorRef, previewRef, handleSave })
 
     if (isBinary) {
       // Editor stays on whatever it was; preview shows download UI for this file.
-      state.setPreviewSource({ kind: 'binary-error', path: node.path, compileVersion: 0 })
+      state.setPreviewSource({ kind: 'binary-error', path: node.path, size: node.size, compileVersion: 0 })
       state.setIsLoadingFile(false)
       return false
     }

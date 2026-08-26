@@ -451,11 +451,19 @@ class FileService:
                 if child.name.startswith('.'):
                     continue
                 rel_path = str(child.relative_to(root))
-                children.append({
+                node = {
                     "name": child.name,
                     "path": rel_path,
                     "type": "directory" if child.is_dir() else "file",
-                })
+                }
+                if node["type"] == "file":
+                    try:
+                        node["size"] = child.stat().st_size
+                    except OSError:
+                        # Vanished or became unreadable mid-scan; size is
+                        # display-only, so omit it rather than fail the listing.
+                        pass
+                children.append(node)
             return children
 
         children = await asyncio.to_thread(_scan)
@@ -489,6 +497,7 @@ class FileService:
                 return item
 
             if not is_dir:
+                item["size"] = stat_result.st_size
                 return item
 
             inode_key = (stat_result.st_dev, stat_result.st_ino)

@@ -407,6 +407,7 @@
   "preview.cannotPreview": "पूर्वावलोकन नहीं हो सकता",
   "preview.cannotPreviewDesc": "इस फ़ाइल प्रकार का पूर्वावलोकन या सीधे संपादन नहीं किया जा सकता।",
   "preview.downloadName": "{{name}} डाउनलोड करें",
+  "preview.downloadNameSize": "{{name}} डाउनलोड करें ({{size}})",
   "preview.noPreview": "कोई पूर्वावलोकन नहीं मिला",
   "preview.jumpToPage": "पृष्ठ पर जाने के लिए क्लिक करें",
   "preview.fitWidth": "चौड़ाई फ़िट करें",

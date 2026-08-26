@@ -10,6 +10,7 @@ import renderMathInElement from 'katex/dist/contrib/auto-render.mjs'
 import { useStore } from '../store/useStore'
 import { filesAPI, compileAPI } from '../api'
 import { storage } from '../utils/storage'
+import { formatBytes } from '../utils/formatBytes'
 import { getCompiledPdfName } from '../utils/constants'
 import { toastError } from './Toast'
 import { rewriteProjectImageSrc, decorateMarkdownLinks } from './ChatShared'
@@ -841,6 +842,7 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
 
   const binaryErrorPath = previewKind === 'binary-error' ? previewPath : null
   const binaryErrorName = binaryErrorPath ? binaryErrorPath.split('/').pop() : null
+  const binaryErrorSize = binaryErrorPath ? formatBytes(previewSource.size) : null
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-[#f3f4f6] dark:bg-gray-900 relative group">
@@ -988,7 +990,9 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
               download={binaryErrorName}
               className="bg-sigma-600 hover:bg-sigma-700 text-white px-5 py-2.5 rounded-xl flex items-center gap-2 text-sm font-bold transition-all shadow-lg shadow-blue-100 dark:shadow-none active:scale-95"
             >
-              <Download className="w-4 h-4" /> {t('preview.downloadName', { name: binaryErrorName })}
+              <Download className="w-4 h-4" /> {binaryErrorSize
+                ? t('preview.downloadNameSize', { name: binaryErrorName, size: binaryErrorSize })
+                : t('preview.downloadName', { name: binaryErrorName })}
             </a>
           </div>
         ) : (!compiling && (

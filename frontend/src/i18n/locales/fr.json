@@ -407,6 +407,7 @@
   "preview.cannotPreview": "Aperçu impossible",
   "preview.cannotPreviewDesc": "Ce type de fichier ne peut pas être prévisualisé ou modifié directement.",
   "preview.downloadName": "Télécharger {{name}}",
+  "preview.downloadNameSize": "Télécharger {{name}} ({{size}})",
   "preview.noPreview": "Aucun aperçu trouvé",
   "preview.jumpToPage": "Cliquer pour aller à la page",
   "preview.fitWidth": "Ajuster à la largeur",

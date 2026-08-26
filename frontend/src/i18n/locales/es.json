@@ -407,6 +407,7 @@
   "preview.cannotPreview": "No se puede previsualizar",
   "preview.cannotPreviewDesc": "Este tipo de archivo no se puede previsualizar ni editar directamente.",
   "preview.downloadName": "Descargar {{name}}",
+  "preview.downloadNameSize": "Descargar {{name}} ({{size}})",
   "preview.noPreview": "No se encontró vista previa",
   "preview.jumpToPage": "Haz clic para ir a la página",
   "preview.fitWidth": "Ajustar al ancho",
