@@ -406,6 +406,8 @@
   "preview.title": "미리보기",
   "preview.cannotPreview": "미리보기 불가",
   "preview.cannotPreviewDesc": "이 파일 형식은 미리보기나 직접 편집할 수 없습니다.",
+  "preview.fileTooLarge": "파일이 너무 큽니다",
+  "preview.fileTooLargeDesc": "이 파일은 편집기에서 열 수 있는 크기 제한을 초과합니다. 다운로드하여 로컬에서 확인할 수 있습니다.",
   "preview.downloadName": "{{name}} 다운로드",
   "preview.downloadNameSize": "{{name}} ({{size}}) 다운로드",
   "preview.noPreview": "미리보기를 찾을 수 없음",

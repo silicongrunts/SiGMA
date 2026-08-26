@@ -4,6 +4,31 @@ import pytest
 
 from app.models.requests import FileContent, FileExtractRequest
 from app.routes import files
+from app.services.file_service import MAX_UI_READ_BYTES
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_get_content_applies_ui_read_cap(monkeypatch):
+    """The content route must pass the UI whole-read cap so oversized text
+    files fail fast (FILE_TOO_LARGE) instead of streaming to the browser."""
+    calls = {}
+
+    async def read_file(project_id, path, max_bytes=None):
+        calls["args"] = (project_id, path)
+        calls["max_bytes"] = max_bytes
+        return "hello"
+
+    fake_service = SimpleNamespace(read_file=read_file, compute_hash=lambda text: "hash-1")
+    monkeypatch.setattr(files, "file_service", fake_service)
+
+    response = await files.get_content("project-1", "notes.md")
+
+    assert calls["args"] == ("project-1", "notes.md")
+    assert calls["max_bytes"] == MAX_UI_READ_BYTES
+    assert response.body == b"hello"
+    assert response.headers["X-Content-Hash"] == "hash-1"
+    assert response.media_type == "text/plain"
 
 
 @pytest.mark.route

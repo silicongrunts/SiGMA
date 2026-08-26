@@ -406,6 +406,8 @@
   "preview.title": "Vista previa",
   "preview.cannotPreview": "No se puede previsualizar",
   "preview.cannotPreviewDesc": "Este tipo de archivo no se puede previsualizar ni editar directamente.",
+  "preview.fileTooLarge": "Archivo demasiado grande",
+  "preview.fileTooLargeDesc": "Este archivo supera el límite de tamaño para abrirse en el editor. Aún puedes descargarlo y verlo localmente.",
   "preview.downloadName": "Descargar {{name}}",
   "preview.downloadNameSize": "Descargar {{name}} ({{size}})",
   "preview.noPreview": "No se encontró vista previa",

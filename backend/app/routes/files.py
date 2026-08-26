@@ -4,7 +4,7 @@ from fastapi import APIRouter, UploadFile, Form, Query, Response
 from fastapi.responses import FileResponse
 
 from app.models.requests import FileCreate, FileContent, FileRename, FileMove, FileExtractRequest, FileBatchDownloadRequest
-from app.services.file_service import file_service
+from app.services.file_service import file_service, MAX_UI_READ_BYTES
 from app.core.downloads import download_headers
 from app.core.response import ok
 
@@ -26,8 +26,13 @@ async def get_children(project_id: str, path: str = Query("")):
 
 @router.get("/{project_id}/content")
 async def get_content(project_id: str, path: str):
-    """Return raw file content as text/plain with content hash header."""
-    content = await file_service.read_file(project_id, path)
+    """Return raw file content as text/plain with content hash header.
+
+    Capped at ``MAX_UI_READ_BYTES``: oversized files fail fast with
+    FILE_TOO_LARGE so the editor can show its "file too large" panel
+    instead of loading a browser-freezing document.
+    """
+    content = await file_service.read_file(project_id, path, max_bytes=MAX_UI_READ_BYTES)
     content_hash = file_service.compute_hash(content)
     return Response(content=content, media_type="text/plain", headers={"X-Content-Hash": content_hash})
 

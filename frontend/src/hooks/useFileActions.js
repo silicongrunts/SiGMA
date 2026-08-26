@@ -15,6 +15,8 @@
  *                    both set (md → markdown, tex → pdf-compiled, other
  *                    text → previewSource untouched)
  *   binary         → previewSource = binary-error; currentFile untouched
+ *   oversized text → previewSource = file-too-large (download panel with a
+ *                    size notice, not a "binary" label); currentFile untouched
  *
  * isTexFile is also set here as the single writer, so Header / AutoCompile /
  * Compile all see a consistent TeX-mode flag.
@@ -79,26 +81,31 @@ export function useFileActions({ projectId, editorRef, previewRef, handleSave })
 
     state.setIsLoadingFile(true)
 
-    let isBinary = false
+    // Which degraded outcome the backend reported: binary content, or a text
+    // file over the UI read cap (FILE_TOO_LARGE). Both keep the editor on its
+    // previous file and hand the preview a download panel; only the wording
+    // differs. Detection matches the backend's stable error phrasing, same
+    // as the binary branch below.
+    let degradedKind = null
     let validatedContent = null
     try {
       const data = await filesAPI.read(projectId, node.path)
       validatedContent = data.content ?? ''
       if (data.hash) state.setFileHash(data.hash)
-      // Binary content is surfaced via BinaryFileError on the backend side
-      // (handled in the catch below); no client-side heuristic needed here.
     } catch (error) {
-      if (error?.status === 400 && String(error.message || '').includes('Cannot open binary file')) {
-        isBinary = true
+      const message = String(error.message || '')
+      if (error?.status === 400 && message.includes('Cannot open binary file')) {
+        degradedKind = 'binary-error'
+      } else if (error?.status === 400 && message.includes('too large to read whole')) {
+        degradedKind = 'file-too-large'
       } else {
         state.setIsLoadingFile(false)
         return false
       }
     }
 
-    if (isBinary) {
-      // Editor stays on whatever it was; preview shows download UI for this file.
-      state.setPreviewSource({ kind: 'binary-error', path: node.path, size: node.size, compileVersion: 0 })
+    if (degradedKind) {
+      state.setPreviewSource({ kind: degradedKind, path: node.path, size: node.size, compileVersion: 0 })
       state.setIsLoadingFile(false)
       return false
     }

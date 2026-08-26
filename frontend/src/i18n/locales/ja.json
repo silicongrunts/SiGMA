@@ -407,6 +407,8 @@
   "preview.title": "プレビュー",
   "preview.cannotPreview": "プレビューできません",
   "preview.cannotPreviewDesc": "このファイル形式はプレビューまたは直接編集できません。",
+  "preview.fileTooLarge": "ファイルが大きすぎます",
+  "preview.fileTooLargeDesc": "このファイルはエディターで開けるサイズ上限を超えています。ダウンロードしてローカルで確認できます。",
   "preview.downloadName": "{{name}} をダウンロード",
   "preview.downloadNameSize": "{{name}} ({{size}}) をダウンロード",
   "preview.noPreview": "プレビューが見つかりません",

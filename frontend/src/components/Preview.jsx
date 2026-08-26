@@ -840,9 +840,12 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
     return base
   })()
 
-  const binaryErrorPath = previewKind === 'binary-error' ? previewPath : null
-  const binaryErrorName = binaryErrorPath ? binaryErrorPath.split('/').pop() : null
-  const binaryErrorSize = binaryErrorPath ? formatBytes(previewSource.size) : null
+  // Degraded outcomes (binary file / oversized text) share one render branch:
+  // an explanation plus a download link. Only the wording differs.
+  const degradedKind = (previewKind === 'binary-error' || previewKind === 'file-too-large') ? previewKind : null
+  const degradedPath = degradedKind ? previewPath : null
+  const degradedName = degradedPath ? degradedPath.split('/').pop() : null
+  const degradedSize = degradedPath ? formatBytes(previewSource.size) : null
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-[#f3f4f6] dark:bg-gray-900 relative group">
@@ -980,19 +983,23 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
                     })() }}
                 />
             </div>
-        ) : binaryErrorPath ? (
+        ) : degradedPath ? (
           <div className="flex flex-col items-center justify-center m-auto text-gray-400 dark:text-gray-500 px-8">
             <AlertTriangle className="w-16 h-12 mb-4 text-amber-300 dark:text-amber-500/50" />
-            <p className="text-sm font-bold text-gray-600 dark:text-gray-300 mb-2">{t('preview.cannotPreview')}</p>
-            <p className="text-xs text-gray-400 dark:text-gray-500 mb-4 text-center">{t('preview.cannotPreviewDesc')}</p>
+            <p className="text-sm font-bold text-gray-600 dark:text-gray-300 mb-2">
+              {degradedKind === 'file-too-large' ? t('preview.fileTooLarge') : t('preview.cannotPreview')}
+            </p>
+            <p className="text-xs text-gray-400 dark:text-gray-500 mb-4 text-center">
+              {degradedKind === 'file-too-large' ? t('preview.fileTooLargeDesc') : t('preview.cannotPreviewDesc')}
+            </p>
             <a
-              href={`/api/v1/files/${encodeURIComponent(currentProjectId)}/download?path=${encodeURIComponent(binaryErrorPath)}`}
-              download={binaryErrorName}
+              href={`/api/v1/files/${encodeURIComponent(currentProjectId)}/download?path=${encodeURIComponent(degradedPath)}`}
+              download={degradedName}
               className="bg-sigma-600 hover:bg-sigma-700 text-white px-5 py-2.5 rounded-xl flex items-center gap-2 text-sm font-bold transition-all shadow-lg shadow-blue-100 dark:shadow-none active:scale-95"
             >
-              <Download className="w-4 h-4" /> {binaryErrorSize
-                ? t('preview.downloadNameSize', { name: binaryErrorName, size: binaryErrorSize })
-                : t('preview.downloadName', { name: binaryErrorName })}
+              <Download className="w-4 h-4" /> {degradedSize
+                ? t('preview.downloadNameSize', { name: degradedName, size: degradedSize })
+                : t('preview.downloadName', { name: degradedName })}
             </a>
           </div>
         ) : (!compiling && (

@@ -406,6 +406,8 @@
   "preview.title": "पूर्वावलोकन",
   "preview.cannotPreview": "पूर्वावलोकन नहीं हो सकता",
   "preview.cannotPreviewDesc": "इस फ़ाइल प्रकार का पूर्वावलोकन या सीधे संपादन नहीं किया जा सकता।",
+  "preview.fileTooLarge": "फ़ाइल बहुत बड़ी है",
+  "preview.fileTooLargeDesc": "यह फ़ाइल संपादक में खोलने की आकार सीमा से बड़ी है। आप इसे डाउनलोड करके स्थानीय रूप से देख सकते हैं।",
   "preview.downloadName": "{{name}} डाउनलोड करें",
   "preview.downloadNameSize": "{{name}} डाउनलोड करें ({{size}})",
   "preview.noPreview": "कोई पूर्वावलोकन नहीं मिला",

@@ -25,7 +25,7 @@ from app.agents.tools.read_state import read_state_cache
 from app.core.chat_attachments import MAX_CHAT_IMAGE_BYTES
 from app.core.exceptions import FileSystemError
 from app.services.chat_attachments import read_image_path_base64
-from app.services.file_service import MAX_TOOL_READ_BYTES, file_service
+from app.services.file_service import MAX_TOOL_READ_BYTES, MAX_UI_READ_BYTES, file_service
 
 
 @pytest.fixture(autouse=True)
@@ -329,6 +329,28 @@ async def test_read_sandbox_oversize_rejected(tmp_path, monkeypatch):
     with pytest.raises(FileSystemError) as exc_info:
         await file_service.read_file("proj", "big.txt", max_bytes=MAX_TOOL_READ_BYTES)
     assert exc_info.value.code == "FILE_TOO_LARGE"
+
+
+@pytest.mark.asyncio
+async def test_read_ui_cap_rejects_oversize_text(tmp_path, monkeypatch):
+    """The UI content route's 5 MiB cap rejects oversized text before any
+    byte is read — the editor degrades to a download panel instead of
+    loading a tab-freezing document."""
+    _patch_file_service(monkeypatch, tmp_path)
+    _sparse_file(tmp_path / "huge.json", MAX_UI_READ_BYTES + 1)
+    with pytest.raises(FileSystemError) as exc_info:
+        await file_service.read_file("proj", "huge.json", max_bytes=MAX_UI_READ_BYTES)
+    assert exc_info.value.code == "FILE_TOO_LARGE"
+    assert "too large to read whole" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_read_ui_cap_boundary_exact_limit_reads(tmp_path, monkeypatch):
+    """A file exactly at the cap is readable — the limit is exclusive."""
+    _patch_file_service(monkeypatch, tmp_path)
+    (tmp_path / "edge.txt").write_text("a" * MAX_UI_READ_BYTES, encoding="utf-8")
+    text = await file_service.read_file("proj", "edge.txt", max_bytes=MAX_UI_READ_BYTES)
+    assert len(text) == MAX_UI_READ_BYTES
 
 
 @pytest.mark.asyncio

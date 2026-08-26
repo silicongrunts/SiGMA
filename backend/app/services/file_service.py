@@ -31,11 +31,18 @@ MAX_TREE_NODES = 10000
 
 # Whole-file read cap for agent tools. Agent-chosen paths can point at
 # multi-GB datasets inside (or outside) the sandbox; reads stay unrestricted
-# by design, but the *amount read in one call* is bounded. UI routes keep the
-# historical uncapped behaviour by not passing ``max_bytes``. Larger files
+# by design, but the *amount read in one call* is bounded. Larger files
 # stay readable through the streaming range reader (``read_text_range``),
 # which only accumulates the requested line window.
 MAX_TOOL_READ_BYTES = 10 * 1024 * 1024
+
+# Whole-file read cap for the UI content route. The Synthesis editor loads
+# the whole document into the browser (editor and markdown preview refetch
+# it independently), so an oversized file freezes the tab and spikes backend
+# memory; the UI degrades to a "file too large" download panel instead.
+# Deliberately smaller than the agent cap: tool reads are windowed and
+# headless, UI reads land in a renderer.
+MAX_UI_READ_BYTES = 5 * 1024 * 1024
 
 # Range-read budgets: a windowed read may scan the file to count lines, but
 # the scan itself is bounded (a multi-TB file must not occupy a worker thread
@@ -45,7 +52,7 @@ _RANGE_CHUNK_BYTES = 1 << 20     # 1 MiB
 
 
 def check_readable(p: Path, path_label: str, max_bytes: int | None) -> os.stat_result:
-    """Validate a file before reading it on behalf of an agent tool.
+    """Validate a file before a whole-file read.
 
     ``stat`` first, and only regular files pass: devices and fifos report
     size 0 yet never reach EOF (``/dev/zero``), so a byte cap alone cannot

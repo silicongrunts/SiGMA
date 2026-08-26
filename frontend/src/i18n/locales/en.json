@@ -406,6 +406,8 @@
   "preview.title": "Preview",
   "preview.cannotPreview": "Cannot Preview",
   "preview.cannotPreviewDesc": "This file type cannot be previewed or edited directly.",
+  "preview.fileTooLarge": "File Too Large",
+  "preview.fileTooLargeDesc": "This file exceeds the size limit for opening in the editor. You can still download it and view it locally.",
   "preview.downloadName": "Download {{name}}",
   "preview.downloadNameSize": "Download {{name}} ({{size}})",
   "preview.noPreview": "No Preview Found",

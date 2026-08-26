@@ -406,6 +406,8 @@
   "preview.title": "Aperçu",
   "preview.cannotPreview": "Aperçu impossible",
   "preview.cannotPreviewDesc": "Ce type de fichier ne peut pas être prévisualisé ou modifié directement.",
+  "preview.fileTooLarge": "Fichier trop volumineux",
+  "preview.fileTooLargeDesc": "Ce fichier dépasse la taille maximale pour être ouvert dans l'éditeur. Vous pouvez toujours le télécharger et le consulter localement.",
   "preview.downloadName": "Télécharger {{name}}",
   "preview.downloadNameSize": "Télécharger {{name}} ({{size}})",
   "preview.noPreview": "Aucun aperçu trouvé",

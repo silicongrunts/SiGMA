@@ -406,6 +406,8 @@
   "preview.title": "預覽",
   "preview.cannotPreview": "無法預覽",
   "preview.cannotPreviewDesc": "此檔案類型無法直接預覽或編輯。",
+  "preview.fileTooLarge": "檔案過大",
+  "preview.fileTooLargeDesc": "此檔案超過了編輯器可開啟的大小上限，無法開啟。您仍可下載後使用本機工具檢視。",
   "preview.downloadName": "下載 {{name}}",
   "preview.downloadNameSize": "下載 {{name}} ({{size}})",
   "preview.noPreview": "找不到預覽",
