@@ -373,6 +373,10 @@ export const chatAPI = {
   getSessionMessages: (projectId, sessionId) =>
     request(`/chat/sessions/${projectId}/${sessionId}/messages`),
 
+  /** Search session titles and user-visible message text across all sessions */
+  search: (projectId, q, signal) =>
+    request(`/chat/search/${projectId}?q=${encodeURIComponent(q)}`, { signal }),
+
   /** Cancel a running LLM task */
   cancel: (projectId, taskId) =>
     request(`/chat/cancel/${projectId}/${taskId}`, { method: 'POST' }),

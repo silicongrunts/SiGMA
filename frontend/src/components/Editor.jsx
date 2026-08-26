@@ -24,16 +24,11 @@ import { getSchemeExtension } from '../utils/highlightSchemes'
 import { storage } from '../utils/storage'
 import { matchAnnotation } from '../utils/annotationMatching'
 import { findIndependentOccurrences } from '../utils/diffState'
+import { formatTimestamp } from '../utils/formatTimestamp'
 import { AnnotationPopup } from './Annotations'
 import ContextMenu from './ContextMenu'
 
 const languageConf = new Compartment()
-
-/** Format ISO timestamp for annotation UI → "2026-01-01 12:34:22" */
-function formatTimestamp(iso) {
-  if (!iso) return ''
-  return new Date(iso).toLocaleString('sv-SE', { hour12: false }).replace('T', ' ')
-}
 
 // --- Annotation Effects ---
 const addAnnoEffect = StateEffect.define()

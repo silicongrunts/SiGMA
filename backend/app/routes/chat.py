@@ -105,6 +105,12 @@ async def clear_chat_history(project_id: str, session_id: str = Query(None)):
     return ok(None)
 
 
+@router.get("/search/{project_id}")
+async def search_chat(project_id: str, q: str = Query(..., min_length=1, max_length=200)):
+    """Search session titles and user-visible message text across all sessions."""
+    return ok(await ai_service.search_chat(project_id, q))
+
+
 @router.post("/attachments/{project_id}")
 async def upload_chat_attachment(
     project_id: str,

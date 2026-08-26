@@ -17,6 +17,7 @@ import { FileDropzone, collectDropEntries } from './FileDropzone'
 import { SelectedFilesList } from './SelectedFilesList'
 import { LibraryActionsContext } from './LibraryActionsContext'
 import { LoadingOverlay, Spinner, LoadingButton } from './ui'
+import { HighlightText } from './Highlight'
 import ContextMenu from './ContextMenu'
 import { storage } from '../utils/storage'
 
@@ -29,22 +30,6 @@ function getLibrarySearchErrorMessage(error, t) {
     return t('library.toast.embeddingModelChanged')
   }
   return message || t('library.toast.searchFailed')
-}
-
-/** Highlight query keyword in text with <mark> tag */
-function highlightQuery(text, query) {
-  if (!query || !text) return text
-  try {
-    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const parts = text.split(new RegExp(`(${escaped})`, 'gi'))
-    return parts.map((part, i) =>
-      part.toLowerCase() === query.toLowerCase()
-        ? <mark key={i} className="bg-yellow-200 dark:bg-yellow-700 text-yellow-900 dark:text-yellow-200 rounded px-0.5">{part}</mark>
-        : part
-    )
-  } catch {
-    return text
-  }
 }
 
 /* =========================================================================
@@ -1602,7 +1587,7 @@ function LibraryItem({ doc, idx, selectedDocId, isSelected, isSearchResult, sear
               <div className="mt-1 space-y-0.5">
                 {doc.search_snippets.map((snippet, i) => (
                   <div key={i} className="text-[11px] text-gray-500 dark:text-gray-400 bg-yellow-50/50 dark:bg-yellow-900/30 border-l-2 border-yellow-200 dark:border-yellow-800/50 pl-2 py-0.5 rounded-r">
-                    {searchMode === 'keyword' ? highlightQuery(snippet, searchQuery) : snippet}
+                    {searchMode === 'keyword' ? <HighlightText text={snippet} query={searchQuery} /> : snippet}
                   </div>
                 ))}
               </div>

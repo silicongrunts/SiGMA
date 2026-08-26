@@ -140,6 +140,24 @@ async def test_edit_chat_message_passes_replace_request(monkeypatch):
 
 @pytest.mark.route
 @pytest.mark.asyncio
+async def test_search_chat_passes_query_and_wraps_result(monkeypatch):
+    calls = {}
+
+    async def search_chat(project_id, q):
+        calls["search"] = (project_id, q)
+        return {"query": q, "groups": [], "total_matches": 0, "total_sessions": 0}
+
+    monkeypatch.setattr(chat, "ai_service", SimpleNamespace(search_chat=search_chat))
+
+    result = await chat.search_chat("project-1", "needle")
+
+    assert result["success"] is True
+    assert result["data"]["query"] == "needle"
+    assert calls["search"] == ("project-1", "needle")
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
 async def test_fork_session_passes_message_and_returns_session(monkeypatch):
     calls = {}
 

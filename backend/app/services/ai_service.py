@@ -25,6 +25,12 @@ from app.core.chat_attachments import (
     render_attachments_tag,
     strip_internal_image_tags,
 )
+from app.core.chat_search import (
+    compile_search_pattern,
+    sql_prefilter_reliable,
+    visible_search_matches,
+)
+from app.core.message_format import page_ui_turns, shape_messages_for_ui
 from app.services.query_loop import QueryLoop
 from app.services.project_service import project_service
 from app.database.unit_of_work import UnitOfWork
@@ -357,8 +363,6 @@ class AIService:
 
     async def get_session_messages(self, project_id: str, session_id: str) -> list[Dict]:
         """Get UI-shaped messages for a specific session (archive preview)."""
-        from app.core.message_format import shape_messages_for_ui
-
         async with UnitOfWork(project_id) as uow:
             messages, boundary_seq = await uow.messages.get_messages_with_boundary(session_id)
         return shape_messages_for_ui(messages, boundary_seq)
@@ -375,8 +379,6 @@ class AIService:
         before_seq: int | None = None,
     ) -> Dict[str, Any]:
         """Get a cursor-paginated UI chat history page."""
-        from app.core.message_format import page_ui_turns, shape_messages_for_ui
-
         async with UnitOfWork(project_id) as uow:
             if session_id is None:
                 sessions = await uow.sessions.list_all()
@@ -402,6 +404,76 @@ class AIService:
                     return {"success": True, "message": "No sessions to clear"}
             await uow.messages.delete_by_session(session_id)
             return {"success": True, "message": "History cleared"}
+
+    # ------------------------------------------------------------------
+    # Chat search
+    # ------------------------------------------------------------------
+
+    # Caps keep one search response bounded. total_matches only covers
+    # sessions inside the cap — candidates beyond it are never shaped, so
+    # their hits stay uncounted. total_sessions is the pre-filter candidate
+    # count: an upper bound on groups, since raw-row hits in invisible text
+    # (internal tags, process-only rows) yield no group.
+    SEARCH_MAX_SESSIONS = 20
+    SEARCH_MAX_MATCHES_PER_SESSION = 5
+
+    async def search_chat(self, project_id: str, query: str) -> Dict[str, Any]:
+        """Search session titles and user-visible message text across all sessions.
+
+        Message matching runs over ``shape_messages_for_ui`` output, so only
+        user bubbles and final assistant bubbles match — intermediate
+        process content (tool calls, hints) and internal tags never do.
+        Archived sessions are included.
+        """
+        query = query.strip()
+        if not query:
+            raise ValidationError("Search query must not be empty")
+
+        pattern = compile_search_pattern(query)
+        async with UnitOfWork(project_id) as uow:
+            sessions = await uow.sessions.list_all(include_archived=True)
+            # The SQL pre-filter folds ASCII case only; needles with non-ASCII
+            # cased letters skip it so message matching stays as case-
+            # insensitive as the title match, at the cost of scanning every
+            # session.
+            scan_all = not sql_prefilter_reliable(query)
+            matched_ids: set = set()
+            if sessions and not scan_all:
+                matched_ids = set(await uow.messages.search_session_ids_containing(
+                    [s.id for s in sessions], query,
+                ))
+
+            candidates = [
+                s for s in sessions
+                if scan_all
+                or s.id in matched_ids
+                or pattern.search(s.title or "")
+            ]
+            groups: list[Dict[str, Any]] = []
+            total_matches = 0
+            for session in candidates[:self.SEARCH_MAX_SESSIONS]:
+                messages, boundary_seq = await uow.messages.get_messages_with_boundary(session.id)
+                entries = shape_messages_for_ui(messages, boundary_seq)
+                matches = visible_search_matches(entries, pattern)
+                title_match = bool(pattern.search(session.title or ""))
+                if not matches and not title_match:
+                    # Pre-filter false positive: the raw row hit an internal
+                    # tag or intermediate process text only.
+                    continue
+                total_matches += len(matches)
+                groups.append({
+                    "session": session.to_dict(),
+                    "title_match": title_match,
+                    "matches": matches[:self.SEARCH_MAX_MATCHES_PER_SESSION],
+                    "match_count": len(matches),
+                })
+
+        return {
+            "query": query,
+            "groups": groups,
+            "total_matches": total_matches,
+            "total_sessions": len(candidates),
+        }
 
     # ==================================================================
     # 3. Task submission

@@ -5,6 +5,7 @@ import { filesAPI } from '../api'
 import { InlineDiffViewer } from './DiffViewer'
 import { SideBySideDiffViewer } from './DiffViewer'
 import { computeDiffState } from '../utils/diffState'
+import { formatTimestamp } from '../utils/formatTimestamp'
 import { useStore } from '../store/useStore'
 import { createSSEStreamParser } from '../utils/sse'
 import { ThinkingProcess } from './ChatShared'
@@ -22,12 +23,6 @@ const MIN_THREAD_HEIGHT = 100
  *  React-derived maxHeight and the DOM-direct resize path so they stay in sync. */
 const threadMaxHeightFor = (cardHeight) =>
   Math.max(MIN_THREAD_HEIGHT, cardHeight - CARD_CHROME_HEIGHT)
-
-/** Format ISO timestamp → "2026-01-01 12:34:22" */
-function formatTimestamp(iso) {
-  if (!iso) return ''
-  return new Date(iso).toLocaleString('sv-SE', { hour12: false }).replace('T', ' ')
-}
 
 function streamStatusText(data, t) {
   if (data?.status === 'retrying') {

@@ -9,22 +9,18 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { MarkdownContent, ThinkingProcess } from './ChatShared'
-import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2, GitBranch } from 'lucide-react'
+import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2, GitBranch, Search } from 'lucide-react'
 import { toastError, toastSuccess } from './Toast'
 import { ModalOverlay, ConfirmModal } from './Modal'
+import ChatSearchModal from './ChatSearchModal'
 import Toggle from './Toggle'
 import { chatAPI, skillsAPI, permissionsAPI } from '../api'
 import { createSSEStreamParser } from '../utils/sse'
 import { storage, STORAGE_KEYS } from '../utils/storage'
 import { copyToClipboard } from '../utils/clipboard'
+import { formatTimestamp } from '../utils/formatTimestamp'
 import { useStore } from '../store/useStore'
 import { useTranslation } from 'react-i18next'
-
-/** Format ISO timestamp → "2026-01-01 12:34:22" */
-function formatTimestamp(iso) {
-  if (!iso) return ''
-  return new Date(iso).toLocaleString('sv-SE', { hour12: false }).replace('T', ' ')
-}
 
 function formatTokenCount(value) {
   const n = Number(value || 0)
@@ -119,6 +115,9 @@ function displayMessageText(text, planLabel) {
 // Sentinel highlight id for a just-sent/edit-resend bubble that has no server
 // id yet — by definition the latest, so the list highlights its final entry.
 const NAV_HIGHLIGHT_LAST = '__latest__'
+
+// Platform-appropriate hint for the search shortcut.
+const SEARCH_SHORTCUT_LABEL = navigator.userAgent.includes('Mac') ? '⌘K' : 'Ctrl+K'
 
 // One-line summary for the message-list popup: whitespace only is collapsed
 // (multi-line content must render as a single row). Visual truncation is
@@ -239,6 +238,23 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   const dropdownRef = useRef(null)
   const dropdownBtnRef = useRef(null)
   const [dropdownPos, setDropdownPos] = useState({ top: 0, left: 0 })
+
+  // Chat search (opened from the sessions dropdown, or Ctrl/Cmd+K)
+  const [searchOpen, setSearchOpen] = useState(false)
+  const panelRootRef = useRef(null)
+  // Brief row highlight so a jump landing is instantly visible.
+  const [flashMessageId, setFlashMessageId] = useState(null)
+  const flashTimerRef = useRef(null)
+  // Search jump waiting on a session switch: consumed after the new
+  // session's initial history commit (see the pendingJump effect).
+  const pendingJumpRef = useRef(null)
+  // Session id whose messages are currently committed in state — guards
+  // the pending-jump effect against firing on the previous session's
+  // still-rendered messages.
+  const messagesOwnerRef = useRef(null)
+  // Archive-modal focus target from a search hit: consumed once the target
+  // session's messages render (see the archivedFocus effect).
+  const archivedFocusRef = useRef(null)
 
   // Auto-approve settings menu
   const [showAutoApproveMenu, setShowAutoApproveMenu] = useState(false)
@@ -600,6 +616,9 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
 
       // Commit the final message array in a single setState.
       setMessages(history)
+      // Mark ownership synchronously with the commit: the pending-jump
+      // effect must only act once these messages belong to this session.
+      messagesOwnerRef.current = sessionId
 
       // Load persisted token budget for this session
       const savedBudget = storage.getBudget(projectId, sessionId)
@@ -852,6 +871,15 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
     }
   }, [navListOpen, projectId, sessionId, t])
 
+  // Brief row highlight so a jump landing is instantly visible; the row's
+  // persistent transition-colors class fades the highlight back out.
+  const flashMessage = useCallback((messageId) => {
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current)
+    setFlashMessageId(messageId)
+    flashTimerRef.current = setTimeout(() => setFlashMessageId(null), 1600)
+  }, [])
+  useEffect(() => () => { if (flashTimerRef.current) clearTimeout(flashTimerRef.current) }, [])
+
   // Jumping to a far-back entry needs the whole span from that entry to the
   // latest message loaded. Loading it through the wheel-driven 10-turn pages
   // would re-render the full list once per page (minutes on long sessions)
@@ -861,26 +889,16 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   // is committed when alignment measures it — an rAF wait can fire before
   // React commits under heavy renders. The sweep continues from the current
   // cursor so pages the user already scrolled up to load are not refetched.
-  const jumpToNavEntry = useCallback(async (entry) => {
-    if (navJumpingRef.current || !entry.id) return
+  const jumpToMessage = useCallback(async (messageId, { fallbackNode = null } = {}) => {
+    if (navJumpingRef.current || !messageId) return
     const el = chatScrollRef.current
     if (!el) return
-    // Jumping is a destination action — close first so the list never lingers
-    // over the chat while pages load for a far-back target.
-    setNavListOpen(false)
     navJumpingRef.current = true
     historyLoadingRef.current = true
     setIsLoadingHistory(true)
     try {
-      const findNode = () => el.querySelector(`[data-msg-id="${CSS.escape(entry.id)}"]`)
-      let node = findNode()
-      if (!node) {
-        // A just-sent/edit-resend bubble has no server id yet, but by
-        // definition it is the latest message — match it positionally.
-        const userStops = el.querySelectorAll('[data-chat-msg][data-msg-role="user"]')
-        const lastUser = userStops[userStops.length - 1]
-        if (!lastUser?.getAttribute('data-msg-id') && entry === navList[navList.length - 1]) node = lastUser
-      }
+      const findNode = () => el.querySelector(`[data-msg-id="${CSS.escape(messageId)}"]`)
+      let node = findNode() || fallbackNode
       if (!node && projectId && sessionId) {
         const older = []
         let beforeSeq = historyCursorRef.current
@@ -892,7 +910,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
           if (sessionIdRef.current !== sessionId) return
           older.push(...page.messages)
           setHistoryPaging(page)
-          if (page.messages.some(m => m.id === entry.id) || !page.has_more || page.next_before_seq === null) break
+          if (page.messages.some(m => m.id === messageId) || !page.has_more || page.next_before_seq === null) break
           beforeSeq = page.next_before_seq
         }
         if (older.length > 0) {
@@ -908,7 +926,10 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
       }
       // History exhausted without the target (deleted concurrently, etc.) —
       // leave the scroll position untouched rather than guessing.
-      if (node) alignStopTop(node)
+      if (node) {
+        alignStopTop(node)
+        flashMessage(messageId)
+      }
     } catch (e) {
       console.error('Failed to load messages for jump:', e)
     } finally {
@@ -922,7 +943,42 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
         setIsLoadingHistory(false)
       }
     }
-  }, [alignStopTop, navList, projectId, sessionId])
+  }, [alignStopTop, flashMessage, projectId, sessionId])
+
+  // The nav popup wrapper: a just-sent/edit-resent bubble has no server id
+  // yet, but by definition it is the latest message — match it positionally.
+  const jumpToNavEntry = useCallback(async (entry) => {
+    if (!entry?.id) return
+    // Jumping is a destination action — close first so the list never
+    // lingers over the chat while pages load for a far-back target.
+    setNavListOpen(false)
+    let fallbackNode = null
+    const el = chatScrollRef.current
+    if (el) {
+      const userStops = el.querySelectorAll('[data-chat-msg][data-msg-role="user"]')
+      const lastUser = userStops[userStops.length - 1]
+      if (!lastUser?.getAttribute('data-msg-id') && entry === navList[navList.length - 1]) fallbackNode = lastUser
+    }
+    await jumpToMessage(entry.id, { fallbackNode })
+  }, [jumpToMessage, navList])
+
+  // A search jump to another session: switchToSession only changes the id —
+  // the messages arrive with Effect 2's initial history commit. The owner
+  // ref guarantees this fires on the new session's committed messages, never
+  // on the old session's still-rendered ones.
+  useEffect(() => {
+    const pending = pendingJumpRef.current
+    if (!pending) return
+    // A switch to any other session abandons the jump; keeping it would fire
+    // when the user later opens that session on their own.
+    if (pending.sessionId !== sessionId) {
+      pendingJumpRef.current = null
+      return
+    }
+    if (messagesOwnerRef.current !== sessionId) return
+    pendingJumpRef.current = null
+    jumpToMessage(pending.messageId)
+  }, [sessionId, messages, jumpToMessage])
 
   // Close the popup when the session changes; its entries belong to the old
   // one. sessionIdRef lets the in-flight nav sweeps (list build, jump
@@ -1281,14 +1337,82 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   }
 
   // ---- Archived sessions ----
-  async function openArchived() {
+  // *focus* (from a search hit) expands the target session immediately;
+  // the archivedFocus effect scrolls to the message once it renders.
+  async function openArchived(focus = null) {
     setShowDropdown(false)
     try {
       const list = await chatAPI.listSessions(projectId, { include_archived: true })
       const archived = list.filter(s => s.is_archived)
       setArchivedSessions(archived)
       setShowArchived(true)
+      if (focus) {
+        // Only row-level hits need staging; session-level jumps land on the
+        // expanded session itself. Staged refs are consumed once rendered —
+        // or dropped on failure so they cannot fire for a later manual open.
+        if (focus.messageId) archivedFocusRef.current = focus
+        if (focus.sessionId !== expandedArchivedId) {
+          try {
+            const msgs = await chatAPI.getSessionMessages(projectId, focus.sessionId)
+            setArchivedMessages(msgs)
+            setExpandedArchivedId(focus.sessionId)
+          } catch {
+            archivedFocusRef.current = null
+            toastError(t('chat.toast.loadMessagesFailed'))
+          }
+        }
+      }
     } catch { /* ignore */ }
+  }
+
+  // Scroll the archive modal to a search hit once its messages render.
+  useEffect(() => {
+    const focus = archivedFocusRef.current
+    if (!showArchived || !focus?.messageId) return
+    if (!archivedMessages.some(m => m.id === focus.messageId)) return
+    archivedFocusRef.current = null
+    const node = document.querySelector(`[data-archived-msg-id="${CSS.escape(focus.messageId)}"]`)
+    if (node) {
+      node.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      flashMessage(focus.messageId)
+    }
+  }, [showArchived, archivedMessages, flashMessage])
+
+  // Global Ctrl/Cmd+K opens chat search — the dropdown entry is two clicks
+  // away. Only a visible panel responds: multiple ChatPanels can be mounted
+  // (one per module view) and hidden ones have no offsetParent.
+  useEffect(() => {
+    const handler = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        if (panelRootRef.current?.offsetParent != null) openSearch()
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
+
+  // ---- Chat search ----
+  function openSearch() {
+    setShowDropdown(false)
+    setSearchOpen(true)
+  }
+
+  function handleSearchJump(session, match) {
+    setSearchOpen(false)
+    if (session.is_archived) {
+      openArchived({ sessionId: session.id, messageId: match?.id || null })
+      return
+    }
+    if (session.id === sessionId) {
+      if (match) jumpToMessage(match.id)
+      return
+    }
+    // Switch first; the pending jump lands after the new session's initial
+    // history commit (see the pendingJump effect). Without a match the
+    // switch itself is the whole navigation.
+    pendingJumpRef.current = match ? { sessionId: session.id, messageId: match.id } : null
+    switchToSession(session.id)
   }
 
   async function toggleArchivedMessages(sid) {
@@ -2088,7 +2212,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
   }
 
   return (
-    <div className="flex-1 flex flex-col bg-gray-50/30 dark:bg-gray-900 overflow-hidden">
+    <div ref={panelRootRef} className="flex-1 flex flex-col bg-gray-50/30 dark:bg-gray-900 overflow-hidden">
       {/* ── Session header bar ── */}
       <div className="px-4 py-2.5 bg-white dark:bg-gray-900 border-b border-gray-100 dark:border-gray-800 flex items-center gap-2 flex-shrink-0">
         {/* Title area */}
@@ -2139,8 +2263,16 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
 
           {showDropdown && (
             <div className="fixed z-[90] w-72 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-xl shadow-xl overflow-hidden animate-in fade-in zoom-in duration-150" style={{ top: dropdownPos.top, left: dropdownPos.left }}>
-              <div className="px-3 py-2 border-b border-gray-100 dark:border-gray-800">
+              <div className="px-3 py-2 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between">
                 <span className="text-[10px] font-black uppercase tracking-widest text-gray-400">{t('chat.sessions')}</span>
+                <button
+                  onClick={openSearch}
+                  className="p-1 text-gray-400 dark:text-gray-500 hover:text-sigma-600 dark:hover:text-sigma-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+                  title={`${t('chat.search')} (${SEARCH_SHORTCUT_LABEL})`}
+                  aria-label={t('chat.search')}
+                >
+                  <Search className="w-3.5 h-3.5" />
+                </button>
               </div>
 
               <div className="max-h-64 overflow-y-auto">
@@ -2191,7 +2323,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
                   {t('chat.newSession')}
                 </button>
                 <button
-                  onClick={openArchived}
+                  onClick={() => openArchived()}
                   className="w-full flex items-center gap-2 px-2 py-1.5 text-[10px] font-medium text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
                 >
                   <Archive className="w-3.5 h-3.5" />
@@ -2224,7 +2356,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
             const isLastMessage = i === messages.length - 1
             const isCurrentlyStreaming = isLastMessage && isStreaming
             return (
-              <div key={m.id || i} data-chat-msg="" data-msg-id={m.id} data-msg-role={m.role} className={`group/message flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+              <div key={m.id || i} data-chat-msg="" data-msg-id={m.id} data-msg-role={m.role} className={`group/message flex flex-col rounded-2xl transition-colors duration-700 ${m.role === 'user' ? 'items-end' : 'items-start'} ${m.id === flashMessageId ? 'bg-amber-100/60 dark:bg-amber-900/25' : ''}`}>
                 <div className="flex items-center gap-2 mb-1.5 px-1">
                   {m.role === 'SiGMA' ? <Zap className="w-3 h-3 text-sigma-600" /> : <User className="w-3 h-3 text-gray-400 dark:text-gray-500" />}
                   <span className="text-[10px] font-black uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.role}</span>
@@ -2794,7 +2926,7 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
                         <div className="text-xs text-gray-400 dark:text-gray-500 text-center py-4">{t('chat.noMessages')}</div>
                       )}
                       {archivedMessages.map((m, mi) => (
-                        <div key={mi} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+                        <div key={mi} data-archived-msg-id={m.id} className={`flex flex-col rounded-lg transition-colors duration-700 ${m.role === 'user' ? 'items-end' : 'items-start'} ${m.id === flashMessageId ? 'bg-amber-100/60 dark:bg-amber-900/25' : ''}`}>
                           <div className="flex items-center gap-1.5 mb-1">
                             <span className="text-[9px] font-black uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.role === 'SiGMA' ? t('chat.roleSigma') : m.role}</span>
                             {m.created_at && <span className="text-[8px] text-gray-300 dark:text-gray-600">{formatTimestamp(m.created_at)}</span>}
@@ -2819,6 +2951,15 @@ export default function ChatPanel({ projectId, placeholder, citation = null, onC
           </div>
         </div>
       )}
+
+      {/* ── Chat Search Modal ── */}
+      <ChatSearchModal
+        isOpen={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        projectId={projectId}
+        currentSessionId={sessionId}
+        onJump={handleSearchJump}
+      />
 
       {/* ── Citation Viewer Modal ── */}
       <ModalOverlay isOpen={!!viewingCitation} onClose={() => setViewingCitation(null)}>

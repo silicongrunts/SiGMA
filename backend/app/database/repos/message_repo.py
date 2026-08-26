@@ -199,6 +199,31 @@ class MessageRepository:
         """
         return await self._get_messages_from_last_boundary("session_id", session_id)
 
+    async def search_session_ids_containing(
+        self, session_ids: List[str], needle: str,
+    ) -> List[str]:
+        """Return distinct session ids with a user/assistant row containing *needle*.
+
+        Coarse chat-search pre-filter: a hit here does not mean the match
+        is user-visible (internal tags and process-only rows are dropped
+        later by UI shaping), but no hit here means no visible hit exists.
+        Comparison folds only ASCII case (SQLite ``lower``); see
+        ``core.chat_search.sql_prefilter_reliable`` for when the pre-filter
+        may be used without losing matches.
+        """
+        if not session_ids or not needle:
+            return []
+        result = await self._session.execute(
+            select(Message.session_id)
+            .where(
+                Message.session_id.in_(session_ids),
+                Message.role.in_(("user", "assistant")),
+                func.instr(func.lower(Message.content), needle.lower()) > 0,
+            )
+            .group_by(Message.session_id)
+        )
+        return list(result.scalars().all())
+
     async def get_count(self, session_id: str) -> int:
         result = await self._session.execute(
             select(func.count()).select_from(Message).where(
