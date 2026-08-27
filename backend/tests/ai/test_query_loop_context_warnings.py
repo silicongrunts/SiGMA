@@ -27,10 +27,11 @@ async def test_context_warning_is_injected_once_at_sixty_percent(monkeypatch):
 
     warnings = [
         msg for msg in prepared
-        if msg.get("role") == "system" and "60% of the configured" in msg.get("content", "")
+        if msg.get("role") == "user" and "60% of the configured" in msg.get("content", "")
     ]
     assert len(warnings) == 1
     assert warnings[0]["_ephemeral"] is True
+    assert warnings[0]["content"].startswith("<status>")
 
 
 @pytest.mark.asyncio

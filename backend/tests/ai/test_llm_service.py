@@ -5,6 +5,7 @@ import pytest
 from app.core.config import settings
 from app.core.config import ModelSettings
 from app.services.llm_service import LLMService
+from app.services.llm_service import _with_single_leading_system
 
 
 class FakeLiteLLM:
@@ -318,3 +319,96 @@ async def test_call_chat_text_omits_tools_when_none(monkeypatch):
     assert usage is None
     assert "tools" not in captured
     assert "tool_choice" not in captured
+
+
+# ---------------------------------------------------------------------------
+# System-message folding at the outbound boundary
+# ---------------------------------------------------------------------------
+
+def test_with_single_leading_system_merges_boundary_summary_into_prompt():
+    folded = _with_single_leading_system([
+        {"role": "system", "content": "system prompt"},
+        {"role": "system", "content": "[passive] summary"},
+        {"role": "user", "content": "hi"},
+    ])
+    assert [m["role"] for m in folded] == ["system", "user"]
+    assert folded[0]["content"] == "system prompt\n\n[passive] summary"
+    assert folded[1] == {"role": "user", "content": "hi"}
+
+
+def test_with_single_leading_system_passes_compliant_lists_through():
+    leading_only = [{"role": "system", "content": "prompt"}, {"role": "user", "content": "hi"}]
+    assert _with_single_leading_system(leading_only) is leading_only
+    no_system = [{"role": "user", "content": "hi"}]
+    assert _with_single_leading_system(no_system) is no_system
+
+
+def test_with_single_leading_system_promotes_lone_mid_list_system():
+    folded = _with_single_leading_system([
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": "note"},
+    ])
+    assert [m["role"] for m in folded] == ["system", "user"]
+    assert folded[0]["content"] == "note"
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_folds_extra_system_messages(monkeypatch):
+    captured = {}
+
+    class CaptureLiteLLM(FakeLiteLLM):
+        async def acompletion(self, **kwargs):
+            captured["messages"] = kwargs["messages"]
+            return await super().acompletion(**kwargs)
+
+    monkeypatch.setattr(settings.models, "supervisor", ModelSettings(
+        model="gpt-test",
+        provider="openai",
+        api_key="sk-test",
+    ))
+    monkeypatch.setattr(LLMService, "_litellm", staticmethod(lambda: CaptureLiteLLM()))
+
+    service = LLMService()
+    await service.stream_chat(
+        messages=[
+            {"role": "system", "content": "prompt"},
+            {"role": "system", "content": "summary"},
+            {"role": "user", "content": "hi"},
+        ],
+        model_role="supervisor",
+    )
+
+    roles = [m["role"] for m in captured["messages"]]
+    assert roles == ["system", "user"]
+    assert "summary" in captured["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_call_chat_text_folds_extra_system_messages(monkeypatch):
+    captured = {}
+
+    class CaptureLiteLLM:
+        async def acompletion(self, **kwargs):
+            captured["messages"] = kwargs["messages"]
+            return {"choices": [{"message": {"content": "summary text"}}]}
+
+    monkeypatch.setattr(settings.models, "ra", ModelSettings(
+        model="gpt-test",
+        provider="openai",
+        api_key="sk-test",
+    ))
+    monkeypatch.setattr(LLMService, "_litellm", staticmethod(lambda: CaptureLiteLLM()))
+
+    service = LLMService()
+    await service.call_chat_text(
+        messages=[
+            {"role": "system", "content": "prompt"},
+            {"role": "system", "content": "old summary"},
+            {"role": "user", "content": "compact"},
+        ],
+        model_role="ra",
+    )
+
+    roles = [m["role"] for m in captured["messages"]]
+    assert roles == ["system", "user"]
+    assert "old summary" in captured["messages"][0]["content"]

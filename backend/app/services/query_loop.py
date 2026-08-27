@@ -405,9 +405,12 @@ class QueryLoop:
         if stats.current_tokens <= stats.compact_threshold:
             warning_message = self._context_threshold_warning(stats)
             if warning_message:
+                # User role on purpose: serving-side chat templates reject a
+                # system message outside the first position, and this warning
+                # must reach the model at the current end of the conversation.
                 messages.append(LLMLoopRunner.msg(
-                    "system",
-                    warning_message,
+                    "user",
+                    f"<status>{warning_message}</status>",
                     _ephemeral=True,
                 ))
             LLMLoopRunner.apply_cache_control(messages, target_offset=0)

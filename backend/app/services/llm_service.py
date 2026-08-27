@@ -43,6 +43,29 @@ def _session_headers(session_id: str | None) -> dict:
     return {"extra_headers": {"x-session-id": session_id}}
 
 
+def _with_single_leading_system(messages: list[dict]) -> list[dict]:
+    """Fold every system message into a single leading one; copy if changed.
+
+    Serving-side chat templates (strict Jinja templates behind
+    OpenAI-compatible endpoints) may reject a system message in any position
+    but the first. SiGMA legitimately builds a second system message — the
+    compaction boundary summary sits right after the system prompt — so every
+    outbound call flattens system content, in original order, into the first
+    system message. Lists that already comply are passed through unchanged.
+    """
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    first_is_system = bool(messages) and messages[0].get("role") == "system"
+    if len(system_msgs) <= 1 and (not system_msgs or first_is_system):
+        return messages
+    merged = {
+        **system_msgs[0],
+        "content": "\n\n".join(
+            str(m.get("content") or "") for m in system_msgs if m.get("content")
+        ),
+    }
+    return [merged, *[m for m in messages if m.get("role") != "system"]]
+
+
 @dataclass(frozen=True)
 class GeneratedImage:
     """Provider-neutral image generation result."""
@@ -233,7 +256,7 @@ class LLMService:
 
         payload = {
             "model": endpoint.litellm_model,
-            "messages": messages,
+            "messages": _with_single_leading_system(messages),
             "stream": True,
             "stream_options": {"include_usage": True},
             "drop_params": True,
@@ -379,7 +402,7 @@ class LLMService:
             litellm = self._litellm()
             payload = {
                 "model": endpoint.litellm_model,
-                "messages": messages,
+                "messages": _with_single_leading_system(messages),
                 "stream": stream,
                 "drop_params": True,
                 **endpoint.litellm_kwargs(),
