@@ -1,5 +1,6 @@
 """Message shaping: turning raw message rows into UI chat-history entries."""
 
+import json
 from types import SimpleNamespace
 
 from app.core.compaction_text import (
@@ -7,7 +8,7 @@ from app.core.compaction_text import (
     PASSIVE_SUMMARY_PREFIX,
     split_boundary_content,
 )
-from app.core.message_format import page_ui_turns, shape_messages_for_ui
+from app.core.message_format import file_edit_stats, page_ui_turns, shape_messages_for_ui
 
 
 def _row(seq, role, content="", *, boundary=False, tool_calls=None, tool_call_id=None):
@@ -132,3 +133,86 @@ def test_boundary_cards_survive_pagination_before_the_window():
     boundary_seqs = [e["seq"] for e in page["messages"] if e.get("is_boundary")]
     assert boundary_seqs == [1]
     assert page["messages"][0]["seq"] == 1
+
+
+def _tool_turn(seq, name, arguments, result):
+    """Assistant row issuing one tool call, its tool-result row, closing text."""
+    calls = json.dumps([{
+        "id": f"t{seq}", "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }])
+    return [
+        _row(seq, "assistant", "", tool_calls=calls),
+        _row(seq + 1, "tool", result, tool_call_id=f"t{seq}"),
+        _turn(seq + 2),
+    ]
+
+
+def test_file_edit_stats_counts_edit_lines():
+    meta = file_edit_stats("edit", {
+        "file_path": "src/app.py",
+        "old_string": "a\nb\nc",
+        "new_string": "a\nB\nc\nd",
+    }, result="File edited: src/app.py (1 replacement(s))")
+    assert meta["kind"] == "edit"
+    assert meta["path"] == "src/app.py"
+    assert meta["adds"] == 2
+    assert meta["dels"] == 1
+    assert meta["diff"].splitlines() == [
+        "@@ -1,3 +1,4 @@", " a", "-b", "+B", " c", "+d",
+    ]
+
+
+def test_file_edit_stats_deletion_to_empty_reports_only_dels():
+    meta = file_edit_stats("edit", {
+        "path": "a.py", "old_string": "x\ny", "new_string": "",
+    }, result="File edited: a.py (1 replacement(s))")
+    assert meta["adds"] == 0
+    assert meta["dels"] == 2
+
+
+def test_file_edit_stats_write_reports_content_lines_without_dels():
+    meta = file_edit_stats("write", {
+        "file_path": "new.py", "content": "a\nb\nc",
+    }, result="File written: new.py (12 chars)")
+    assert meta == {"kind": "write", "path": "new.py", "adds": 3}
+
+
+def test_file_edit_stats_caps_diff_body_but_keeps_exact_counts():
+    new_body = "\n".join(f"line {i}" for i in range(50))
+    meta = file_edit_stats("edit", {
+        "file_path": "big.py", "old_string": "x", "new_string": new_body,
+    }, result="File edited: big.py (1 replacement(s))")
+    assert meta["adds"] == 50
+    assert meta["dels"] == 1
+    lines = meta["diff"].splitlines()
+    assert len(lines) <= 41
+    assert lines[-1] == "…"
+
+
+def test_file_edit_stats_ignores_failures_and_non_file_calls():
+    ok = {"file_path": "a.py", "old_string": "x", "new_string": "y"}
+    assert file_edit_stats("read", ok, result="ok") is None
+    assert file_edit_stats("edit", ok, result="Error: old_string not found in a.py") is None
+    assert file_edit_stats("edit", {"old_string": "x", "new_string": "y"}) is None
+    assert file_edit_stats("edit", {"file_path": "a.py", "new_string": "y"}) is None
+    assert file_edit_stats("edit", "not-a-dict", result="ok") is None
+
+
+def test_history_tool_step_carries_file_edit_only_for_successful_calls():
+    args = json.dumps({"file_path": "a.py", "old_string": "x", "new_string": "y"})
+    entries = shape_messages_for_ui([
+        _row(1, "user", "fix it"),
+        *_tool_turn(2, "edit", args, "File edited: a.py (1 replacement(s))"),
+    ], None)
+    step = entries[-1]["process"][0]
+    meta = step["fileEdit"]
+    assert (meta["kind"], meta["path"], meta["adds"], meta["dels"]) == (
+        "edit", "a.py", 1, 1,
+    )
+
+    entries = shape_messages_for_ui([
+        _row(1, "user", "fix it"),
+        *_tool_turn(2, "edit", args, "Error: old_string not found in a.py"),
+    ], None)
+    assert "fileEdit" not in entries[-1]["process"][0]

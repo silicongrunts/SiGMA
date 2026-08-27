@@ -14,6 +14,7 @@ attributes), so they have no service or DB dependencies and can live in
 
 from __future__ import annotations
 
+import difflib
 import json as _json
 import re
 from typing import Any, Dict, List, Optional
@@ -40,6 +41,71 @@ def build_tool_results_index(messages: list) -> Dict[str, str]:
         if getattr(m, "role", None) == "tool" and getattr(m, "tool_call_id", None):
             results[m.tool_call_id] = strip_image_refs_tag(m.content)
     return results
+
+
+# Display caps for the inline edit diff: counts stay exact, only the shown
+# body is trimmed so one huge replacement cannot flood the timeline card.
+_MAX_EDIT_DIFF_LINES = 40
+_MAX_EDIT_DIFF_CHARS = 2000
+
+
+def file_edit_stats(
+    tool_name: str, params: Any, *, result: str = ""
+) -> Optional[Dict[str, Any]]:
+    """Diff metadata for a completed ``edit``/``write`` tool call, or None.
+
+    ``edit`` reports +adds/−dels line counts plus a context-capped unified
+    diff of one ``old_string`` → ``new_string`` replacement. For
+    ``replace_all`` the counts cover a single occurrence; the replacement
+    count stays visible in the tool result text. ``write`` reports the line
+    count of the written content only — the previous file content is not
+    available at this layer, so no deletion side is claimed.
+
+    Returns None for non-file tools, failed calls (``result`` starting with
+    ``Error:``), and calls without a usable path.
+    """
+    if tool_name not in ("edit", "write") or not isinstance(params, dict):
+        return None
+    if result.startswith("Error:"):
+        return None
+    path = params.get("file_path") or params.get("path")
+    if not path or not isinstance(path, str):
+        return None
+
+    if tool_name == "write":
+        content = params.get("content")
+        if not isinstance(content, str):
+            return None
+        return {"kind": "write", "path": path, "adds": len(content.splitlines())}
+
+    old, new = params.get("old_string"), params.get("new_string")
+    if not isinstance(old, str) or not isinstance(new, str) or not old:
+        return None
+    # unified_diff always emits the ---/+++ file headers first; dropping them
+    # by position keeps a removed line that itself starts with "--" from
+    # being mistaken for a header.
+    body = list(difflib.unified_diff(
+        old.splitlines(), new.splitlines(), lineterm=""
+    ))[2:]
+    adds = sum(1 for line in body if line.startswith("+"))
+    dels = sum(1 for line in body if line.startswith("-"))
+    diff = "\n".join(body[:_MAX_EDIT_DIFF_LINES])
+    if len(diff) > _MAX_EDIT_DIFF_CHARS:
+        diff = diff[:_MAX_EDIT_DIFF_CHARS] + "\n…"
+    elif len(body) > _MAX_EDIT_DIFF_LINES:
+        diff += "\n…"
+    return {"kind": "edit", "path": path, "adds": adds, "dels": dels, "diff": diff}
+
+
+def _parsed_edit_meta(
+    tool_name: str, raw_args: str, result: str
+) -> Optional[Dict[str, Any]]:
+    """``file_edit_stats`` over persisted JSON tool arguments (None if unparsable)."""
+    try:
+        params = _json.loads(raw_args)
+    except (_json.JSONDecodeError, TypeError):
+        return None
+    return file_edit_stats(tool_name, params, result=result)
 
 
 def _assistant_turn_follows(messages: list, index: int) -> bool:
@@ -121,10 +187,11 @@ def build_assistant_turn(
             collected_tool_calls.extend(tcs)
             for tc in tcs:
                 fn = tc.get("function", {})
+                raw_args = fn.get("arguments", "") or ""
                 step: Dict[str, Any] = {
                     "type": "tool",
                     "tool": fn.get("name", "unknown"),
-                    "params": (fn.get("arguments", "") or "")[:truncate_params],
+                    "params": raw_args[:truncate_params],
                     "status": "done",
                 }
                 tc_id = tc.get("id", "")
@@ -133,6 +200,9 @@ def build_assistant_turn(
                     step["result"] = r[:truncate_result] + (
                         "..." if len(r) > truncate_result else ""
                     )
+                    edit_meta = _parsed_edit_meta(fn.get("name", ""), raw_args, r)
+                    if edit_meta:
+                        step["fileEdit"] = edit_meta
                 collected_process.append(step)
 
     # Process the first assistant message

@@ -15,6 +15,7 @@ from typing import AsyncIterator, Callable, Awaitable, Any
 
 from app.core.chat_attachments import render_image_refs_tag, strip_image_refs_tag
 from app.core.logging import get_logger
+from app.core.message_format import file_edit_stats
 from app.core.task_status import SSE_CANCELLED, SSE_DONE, SSE_ERROR
 from app.agents.tools.registry import tool_registry
 from app.services.token_budget import TokenBudgetTracker, TokenBudgetExceeded, extract_llm_usage
@@ -634,12 +635,15 @@ class LLMLoopRunner:
                     tool_result = tool_result[:MAX_TOOL_OUTPUT_CHARS] + "\n... [truncated]"
 
                 # Emit tool_end with tool_call_id
-                evt_end = self.sse(SSE_TOOL_END, {
+                end_payload = {
                     "tool": tool_name,
                     "result_summary": strip_image_refs_tag(tool_result)[:200],
                     "tool_call_id": tool_call_id,
-                })
-                yield evt_end
+                }
+                edit_meta = file_edit_stats(tool_name, tool_args, result=tool_result)
+                if edit_meta:
+                    end_payload["file_edit"] = edit_meta
+                yield self.sse(SSE_TOOL_END, end_payload)
 
                 # Side-effect events (file_changed, annotation_changed, task_list)
                 fc_evt = self._emit_file_changed(tool_name, tool_args, tool_result)

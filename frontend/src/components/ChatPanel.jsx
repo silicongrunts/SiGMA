@@ -34,8 +34,8 @@ function isAgentToolName(tool) {
   return String(tool || '').toLowerCase() === 'agent'
 }
 
-function withTransientHint(process, content) {
-  const hint = { type: 'hint', content, transient: true }
+function withTransientHint(process, content, extra = {}) {
+  const hint = { type: 'hint', content, transient: true, ...extra }
   if (process.length > 0) {
     const last = process[process.length - 1]
     if (last.type === 'hint' && last.transient) {
@@ -43,6 +43,55 @@ function withTransientHint(process, content) {
     }
   }
   return [...process.filter(s => !(s.type === 'hint' && s.transient && s.content === content)), hint]
+}
+
+// Mark a running tool step done; edit/write calls additionally carry the
+// backend's file_edit diff metadata for the timeline card.
+function finishToolStep(step, payload) {
+  const done = { ...step, result: payload.result_summary, status: 'done' }
+  if (payload.file_edit) done.fileEdit = payload.file_edit
+  return done
+}
+
+// Live reasoning window tuning: the flush throttle keeps token-frequency SSE
+// chunks from re-rendering the panel every few milliseconds, and the tail
+// slice bounds how much text enters React state per flush.
+const THINK_FLUSH_MS = 120
+const THINK_TAIL_CHARS = 800
+
+// Events that never interrupt an open thinking segment — bookkeeping or
+// out-of-band notifications arriving mid-thought.
+const THINK_PASSTHROUGH_TYPES = new Set([
+  'task_id', 'context_stats', 'task_list', 'turn_usage',
+  'file_changed', 'annotation_changed',
+])
+
+// Last n characters of the reasoning buffer, backing off from a cut that
+// would split a UTF-16 surrogate pair — the rendered content of the live
+// thinking window.
+function thinkingTail(text) {
+  const s = text || ''
+  if (s.length <= THINK_TAIL_CHARS) return s
+  let start = s.length - THINK_TAIL_CHARS
+  while (start > 0 && s.charCodeAt(start) >= 0xdc00 && s.charCodeAt(start) <= 0xdfff) {
+    start -= 1
+  }
+  return s.slice(start)
+}
+
+// Elapsed ms from the preceding user bubble to now, or null when the turn has
+// no user bubble (e.g. interaction resume) or an unparseable timestamp.
+function turnDurationMs(newMsgs, lastIdx) {
+  const prev = newMsgs[lastIdx - 1]
+  if (prev?.role !== 'user' || !prev.created_at) return null
+  const started = Date.parse(prev.created_at)
+  return Number.isFinite(started) ? Date.now() - started : null
+}
+
+function formatDurationMs(ms) {
+  const s = Math.max(1, Math.round(ms / 1000))
+  if (s < 60) return `${s}s`
+  return `${Math.floor(s / 60)}m ${s % 60}s`
 }
 
 function streamStatusText(data, t) {
@@ -208,7 +257,27 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   // bottom whenever async layout (KaTeX typesetting, image decode, entrance
   // animations) grows the content height after the initial render.
   const chatContentRef = useRef(null)
-  const currentHintRef = useRef('')
+  // Streaming phase drives the spinner label (thinking/processing/executing/
+  // compacting) and is derived from SSE events as they arrive. The reasoning
+  // teaser (first line of the model's live thinking) is shown next to the
+  // label while the phase is "thinking" and dropped the moment it changes —
+  // reasoning never reaches the persisted timeline.
+  const [streamPhase, setStreamPhase] = useState(null)
+  // Live "thinking" window. The buffer ref accumulates the current reasoning
+  // segment in full; thinkingLive mirrors only its throttled tail so the
+  // panel re-renders on the flush cadence, not per token.
+  const [thinkingLive, setThinkingLive] = useState('')
+  const liveBufferRef = useRef('')
+  const liveFlushAtRef = useRef(0)
+  const segOpenRef = useRef(false)
+  const segStartAtRef = useRef(0)
+  // Auto-follow for the live window — released when the user scrolls up.
+  const thinkBoxRef = useRef(null)
+  const thinkFollowRef = useRef(true)
+  useEffect(() => {
+    const el = thinkBoxRef.current
+    if (el && thinkFollowRef.current) el.scrollTop = el.scrollHeight
+  }, [thinkingLive])
   const abortRef = useRef(null)
   const textareaRef = useRef(null)
   const imageInputRef = useRef(null)
@@ -635,6 +704,9 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       if (active?.active && (active.status === 'running' || active.status === 'queued' || active.status === 'cancelling')) {
         if (cancelled) return
         setIsStreaming(true)
+        // Reconnecting mid-task: assume thinking until the next SSE event
+        // reports the actual phase.
+        setStreamPhase('thinking')
         abortRef.current = abortController
         try {
           const body = await chatAPI.resumeStream(active.task_id, abortController.signal)
@@ -1098,6 +1170,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
   async function handleInteractionStream(streamBody) {
     setIsStreaming(true)
+    setStreamPhase('thinking')
+    resetThinkingLive()
     const gen = genRef.current
     // Immediately remove awaiting_input step on user submission
     setMessages(prev => {
@@ -1159,7 +1233,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     const gen = genRef.current
       setMessages(prev => [...prev, { role: 'user', content: displayMessageText(text, t('chat.planDisplay')), created_at: new Date().toISOString() }])
     setMessages(prev => [...prev, { role: 'SiGMA', content: '', process: [] }])
-    currentHintRef.current = t('chat.thinking')
+    setStreamPhase('thinking')
+    resetThinkingLive()
     const controller = new AbortController()
     abortRef.current = controller
     try {
@@ -1475,7 +1550,35 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   // NOTE: This function does NOT manage isStreaming. The caller is responsible
   // for setting isStreaming=true before calling and isStreaming=false in a
   // finally block when the returned promise resolves.
+
+  function resetThinkingLive() {
+    segOpenRef.current = false
+    segStartAtRef.current = 0
+    liveBufferRef.current = ''
+    liveFlushAtRef.current = 0
+    thinkFollowRef.current = true
+    setThinkingLive('')
+  }
+
+  // Close the open thinking segment and shape it as a timeline entry with its
+  // measured duration. Null when nothing was open or the text stayed empty.
+  // Runs at event-dispatch level (outside the setMessages updater) so the ref
+  // flip stays idempotent across updater re-invocations.
+  function takeClosedThought() {
+    if (!segOpenRef.current) return null
+    segOpenRef.current = false
+    const content = liveBufferRef.current
+    const durationMs = Math.max(0, Date.now() - segStartAtRef.current)
+    liveBufferRef.current = ''
+    liveFlushAtRef.current = 0
+    thinkFollowRef.current = true
+    setThinkingLive('')
+    if (!content.trim()) return null
+    return { type: 'thinking', content, durationMs }
+  }
+
   async function processSSEStream(reader, decoder, abortSignal) {
+    resetThinkingLive()
     const parser = createSSEStreamParser({
       onEvent(type, data) {
         const isTerminal = type === 'done' || type === 'error' || type === 'cancelled'
@@ -1524,6 +1627,33 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         } else if (type === 'error' || type === 'cancelled') {
           abnormalTerminalRef.current = true
         }
+        // Reasoning deltas — feed the live thinking window shown under the
+        // spinner while the phase is "thinking". Each stretch of reasoning is
+        // one segment: opened on the first delta, appended to the timeline by
+        // takeClosedThought() when a later non-reasoning event closes it.
+        // The window only re-renders on the flush cadence.
+        if (type === 'thought' && data.content) {
+          setStreamPhase('thinking')
+          const now = Date.now()
+          if (!segOpenRef.current) {
+            segOpenRef.current = true
+            segStartAtRef.current = now
+            liveBufferRef.current = ''
+          }
+          liveBufferRef.current += data.content
+          if (now - liveFlushAtRef.current >= THINK_FLUSH_MS) {
+            liveFlushAtRef.current = now
+            setThinkingLive(thinkingTail(liveBufferRef.current))
+          }
+          return
+        }
+        // A non-passive event ends reasoning — close any open segment here,
+        // before the setMessages updater, and let the branch below insert it
+        // at its chronological spot.
+        let pendingThought = null
+        if (type !== 'thought' && !THINK_PASSTHROUGH_TYPES.has(type)) {
+          pendingThought = takeClosedThought()
+        }
         setMessages(prev => {
           const newMsgs = [...prev]
           const lastIdx = newMsgs.length - 1
@@ -1531,36 +1661,26 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
           const lastMsg = { ...newMsgs[lastIdx] }
           const currentProcess = [...(lastMsg.process || [])]
 
-          if (type === 'thought') {
-            // Only display explicit status messages. Reasoning token deltas
-            // arrive as data.content and are intentionally hidden from chat UI.
-            if (data.message) {
-              currentHintRef.current = data.message
-              lastMsg.process = withTransientHint(currentProcess, data.message)
-            } else {
-              lastMsg.process = currentProcess
-            }
-          } else if (type === 'stream_status') {
+          if (type === 'stream_status') {
             const statusMessage = streamStatusText(data, t)
+            // Closed reasoning lands after prior steps, before this event's
+            // own transient status hint.
+            const baseProcess = pendingThought ? [...currentProcess, pendingThought] : currentProcess
             if (statusMessage) {
               const processForStatus = data.status === 'retrying'
-                ? currentProcess.filter(s => s.type !== 'streaming_text')
-                : currentProcess
-              lastMsg.process = withTransientHint(processForStatus, statusMessage)
+                ? baseProcess.filter(s => s.type !== 'streaming_text')
+                : baseProcess
+              lastMsg.process = withTransientHint(processForStatus, statusMessage, {
+                retry: data.status === 'retrying',
+                error: data.status === 'retrying' ? data.error : undefined,
+              })
             } else {
-              lastMsg.process = currentProcess
+              lastMsg.process = baseProcess
             }
-          } else if (type === 'step') {
-            lastMsg.process = [...currentProcess, data]
-          } else if (type === 'step_delta') {
-            const lastIdx = currentProcess.length - 1
-            if (lastIdx >= 0 && currentProcess[lastIdx].type === 'agent' && currentProcess[lastIdx].agent === data.agent) {
-              currentProcess[lastIdx] = { ...currentProcess[lastIdx], content: currentProcess[lastIdx].content + data.content }
-            } else {
-              currentProcess.push({ type: 'agent', agent: data.agent || t('chat.thinkingAgent'), content: data.content })
-            }
-            lastMsg.process = currentProcess
           } else if (type === 'delta') {
+            setStreamPhase('processing')
+            resetThinkingLive()
+            if (pendingThought) currentProcess.push(pendingThought)
             const streamIdx = currentProcess.findLastIndex(s => s.type === 'streaming_text')
             if (streamIdx >= 0) {
               currentProcess[streamIdx] = { ...currentProcess[streamIdx], content: currentProcess[streamIdx].content + data.content }
@@ -1569,9 +1689,12 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             }
             lastMsg.process = currentProcess
           } else if (type === 'tool_start') {
+            setStreamPhase('executing')
+            resetThinkingLive()
             const finalProcess = currentProcess.map(s =>
               s.type === 'streaming_text' ? { type: 'hint', content: s.content } : s
             )
+            if (pendingThought) finalProcess.push(pendingThought)
             const toolStep = { type: 'tool', tool: data.tool, params: data.params, status: 'running' }
             // Store tool_call_id for agent_event matching
             if (data.tool_call_id) {
@@ -1581,36 +1704,37 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             finalProcess.push(toolStep)
             lastMsg.process = finalProcess
           } else if (type === 'tool_end') {
+            // Tool result is in — the next LLM iteration starts with reasoning
+            setStreamPhase('thinking')
             const updated = currentProcess.map(s => {
               // Match by tool_call_id first, then by tool name + running status
               if (data.tool_call_id && s._toolCallId === data.tool_call_id) {
-                return { ...s, result: data.result_summary, status: 'done' }
+                return finishToolStep(s, data)
               }
               if (s.type === 'tool' && s.tool === data.tool && s.status === 'running' && !data.tool_call_id) {
-                return { ...s, result: data.result_summary, status: 'done' }
+                return finishToolStep(s, data)
               }
               return s
             })
             lastMsg.process = updated
           } else if (type === 'compact_start') {
-            currentHintRef.current = data.message || t('chat.compacting')
-            lastMsg.process = withTransientHint(currentProcess, data.message || t('chat.compacting'))
+            setStreamPhase('compacting')
+            resetThinkingLive()
+            lastMsg.process = withTransientHint(
+              pendingThought ? [...currentProcess, pendingThought] : currentProcess,
+              t('chat.compacting'),
+            )
           } else if (type === 'compact_done') {
             setContextStats(data)
-            currentHintRef.current = t('chat.thinking')
+            setStreamPhase('thinking')
             // With the summary the step renders as the same expandable card
             // the history view shows after refresh; backends that predate the
             // summary field get the plain hint.
             currentProcess.push(data.summary
               ? { type: 'compact', content: data.summary }
-              : { type: 'hint', content: t('chat.compacted') })
+              : { type: 'hint', content: t('chat.compacted'), plain: true })
             lastMsg.process = currentProcess
             refreshCanEditFlags()
-          } else if (type === 'agent_start') {
-            currentProcess.push({ type: 'agent_call', agent: data.agent, target_agent: data.target_agent || data.agent, description: data.description || '' })
-            lastMsg.process = currentProcess
-          } else if (type === 'agent_end') {
-            lastMsg.process = [...currentProcess, { type: 'agent_result', agent: data.agent, result: (data.result || '').slice(0, 200) }]
           } else if (type === 'agent_event') {
             // Subagent SSE event — nest inside the agent tool step with matching tool_call_id
             const parentTcId = data.parent_tool_call_id
@@ -1647,7 +1771,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                   subSteps.push({ type: 'streaming_text', content: innerData.content || '' })
                 }
               } else if (innerType === 'compact_start') {
-                subSteps.splice(0, subSteps.length, ...withTransientHint(subSteps, innerData.message || t('chat.compacting')))
+                subSteps.splice(0, subSteps.length, ...withTransientHint(subSteps, t('chat.compacting')))
               } else if (innerType === 'compact_done') {
                 subSteps.push(innerData.summary
                   ? { type: 'compact', content: innerData.summary }
@@ -1673,7 +1797,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                 if (innerData.tool_call_id) {
                   for (let i = subSteps.length - 1; i >= 0; i--) {
                     if (subSteps[i].type === 'tool' && subSteps[i]._toolCallId === innerData.tool_call_id) {
-                      subSteps[i] = { ...subSteps[i], result: innerData.result_summary, status: 'done' }
+                      subSteps[i] = finishToolStep(subSteps[i], innerData)
                       matched = true
                       break
                     }
@@ -1682,7 +1806,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                 if (!matched) {
                   for (let i = subSteps.length - 1; i >= 0; i--) {
                     if (subSteps[i].type === 'tool' && subSteps[i].tool === innerData.tool && subSteps[i].status === 'running') {
-                      subSteps[i] = { ...subSteps[i], result: innerData.result_summary, status: 'done' }
+                      subSteps[i] = finishToolStep(subSteps[i], innerData)
                       break
                     }
                   }
@@ -1703,6 +1827,9 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             }
             lastMsg.process = currentProcess
           } else if (type === 'awaiting_input') {
+            setStreamPhase(null)
+            resetThinkingLive()
+            if (pendingThought) currentProcess.push(pendingThought)
             currentProcess.push({ type: 'awaiting_input', interaction_type: data.interaction_type, data: data, transient: true })
             lastMsg.process = currentProcess
             if (data.interaction_type === 'permission') {
@@ -1711,6 +1838,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               pendingInteractionRef.current = { type: data.interaction_type, data: data, sessionId }
             }
           } else if (type === 'done') {
+            setStreamPhase(null)
+            resetThinkingLive()
             const streamIdx = currentProcess.findLastIndex(s => s.type === 'streaming_text')
             if (streamIdx >= 0) {
               lastMsg.content = currentProcess[streamIdx].content
@@ -1718,25 +1847,46 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               lastMsg.content = t('chat.compacted')
             }
             lastMsg.created_at = new Date().toISOString()
+            const duration = turnDurationMs(newMsgs, lastIdx)
+            if (duration != null) lastMsg.durationMs = duration
             if (data.usage) {
               lastMsg.usage = data.usage
             }
             const lastStep = currentProcess[currentProcess.length - 1]
             const isPausingForInput = lastStep?.type === 'awaiting_input'
             if (isPausingForInput) {
-              lastMsg.process = currentProcess.filter(s => s.type !== 'streaming_text')
+              lastMsg.process = [
+                ...currentProcess.filter(s => s.type !== 'streaming_text'),
+                ...(pendingThought ? [pendingThought] : []),
+              ]
             } else {
-              lastMsg.process = currentProcess.filter(s => !s.transient && s.type !== 'streaming_text')
+              lastMsg.process = [
+                ...currentProcess.filter(s => !s.transient && s.type !== 'streaming_text'),
+                ...(pendingThought ? [pendingThought] : []),
+              ]
             }
           } else if (type === 'error') {
+            setStreamPhase(null)
+            resetThinkingLive()
             const content = data.content || data.error || data.message || t('chat.toast.unknownError')
             lastMsg.content = content
             lastMsg.created_at = new Date().toISOString()
-            lastMsg.process = currentProcess.filter(s => !s.transient && s.type !== 'streaming_text')
+            const duration = turnDurationMs(newMsgs, lastIdx)
+            if (duration != null) lastMsg.durationMs = duration
+            lastMsg.process = [
+              ...currentProcess.filter(s => !s.transient && s.type !== 'streaming_text'),
+              ...(pendingThought ? [pendingThought] : []),
+            ]
             if (data.usage) {
               lastMsg.usage = data.usage
             }
           } else if (type === 'cancelled') {
+            setStreamPhase(null)
+            resetThinkingLive()
+            lastMsg.interrupted = true
+            if (pendingThought) lastMsg.process = [...currentProcess, pendingThought]
+            const duration = turnDurationMs(newMsgs, lastIdx)
+            if (duration != null) lastMsg.durationMs = duration
             if (data.usage) {
               lastMsg.usage = data.usage
             }
@@ -1966,7 +2116,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
     const editIndex = messages.findIndex(m => m.id === messageId)
     setIsStreaming(true)
-    currentHintRef.current = t('chat.thinking')
+    setStreamPhase('thinking')
+    resetThinkingLive()
     const gen = genRef.current
     const controller = new AbortController()
     abortRef.current = controller
@@ -2108,7 +2259,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     }])
     setMessages(prev => [...prev, { role: 'SiGMA', content: '', process: [] }])
 
-    currentHintRef.current = isCompactCommand ? t('chat.compacting') : t('chat.thinking')
+    setStreamPhase(isCompactCommand ? 'compacting' : 'thinking')
+    resetThinkingLive()
 
     const controller = new AbortController()
     abortRef.current = controller
@@ -2399,10 +2551,46 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                       {t('chat.viewCitation')}
                     </button>
                   )}
-                  {isStreaming && i === messages.length - 1 && !m.content && (
-                    <div className="flex items-center gap-2 text-gray-400 dark:text-gray-500 mt-1">
-                      <RotateCw className="w-3.5 h-3.5 animate-spin" />
-                      <span className="text-[11px] font-bold italic tracking-wider animate-pulse">{currentHintRef.current}</span>
+                  {isStreaming && i === messages.length - 1 && !m.content && streamPhase && (
+                    <div className="mt-1 min-w-0">
+                      <div className="flex items-center gap-2 text-gray-400 dark:text-gray-500">
+                        <RotateCw className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
+                        <span className="shimmer-text text-[11px] font-bold italic tracking-wider flex-shrink-0">{t(`chat.${streamPhase}`)}</span>
+                      </div>
+                      {streamPhase === 'thinking' && thinkingLive && (
+                        <div
+                          ref={thinkBoxRef}
+                          onScroll={() => {
+                            // Release auto-follow when the user scrolls away
+                            // from the bottom to read older reasoning.
+                            const el = thinkBoxRef.current
+                            if (el) {
+                              thinkFollowRef.current =
+                                el.scrollHeight - el.scrollTop - el.clientHeight < 8
+                            }
+                          }}
+                          className="mt-1.5 h-[4.75rem] overflow-y-auto rounded border border-gray-100 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-900 px-2 py-1"
+                        >
+                          <pre
+                            className="whitespace-pre-wrap break-words text-[10px] leading-relaxed font-mono text-gray-500 dark:text-gray-400"
+                            style={{
+                              WebkitMaskImage: 'linear-gradient(to bottom, transparent, black 1.35em)',
+                              maskImage: 'linear-gradient(to bottom, transparent, black 1.35em)',
+                            }}
+                          >{thinkingLive}</pre>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {!isStreaming && m.role === 'SiGMA' && (m.interrupted || m.durationMs != null) && (
+                    <div className="mt-1 flex items-center gap-2 text-[9px] text-gray-400 dark:text-gray-500">
+                      {m.interrupted && (
+                        <span className="flex items-center gap-1 text-amber-500 dark:text-amber-400">
+                          <span className="w-1 h-1 rounded-full bg-amber-400" />
+                          {t('chat.interrupted')}
+                        </span>
+                      )}
+                      {m.durationMs != null && <span>{formatDurationMs(m.durationMs)}</span>}
                     </div>
                   )}
                 </div>

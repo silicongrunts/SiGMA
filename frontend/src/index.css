@@ -21,6 +21,27 @@
   background: #d1d5db;
 }
 
+/* ───────────────── Streaming status shimmer ─────────────────
+   Sweeps a brighter band across the "Thinking/Processing/..." label while
+   the assistant works. Text stays selectable-transparent via background-clip;
+   the gradient colors replace the text color entirely, so the label inherits
+   no color from its parent (kept gray on purpose — see .dark override). */
+@keyframes sigma-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+.shimmer-text {
+  color: transparent;
+  background-image: linear-gradient(110deg, #9ca3af 40%, #374151 50%, #9ca3af 60%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: sigma-shimmer 1.4s linear infinite;
+}
+.dark .shimmer-text {
+  background-image: linear-gradient(110deg, #6b7280 40%, #e5e7eb 50%, #6b7280 60%);
+}
+
 /* Markdown preview base is now provided by Tailwind Typography (`.prose`).
    Only project-specific overrides (highlight sync, KaTeX scroll) live here. */
 
@@ -108,6 +129,20 @@
   background-color: var(--sigma-table-header-bg);
   font-weight: 600;
 }
+
+/* Compact markdown variant for workflow-timeline hints (intermediate model
+   text between tool calls). Same rendering pipeline as the chat bubble, just
+   smaller type and tighter vertical rhythm so a timeline row stays a row. */
+.sigma-content-compact { font-size: 0.6875rem; line-height: 1.5; }
+.sigma-content-compact p { margin-bottom: 0.4em; }
+.sigma-content-compact h1, .sigma-content-compact h2, .sigma-content-compact h3 {
+  font-size: 1em; margin: 0.6em 0 0.3em;
+}
+.sigma-content-compact ul, .sigma-content-compact ol { margin-left: 1.2em; margin-bottom: 0.4em; }
+.sigma-content-compact li { margin-bottom: 0.15em; }
+.sigma-content-compact pre { padding: 0.5em; margin: 0.4em 0; }
+.sigma-content-compact blockquote { margin: 0.4em 0; }
+.sigma-content-compact table { margin-bottom: 0.4em; }
 
 /* All markdown element typography (headings, lists, code, tables, etc.) is now
    handled by Tailwind Typography (`.prose`). The rules below are project-specific

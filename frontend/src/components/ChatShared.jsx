@@ -10,7 +10,7 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import renderMathInElement from 'katex/dist/contrib/auto-render.mjs'
 import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
-import { ChevronDown, MessageSquare, Cpu, CheckCircle2, Loader2, AlertCircle, FoldVertical } from 'lucide-react'
+import { ChevronDown, Brain, Cpu, CheckCircle2, Loader2, AlertCircle, FoldVertical, Search, FileText } from 'lucide-react'
 import TaskList from './TaskList'
 
 marked.setOptions({ gfm: true, breaks: true })
@@ -99,6 +99,64 @@ function isAgentToolName(tool) {
     return String(tool || '').toLowerCase() === 'agent'
 }
 
+/**
+ * Extract the subagent's instruction prompt from the agent tool step params.
+ * Params arrive as a JSON string that the backend may truncate mid-value, so
+ * a regex fallback recovers the (possibly cut) prompt when JSON.parse fails.
+ */
+function agentPromptFromParams(params) {
+  const s = String(params || '')
+  if (!s) return ''
+  try {
+    const obj = JSON.parse(s)
+    if (typeof obj?.prompt === 'string') return obj.prompt
+  } catch { /* truncated JSON — extract the raw prompt text below */ }
+  const unescape = (v) => v.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"')
+  const closed = s.match(/"prompt"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+  if (closed) return unescape(closed[1])
+  const tail = s.split(/"prompt"\s*:\s*"/)[1]
+  return tail !== undefined ? unescape(tail) : ''
+}
+
+// Target path of a running edit/write call. Live params arrive truncated at
+// 200 chars, so like agentPromptFromParams this falls back to a regex over
+// the raw string when the JSON no longer parses.
+function filePathFromParams(params) {
+  const s = String(params || '')
+  if (!s) return ''
+  try {
+    const obj = JSON.parse(s)
+    const p = obj?.file_path ?? obj?.path
+    if (typeof p === 'string') return p
+  } catch { /* truncated JSON — regex below */ }
+  const m = s.match(/"(?:file_path|path)"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+  return m ? m[1].replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"') : ''
+}
+
+// Consecutive read-only lookups collapse into one "Exploring" group in the
+// timeline — they are high-frequency, low-signal steps that would otherwise
+// flood the workflow view while the model explores the project.
+const READ_GROUP_TOOLS = new Set(['read', 'glob', 'grep', 'ls'])
+
+function groupReadLookups(steps) {
+  const items = []
+  let i = 0
+  while (i < steps.length) {
+    const isLookup = steps[i].type === 'tool' && READ_GROUP_TOOLS.has(String(steps[i].tool).toLowerCase())
+    if (!isLookup) { items.push(steps[i]); i++; continue }
+    const group = []
+    while (i < steps.length
+      && steps[i].type === 'tool'
+      && READ_GROUP_TOOLS.has(String(steps[i].tool).toLowerCase())) {
+      group.push(steps[i])
+      i++
+    }
+    if (group.length >= 2) items.push({ group })
+    else items.push(...group)
+  }
+  return items
+}
+
 // Internal context params the backend runner injects into tool_args before
 // calling a tool (see llm_loop_runner.py). They are required server-side but
 // should never be shown to the user in the workflow timeline.
@@ -162,7 +220,7 @@ function sanitizeToolParams(paramsStr) {
 const SIGMA_CITATION_SCHEME = 'sigma'
 const citationUriRegexp = /^(?:sigma:|(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
 
-export const MarkdownContent = ({ content, projectId = null, onCitation = null }) => {
+export const MarkdownContent = ({ content, projectId = null, onCitation = null, compact = false }) => {
     const containerRef = useRef(null)
 
     // Memoize parsing+sanitizing: in streaming chat the parent re-renders on
@@ -234,11 +292,86 @@ export const MarkdownContent = ({ content, projectId = null, onCitation = null }
     return (
         <div
             ref={containerRef}
-            className="sigma-content text-sm leading-relaxed break-words overflow-hidden"
+            className={`${compact ? 'sigma-content sigma-content-compact' : 'sigma-content'} text-sm leading-relaxed break-words overflow-hidden`}
             dangerouslySetInnerHTML={{ __html: html }}
             onClick={handleClick}
         />
     )
+}
+
+/**
+ * ThoughtStep — collapsed record of one completed reasoning segment: a
+ * duration summary row that expands to the full reasoning text captured
+ * live. Live-session only; history rebuilds carry no thinking entries.
+ */
+function ThoughtStep({ step }) {
+    const { t } = useTranslation()
+    const [open, setOpen] = useState(false)
+    const seconds = Math.max(1, Math.round((step.durationMs || 0) / 1000))
+    return <div className="flex flex-col py-0.5">
+        <button
+            onClick={() => setOpen(!open)}
+            aria-expanded={open}
+            className="flex items-center gap-1.5 w-full text-left rounded transition-colors py-0.5 hover:bg-gray-50/50 dark:hover:bg-gray-800"
+        >
+            <Brain className="w-3 h-3 flex-shrink-0 text-violet-500 dark:text-violet-400" />
+            <span className="flex-1 min-w-0 truncate text-[10px] text-gray-600 dark:text-gray-300">{t('chat.thoughtFor', { count: seconds })}</span>
+            <ChevronDown className={`w-2.5 h-2.5 flex-shrink-0 text-gray-300 dark:text-gray-600 transition-transform ${open ? 'rotate-180' : ''}`} />
+        </button>
+        {open && (
+            <div className="ml-2 mt-0.5 max-h-72 overflow-y-auto rounded border border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900">
+                <pre className="p-1.5 whitespace-pre-wrap break-words text-[10px] leading-relaxed font-mono text-gray-500 dark:text-gray-400">{step.content}</pre>
+            </div>
+        )}
+    </div>
+}
+
+/**
+ * FileEditStep — timeline card for a finished edit/write tool call: file
+ * path with +adds/-dels badges; edits expand to the backend's capped
+ * unified diff. Writes have no prior content to diff against, so they stay
+ * a plain path + line-count row.
+ */
+function FileEditStep({ step }) {
+    const { t } = useTranslation()
+    const fe = step.fileEdit
+    const [open, setOpen] = useState(false)
+    const isEdit = fe.kind === 'edit'
+    const expandable = isEdit && !!fe.diff
+    return <div className="flex flex-col py-0.5">
+        <button
+            onClick={() => expandable && setOpen(!open)}
+            className={`flex items-center gap-1.5 w-full text-left rounded transition-colors py-0.5 ${expandable ? 'hover:bg-gray-50/50 dark:hover:bg-gray-800' : 'cursor-default'}`}
+        >
+            <FileText className="w-3 h-3 flex-shrink-0 text-emerald-500 dark:text-emerald-400" />
+            <span className="flex-1 min-w-0 truncate text-[10px] font-mono text-gray-600 dark:text-gray-300" title={fe.path}>{fe.path}</span>
+            <span className="flex-shrink-0 flex items-baseline gap-1.5 font-mono text-[9px]">
+                {isEdit ? (<>
+                    {fe.dels > 0 && <span className="text-rose-500 dark:text-rose-400">-{fe.dels}</span>}
+                    {fe.adds > 0 && <span className="text-emerald-600 dark:text-emerald-400">+{fe.adds}</span>}
+                </>) : (
+                    <span className="text-gray-400 dark:text-gray-500">{t('chat.linesWritten', { count: fe.adds })}</span>
+                )}
+            </span>
+            {expandable && <ChevronDown className={`w-2.5 h-2.5 flex-shrink-0 text-gray-300 dark:text-gray-600 transition-transform ${open ? 'rotate-180' : ''}`} />}
+        </button>
+        {open && expandable && (
+            <div className="ml-2 mt-0.5 max-h-48 overflow-y-auto rounded border border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900">
+                <pre className="p-1.5 text-[9px] leading-relaxed font-mono overflow-x-auto">
+                    {fe.diff.split('\n').map((line, i) => {
+                        const tone = line.startsWith('+')
+                            ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                            : line.startsWith('-')
+                                ? 'bg-rose-500/10 text-rose-600 dark:text-rose-300'
+                                : line.startsWith('@')
+                                    ? 'text-sigma-600 dark:text-sigma-300'
+                                    : 'text-gray-400 dark:text-gray-500'
+                        return <div key={i} className={`px-1 ${tone}`}>{line || ' '}</div>
+                    })}
+                </pre>
+            </div>
+        )}
+    </div>
 }
 
 /**
@@ -250,6 +383,7 @@ function AgentToolStep({ step }) {
   const isRunning = step.status === 'running'
   const [agentOpen, setAgentOpen] = useState(isRunning)
   const agentLabel = step.agentType || 'agent'
+  const prompt = agentPromptFromParams(step.params)
   return <div className="flex flex-col gap-0.5 py-0.5">
       <button
           onClick={() => setAgentOpen(!agentOpen)}
@@ -268,6 +402,11 @@ function AgentToolStep({ step }) {
       </button>
       {agentOpen && (
           <div className="ml-2 pl-2 border-l-2 border-dashed border-purple-200">
+              {prompt && (
+                  <div className="mb-1 text-[9px] text-gray-400 dark:text-gray-500 whitespace-pre-wrap break-words max-h-24 overflow-y-auto bg-gray-50/50 dark:bg-gray-900 rounded px-1.5 py-1 border border-gray-100 dark:border-gray-800">
+                      {prompt}
+                  </div>
+              )}
               {step.subSteps && step.subSteps.map((s, i) => <ThinkingStep key={i} step={s} />)}
           </div>
       )}
@@ -311,11 +450,34 @@ export const ThinkingStep = ({ step }) => {
     const { t } = useTranslation()
     // ── hint / streaming text (processing status, intermediate thoughts) ──
     if (step.type === 'hint' || step.type === 'streaming_text') {
+        // Model-authored intermediate text renders as markdown; system status
+        // hints (transient markers, retry notices, plain flags) stay plain.
+        if (step.type === 'hint' && !step.transient && !step.plain) {
+            return <div className="py-0.5 max-h-64 overflow-y-auto">
+                <MarkdownContent content={step.content} compact />
+            </div>
+        }
+        // LLM stream retry — amber notice with the underlying error as a
+        // subtle second line so the user sees why output paused.
+        if (step.retry) {
+            return <div className="flex items-start gap-2 py-0.5">
+                <AlertCircle className="w-3 h-3 mt-0.5 flex-shrink-0 text-amber-500 dark:text-amber-400" />
+                <div className="min-w-0">
+                    <div className="text-[10px] font-medium text-amber-600 dark:text-amber-400">{step.content}</div>
+                    {step.error && <div className="text-[9px] text-gray-400 dark:text-gray-500 truncate">{step.error}</div>}
+                </div>
+            </div>
+        }
         const isLive = step.type === 'streaming_text'
         return <div className="flex items-center gap-2 py-0.5">
             <div className={`w-1 h-1 rounded-full flex-shrink-0 ${isLive ? 'bg-blue-400 animate-pulse' : 'bg-gray-300 dark:bg-gray-600'}`} />
             <div className={`text-[10px] leading-tight ${isLive ? 'text-gray-500 dark:text-gray-400' : 'text-gray-400 dark:text-gray-500 italic'}`}>{step.content}</div>
         </div>
+    }
+
+    // ── completed reasoning segment (live session only) ──
+    if (step.type === 'thinking') {
+        return <ThoughtStep step={step} />
     }
 
     // ── tool call ──
@@ -324,42 +486,30 @@ export const ThinkingStep = ({ step }) => {
         if (isAgentToolName(step.tool) && step.subSteps && step.subSteps.length > 0) {
             return <AgentToolStep step={step} />
         }
+        // finished edit/write — diff card from backend file_edit metadata
+        if (step.fileEdit) {
+            return <FileEditStep step={step} />
+        }
 
         const Icon = step.status === 'running' ? Loader2 : CheckCircle2
         const iconCls = step.status === 'running' ? 'text-blue-400 animate-spin' : 'text-green-500'
-        const cleanParams = sanitizeToolParams(step.params)
+        // A running edit/write shows its target path instead of raw truncated
+        // JSON params; once done, the FileEditStep card or the error result
+        // in the generic row below takes over.
+        const pendingPath = step.status === 'running' && (step.tool === 'edit' || step.tool === 'write')
+            ? filePathFromParams(step.params) : ''
+        const cleanParams = pendingPath ? '' : sanitizeToolParams(step.params)
         return <div className="flex items-start gap-1.5 py-0.5">
             <Icon className={`w-3 h-3 mt-0.5 flex-shrink-0 ${iconCls}`} />
             <div className="flex-1 min-w-0">
                 <span className="text-[10px] font-mono text-gray-500 dark:text-gray-400">{step.tool}</span>
+                {pendingPath && <span className="text-[9px] font-mono text-gray-400 dark:text-gray-500 ml-1 truncate">{pendingPath}</span>}
                 {cleanParams && <span className="text-[9px] text-gray-400 dark:text-gray-500 ml-1 break-all">({cleanParams})</span>}
                 {step.result && (
                     <div className="mt-0.5 text-[9px] text-gray-400 dark:text-gray-500 bg-gray-50/50 dark:bg-gray-900 rounded px-1.5 py-0.5 max-h-16 overflow-y-auto whitespace-pre-wrap break-all border border-gray-100 dark:border-gray-800">
                         {step.result}
                     </div>
                 )}
-            </div>
-        </div>
-    }
-
-    // ── agent call ──
-    if (step.type === 'agent_call') {
-        return <div className="flex items-start gap-1.5 py-0.5">
-            <Cpu className="w-3 h-3 mt-0.5 text-purple-400 flex-shrink-0" />
-            <div className="flex-1 min-w-0">
-                <span className="text-[10px] font-mono text-purple-600">{step.agent}</span>
-                {step.description && <span className="text-[9px] text-gray-400 dark:text-gray-500 ml-1">{step.description}</span>}
-            </div>
-        </div>
-    }
-
-    // ── agent progress (step_delta) ──
-    if (step.type === 'agent') {
-        return <div className="flex items-start gap-1.5 py-0.5">
-            <MessageSquare className="w-3 h-3 mt-0.5 text-sigma-400 flex-shrink-0" />
-            <div className="flex-1 min-w-0">
-                <span className="text-[9px] font-semibold text-sigma-500">{step.agent}</span>
-                <div className="text-[10px] text-gray-500 dark:text-gray-400 leading-relaxed whitespace-pre-wrap mt-0.5">{step.content}</div>
             </div>
         </div>
     }
@@ -381,7 +531,37 @@ export const ThinkingStep = ({ step }) => {
     return null
 }
 
+/** Collapsible group for a run of consecutive read-only lookups. */
+function ReadToolGroup({ steps, isStreaming }) {
+    const { t } = useTranslation()
+    const [open, setOpen] = useState(false)
+    const running = isStreaming && steps.some(s => s.status === 'running')
+    return <div className="flex flex-col py-0.5">
+        <button
+            onClick={() => setOpen(!open)}
+            className="flex items-center gap-1.5 w-full text-left hover:bg-gray-50/50 dark:hover:bg-gray-800 rounded transition-colors py-0.5"
+        >
+            {running
+                ? <Loader2 className="w-3 h-3 flex-shrink-0 text-blue-400 animate-spin" />
+                : <Search className="w-3 h-3 flex-shrink-0 text-gray-400 dark:text-gray-500" />}
+            <span className="flex items-baseline gap-1 min-w-0">
+                <span className={`text-[10px] font-medium tracking-wide ${running ? 'shimmer-text' : 'text-gray-400 dark:text-gray-500'}`}>
+                    {running ? t('chat.exploring') : t('chat.explored')}
+                </span>
+                <span className="text-[9px] text-gray-400 dark:text-gray-500">· {t('chat.lookupCount', { count: steps.length })}</span>
+            </span>
+            <ChevronDown className={`w-2.5 h-2.5 flex-shrink-0 text-gray-300 dark:text-gray-600 transition-transform ${open ? 'rotate-180' : ''}`} />
+        </button>
+        {open && (
+            <div className="ml-2 pl-2 border-l-2 border-dashed border-gray-200 dark:border-gray-700">
+                {steps.map((s, i) => <ThinkingStep key={i} step={s} />)}
+            </div>
+        )}
+    </div>
+}
+
 export const ThinkingProcess = ({ steps, isStreaming }) => {
+    const { t } = useTranslation()
     const [isOpen, setIsOpen] = useState(false)
     const prevStreamingRef = useRef(isStreaming)
 
@@ -399,10 +579,10 @@ export const ThinkingProcess = ({ steps, isStreaming }) => {
         prevStreamingRef.current = isStreaming
     }, [isStreaming])
 
-    const visibleSteps = (steps || []).filter(s => s.type !== 'reasoning')
+    const visibleSteps = steps || []
     if (visibleSteps.length === 0) return null
 
-    const toolSteps = visibleSteps.filter(s => s.type === 'tool' || s.type === 'agent_call')
+    const toolSteps = visibleSteps.filter(s => s.type === 'tool')
     const runningTools = toolSteps.filter(s => s.status === 'running')
 
     return (
@@ -417,14 +597,18 @@ export const ThinkingProcess = ({ steps, isStreaming }) => {
                     <div className={`w-1.5 h-1.5 rounded-full ${toolSteps.length > 0 ? 'bg-green-400' : 'bg-gray-300 dark:bg-gray-600'}`} />
                 )}
                 <span className="font-medium tracking-wide">
-                    {isOpen ? 'Hide' : 'Show'} work
-                    {toolSteps.length > 0 && ` (${toolSteps.length} step${toolSteps.length > 1 ? 's' : ''})`}
+                    {t(isOpen ? 'chat.hideWork' : 'chat.showWork')}
+                    {toolSteps.length > 0 && ` · ${t('chat.workSteps', { count: toolSteps.length })}`}
                 </span>
                 <ChevronDown className={`w-2.5 h-2.5 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} />
             </button>
             {isOpen && (
                 <div className="mt-1 ml-0.5 pl-2 border-l-2 border-dashed border-gray-200 dark:border-gray-700 text-[10px] animate-in fade-in slide-in-from-top-1 duration-150">
-                    {visibleSteps.map((s, i) => <ThinkingStep key={i} step={s} />)}
+                    {groupReadLookups(visibleSteps).map((item, i) => (
+                        item.group
+                            ? <ReadToolGroup key={i} steps={item.group} isStreaming={isStreaming} />
+                            : <ThinkingStep key={i} step={item} />
+                    ))}
                     <TaskList expanded={isStreaming} />
                 </div>
             )}
