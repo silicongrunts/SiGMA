@@ -391,7 +391,12 @@ class AIService:
             messages, boundary_seq = await uow.messages.get_messages_with_boundary(session_id)
 
         entries = shape_messages_for_ui(messages, boundary_seq)
-        return page_ui_turns(entries, limit=limit, before_seq=before_seq)
+        page = page_ui_turns(entries, limit=limit, before_seq=before_seq)
+        # Clients lock edits on pre-boundary messages they hold from older
+        # pages; passive boundaries hide inside turn process steps, so the
+        # seq cannot be recovered from the entries alone.
+        page["boundary_seq"] = boundary_seq
+        return page
 
     async def clear_history(self, project_id: str, session_id: str = None) -> Dict[str, Any]:
         """Clear chat history for a session. Falls back to most recent session if session_id is None."""

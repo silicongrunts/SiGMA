@@ -334,6 +334,7 @@
   "chat.thinking": "思考中...",
   "chat.compacting": "工作階段壓縮中...",
   "chat.compacted": "工作階段已壓縮。",
+  "chat.compactBoundary": "工作階段已壓縮",
   "chat.staleFallback": "前一個任務在產生最終回應前已停止。",
   "snapshot.bannerBody": "自動快照已連續失敗，版本保護可能已中斷。",
   "snapshot.repair": "修復並立即快照",

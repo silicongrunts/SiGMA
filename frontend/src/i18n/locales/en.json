@@ -334,6 +334,7 @@
   "chat.thinking": "Thinking...",
   "chat.compacting": "Session Compacting...",
   "chat.compacted": "Session compacted.",
+  "chat.compactBoundary": "Session compacted",
   "chat.staleFallback": "The previous task stopped before producing a final response.",
   "snapshot.bannerBody": "Auto-snapshots are failing repeatedly — version protection may be interrupted.",
   "snapshot.repair": "Repair and snapshot now",

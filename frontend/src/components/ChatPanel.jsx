@@ -8,7 +8,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import { useClickOutside } from '../hooks/useClickOutside'
-import { MarkdownContent, ThinkingProcess } from './ChatShared'
+import { MarkdownContent, ThinkingProcess, CompactSummaryNote } from './ChatShared'
 import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2, GitBranch, Search } from 'lucide-react'
 import { toastError, toastSuccess } from './Toast'
 import { ModalOverlay, ConfirmModal } from './Modal'
@@ -422,6 +422,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       messages,
       has_more: Boolean(response?.has_more),
       next_before_seq: response?.next_before_seq ?? null,
+      boundary_seq: response?.boundary_seq ?? null,
     }
   }
 
@@ -1915,12 +1916,9 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       for (const m of page.messages) {
         if (m.id) canEditMap.set(m.id, m.can_edit)
       }
-      const boundarySeq = Math.max(
-        ...page.messages
-          .filter(m => m.is_boundary)
-          .map(m => messageSeq(m))
-          .filter(seq => seq !== null),
-      )
+      // Server's last-boundary seq: covers user messages from older pages
+      // that aren't in canEditMap.
+      const boundarySeq = page.boundary_seq
       setMessages(prev => {
         const updated = prev.map(m => {
           if (m.id && canEditMap.has(m.id)) {
@@ -2356,6 +2354,14 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
           {messages.map((m, i) => {
             const isLastMessage = i === messages.length - 1
             const isCurrentlyStreaming = isLastMessage && isStreaming
+            // Compaction boundaries render as a collapsed card, not a bubble.
+            if (m.is_boundary) {
+              return (
+                <div key={m.id || i} data-chat-msg="" data-msg-id={m.id} data-msg-role="system" className="w-full my-1 px-1">
+                  <CompactSummaryNote summary={m.content} />
+                </div>
+              )
+            }
             return (
               <div key={m.id || i} data-chat-msg="" data-msg-id={m.id} data-msg-role={m.role} className={`group/message flex flex-col rounded-2xl transition-colors duration-700 ${m.role === 'user' ? 'items-end' : 'items-start'} ${m.id === flashMessageId ? 'bg-amber-100/60 dark:bg-amber-900/25' : ''}`}>
                 <div className="flex items-center gap-2 mb-1.5 px-1">
@@ -2931,6 +2937,11 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                         <div className="text-xs text-gray-400 dark:text-gray-500 text-center py-4">{t('chat.noMessages')}</div>
                       )}
                       {archivedMessages.map((m, mi) => (
+                        m.is_boundary ? (
+                          <div key={mi} data-archived-msg-id={m.id} className="w-full my-1">
+                            <CompactSummaryNote summary={m.content} />
+                          </div>
+                        ) : (
                         <div key={mi} data-archived-msg-id={m.id} className={`flex flex-col rounded-lg transition-colors duration-700 ${m.role === 'user' ? 'items-end' : 'items-start'} ${m.id === flashMessageId ? 'bg-amber-100/60 dark:bg-amber-900/25' : ''}`}>
                           <div className="flex items-center gap-1.5 mb-1">
                             <span className="text-[9px] font-black uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.role === 'SiGMA' ? t('chat.roleSigma') : m.role}</span>
@@ -2947,6 +2958,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                             )}
                           </div>
                         </div>
+                        )
                       ))}
                     </div>
                   )}

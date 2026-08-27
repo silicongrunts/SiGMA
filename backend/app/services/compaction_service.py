@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import tiktoken
 
+from app.core.compaction_text import ACTIVE_SUMMARY_PREFIX, PASSIVE_SUMMARY_PREFIX
 from app.core.config import settings
 from app.core.utils import image_dimensions
 from app.core.logging import get_logger
@@ -44,21 +45,6 @@ Your summary must preserve:
 Do not invent facts. Do not omit active blockers. Be concise but complete. Prefer structured sections with concrete filenames, IDs, and next steps.
 
 Do not call any tools or functions. Respond with only the summary text."""
-
-
-PASSIVE_SUMMARY_PREFIX = """This session was compacted automatically because the context exceeded the configured threshold.
-
-Continue the user's latest request using the summary below. Do not ask the user to repeat information already captured here.
-
-"""
-
-
-ACTIVE_SUMMARY_PREFIX = """The user explicitly requested /compact. This session summary is now the active handoff context.
-
-When the user sends the next request, continue from this summary and the subsequent messages.
-
-"""
-
 
 
 def _decode_base64_prefix(payload: str, max_bytes: int) -> bytes:

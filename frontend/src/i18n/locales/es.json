@@ -334,6 +334,7 @@
   "chat.thinking": "Pensando...",
   "chat.compacting": "Compactando sesión...",
   "chat.compacted": "Sesión compactada.",
+  "chat.compactBoundary": "Sesión compactada",
   "chat.staleFallback": "La tarea anterior se detuvo antes de producir una respuesta final.",
   "snapshot.bannerBody": "Las instantáneas automáticas están fallando repetidamente: la protección de versiones puede estar interrumpida.",
   "snapshot.repair": "Reparar y crear instantánea",

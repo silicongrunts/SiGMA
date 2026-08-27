@@ -23,6 +23,7 @@ from app.core.chat_attachments import (
     strip_image_refs_tag,
     strip_internal_image_tags,
 )
+from app.core.compaction_text import split_boundary_content
 from app.core.utils import to_iso
 
 
@@ -39,6 +40,19 @@ def build_tool_results_index(messages: list) -> Dict[str, str]:
         if getattr(m, "role", None) == "tool" and getattr(m, "tool_call_id", None):
             results[m.tool_call_id] = strip_image_refs_tag(m.content)
     return results
+
+
+def _assistant_turn_follows(messages: list, index: int) -> bool:
+    """True if an assistant row appears after *index* before the next user
+    or boundary row — i.e. the row at *index* is followed by (or starts) a
+    turn that produced assistant output."""
+    for m in messages[index + 1:]:
+        role = getattr(m, "role", None)
+        if role == "assistant":
+            return True
+        if role == "user" or (role == "system" and getattr(m, "is_boundary", False)):
+            return False
+    return False
 
 
 def build_assistant_turn(
@@ -135,6 +149,16 @@ def build_assistant_turn(
             _process_assistant(nxt)
         elif role == "tool":
             _add_usage(nxt)
+        elif role == "system" and getattr(nxt, "is_boundary", False):
+            if _assistant_turn_follows(messages, j):
+                # Mid-turn compaction boundary: surface it as a timeline
+                # step at its real position so the turn stays one entry.
+                _, summary = split_boundary_content(getattr(nxt, "content", None) or "")
+                collected_process.append({"type": "compact", "content": summary})
+            else:
+                # Boundary at the turn's tail belongs to the next turn —
+                # stop here so the outer loop can attach it there.
+                break
         j += 1
 
     return {
@@ -205,6 +229,21 @@ def finalize_assistant_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
 # pass in the rows fetched from the repository.
 
 
+def _boundary_card_entry(msg, summary: str) -> Dict[str, Any]:
+    """Build the standalone UI entry for a compaction boundary card."""
+    return {
+        "id": msg.id,
+        "role": "system",
+        "content": summary,
+        "token_count": getattr(msg, "token_count", 0),
+        "cached_tokens": getattr(msg, "cached_tokens", 0),
+        "input_tokens": getattr(msg, "input_tokens", 0),
+        "is_boundary": True,
+        "seq": msg.seq,
+        "created_at": to_iso(msg.created_at),
+    }
+
+
 def shape_messages_for_ui(
     messages: list,
     boundary_seq: Optional[int],
@@ -216,12 +255,26 @@ def shape_messages_for_ui(
     intermediate assistant thoughts and tool calls go into the ``process``
     timeline of the same entry.
 
+    Compaction boundaries are shown without their LLM instruction prefix.
+    An active boundary (``/compact``) becomes a standalone ``system`` card
+    entry at its own position; a passive boundary becomes a ``compact``
+    step leading the timeline of the assistant turn whose preparation
+    triggered it, or a standalone card when no such turn exists.
+
     *boundary_seq* is the seq of the last compaction boundary; user
     messages at or before it are marked ``can_edit=False`` because the
     prior context has been summarised away.
     """
     tool_results = build_tool_results_index(messages)
     result: List[Dict[str, Any]] = []
+    pending_compacts: List[tuple] = []
+
+    def _flush_pending() -> None:
+        result.extend(
+            _boundary_card_entry(row, summary) for row, summary in pending_compacts
+        )
+        pending_compacts.clear()
+
     i = 0
     while i < len(messages):
         msg = messages[i]
@@ -236,12 +289,24 @@ def shape_messages_for_ui(
             i += 1
             continue
 
+        # Passive compaction fired while preparing the next turn — defer the
+        # summary into that turn's timeline (see the assistant branch below).
         if msg.is_boundary:
+            mode, summary = split_boundary_content(msg.content or "")
+            if mode == "passive":
+                pending_compacts.append((msg, summary))
+                i += 1
+                continue
             role_for_ui = "system"
         elif msg.role == "assistant":
             role_for_ui = "SiGMA"
         else:
             role_for_ui = msg.role
+
+        # A user row whose turn never produced assistant output ends the
+        # reach of a pending passive boundary — emit its card in position.
+        if msg.role == "user" and pending_compacts and not _assistant_turn_follows(messages, i):
+            _flush_pending()
 
         if msg.role == "user":
             citation_match = CITATION_TAG_RE.search(msg.content)
@@ -250,6 +315,8 @@ def shape_messages_for_ui(
             clean_content = strip_internal_image_tags(
                 CITATION_TAG_RE.sub("", STATUS_TAG_RE.sub("", msg.content))
             ).strip()
+        elif msg.is_boundary:
+            clean_content = summary
         else:
             citation_text = None
             attachments = []
@@ -289,12 +356,23 @@ def shape_messages_for_ui(
             entry["token_count"] = turn["token_count"]
             entry["cached_tokens"] = turn["cached_tokens"]
             entry["input_tokens"] = turn["input_tokens"]
+            if pending_compacts:
+                # Compaction fired while this turn was being prepared: lead
+                # its timeline with the summary step, matching where the
+                # live stream showed the compaction hint.
+                entry["process"] = [
+                    {"type": "compact", "content": summary}
+                    for _, summary in pending_compacts
+                ] + entry.get("process", [])
+                pending_compacts.clear()
             i = next_i
         else:
             i += 1
 
         result.append(entry)
 
+    # Boundaries never followed by any turn (compaction at session end).
+    _flush_pending()
     return result
 
 

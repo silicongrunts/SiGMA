@@ -10,7 +10,7 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import renderMathInElement from 'katex/dist/contrib/auto-render.mjs'
 import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
-import { ChevronDown, MessageSquare, Cpu, CheckCircle2, Loader2, AlertCircle } from 'lucide-react'
+import { ChevronDown, MessageSquare, Cpu, CheckCircle2, Loader2, AlertCircle, FoldVertical } from 'lucide-react'
 import TaskList from './TaskList'
 
 marked.setOptions({ gfm: true, breaks: true })
@@ -274,6 +274,39 @@ function AgentToolStep({ step }) {
   </div>
 }
 
+/**
+ * CompactSummaryNote — collapsed affordance marking where a session was
+ * compacted. Expands to the summary the next LLM call received (the LLM
+ * instruction preface is stripped server-side). Used both as the standalone
+ * card between chat bubbles and as a step inside the workflow timeline.
+ */
+export const CompactSummaryNote = ({ summary }) => {
+    const { t } = useTranslation()
+    const [open, setOpen] = useState(false)
+    return (
+        <div className="w-full">
+            <button
+                onClick={() => setOpen(!open)}
+                className="flex items-center gap-1.5 py-0.5 text-left group"
+                title={t('chat.compactBoundary')}
+            >
+                <FoldVertical className="w-3 h-3 text-amber-500 dark:text-amber-400 flex-shrink-0" />
+                <span className="text-[10px] font-medium text-gray-400 dark:text-gray-500 group-hover:text-gray-600 dark:group-hover:text-gray-300 transition-colors">
+                    {t('chat.compactBoundary')}
+                </span>
+                <ChevronDown className={`w-2.5 h-2.5 text-gray-300 dark:text-gray-600 transition-transform ${open ? 'rotate-180' : ''}`} />
+            </button>
+            {open && (
+                <div className="mt-1 ml-0.5 pl-2 border-l-2 border-dashed border-amber-200 dark:border-amber-900/50">
+                    <div className="text-[10px] text-gray-500 dark:text-gray-400 leading-relaxed whitespace-pre-wrap max-h-64 overflow-y-auto bg-gray-50/50 dark:bg-gray-900 rounded px-2 py-1.5 border border-gray-100 dark:border-gray-800">
+                        {summary}
+                    </div>
+                </div>
+            )}
+        </div>
+    )
+}
+
 export const ThinkingStep = ({ step }) => {
     const { t } = useTranslation()
     // ── hint / streaming text (processing status, intermediate thoughts) ──
@@ -329,6 +362,11 @@ export const ThinkingStep = ({ step }) => {
                 <div className="text-[10px] text-gray-500 dark:text-gray-400 leading-relaxed whitespace-pre-wrap mt-0.5">{step.content}</div>
             </div>
         </div>
+    }
+
+    // ── compaction boundary (session was compacted here) ──
+    if (step.type === 'compact') {
+        return <div className="py-0.5"><CompactSummaryNote summary={step.content} /></div>
     }
 
     // ── awaiting user input ──

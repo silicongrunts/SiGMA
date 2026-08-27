@@ -335,6 +335,7 @@
   "chat.thinking": "思考中...",
   "chat.compacting": "セッションを圧縮中...",
   "chat.compacted": "セッションを圧縮しました。",
+  "chat.compactBoundary": "セッションを圧縮しました",
   "chat.staleFallback": "前回のタスクは最終応答を生成する前に停止しました。",
   "snapshot.bannerBody": "自動スナップショットが連続して失敗しています。バージョン保護が中断されている可能性があります。",
   "snapshot.repair": "修復して今すぐスナップショット",
