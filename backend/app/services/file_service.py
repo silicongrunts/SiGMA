@@ -1,7 +1,6 @@
 import asyncio
 import os
 import hashlib
-import difflib
 import shutil
 import stat
 import zipfile
@@ -20,6 +19,7 @@ from app.core.atomic_file import (
     ProjectFileLock, atomic_write_text, atomic_write_bytes, atomic_replace_bytes,
     AtomicFileExistsError,
 )
+from app.core.text_diff import compute_diff_lines
 from app.core.utils import is_within, sanitize_filename
 from app.core.logging import get_logger
 from app.services.snapshot_service import snapshot_service
@@ -260,34 +260,6 @@ def _read_text_range_sync(full_path: Path, offset: int, limit: int,
             code="FILE_TOO_LARGE",
         )
     return TextRange(window, offset, offset + len(window), total)
-
-
-def compute_diff_lines(old_text: str, new_text: str) -> list:
-    """Compute a line-level diff between two texts using difflib.
-
-    Returns ``{type, content}`` dicts where ``type`` is ``'context'``,
-    ``'remove'``, or ``'add'``.
-    """
-    old_lines = old_text.splitlines(keepends=True)
-    new_lines = new_text.splitlines(keepends=True)
-    sm = difflib.SequenceMatcher(None, old_lines, new_lines)
-    lines = []
-    for op, i1, i2, j1, j2 in sm.get_opcodes():
-        if op == 'equal':
-            for line in old_lines[i1:i2]:
-                lines.append({'type': 'context', 'content': line.rstrip('\r\n')})
-        elif op == 'replace':
-            for line in old_lines[i1:i2]:
-                lines.append({'type': 'remove', 'content': line.rstrip('\r\n')})
-            for line in new_lines[j1:j2]:
-                lines.append({'type': 'add', 'content': line.rstrip('\r\n')})
-        elif op == 'delete':
-            for line in old_lines[i1:i2]:
-                lines.append({'type': 'remove', 'content': line.rstrip('\r\n')})
-        elif op == 'insert':
-            for line in new_lines[j1:j2]:
-                lines.append({'type': 'add', 'content': line.rstrip('\r\n')})
-    return lines
 
 
 # ---------------------------------------------------------------------------

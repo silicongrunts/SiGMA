@@ -14,7 +14,6 @@ attributes), so they have no service or DB dependencies and can live in
 
 from __future__ import annotations
 
-import difflib
 import json as _json
 import re
 from typing import Any, Dict, List, Optional
@@ -25,6 +24,7 @@ from app.core.chat_attachments import (
     strip_internal_image_tags,
 )
 from app.core.compaction_text import split_boundary_content
+from app.core.text_diff import DIFF_LINE_SOFT_LIMIT, compute_diff_lines
 from app.core.utils import to_iso
 
 
@@ -43,10 +43,19 @@ def build_tool_results_index(messages: list) -> Dict[str, str]:
     return results
 
 
-# Display caps for the inline edit diff: counts stay exact, only the shown
-# body is trimmed so one huge replacement cannot flood the timeline card.
-_MAX_EDIT_DIFF_LINES = 40
-_MAX_EDIT_DIFF_CHARS = 2000
+# "File edited: <path> (N replacement(s))" — N scales the badges for
+# replace_all calls, where one old→new pair is applied N times.
+_REPLACEMENT_COUNT_RE = re.compile(r"\((\d+) replacement\(s\)\)")
+
+
+def _is_failed_tool_result(result: str) -> bool:
+    """True for the failure texts a tool result can carry: tool-layer
+    ``Error:`` returns, the runner's exception wrapper ``Tool '<name>'
+    error: …``, and mid-tool cancellation (``Tool cancelled by user.``)."""
+    return (
+        result.startswith(("Error:", "Tool cancelled by user."))
+        or (result.startswith("Tool '") and " error: " in result)
+    )
 
 
 def file_edit_stats(
@@ -54,19 +63,22 @@ def file_edit_stats(
 ) -> Optional[Dict[str, Any]]:
     """Diff metadata for a completed ``edit``/``write`` tool call, or None.
 
-    ``edit`` reports +adds/−dels line counts plus a context-capped unified
-    diff of one ``old_string`` → ``new_string`` replacement. For
-    ``replace_all`` the counts cover a single occurrence; the replacement
-    count stays visible in the tool result text. ``write`` reports the line
-    count of the written content only — the previous file content is not
-    available at this layer, so no deletion side is claimed.
+    ``edit`` reports +adds/−dels line counts plus ``diff_lines`` for the
+    timeline modal — the same typed-lines format and soft limit the
+    permission dialog uses; the frontend renders it with char-level
+    highlighting. For ``replace_all`` the counts are scaled by the
+    replacement count parsed from the tool result. ``write`` reports the
+    line count of the written content and the content itself (soft-capped)
+    — the previous file content is not available at this layer, so no
+    deletion side is claimed.
 
-    Returns None for non-file tools, failed calls (``result`` starting with
-    ``Error:``), and calls without a usable path.
+    Returns None for non-file tools, failed calls (``result`` carrying a
+    failure marker — see ``_is_failed_tool_result``), and calls without a
+    usable path.
     """
     if tool_name not in ("edit", "write") or not isinstance(params, dict):
         return None
-    if result.startswith("Error:"):
+    if _is_failed_tool_result(result):
         return None
     path = params.get("file_path") or params.get("path")
     if not path or not isinstance(path, str):
@@ -76,25 +88,34 @@ def file_edit_stats(
         content = params.get("content")
         if not isinstance(content, str):
             return None
-        return {"kind": "write", "path": path, "adds": len(content.splitlines())}
+        lines = content.splitlines()
+        return {
+            "kind": "write",
+            "path": path,
+            "adds": len(lines),
+            "content": "\n".join(lines[:DIFF_LINE_SOFT_LIMIT]),
+            "content_truncated": len(lines) > DIFF_LINE_SOFT_LIMIT,
+        }
 
     old, new = params.get("old_string"), params.get("new_string")
     if not isinstance(old, str) or not isinstance(new, str) or not old:
         return None
-    # unified_diff always emits the ---/+++ file headers first; dropping them
-    # by position keeps a removed line that itself starts with "--" from
-    # being mistaken for a header.
-    body = list(difflib.unified_diff(
-        old.splitlines(), new.splitlines(), lineterm=""
-    ))[2:]
-    adds = sum(1 for line in body if line.startswith("+"))
-    dels = sum(1 for line in body if line.startswith("-"))
-    diff = "\n".join(body[:_MAX_EDIT_DIFF_LINES])
-    if len(diff) > _MAX_EDIT_DIFF_CHARS:
-        diff = diff[:_MAX_EDIT_DIFF_CHARS] + "\n…"
-    elif len(body) > _MAX_EDIT_DIFF_LINES:
-        diff += "\n…"
-    return {"kind": "edit", "path": path, "adds": adds, "dels": dels, "diff": diff}
+    diff_lines = compute_diff_lines(old, new)
+    # Counts stay exact even when the shipped lines are capped below.
+    adds = sum(1 for line in diff_lines if line["type"] == "add")
+    dels = sum(1 for line in diff_lines if line["type"] == "remove")
+    count_match = _REPLACEMENT_COUNT_RE.search(result)
+    if count_match:
+        count = int(count_match.group(1))
+        adds *= count
+        dels *= count
+    truncated = len(diff_lines) > DIFF_LINE_SOFT_LIMIT
+    if truncated:
+        diff_lines = diff_lines[:DIFF_LINE_SOFT_LIMIT]
+    return {
+        "kind": "edit", "path": path, "adds": adds, "dels": dels,
+        "diff_lines": diff_lines, "diff_truncated": truncated,
+    }
 
 
 def _parsed_edit_meta(

@@ -69,6 +69,9 @@ function PermissionPrompt({
     try {
       await permissionsAPI.setAutoApprove(projectId, { category: tool, enabled: checked })
       onToggleAutoApprove(checked)
+      // Reconcile the whole snapshot — the checkbox lives in its own component
+      // and other panels (ChatPanel settings menu) share the same store.
+      if (projectId) useStore.getState().loadAutoApproveSettings(projectId)
     } catch (e) {
       toastError(t('permission.toggleFailed'))
     } finally {

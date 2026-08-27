@@ -64,8 +64,6 @@ async def stream_chat_for_task(
         token_budget_tracker=token_budget_tracker,
     )
 
-    yield _format_sse("thought", {"message": "Processing..."})
-
     event_stream = (
         query_loop.compact_active()
         if context.get("compact_only")

@@ -9,7 +9,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { MarkdownContent, ThinkingProcess, CompactSummaryNote } from './ChatShared'
-import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2, GitBranch, Search } from 'lucide-react'
+import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2, GitBranch, Search, AlertTriangle } from 'lucide-react'
 import { toastError, toastSuccess } from './Toast'
 import { ModalOverlay, ConfirmModal } from './Modal'
 import ChatSearchModal from './ChatSearchModal'
@@ -65,6 +65,24 @@ const THINK_PASSTHROUGH_TYPES = new Set([
   'task_id', 'context_stats', 'task_list', 'turn_usage',
   'file_changed', 'annotation_changed',
 ])
+
+// Spinner phase per SSE event, flipped at event-dispatch level so the
+// setMessages updater stays free of setState/ref side effects. Unmapped
+// events (reasoning deltas, stream-status noise, passthrough bookkeeping)
+// leave the current phase unchanged.
+const STREAM_PHASE_BY_EVENT = {
+  delta: 'processing',
+  tool_start: 'executing',
+  // tool_end returns to "thinking": the next LLM iteration reopens with
+  // reasoning before producing text or another tool call.
+  tool_end: 'thinking',
+  compact_start: 'compacting',
+  compact_done: 'thinking',
+  awaiting_input: null,
+  done: null,
+  error: null,
+  cancelled: null,
+}
 
 // Last n characters of the reasoning buffer, backing off from a cut that
 // would split a UTF-16 surrogate pair — the rendered content of the live
@@ -258,10 +276,9 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   // animations) grows the content height after the initial render.
   const chatContentRef = useRef(null)
   // Streaming phase drives the spinner label (thinking/processing/executing/
-  // compacting) and is derived from SSE events as they arrive. The reasoning
-  // teaser (first line of the model's live thinking) is shown next to the
-  // label while the phase is "thinking" and dropped the moment it changes —
-  // reasoning never reaches the persisted timeline.
+  // compacting) and is derived from SSE events as they arrive. Reasoning is
+  // shown only in the live window below the label while the phase is
+  // "thinking" — it never reaches the persisted timeline.
   const [streamPhase, setStreamPhase] = useState(null)
   // Live "thinking" window. The buffer ref accumulates the current reasoning
   // segment in full; thinkingLive mirrors only its throttled tail so the
@@ -270,7 +287,6 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   const liveBufferRef = useRef('')
   const liveFlushAtRef = useRef(0)
   const segOpenRef = useRef(false)
-  const segStartAtRef = useRef(0)
   // Auto-follow for the live window — released when the user scrolls up.
   const thinkBoxRef = useRef(null)
   const thinkFollowRef = useRef(true)
@@ -337,6 +353,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   const autoApproveBtnRef = useRef(null)
   const [autoApproveMenuPos, setAutoApproveMenuPos] = useState({ bottom: 0, left: 0 })
   const autoApproveSettings = useStore(s => s.autoApproveSettings)
+  const autoApproveLoadFailed = useStore(s => s.autoApproveLoadFailed)
+  const loadAutoApproveSettings = useStore(s => s.loadAutoApproveSettings)
   const setAutoApproveType = useStore(s => s.setAutoApproveType)
   const currentProject = useStore(s => s.currentProject)
   const skillsVersion = useStore(s => s.skillsVersion)
@@ -1553,28 +1571,10 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
   function resetThinkingLive() {
     segOpenRef.current = false
-    segStartAtRef.current = 0
     liveBufferRef.current = ''
     liveFlushAtRef.current = 0
     thinkFollowRef.current = true
     setThinkingLive('')
-  }
-
-  // Close the open thinking segment and shape it as a timeline entry with its
-  // measured duration. Null when nothing was open or the text stayed empty.
-  // Runs at event-dispatch level (outside the setMessages updater) so the ref
-  // flip stays idempotent across updater re-invocations.
-  function takeClosedThought() {
-    if (!segOpenRef.current) return null
-    segOpenRef.current = false
-    const content = liveBufferRef.current
-    const durationMs = Math.max(0, Date.now() - segStartAtRef.current)
-    liveBufferRef.current = ''
-    liveFlushAtRef.current = 0
-    thinkFollowRef.current = true
-    setThinkingLive('')
-    if (!content.trim()) return null
-    return { type: 'thinking', content, durationMs }
   }
 
   async function processSSEStream(reader, decoder, abortSignal) {
@@ -1629,15 +1629,14 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         }
         // Reasoning deltas — feed the live thinking window shown under the
         // spinner while the phase is "thinking". Each stretch of reasoning is
-        // one segment: opened on the first delta, appended to the timeline by
-        // takeClosedThought() when a later non-reasoning event closes it.
-        // The window only re-renders on the flush cadence.
+        // one segment: opened on the first delta, dropped (never appended to
+        // the timeline) when a later non-reasoning event closes it. The
+        // window only re-renders on the flush cadence.
         if (type === 'thought' && data.content) {
           setStreamPhase('thinking')
           const now = Date.now()
           if (!segOpenRef.current) {
             segOpenRef.current = true
-            segStartAtRef.current = now
             liveBufferRef.current = ''
           }
           liveBufferRef.current += data.content
@@ -1647,13 +1646,13 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
           }
           return
         }
-        // A non-passive event ends reasoning — close any open segment here,
-        // before the setMessages updater, and let the branch below insert it
-        // at its chronological spot.
-        let pendingThought = null
+        // A non-passive event ends reasoning — the live window is transient
+        // by design (shown while thinking, dropped the moment it ends), so
+        // just reset the segment; nothing is appended to the timeline.
         if (type !== 'thought' && !THINK_PASSTHROUGH_TYPES.has(type)) {
-          pendingThought = takeClosedThought()
+          resetThinkingLive()
         }
+        if (type in STREAM_PHASE_BY_EVENT) setStreamPhase(STREAM_PHASE_BY_EVENT[type])
         setMessages(prev => {
           const newMsgs = [...prev]
           const lastIdx = newMsgs.length - 1
@@ -1663,24 +1662,18 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
           if (type === 'stream_status') {
             const statusMessage = streamStatusText(data, t)
-            // Closed reasoning lands after prior steps, before this event's
-            // own transient status hint.
-            const baseProcess = pendingThought ? [...currentProcess, pendingThought] : currentProcess
             if (statusMessage) {
               const processForStatus = data.status === 'retrying'
-                ? baseProcess.filter(s => s.type !== 'streaming_text')
-                : baseProcess
+                ? currentProcess.filter(s => s.type !== 'streaming_text')
+                : currentProcess
               lastMsg.process = withTransientHint(processForStatus, statusMessage, {
                 retry: data.status === 'retrying',
                 error: data.status === 'retrying' ? data.error : undefined,
               })
             } else {
-              lastMsg.process = baseProcess
+              lastMsg.process = currentProcess
             }
           } else if (type === 'delta') {
-            setStreamPhase('processing')
-            resetThinkingLive()
-            if (pendingThought) currentProcess.push(pendingThought)
             const streamIdx = currentProcess.findLastIndex(s => s.type === 'streaming_text')
             if (streamIdx >= 0) {
               currentProcess[streamIdx] = { ...currentProcess[streamIdx], content: currentProcess[streamIdx].content + data.content }
@@ -1689,12 +1682,9 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             }
             lastMsg.process = currentProcess
           } else if (type === 'tool_start') {
-            setStreamPhase('executing')
-            resetThinkingLive()
             const finalProcess = currentProcess.map(s =>
               s.type === 'streaming_text' ? { type: 'hint', content: s.content } : s
             )
-            if (pendingThought) finalProcess.push(pendingThought)
             const toolStep = { type: 'tool', tool: data.tool, params: data.params, status: 'running' }
             // Store tool_call_id for agent_event matching
             if (data.tool_call_id) {
@@ -1704,8 +1694,6 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             finalProcess.push(toolStep)
             lastMsg.process = finalProcess
           } else if (type === 'tool_end') {
-            // Tool result is in — the next LLM iteration starts with reasoning
-            setStreamPhase('thinking')
             const updated = currentProcess.map(s => {
               // Match by tool_call_id first, then by tool name + running status
               if (data.tool_call_id && s._toolCallId === data.tool_call_id) {
@@ -1718,15 +1706,9 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             })
             lastMsg.process = updated
           } else if (type === 'compact_start') {
-            setStreamPhase('compacting')
-            resetThinkingLive()
-            lastMsg.process = withTransientHint(
-              pendingThought ? [...currentProcess, pendingThought] : currentProcess,
-              t('chat.compacting'),
-            )
+            lastMsg.process = withTransientHint(currentProcess, t('chat.compacting'))
           } else if (type === 'compact_done') {
             setContextStats(data)
-            setStreamPhase('thinking')
             // With the summary the step renders as the same expandable card
             // the history view shows after refresh; backends that predate the
             // summary field get the plain hint.
@@ -1827,9 +1809,6 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             }
             lastMsg.process = currentProcess
           } else if (type === 'awaiting_input') {
-            setStreamPhase(null)
-            resetThinkingLive()
-            if (pendingThought) currentProcess.push(pendingThought)
             currentProcess.push({ type: 'awaiting_input', interaction_type: data.interaction_type, data: data, transient: true })
             lastMsg.process = currentProcess
             if (data.interaction_type === 'permission') {
@@ -1838,8 +1817,6 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               pendingInteractionRef.current = { type: data.interaction_type, data: data, sessionId }
             }
           } else if (type === 'done') {
-            setStreamPhase(null)
-            resetThinkingLive()
             const streamIdx = currentProcess.findLastIndex(s => s.type === 'streaming_text')
             if (streamIdx >= 0) {
               lastMsg.content = currentProcess[streamIdx].content
@@ -1855,36 +1832,22 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             const lastStep = currentProcess[currentProcess.length - 1]
             const isPausingForInput = lastStep?.type === 'awaiting_input'
             if (isPausingForInput) {
-              lastMsg.process = [
-                ...currentProcess.filter(s => s.type !== 'streaming_text'),
-                ...(pendingThought ? [pendingThought] : []),
-              ]
+              lastMsg.process = currentProcess.filter(s => s.type !== 'streaming_text')
             } else {
-              lastMsg.process = [
-                ...currentProcess.filter(s => !s.transient && s.type !== 'streaming_text'),
-                ...(pendingThought ? [pendingThought] : []),
-              ]
+              lastMsg.process = currentProcess.filter(s => !s.transient && s.type !== 'streaming_text')
             }
           } else if (type === 'error') {
-            setStreamPhase(null)
-            resetThinkingLive()
             const content = data.content || data.error || data.message || t('chat.toast.unknownError')
             lastMsg.content = content
             lastMsg.created_at = new Date().toISOString()
             const duration = turnDurationMs(newMsgs, lastIdx)
             if (duration != null) lastMsg.durationMs = duration
-            lastMsg.process = [
-              ...currentProcess.filter(s => !s.transient && s.type !== 'streaming_text'),
-              ...(pendingThought ? [pendingThought] : []),
-            ]
+            lastMsg.process = currentProcess.filter(s => !s.transient && s.type !== 'streaming_text')
             if (data.usage) {
               lastMsg.usage = data.usage
             }
           } else if (type === 'cancelled') {
-            setStreamPhase(null)
-            resetThinkingLive()
             lastMsg.interrupted = true
-            if (pendingThought) lastMsg.process = [...currentProcess, pendingThought]
             const duration = turnDurationMs(newMsgs, lastIdx)
             if (duration != null) lastMsg.durationMs = duration
             if (data.usage) {
@@ -2824,6 +2787,9 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               setShowAutoApproveMenu(opening)
               if (opening && autoApproveBtnRef.current) {
                 setSettingsPanel('main')
+                // Re-read from the backend on every open — the store is only a
+                // snapshot and other tabs / the dialog checkbox can change it.
+                if (currentProject) loadAutoApproveSettings(currentProject.id)
                 const rect = autoApproveBtnRef.current.getBoundingClientRect()
                 setAutoApproveMenuPos({
                   bottom: window.innerHeight - rect.top + 4,
@@ -3000,7 +2966,22 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             )}
             {settingsPanel === 'approve' && (
               <div className="px-3 py-2 space-y-2">
-              {toolTypes.map(({ key, label, desc }) => {
+              {autoApproveLoadFailed ? (
+                // The stored snapshot is untrustworthy (could read all-off
+                // while the backend auto-approves) — hide the toggles until a
+                // successful reload instead of showing a fake state.
+                <div className="flex items-center gap-2 px-3 py-2.5 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl">
+                  <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 text-amber-500 dark:text-amber-400" />
+                  <span className="flex-1 min-w-0 text-[10px] leading-snug text-amber-700 dark:text-amber-300">{t('permission.loadFailed')}</span>
+                  <button
+                    onClick={() => currentProject && loadAutoApproveSettings(currentProject.id)}
+                    disabled={!currentProject}
+                    className="flex-shrink-0 px-2 py-1 rounded-lg text-[10px] font-semibold bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-200 hover:bg-amber-200 dark:hover:bg-amber-900/60 transition-colors"
+                  >
+                    {t('permission.retry')}
+                  </button>
+                </div>
+              ) : toolTypes.map(({ key, label, desc }) => {
                 const enabled = autoApproveSettings[key] === true
                 const isLoading = approvingCategory === key
                 return (
@@ -3022,6 +3003,10 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                         try {
                           await permissionsAPI.setAutoApprove(currentProject.id, { category: key, enabled: next })
                           setAutoApproveType(key, next)
+                          // Reconcile the whole snapshot from the backend —
+                          // also clears a stale load-failed banner now that
+                          // the backend is proven reachable.
+                          loadAutoApproveSettings(currentProject.id)
                         } catch (e) {
                           toastError(t('permission.toggleFailed'))
                         } finally {

@@ -9,6 +9,7 @@ from app.core.compaction_text import (
     split_boundary_content,
 )
 from app.core.message_format import file_edit_stats, page_ui_turns, shape_messages_for_ui
+from app.core.text_diff import DIFF_LINE_SOFT_LIMIT
 
 
 def _row(seq, role, content="", *, boundary=False, tool_calls=None, tool_call_id=None):
@@ -158,8 +159,13 @@ def test_file_edit_stats_counts_edit_lines():
     assert meta["path"] == "src/app.py"
     assert meta["adds"] == 2
     assert meta["dels"] == 1
-    assert meta["diff"].splitlines() == [
-        "@@ -1,3 +1,4 @@", " a", "-b", "+B", " c", "+d",
+    assert meta["diff_truncated"] is False
+    assert meta["diff_lines"] == [
+        {"type": "context", "content": "a"},
+        {"type": "remove", "content": "b"},
+        {"type": "add", "content": "B"},
+        {"type": "context", "content": "c"},
+        {"type": "add", "content": "d"},
     ]
 
 
@@ -175,28 +181,55 @@ def test_file_edit_stats_write_reports_content_lines_without_dels():
     meta = file_edit_stats("write", {
         "file_path": "new.py", "content": "a\nb\nc",
     }, result="File written: new.py (12 chars)")
-    assert meta == {"kind": "write", "path": "new.py", "adds": 3}
+    assert meta == {
+        "kind": "write", "path": "new.py", "adds": 3,
+        "content": "a\nb\nc", "content_truncated": False,
+    }
 
 
-def test_file_edit_stats_caps_diff_body_but_keeps_exact_counts():
-    new_body = "\n".join(f"line {i}" for i in range(50))
+def test_file_edit_stats_truncates_lines_at_soft_limit_but_keeps_exact_counts():
+    new_body = "\n".join(f"line {i}" for i in range(DIFF_LINE_SOFT_LIMIT + 5))
     meta = file_edit_stats("edit", {
         "file_path": "big.py", "old_string": "x", "new_string": new_body,
     }, result="File edited: big.py (1 replacement(s))")
-    assert meta["adds"] == 50
+    assert meta["adds"] == DIFF_LINE_SOFT_LIMIT + 5
     assert meta["dels"] == 1
-    lines = meta["diff"].splitlines()
-    assert len(lines) <= 41
-    assert lines[-1] == "…"
+    assert meta["diff_truncated"] is True
+    assert len(meta["diff_lines"]) == DIFF_LINE_SOFT_LIMIT
+
+    content = "\n".join("x" for _ in range(DIFF_LINE_SOFT_LIMIT + 1))
+    meta = file_edit_stats("write", {
+        "file_path": "big.py", "content": content,
+    }, result="File written: big.py")
+    assert meta["adds"] == DIFF_LINE_SOFT_LIMIT + 1
+    assert meta["content_truncated"] is True
+    assert meta["content"].count("\n") == DIFF_LINE_SOFT_LIMIT - 1
 
 
 def test_file_edit_stats_ignores_failures_and_non_file_calls():
     ok = {"file_path": "a.py", "old_string": "x", "new_string": "y"}
     assert file_edit_stats("read", ok, result="ok") is None
     assert file_edit_stats("edit", ok, result="Error: old_string not found in a.py") is None
+    assert file_edit_stats("edit", ok, result="Tool cancelled by user.") is None
+    assert file_edit_stats("edit", ok, result="Tool 'edit' error: disk full") is None
     assert file_edit_stats("edit", {"old_string": "x", "new_string": "y"}) is None
     assert file_edit_stats("edit", {"file_path": "a.py", "new_string": "y"}) is None
     assert file_edit_stats("edit", "not-a-dict", result="ok") is None
+
+
+def test_file_edit_stats_scales_counts_by_replacement_count():
+    meta = file_edit_stats("edit", {
+        "file_path": "a.py", "old_string": "x", "new_string": "y\nz",
+        "replace_all": True,
+    }, result="File edited: a.py (3 replacement(s))")
+    assert meta["adds"] == 6
+    assert meta["dels"] == 3
+    # The shipped diff stays one occurrence.
+    assert meta["diff_lines"] == [
+        {"type": "remove", "content": "x"},
+        {"type": "add", "content": "y"},
+        {"type": "add", "content": "z"},
+    ]
 
 
 def test_history_tool_step_carries_file_edit_only_for_successful_calls():
@@ -211,8 +244,11 @@ def test_history_tool_step_carries_file_edit_only_for_successful_calls():
         "edit", "a.py", 1, 1,
     )
 
-    entries = shape_messages_for_ui([
-        _row(1, "user", "fix it"),
-        *_tool_turn(2, "edit", args, "Error: old_string not found in a.py"),
-    ], None)
-    assert "fileEdit" not in entries[-1]["process"][0]
+    for failure in ("Error: old_string not found in a.py",
+                    "Tool cancelled by user.",
+                    "Tool 'edit' error: disk full"):
+        entries = shape_messages_for_ui([
+            _row(1, "user", "fix it"),
+            *_tool_turn(2, "edit", args, failure),
+        ], None)
+        assert "fileEdit" not in entries[-1]["process"][0]

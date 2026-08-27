@@ -343,10 +343,17 @@
   100% { background-color: rgba(217, 70, 239, 0);    box-shadow: 0 0 0 0 rgba(217, 70, 239, 0); }
 }
 
-/* Custom Animations */
+/* Custom Animations.
+   fill-mode is `backwards`, not `forwards`: every enter animation's end
+   state equals the element's base style, so filling after the animation
+   buys nothing — and holding an animated transform past the end keeps the
+   element on its own compositing layer, which misorders it against
+   backdrop-filter siblings on WebKit (invisible-dialog bug). `backwards`
+   still covers the pre-animation delay window and releases all animated
+   properties when the animation finishes. */
 .animate-in {
   animation-duration: 150ms;
-  animation-fill-mode: forwards;
+  animation-fill-mode: backwards;
 }
 
 .fade-in {
@@ -364,7 +371,7 @@
 
 @keyframes zoomIn {
   from { transform: scale(0.95); opacity: 0; }
-  to { transform: scale(1); opacity: 1; }
+  to { opacity: 1; }
 }
 
 .synctex-indicator {

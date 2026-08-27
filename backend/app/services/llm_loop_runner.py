@@ -608,11 +608,9 @@ class LLMLoopRunner:
                         return  # loop pauses
 
                     tool_result = f"Tool '{tool_name}' error: {exc}"
-                    yield self.sse(SSE_TOOL_END, {
-                        "tool": tool_name,
-                        "result_summary": tool_result[:200],
-                        "tool_call_id": tool_call_id,
-                    })
+                    yield self.sse(SSE_TOOL_END, self.tool_end_payload(
+                        tool_name, tool_args, tool_result, tool_call_id,
+                    ))
                     messages.append(self.msg(
                         "tool", tool_result, tool_call_id=tool_call_id,
                     ))
@@ -635,15 +633,9 @@ class LLMLoopRunner:
                     tool_result = tool_result[:MAX_TOOL_OUTPUT_CHARS] + "\n... [truncated]"
 
                 # Emit tool_end with tool_call_id
-                end_payload = {
-                    "tool": tool_name,
-                    "result_summary": strip_image_refs_tag(tool_result)[:200],
-                    "tool_call_id": tool_call_id,
-                }
-                edit_meta = file_edit_stats(tool_name, tool_args, result=tool_result)
-                if edit_meta:
-                    end_payload["file_edit"] = edit_meta
-                yield self.sse(SSE_TOOL_END, end_payload)
+                yield self.sse(SSE_TOOL_END, self.tool_end_payload(
+                    tool_name, tool_args, tool_result, tool_call_id,
+                ))
 
                 # Side-effect events (file_changed, annotation_changed, task_list)
                 fc_evt = self._emit_file_changed(tool_name, tool_args, tool_result)
@@ -1249,6 +1241,23 @@ class LLMLoopRunner:
     @staticmethod
     def sse(event_type: str, data: dict) -> dict:
         return {"type": event_type, "data": data}
+
+    @staticmethod
+    def tool_end_payload(tool_name: str, tool_args, tool_result: str,
+                         tool_call_id: str) -> dict:
+        """Data payload of a ``tool_end`` event, shared by the live loop and
+        query_loop's interaction-resume paths: result summary plus file-edit
+        metadata when the call was a successful edit/write (``tool_args``
+        non-dict — e.g. None for denials — skips the metadata)."""
+        payload = {
+            "tool": tool_name,
+            "result_summary": strip_image_refs_tag(tool_result)[:200],
+            "tool_call_id": tool_call_id,
+        }
+        edit_meta = file_edit_stats(tool_name, tool_args, result=tool_result)
+        if edit_meta:
+            payload["file_edit"] = edit_meta
+        return payload
 
     @staticmethod
     def _safe_params(params: dict) -> str:

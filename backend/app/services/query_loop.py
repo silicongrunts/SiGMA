@@ -698,11 +698,13 @@ class QueryLoop:
             async with UnitOfWork(self.project_id) as uow:
                 await uow.task_state.clear_interaction_by_session(self.session_id)
 
-            yield LLMLoopRunner.sse(SSE_TOOL_END, {
-                "tool": tool_name,
-                "result_summary": strip_image_refs_tag(tool_result)[:200],
-                "tool_call_id": tool_call_id,
-            })
+            # A denial executed nothing, so it must carry no file-edit
+            # metadata — pass None for the args. (Fork-agent rows are tool
+            # "agent", which never carries metadata either.)
+            yield LLMLoopRunner.sse(SSE_TOOL_END, LLMLoopRunner.tool_end_payload(
+                tool_name, tool_args if approved else None,
+                tool_result, tool_call_id,
+            ))
 
             # A file-mutating tool was just executed on approval — emit
             # file_changed so the frontend refreshes the file tree, matching the
@@ -838,16 +840,19 @@ class QueryLoop:
         else:
             inner_result = str(self._interaction_response or "")
 
-        # Emit tool_end for the inner tool
+        # Emit tool_end for the inner tool. Denials and plain interaction
+        # responses executed no edit/write, so they pass None for the args
+        # and carry no file-edit metadata.
         yield LLMLoopRunner.sse(SSE_AGENT_EVENT, {
             "parent_tool_call_id": parent_tool_call_id,
             "agent_type": agent_type,
             "inner_type": SSE_TOOL_END,
-            "inner_data": {
-                "tool": inner_tool_name,
-                "result_summary": inner_result[:200],
-                "tool_call_id": inner_tool_call_id,
-            },
+            "inner_data": LLMLoopRunner.tool_end_payload(
+                inner_tool_name,
+                inner_tool_args if is_permission and approved else None,
+                inner_result,
+                inner_tool_call_id,
+            ),
         })
 
         # A permission-approved file-mutating tool was just executed directly —

@@ -1686,3 +1686,30 @@ async def test_read_still_fails_when_session_id_is_none(monkeypatch, tmp_path):
     tool_msgs = [m for m in messages if m.get("role") == "tool"]
     assert tool_msgs
     assert "missing 1 required positional argument: 'session_id'" in tool_msgs[-1]["content"]
+
+
+def test_tool_end_payload_carries_file_edit_only_for_real_edits():
+    """The tool_end payload feeds the chat timeline's file-edit card, and the
+    permission-resume paths in query_loop reuse it. Pin the contract: a
+    successful edit/write carries file_edit; a denial (args=None, the call
+    never executed) and a failed call must not."""
+    args = {"file_path": "a.py", "old_string": "x", "new_string": "y"}
+
+    payload = LLMLoopRunner.tool_end_payload(
+        "edit", args, "File edited: a.py (1 replacement(s))", "call_1",
+    )
+    assert payload["tool"] == "edit"
+    assert payload["tool_call_id"] == "call_1"
+    assert payload["file_edit"]["path"] == "a.py"
+
+    # Denied permission: query_loop passes None so no card implies an edit
+    # that never ran.
+    denied = LLMLoopRunner.tool_end_payload(
+        "edit", None, "User denied permission to modify file: a.py", "call_1",
+    )
+    assert "file_edit" not in denied
+
+    failed = LLMLoopRunner.tool_end_payload(
+        "edit", args, "Tool 'edit' error: disk full", "call_1",
+    )
+    assert "file_edit" not in failed

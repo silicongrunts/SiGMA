@@ -32,7 +32,8 @@ from app.agents.tools.bash_permissions import check_bash_permission
 from app.agents.tools.registry import tool_registry
 from app.agents.tools.schema_validation import validate_tool_args
 from app.core.logging import get_logger
-from app.services.file_service import PathAccessLevel, compute_diff_lines, file_service
+from app.core.text_diff import DIFF_LINE_SOFT_LIMIT, compute_diff_lines
+from app.services.file_service import PathAccessLevel, file_service
 from app.services.llm_loop_runner import LLMLoopRunner
 
 logger = get_logger(__name__)
@@ -97,11 +98,6 @@ class PermissionRequestPause(Exception):
 PERMISSION_CATEGORIES: tuple[str, ...] = (
     "file_external", "file_internal", "bash", "notebook",
 )
-
-# Soft cap on the typed diff lines carried in an edit permission request.
-# Beyond this the diff is truncated and ``diff_truncated`` is set, keeping
-# SSE/checkpoint payloads modest while covering all but whole-file rewrites.
-DIFF_LINE_SOFT_LIMIT = 5000
 
 
 async def execute_with_permission(

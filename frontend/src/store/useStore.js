@@ -52,6 +52,7 @@ const initialState = {
   interactionDismissed: false,        // user closed the interaction modal without resolving (input stays gated)
   pendingPermission: null,            // {session_id, tool, tool_name, path, operation, content, description, diff_lines, diff_truncated}
   autoApproveSettings: {},            // { [toolType]: boolean } per-project, loaded on project switch
+  autoApproveLoadFailed: false,       // last fetch failed — UI must not present stale/all-off as real state
   taskList: [],                       // [{id, subject, status}]
   expandedTasks: false,               // auto-expand when tools modify tasks
   streamInteractionRequest: null,     // non-null triggers ChatPanel to start SSE for interaction response
@@ -88,7 +89,7 @@ const actions = (set, get) => ({
   setCurrentProject: (project) => set((state) => {
     if (state.currentProject?.id === project?.id) return { currentProject: project }
     // auto-approve settings are loaded from the backend by loadAutoApproveSettings()
-    return { currentProject: project, autoApproveSettings: {} }
+    return { currentProject: project, autoApproveSettings: {}, autoApproveLoadFailed: false }
   }),
   addProject: (p) => set((s) => ({ projects: [...s.projects, p] })),
   removeProject: (id) => set((s) => {
@@ -200,12 +201,16 @@ const actions = (set, get) => ({
     return { autoApproveSettings: settings }
   }),
   loadAutoApproveSettings: async (projectId) => {
-    // Fetch the four-category flags from the backend. Called after project switch.
+    // Fetch the four-category flags from the backend. Called after project
+    // switch and whenever the ChatPanel settings menu opens. On failure, set
+    // autoApproveLoadFailed so the UI shows an explicit error instead of
+    // silently rendering an all-off display while the backend may be
+    // auto-approving writes.
     try {
       const data = await permissionsAPI.getAutoApprove(projectId)
-      set({ autoApproveSettings: data || {} })
+      set({ autoApproveSettings: data || {}, autoApproveLoadFailed: false })
     } catch (e) {
-      // Keep the empty default on failure — toggles show all-off, safest.
+      set({ autoApproveSettings: {}, autoApproveLoadFailed: true })
     }
   },
   setTaskList: (tasks) => set({ taskList: tasks }),

@@ -5,13 +5,15 @@
  * PlanApprovalDialog.
  */
 import { useEffect, useState, useRef, useMemo } from 'react'
+import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import renderMathInElement from 'katex/dist/contrib/auto-render.mjs'
 import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
-import { ChevronDown, Brain, Cpu, CheckCircle2, Loader2, AlertCircle, FoldVertical, Search, FileText } from 'lucide-react'
+import { ChevronDown, Cpu, CheckCircle2, Loader2, AlertCircle, AlertTriangle, FoldVertical, Search, FileText, X } from 'lucide-react'
 import TaskList from './TaskList'
+import DiffView from './DiffView'
 
 marked.setOptions({ gfm: true, breaks: true })
 
@@ -300,48 +302,19 @@ export const MarkdownContent = ({ content, projectId = null, onCitation = null, 
 }
 
 /**
- * ThoughtStep — collapsed record of one completed reasoning segment: a
- * duration summary row that expands to the full reasoning text captured
- * live. Live-session only; history rebuilds carry no thinking entries.
- */
-function ThoughtStep({ step }) {
-    const { t } = useTranslation()
-    const [open, setOpen] = useState(false)
-    const seconds = Math.max(1, Math.round((step.durationMs || 0) / 1000))
-    return <div className="flex flex-col py-0.5">
-        <button
-            onClick={() => setOpen(!open)}
-            aria-expanded={open}
-            className="flex items-center gap-1.5 w-full text-left rounded transition-colors py-0.5 hover:bg-gray-50/50 dark:hover:bg-gray-800"
-        >
-            <Brain className="w-3 h-3 flex-shrink-0 text-violet-500 dark:text-violet-400" />
-            <span className="flex-1 min-w-0 truncate text-[10px] text-gray-600 dark:text-gray-300">{t('chat.thoughtFor', { count: seconds })}</span>
-            <ChevronDown className={`w-2.5 h-2.5 flex-shrink-0 text-gray-300 dark:text-gray-600 transition-transform ${open ? 'rotate-180' : ''}`} />
-        </button>
-        {open && (
-            <div className="ml-2 mt-0.5 max-h-72 overflow-y-auto rounded border border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900">
-                <pre className="p-1.5 whitespace-pre-wrap break-words text-[10px] leading-relaxed font-mono text-gray-500 dark:text-gray-400">{step.content}</pre>
-            </div>
-        )}
-    </div>
-}
-
-/**
  * FileEditStep — timeline card for a finished edit/write tool call: file
- * path with +adds/-dels badges; edits expand to the backend's capped
- * unified diff. Writes have no prior content to diff against, so they stay
- * a plain path + line-count row.
+ * path with +adds/-dels badges (line count for writes). Clicking opens a
+ * modal with the char-level diff (edit) or the written content (write).
  */
 function FileEditStep({ step }) {
     const { t } = useTranslation()
     const fe = step.fileEdit
     const [open, setOpen] = useState(false)
     const isEdit = fe.kind === 'edit'
-    const expandable = isEdit && !!fe.diff
-    return <div className="flex flex-col py-0.5">
+    return <div className="py-0.5">
         <button
-            onClick={() => expandable && setOpen(!open)}
-            className={`flex items-center gap-1.5 w-full text-left rounded transition-colors py-0.5 ${expandable ? 'hover:bg-gray-50/50 dark:hover:bg-gray-800' : 'cursor-default'}`}
+            onClick={() => setOpen(true)}
+            className="flex items-center gap-1.5 w-full text-left rounded transition-colors py-0.5 hover:bg-gray-50/50 dark:hover:bg-gray-800"
         >
             <FileText className="w-3 h-3 flex-shrink-0 text-emerald-500 dark:text-emerald-400" />
             <span className="flex-1 min-w-0 truncate text-[10px] font-mono text-gray-600 dark:text-gray-300" title={fe.path}>{fe.path}</span>
@@ -353,25 +326,60 @@ function FileEditStep({ step }) {
                     <span className="text-gray-400 dark:text-gray-500">{t('chat.linesWritten', { count: fe.adds })}</span>
                 )}
             </span>
-            {expandable && <ChevronDown className={`w-2.5 h-2.5 flex-shrink-0 text-gray-300 dark:text-gray-600 transition-transform ${open ? 'rotate-180' : ''}`} />}
         </button>
-        {open && expandable && (
-            <div className="ml-2 mt-0.5 max-h-48 overflow-y-auto rounded border border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900">
-                <pre className="p-1.5 text-[9px] leading-relaxed font-mono overflow-x-auto">
-                    {fe.diff.split('\n').map((line, i) => {
-                        const tone = line.startsWith('+')
-                            ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                            : line.startsWith('-')
-                                ? 'bg-rose-500/10 text-rose-600 dark:text-rose-300'
-                                : line.startsWith('@')
-                                    ? 'text-sigma-600 dark:text-sigma-300'
-                                    : 'text-gray-400 dark:text-gray-500'
-                        return <div key={i} className={`px-1 ${tone}`}>{line || ' '}</div>
-                    })}
-                </pre>
-            </div>
-        )}
+        {open && <FileEditModal fe={fe} onClose={() => setOpen(false)} />}
     </div>
+}
+
+/**
+ * FileEditModal — read-only preview of one finished edit/write call:
+ * side-by-side char-level diff (edit, the same DiffView the permission
+ * dialog renders) or the written content (write). ESC and backdrop close.
+ */
+function FileEditModal({ fe, onClose }) {
+    const { t } = useTranslation()
+    useEffect(() => {
+        const handleEsc = (e) => { if (e.key === 'Escape') onClose() }
+        window.addEventListener('keydown', handleEsc)
+        return () => window.removeEventListener('keydown', handleEsc)
+    }, [onClose])
+    const isEdit = fe.kind === 'edit'
+    const truncated = isEdit ? fe.diff_truncated : fe.content_truncated
+    // Portalled to <body>: the chat timeline sits inside animated, clipped
+    // containers (overflow-hidden panels, fade-in wrapper) whose stacking
+    // contexts can trap or clip a fixed-position child depending on the
+    // browser's compositing. The body root is the one place a fixed overlay
+    // is guaranteed to paint above the app.
+    return createPortal(
+        <div className="fixed inset-0 z-[5000] flex items-center justify-center p-4">
+            <div className="absolute inset-0 bg-gray-900/40 backdrop-blur-sm animate-in fade-in duration-300" onClick={onClose} />
+            <div className="bg-white dark:bg-gray-900 rounded-3xl w-full max-w-4xl relative z-[5001] shadow-2xl border border-gray-100 dark:border-gray-800 overflow-hidden flex flex-col max-h-[85vh] animate-in zoom-in duration-300">
+                <div className="px-5 py-3.5 border-b border-gray-100 dark:border-gray-800 flex items-center gap-2.5">
+                    <FileText className="w-4 h-4 flex-shrink-0 text-emerald-500 dark:text-emerald-400" />
+                    <span className="flex-1 min-w-0 truncate text-sm font-mono font-semibold text-gray-800 dark:text-gray-200" title={fe.path}>{fe.path}</span>
+                    <button onClick={onClose} className="flex-shrink-0 p-1 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+                        <X className="w-4 h-4" />
+                    </button>
+                </div>
+                <div className="flex-1 overflow-y-auto px-5 py-4">
+                    {isEdit ? (
+                        <div className="border border-gray-200 dark:border-gray-700 rounded-xl overflow-hidden">
+                            <DiffView lines={fe.diff_lines || []} maxH="max-h-[60vh]" />
+                        </div>
+                    ) : (
+                        <pre className="bg-gray-900 text-gray-100 rounded-xl px-4 py-3 text-xs font-mono leading-relaxed whitespace-pre-wrap break-all max-h-[60vh] overflow-y-auto">{fe.content}</pre>
+                    )}
+                    {truncated && (
+                        <div className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                            <AlertTriangle className="w-3 h-3 flex-shrink-0" />
+                            <span>{t(isEdit ? 'permission.diffTruncated' : 'chat.fileContentTruncated')}</span>
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>,
+        document.body
+    )
 }
 
 /**
@@ -473,11 +481,6 @@ export const ThinkingStep = ({ step }) => {
             <div className={`w-1 h-1 rounded-full flex-shrink-0 ${isLive ? 'bg-blue-400 animate-pulse' : 'bg-gray-300 dark:bg-gray-600'}`} />
             <div className={`text-[10px] leading-tight ${isLive ? 'text-gray-500 dark:text-gray-400' : 'text-gray-400 dark:text-gray-500 italic'}`}>{step.content}</div>
         </div>
-    }
-
-    // ── completed reasoning segment (live session only) ──
-    if (step.type === 'thinking') {
-        return <ThoughtStep step={step} />
     }
 
     // ── tool call ──
@@ -603,7 +606,7 @@ export const ThinkingProcess = ({ steps, isStreaming }) => {
                 <ChevronDown className={`w-2.5 h-2.5 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} />
             </button>
             {isOpen && (
-                <div className="mt-1 ml-0.5 pl-2 border-l-2 border-dashed border-gray-200 dark:border-gray-700 text-[10px] animate-in fade-in slide-in-from-top-1 duration-150">
+                <div className="mt-1 ml-0.5 pl-2 border-l-2 border-dashed border-gray-200 dark:border-gray-700 text-[10px] animate-in fade-in duration-150">
                     {groupReadLookups(visibleSteps).map((item, i) => (
                         item.group
                             ? <ReadToolGroup key={i} steps={item.group} isStreaming={isStreaming} />
