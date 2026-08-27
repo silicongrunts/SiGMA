@@ -160,7 +160,10 @@ class QueryLoop:
             done_data = {}
             if result.usage:
                 done_data["usage"] = extract_llm_usage(result.usage).to_dict()
-            yield LLMLoopRunner.sse(SSE_COMPACT_DONE, result.stats.to_dict())
+            yield LLMLoopRunner.sse(SSE_COMPACT_DONE, {
+                "summary": result.summary,
+                **result.stats.to_dict(),
+            })
             yield LLMLoopRunner.sse(SSE_CONTEXT_STATS, result.stats.to_dict())
             yield LLMLoopRunner.sse(SSE_DONE, done_data)
         except Exception as e:
@@ -453,7 +456,10 @@ class QueryLoop:
         self._persisted_real_input_tokens = 0
         self._persisted_real_count_at_index = 0
 
-        events.append(LLMLoopRunner.sse(SSE_COMPACT_DONE, result.stats.to_dict()))
+        events.append(LLMLoopRunner.sse(SSE_COMPACT_DONE, {
+            "summary": result.summary,
+            **result.stats.to_dict(),
+        }))
         events.append(LLMLoopRunner.sse(SSE_CONTEXT_STATS, result.stats.to_dict()))
         LLMLoopRunner.apply_cache_control(result.messages, target_offset=0)
         return result.messages, events

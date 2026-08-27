@@ -1598,7 +1598,12 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
           } else if (type === 'compact_done') {
             setContextStats(data)
             currentHintRef.current = t('chat.thinking')
-            currentProcess.push({ type: 'hint', content: t('chat.compacted') })
+            // With the summary the step renders as the same expandable card
+            // the history view shows after refresh; backends that predate the
+            // summary field get the plain hint.
+            currentProcess.push(data.summary
+              ? { type: 'compact', content: data.summary }
+              : { type: 'hint', content: t('chat.compacted') })
             lastMsg.process = currentProcess
             refreshCanEditFlags()
           } else if (type === 'agent_start') {
@@ -1644,7 +1649,9 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               } else if (innerType === 'compact_start') {
                 subSteps.splice(0, subSteps.length, ...withTransientHint(subSteps, innerData.message || t('chat.compacting')))
               } else if (innerType === 'compact_done') {
-                subSteps.push({ type: 'hint', content: t('chat.compacted') })
+                subSteps.push(innerData.summary
+                  ? { type: 'compact', content: innerData.summary }
+                  : { type: 'hint', content: t('chat.compacted') })
                 refreshCanEditFlags()
               } else if (innerType === 'stream_status') {
                 const statusMessage = streamStatusText(innerData, t)
@@ -1707,7 +1714,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             const streamIdx = currentProcess.findLastIndex(s => s.type === 'streaming_text')
             if (streamIdx >= 0) {
               lastMsg.content = currentProcess[streamIdx].content
-            } else if (!lastMsg.content && currentProcess.some(s => s.content === t('chat.compacted'))) {
+            } else if (!lastMsg.content && currentProcess.some(s => s.type === 'compact' || s.content === t('chat.compacted'))) {
               lastMsg.content = t('chat.compacted')
             }
             lastMsg.created_at = new Date().toISOString()
