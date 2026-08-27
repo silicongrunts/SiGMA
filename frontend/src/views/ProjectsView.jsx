@@ -8,6 +8,7 @@ import { useTranslation } from 'react-i18next'
 import { useStore } from '../store/useStore'
 import { projectsAPI, systemAPI } from '../api'
 import { storage } from '../utils/storage'
+import { isModelRoleConfigured } from '../utils/modelRoles'
 import { toastError, toastSuccess } from '../components/Toast'
 import { CreateProjectModal, ConfirmModal, UploadProjectModal } from '../components/Modal'
 import SkillPanel from '../components/SkillPanel'
@@ -76,6 +77,10 @@ function ExportOverlay({ projectName }) {
     </div>
   )
 }
+// Critical model roles: when any of them has no reuse-resolved model the
+// platform can't function, so the settings panel opens as mandatory.
+const CRITICAL_MODEL_ROLES = ['supervisor', 'ra', 'embedding']
+
 export default function ProjectsView() {
   const navigate = useNavigate()
   const projects = useStore(s => s.projects)
@@ -154,17 +159,16 @@ export default function ProjectsView() {
     return () => clearInterval(id)
   }, [backendError])
 
-  // Check whether supervisor / RA / embedding models are configured.
-  // If any is empty the platform can't function — force-open the system
-  // settings panel with close disabled.
+  // Check whether the critical model roles are configured. Configuration is
+  // judged on the reuse-resolved model name so a role reusing another one
+  // (e.g. ra with reuse: supervisor, which leaves models.ra.model empty)
+  // counts as configured — same semantics as the backend and the settings
+  // panel itself, otherwise a fully valid config would be trapped behind a
+  // non-dismissable panel.
   const checkCriticalModels = useCallback(async () => {
     try {
       const data = await systemAPI.getSettings()
-      const cfg = data.config
-      const supervisor = cfg?.models?.supervisor?.model || ''
-      const ra = cfg?.models?.ra?.model || ''
-      const embedding = cfg?.models?.embedding?.model || ''
-      const ok = !!(supervisor && ra && embedding)
+      const ok = CRITICAL_MODEL_ROLES.every(role => isModelRoleConfigured(data.config, role))
       if (!ok) {
         setShowSystemSettings(true)
         setForceSettings(true)

@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { AlertTriangle, BookOpen, Check, CheckCircle2, ChevronDown, Circle, Code2, Edit3, Eye, Globe2, Link2, Loader2, Lock, Minus, RotateCcw, Save, ShieldCheck, ShieldOff, Sparkles, XCircle, X } from 'lucide-react'
 import { systemAPI, authAPI } from '../api'
 import { createSSEStreamParser } from '../utils/sse'
+import { resolveModelRoleConfig } from '../utils/modelRoles'
 import { toastError } from './Toast'
 
 const MODEL_ROLES = [
@@ -134,12 +135,6 @@ function updateNested(object, path, value) {
   }
   current[path[path.length - 1]] = value
   return next
-}
-
-function resolveRoleConfig(config, role, seen = new Set()) {
-  const roleConfig = config?.models?.[role] || {}
-  if (!roleConfig.reuse || seen.has(role)) return roleConfig
-  return resolveRoleConfig(config, roleConfig.reuse, new Set([...seen, role]))
 }
 
 function endpointSummary(roleConfig) {
@@ -484,7 +479,7 @@ function ModelRoleForm({
   const reuseOptions = ROLE_REUSE_OPTIONS[role] || []
   const reuseTarget = roleConfig.reuse || ''
   const isReused = !!reuseTarget
-  const effectiveConfig = resolveRoleConfig(config, role)
+  const effectiveConfig = resolveModelRoleConfig(config, role)
   const roleProviders = providerRoles?.[role] || providers
 
   const handleProviderChange = (nextProvider) => {
