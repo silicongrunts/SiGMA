@@ -33,7 +33,7 @@ FlagEmbedding==1.4.0
 # C++ operator ABI.
 torch==2.13.0
 torchvision==0.28.0
-transformers==5.8.0
+transformers==5.10.1
 tokenizers==0.22.2
 numpy==2.4.4
 onnxruntime==1.25.1
