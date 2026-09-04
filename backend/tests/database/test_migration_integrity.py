@@ -85,26 +85,17 @@ def _fts_search(conn: sqlite3.Connection, term: str) -> list[tuple]:
     ).fetchall()
 
 
-def test_migrations_have_one_head_after_initial() -> None:
-    scripts = ScriptDirectory(str(ALEMBIC_DIR))
-    assert scripts.get_heads() == ["c8a6d03117f9"]
-    assert scripts.get_revision("c8a6d03117f9").down_revision == INITIAL_REVISION
-
-
-def test_migrated_schema_matches_models() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        db_path = Path(td) / "schema.db"
-        _build_fresh_db(db_path)
-        engine = create_engine(f"sqlite:///{db_path}")
-        try:
-            with engine.connect() as connection:
-                context = MigrationContext.configure(
-                    connection,
-                    opts={"compare_type": True},
-                )
-                diffs = compare_metadata(context, Base.metadata)
-        finally:
-            engine.dispose()
+def _assert_schema_matches_models(db_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as connection:
+            context = MigrationContext.configure(
+                connection,
+                opts={"compare_type": True},
+            )
+            diffs = compare_metadata(context, Base.metadata)
+    finally:
+        engine.dispose()
 
     relevant_diffs = [
         diff
@@ -120,6 +111,19 @@ def test_migrated_schema_matches_models() -> None:
         )
     ]
     assert not relevant_diffs, "schema drift: " + repr(relevant_diffs)
+
+
+def test_migrations_have_one_head_after_initial() -> None:
+    scripts = ScriptDirectory(str(ALEMBIC_DIR))
+    assert scripts.get_heads() == ["c8a6d03117f9"]
+    assert scripts.get_revision("c8a6d03117f9").down_revision == INITIAL_REVISION
+
+
+def test_migrated_schema_matches_models() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "schema.db"
+        _build_fresh_db(db_path)
+        _assert_schema_matches_models(db_path)
 
 
 def test_initial_to_head_backfills_completed_library_row() -> None:
@@ -327,6 +331,26 @@ def test_head_downgrade_to_initial_and_upgrade_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "roundtrip.db"
         _build_fresh_db(db_path)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # A folder-nested document must survive the downgrade's
+            # library_documents rebuild despite the parent_id cascade.
+            conn.executemany(
+                "INSERT INTO library_documents "
+                "(id, title, description, content, doc_type, revision, "
+                "processing_status, processing_log, is_folder, parent_id, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, '', ?, 'text', 1, 'completed', '', "
+                "?, ?, '2024-01-01', '2024-01-01')",
+                [
+                    ("folder1", "folder1", "", 1, None),
+                    ("docA", "docA", "xxalphatokenxx", 0, "folder1"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
         _downgrade_to(db_path, INITIAL_REVISION)
 
         conn = sqlite3.connect(str(db_path))
@@ -357,6 +381,9 @@ def test_head_downgrade_to_initial_and_upgrade_roundtrip() -> None:
             }
             assert "ix_sessions_project_id" in _sqlite_names(conn, "index")
             assert "ix_background_tasks_project_id" in _sqlite_names(conn, "index")
+            assert {
+                row[0] for row in conn.execute("SELECT id FROM library_documents")
+            } == {"folder1", "docA"}
         finally:
             conn.close()
 
@@ -374,6 +401,10 @@ def test_head_downgrade_to_initial_and_upgrade_roundtrip() -> None:
             }
             assert "annotation_file_states" in _sqlite_names(conn, "table")
             assert "annotation_file_transactions" in _sqlite_names(conn, "table")
+            assert {
+                row[0] for row in conn.execute("SELECT id FROM library_documents")
+            } == {"folder1", "docA"}
+            assert _fts_search(conn, "alphatoken") == [("docA",)]
         finally:
             conn.close()
 
@@ -512,3 +543,309 @@ def test_current_columns_indexes_and_tables_are_present() -> None:
             ]
         finally:
             engine.dispose()
+
+
+def test_initial_to_head_heals_drifted_fts_index() -> None:
+    """A v0.1.x database can carry an external-content FTS index that has
+    drifted from its content table (edits or deletes made while the sync
+    triggers were absent). FTS5 surfaces such drift unpredictably — from
+    silently wrong search results to "database disk image is malformed"
+    the moment a sync trigger fires for an affected row — which used to
+    brick the upgrade at the first library_documents batch rebuild and
+    strand the project.
+
+    Drift itself cannot be reproduced deterministically (the failure is
+    undefined behavior inside FTS5), so this fixture replaces the sync
+    triggers with ones that abort: any statement that lets a sync trigger
+    fire during the migration fails loudly and deterministically. The
+    migration must complete without firing them, heal the index from the
+    content table, and leave working triggers behind."""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "fts-drift.db"
+        _upgrade_to(db_path, INITIAL_REVISION)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _insert_library_document(conn, "docA", "xxalphatokenxx")
+            _insert_library_document(conn, "docB", "xxbetatokenxx")
+            conn.commit()
+
+            # Recreate v0.1.x-era drift: edit a row while the sync
+            # triggers are absent, so the index keeps the old tokens.
+            for trigger in (
+                "library_documents_ai",
+                "library_documents_ad",
+                "library_documents_au",
+            ):
+                conn.execute(f"DROP TRIGGER {trigger}")
+            conn.execute(
+                "UPDATE library_documents SET content = 'xxdeltatokenxx' "
+                "WHERE id = 'docB'"
+            )
+            # Poison the trigger names with their real event semantics:
+            # the metadata UPDATEs fire the update trigger, row deletes
+            # fire the delete trigger — none of them may run during the
+            # migration.
+            for trigger, event in (
+                ("library_documents_ai", "INSERT"),
+                ("library_documents_ad", "DELETE"),
+                ("library_documents_au", "UPDATE"),
+            ):
+                conn.execute(
+                    f"CREATE TRIGGER {trigger} AFTER {event} "
+                    "ON library_documents "
+                    "BEGIN SELECT RAISE(ABORT, 'sync trigger fired'); END"
+                )
+            conn.commit()
+
+            # Fixture proof: the poisoned triggers do fire on ordinary
+            # statements against the table.
+            with pytest.raises(sqlite3.DatabaseError, match="sync trigger fired"):
+                conn.execute(
+                    "DELETE FROM library_documents WHERE id = 'docA'"
+                )
+            conn.rollback()
+        finally:
+            conn.close()
+
+        _upgrade_to(db_path, "head")
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone()[0] == "c8a6d03117f9"
+
+            # The healed index reflects current content, not the drifted
+            # tokens, and passes FTS5's own consistency check.
+            assert _fts_search(conn, "deltatoken") == [("docB",)]
+            assert _fts_search(conn, "alphatoken") == [("docA",)]
+            assert _fts_search(conn, "betatoken") == []
+            conn.execute(
+                "INSERT INTO library_documents_fts(library_documents_fts) "
+                "VALUES('integrity-check')"
+            )
+
+            # The real sync triggers are restored and safe to fire.
+            conn.execute(
+                "UPDATE library_documents SET content = 'xxepsilontokenxx' "
+                "WHERE id = 'docA'"
+            )
+            conn.commit()
+            assert _fts_search(conn, "epsilontoken") == [("docA",)]
+            assert _fts_search(conn, "alphatoken") == []
+        finally:
+            conn.close()
+
+
+def test_initial_to_head_preserves_folder_nested_documents() -> None:
+    """``library_documents`` carries a self-referential ``parent_id`` ON
+    DELETE CASCADE. The batch rebuilds swap the table via DROP TABLE,
+    whose implicit DELETE — under the foreign-key enforcement alembic's
+    environment enables — cascades from every folder down through all
+    nested documents, silently destroying the user's library. Rebuilds
+    must run with foreign keys off; all documents must survive."""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "nested-docs.db"
+        _upgrade_to(db_path, INITIAL_REVISION)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.executemany(
+                "INSERT INTO library_documents "
+                "(id, title, description, content, doc_type, revision, "
+                "processing_status, processing_log, is_folder, parent_id, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, '', ?, 'text', 1, 'completed', '', "
+                "?, ?, '2024-01-01', '2024-01-01')",
+                [
+                    # folder → child document → grandchild folder → leaf
+                    ("folder1", "folder1", "", 1, None),
+                    ("docA", "docA", "xxalphatokenxx", 0, "folder1"),
+                    ("subfolder", "subfolder", "", 1, "folder1"),
+                    ("docB", "docB", "xxbetatokenxx", 0, "subfolder"),
+                    ("docC", "docC", "xxgammatokenxx", 0, None),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        _upgrade_to(db_path, "head")
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM library_documents"
+            ).fetchone()[0] == 5
+            assert {
+                row[0]
+                for row in conn.execute("SELECT id FROM library_documents")
+            } == {"folder1", "docA", "subfolder", "docB", "docC"}
+            # parent/child links survive the rebuild intact.
+            assert conn.execute(
+                "SELECT parent_id FROM library_documents WHERE id = 'docA'"
+            ).fetchone()[0] == "folder1"
+            assert _fts_search(conn, "alphatoken") == [("docA",)]
+            assert _fts_search(conn, "betatoken") == [("docB",)]
+            assert _fts_search(conn, "gammatoken") == [("docC",)]
+        finally:
+            conn.close()
+
+
+def test_initial_to_head_clears_alembic_tmp_leftovers() -> None:
+    """A previously failed upgrade leaves the batch temp tables it created
+    committed behind it (alembic executes SQLite DDL non-transactionally),
+    and every retry then dies at "table _alembic_tmp_* already exists"
+    before even reaching the original failure. The migration must drop
+    such leftovers before doing anything else."""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "tmp-leftover.db"
+        _upgrade_to(db_path, INITIAL_REVISION)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _insert_task_state(conn, "task-1", "owner-1", "queued")
+            _insert_library_document(conn, "docA", "xxalphatokenxx")
+            conn.commit()
+            # Residue exactly as an interrupted batch rebuild leaves it.
+            conn.execute(
+                "CREATE TABLE _alembic_tmp_task_state "
+                "(task_id VARCHAR NOT NULL, status VARCHAR NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE _alembic_tmp_library_documents "
+                "(id VARCHAR NOT NULL)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        _upgrade_to(db_path, "head")
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name GLOB '_alembic_tmp_*'"
+            ).fetchall() == []
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_state"
+            ).fetchone()[0] == 1
+            assert _fts_search(conn, "alphatoken") == [("docA",)]
+        finally:
+            conn.close()
+
+
+def test_initial_to_head_survives_killed_attempt_prefix() -> None:
+    """alembic executes SQLite DDL non-transactionally, so an upgrade
+    killed partway (crash, power loss, SIGKILL) can leave an arbitrary
+    prefix of the schema applied while alembic_version still says
+    bb1b30aeff77. Re-running must treat every already-applied step as a
+    no-op. This fixture applies everything except the version bump, then
+    lets the migration run on top of it."""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "killed-prefix.db"
+        _upgrade_to(db_path, INITIAL_REVISION)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "INSERT INTO sessions (id, project_id, title, session_kind, "
+                "created_at, updated_at, is_archived) "
+                "VALUES ('s1', 'legacy-pid', 'Chat', 'chat', "
+                "'2024-01-01', '2024-01-01', 0)"
+            )
+            conn.execute(
+                "INSERT INTO messages (id, session_id, role, content, "
+                "token_count, cached_tokens, input_tokens, is_boundary, seq, "
+                "created_at) VALUES "
+                "('m1', 's1', 'user', 'hello', 0, 0, 0, 0, 0, '2024-01-01')"
+            )
+            _insert_task_state(conn, "task-1", "owner-1", "queued")
+            conn.execute(
+                "INSERT INTO background_tasks (id, project_id, kind, queue, "
+                "status, priority, payload_json, attempt_count, max_attempts, "
+                "created_at, updated_at) VALUES "
+                "('b1', 'legacy-pid', 'document_process', 'library', 'queued', "
+                "100, '{}', 0, 3, '2024-01-01', '2024-01-01')"
+            )
+            _insert_library_document(conn, "docA", "xxalphatokenxx")
+            conn.commit()
+
+            # The prefix a killed first attempt may have committed.
+            conn.execute("ALTER TABLE task_state DROP COLUMN heartbeat_at")
+            conn.execute(
+                "CREATE UNIQUE INDEX uq_task_state_owner_runnable "
+                "ON task_state (owner_type, owner_id) "
+                "WHERE status IN ('queued', 'running', 'cancelling')"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX uq_task_state_owner_parked "
+                "ON task_state (owner_type, owner_id) "
+                "WHERE status IN ('awaiting_input', 'interaction_consuming', "
+                "'interaction_failed')"
+            )
+            conn.execute(
+                "ALTER TABLE background_tasks ADD COLUMN not_before DATETIME"
+            )
+            for column in (
+                "indexed_revision",
+                "indexed_generation",
+                "index_generation",
+            ):
+                conn.execute(
+                    f"ALTER TABLE library_documents ADD COLUMN {column} INTEGER"
+                )
+            conn.execute(
+                "UPDATE library_documents SET index_generation = 0 "
+                "WHERE index_generation IS NULL"
+            )
+            conn.execute(
+                "UPDATE library_documents SET indexed_revision = revision, "
+                "indexed_generation = 0 WHERE processing_status = 'completed' "
+                "AND indexed_revision IS NULL"
+            )
+            conn.execute(
+                "CREATE TABLE annotation_file_states ("
+                "file_path VARCHAR(500) NOT NULL, "
+                "revision INTEGER NOT NULL DEFAULT 0, "
+                "file_hash VARCHAR(64), updated_at DATETIME NOT NULL, "
+                "PRIMARY KEY (file_path))"
+            )
+            conn.execute(
+                "CREATE TABLE annotation_file_transactions ("
+                "id VARCHAR(36) NOT NULL, file_path VARCHAR(500) NOT NULL, "
+                "expected_revision INTEGER NOT NULL, "
+                "expected_file_hash VARCHAR(64) NOT NULL, "
+                "new_file_hash VARCHAR(64) NOT NULL, "
+                "old_content TEXT NOT NULL, mutations TEXT NOT NULL, "
+                "created_at DATETIME NOT NULL, PRIMARY KEY (id))"
+            )
+            conn.execute(
+                "CREATE INDEX ix_annotation_file_transactions_file_path "
+                "ON annotation_file_transactions (file_path)"
+            )
+            conn.execute("DROP INDEX ix_sessions_project_id")
+            conn.execute("ALTER TABLE sessions DROP COLUMN project_id")
+            conn.execute("DROP INDEX ix_background_tasks_project_id")
+            conn.execute(
+                "ALTER TABLE background_tasks DROP COLUMN project_id"
+            )
+            conn.execute(
+                "ALTER TABLE library_documents DROP COLUMN embedding_id"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        _upgrade_to(db_path, "head")
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone()[0] == "c8a6d03117f9"
+            assert conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 's1'"
+            ).fetchone()[0] == 1
+            assert _fts_search(conn, "alphatoken") == [("docA",)]
+        finally:
+            conn.close()
+        _assert_schema_matches_models(db_path)
