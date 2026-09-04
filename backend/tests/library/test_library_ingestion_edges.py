@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from app.core.utils import sanitize_filename
 from app.core.exceptions import FileSystemError
 from app.services.document_processing_service import UPLOADABLE_EXTENSIONS
+from tests.factories.uploads import ChunkedUpload
 
 
 # ---------------------------------------------------------------------------
@@ -74,34 +75,52 @@ def test_bat_not_uploadable():
 
 
 # ---------------------------------------------------------------------------
-# Text file encoding
+# Text file encoding — driven through the real processing path
 # ---------------------------------------------------------------------------
 
-def test_read_text_with_invalid_utf8():
-    """Text files with invalid UTF-8 should be readable with errors='replace'."""
+@pytest.mark.asyncio
+async def test_processing_reads_bad_utf8_text_with_replacement_chars():
+    """_run_processing_logic's text branch reads with
+    ``encoding='utf-8', errors='replace'``: undecodable bytes reach the
+    stored content as U+FFFD instead of killing the ingestion task with a
+    UnicodeDecodeError."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.services.document_processing_service import DocumentProcessingService
+
+    svc = DocumentProcessingService()
+
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="wb") as f:
         # Invalid UTF-8 sequence
         f.write(b"Hello \xff\xfe World")
         tmp_path = f.name
 
     try:
-        content = Path(tmp_path).read_text(encoding="utf-8", errors="replace")
+        saved = {}
+        with patch("app.services.library_service.library_service") as mock_ls, \
+             patch("app.services.background_task_service.background_task_service") as mock_bg, \
+             patch.object(svc, "_should_stop", AsyncMock(return_value=False)):
+            mock_ls.mark_document_processing = AsyncMock(return_value=True)
+            mock_ls.mark_document_indexing = AsyncMock(return_value=True)
+            mock_ls.append_processing_log = AsyncMock()
+            mock_ls.update_document_content = AsyncMock(
+                side_effect=lambda _p, _d, content, **_: saved.update(content=content),
+            )
+            # description + keywords populated so no AI extraction is attempted
+            mock_ls.get_document = AsyncMock(return_value={
+                "id": "doc1", "content": "", "file_path": tmp_path,
+                "description": "already described", "keywords": ["k"],
+                "source": "user upload", "title": "T",
+            })
+            mock_bg.enqueue_rag_index = AsyncMock()
+
+            await svc._run_processing_logic("proj1", "doc1")
+
+        content = saved["content"]
         assert "Hello" in content
         assert "World" in content
-        # Replacement chars should appear
+        # Replacement chars should appear where the invalid bytes were
         assert "\ufffd" in content
-    finally:
-        os.unlink(tmp_path)
-
-
-def test_read_empty_text_file():
-    """Empty text files should return empty string."""
-    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
-        tmp_path = f.name
-
-    try:
-        content = Path(tmp_path).read_text(encoding="utf-8", errors="replace")
-        assert content == ""
     finally:
         os.unlink(tmp_path)
 
@@ -227,7 +246,7 @@ async def test_upload_folder_path_creates_nested_library_folders():
     created = []
 
     class FakeUnitOfWork:
-        def __init__(self, project_id):
+        def __init__(self, project_id, immediate=False):
             self.library = SimpleNamespace(
                 get_child_by_title=AsyncMock(return_value=None),
                 create=AsyncMock(side_effect=self._create),
@@ -267,7 +286,7 @@ async def test_upload_folder_path_creates_nested_library_folders():
 def test_document_conversion_error():
     from app.core.exceptions import DocumentConversionError
     err = DocumentConversionError("/path/to/file.pdf", doc_id="abc")
-    assert "conversion" in str(err).lower() or "file.pdf" in str(err)
+    assert str(err) == "Document conversion failed: /path/to/file.pdf"
     assert err.details.get("stage") == "conversion"
     assert err.details.get("doc_id") == "abc"
 
@@ -277,3 +296,37 @@ def test_ai_extraction_error_non_fatal():
     err = AIExtractionError(doc_id="doc1", attempts=3)
     assert "3 attempts" in str(err)
     assert err.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# Concurrent same-title uploads: the duplicate-title check and the insert
+# share one immediate write transaction, so the loser takes the rename path.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_concurrent_same_title_uploads_get_distinct_db_titles(project):
+    """Two concurrent uploads of one name both succeed with distinct DB
+    titles: the second upload's check sees the first's committed row and
+    suffixes the title instead of racing past the check into a duplicate."""
+    import asyncio
+
+    from app.database.unit_of_work import UnitOfWork
+    from app.services.document_processing_service import DocumentProcessingService
+
+    svc = DocumentProcessingService()
+    results = await asyncio.gather(
+        svc.upload_files(project, [ChunkedUpload(b"one", filename="report.txt")]),
+        svc.upload_files(project, [ChunkedUpload(b"two", filename="report.txt")]),
+    )
+
+    assert [err for result in results for err in result["errors"]] == []
+    docs = [doc for result in results for doc in result["documents"]]
+    assert len({doc["id"] for doc in docs}) == 2
+    titles = sorted(doc["title"] for doc in docs)
+    assert titles[0] == "report"
+    assert titles[1].startswith("report_")
+
+    async with UnitOfWork(project) as uow:
+        rows = [doc for doc in await uow.library.get_all() if not doc.is_folder]
+    assert sorted(doc.title for doc in rows) == titles
+    assert len({doc.file_path for doc in rows}) == 2

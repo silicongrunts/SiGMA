@@ -1,3 +1,6 @@
+"""QueryLoop context-usage warnings injected by _prepare_messages: the 60%
+warning fires once per turn and the 90% critical notice supersedes it."""
+
 import pytest
 
 from app.services.compaction_service import ContextStats

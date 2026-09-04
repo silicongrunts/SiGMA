@@ -13,11 +13,9 @@ from app.services.file_service import file_service
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_get_children_includes_size_and_mtime(tmp_path, monkeypatch):
-    monkeypatch.setattr(file_service, "get_project_path", lambda project_id: tmp_path)
-
-    (tmp_path / "big.bin").write_bytes(b"\x00" * 4096)
-    (tmp_path / "sub").mkdir()
+async def test_get_children_includes_size_and_mtime(sandbox):
+    (sandbox / "big.bin").write_bytes(b"\x00" * 4096)
+    (sandbox / "sub").mkdir()
 
     result = await file_service.get_children("project", "")
 
@@ -32,13 +30,11 @@ async def test_get_children_includes_size_and_mtime(tmp_path, monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_get_children_omits_metadata_for_vanished_entries(tmp_path, monkeypatch):
+async def test_get_children_omits_metadata_for_vanished_entries(sandbox):
     """A dangling symlink still lists (its type falls back to file) but carries
     no mtime/size — the listing must not fail on entries unreadable mid-scan."""
-    monkeypatch.setattr(file_service, "get_project_path", lambda project_id: tmp_path)
-
     try:
-        (tmp_path / "dangling").symlink_to(tmp_path / "missing-target")
+        (sandbox / "dangling").symlink_to(sandbox / "missing-target")
     except (OSError, NotImplementedError):
         pytest.skip("symlinks unavailable on this platform")
 
@@ -52,10 +48,8 @@ async def test_get_children_omits_metadata_for_vanished_entries(tmp_path, monkey
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_get_project_tree_includes_size_and_mtime(tmp_path, monkeypatch):
-    monkeypatch.setattr(file_service, "get_project_path", lambda project_id: tmp_path)
-
-    (tmp_path / "data.csv").write_text("a,b\n1,2\n")  # 8 bytes
+async def test_get_project_tree_includes_size_and_mtime(sandbox):
+    (sandbox / "data.csv").write_text("a,b\n1,2\n")  # 8 bytes
 
     result = await file_service.get_project_tree("project")
 

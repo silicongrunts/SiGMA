@@ -1,13 +1,12 @@
 """
 Permission routes — auto-approve settings for agent write operations.
 
-Permission approval no longer uses a dedicated HTTP endpoint. When the LLM
-agent needs user approval for a write/bash/notebook operation, the task is
-parked as ``awaiting_input`` (same mechanism as interactive tools like
-``ask_user_question``). The user's response flows back through the chat resume
-path (``POST /chat/stream`` with ``resume=true`` and
+When the LLM agent needs user approval for a write/bash/notebook operation,
+the task is parked as ``awaiting_input`` (same mechanism as interactive tools
+like ``ask_user_question``). The user's response flows back through the chat
+resume path (``POST /chat/stream`` with ``resume=true`` and
 ``interaction_response``). This makes the permission flow crash-safe: a
-worker restart or page refresh does not lose the pending request.
+backend restart or page refresh does not lose the pending request.
 
 This module exposes the per-project auto-approve settings (one toggle per
 permission category) persisted in ``project_config``.

@@ -7,8 +7,6 @@ These cover the security-critical invariants:
 - the session token rotates when the password hash changes.
 """
 
-import pytest
-
 from app.core import auth
 from app.core.auth import (
     SESSION_COOKIE_NAME,
@@ -47,12 +45,6 @@ def test_session_token_changes_when_password_changes(monkeypatch):
     assert t1 != t2
     # Same inputs are stable (no server-side session store needed).
     assert session_token(h1) == t1
-
-
-def test_session_token_is_deterministic_for_same_inputs(monkeypatch):
-    monkeypatch.setattr(auth, "_auth_secret_cache", b"k" * 32)
-    h = hash_password("pw")
-    assert session_token(h) == session_token(h)
 
 
 def test_is_public_path():

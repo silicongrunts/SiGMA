@@ -5,7 +5,6 @@ The daemon relaunches Chrome when it exits, but only up to
 stops, so a corrupted profile cannot trigger unbounded relaunches.
 """
 
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,8 +14,10 @@ from app.services import browser_service as bs_module
 from app.services.browser_service import BrowserService
 
 
-def _make_service() -> BrowserService:
-    return BrowserService(base_dir="/tmp/sigma-test-daemon")
+def _make_service(tmp_path) -> BrowserService:
+    """BrowserService only resolves base_dir (never creates it), so a
+    per-test tmp dir keeps daemon bookkeeping out of the real /tmp."""
+    return BrowserService(base_dir=str(tmp_path / "browser-daemon"))
 
 
 def _dead_proc(returncode: int = 1) -> SimpleNamespace:
@@ -31,6 +32,11 @@ def _patch_sleep(monkeypatch):
     poll/interval sleeps only slow things down. Patching the module-level
     reference the daemon uses keeps each test under a few milliseconds.
     monkeypatch restores the original on teardown.
+
+    Scope note: ``bs_module.asyncio`` IS the shared asyncio module, so this
+    setattr rebinds ``asyncio.sleep`` process-wide until teardown. That is
+    safe in this serial, single-process suite; every patch site here goes
+    through monkeypatch, which undoes it before the next test runs.
     """
     async def _fast(_delay, *_args, **_kwargs):
         return None
@@ -38,8 +44,8 @@ def _patch_sleep(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_daemon_gives_up_after_max_relaunches(monkeypatch):
-    svc = _make_service()
+async def test_daemon_gives_up_after_max_relaunches(tmp_path, monkeypatch):
+    svc = _make_service(tmp_path)
     svc._running = True
     monkeypatch.setattr(svc, "_port_alive", lambda _port: True)
     _patch_sleep(monkeypatch)
@@ -57,9 +63,9 @@ async def test_daemon_gives_up_after_max_relaunches(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_daemon_resets_counter_when_chrome_is_alive(monkeypatch):
+async def test_daemon_resets_counter_when_chrome_is_alive(tmp_path, monkeypatch):
     """A live Chrome process at poll time clears the failure counter."""
-    svc = _make_service()
+    svc = _make_service(tmp_path)
     svc._running = True
     svc._chrome_relaunch_count = 3
     monkeypatch.setattr(svc, "_port_alive", lambda _port: True)
@@ -88,9 +94,9 @@ async def test_daemon_resets_counter_when_chrome_is_alive(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_daemon_stops_without_relaunch_when_shutdown_during_interval(monkeypatch):
+async def test_daemon_stops_without_relaunch_when_shutdown_during_interval(tmp_path, monkeypatch):
     """_running=False observed during the post-crash interval exits cleanly."""
-    svc = _make_service()
+    svc = _make_service(tmp_path)
     svc._running = True
     monkeypatch.setattr(svc, "_port_alive", lambda _port: True)
 

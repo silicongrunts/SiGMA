@@ -24,11 +24,12 @@ from app.agents.toolsets import (
     ALLOWED_AGENT_TYPES, FORK_FORBIDDEN_TOOLS,
 )
 from app.database.unit_of_work import UnitOfWork
-from app.services.llm_loop_runner import (
-    LLMLoopRunner, LoopContext, InteractiveToolPause,
+from app.core.chat_events import (
     SSE_CONTEXT_STATS, SSE_COMPACT_START, SSE_COMPACT_DONE, SSE_ERROR,
 )
-from app.services.permission_executor import PermissionRequestPause
+from app.services.llm_loop_runner import LLMLoopRunner, LoopContext
+from app.services.pauses import InteractiveToolPause, PermissionRequestPause
+from app.services.token_budget import extract_llm_usage
 from app.services.compaction_service import compaction_service
 from app.services.message_persist import stage_new_messages
 from app.services.project_service import project_service
@@ -396,7 +397,6 @@ class AgentService:
         """Spawn a general agent with independent context and persistent session."""
         async with UnitOfWork(project_id) as uow:
             session = await uow.sessions.create_agent_session(
-                project_id=project_id,
                 agent_type="general",
                 parent_session_id=parent_session_id,
                 parent_tool_call_id=parent_tool_call_id,
@@ -517,7 +517,6 @@ class AgentService:
         """Spawn a plan agent with persistent session for recoverability."""
         async with UnitOfWork(project_id) as uow:
             session = await uow.sessions.create_agent_session(
-                project_id=project_id,
                 agent_type="plan",
                 parent_session_id=parent_session_id,
                 parent_tool_call_id=parent_tool_call_id,
@@ -854,6 +853,11 @@ class AgentService:
             "message": "Session Compacting...",
             **stats.to_dict(),
         }))
+        # Boundary check: a turn the user already cancelled must not start a
+        # new compaction.
+        cancel_event = loop_ctx.cancel_event if loop_ctx else None
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError()
         try:
             result = await compaction_service.compact_messages(
                 messages,
@@ -862,6 +866,7 @@ class AgentService:
                 tools=tools,
                 token_budget_tracker=token_budget_tracker,
                 session_id=session_id,
+                cancel_event=cancel_event,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -872,6 +877,7 @@ class AgentService:
             async def _operation(uow):
                 await compaction_service.stage_session_boundary(
                     uow, session_id, result.boundary_content,
+                    usage=extract_llm_usage(result.usage).to_dict(),
                 )
                 await uow.sessions.stage_touch(session_id)
 

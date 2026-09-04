@@ -1,14 +1,13 @@
 /**
  * FileConflictModal — shown when a save conflicts with external disk changes.
  *
- * Displays a side-by-side diff between the disk version and the editor version,
- * with Cancel and Force Save buttons.
+ * Gives the user a safe reload/cancel choice after a compare-and-swap conflict.
  */
 import { AlertTriangle } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import DiffView from './DiffView'
 
-export default function FileConflictModal({ fileName, diffLines, onForceSave, onCancel }) {
+export default function FileConflictModal({ fileName, diffLines = [], onReload, onCancel }) {
   const { t } = useTranslation()
   return (
     <div className="fixed inset-0 z-[5000] flex items-center justify-center p-4">
@@ -31,7 +30,7 @@ export default function FileConflictModal({ fileName, diffLines, onForceSave, on
 
         {/* Diff view */}
         <div className="flex-1 overflow-hidden border-b border-gray-100 dark:border-gray-800">
-          <DiffView lines={diffLines} leftLabel={t('conflict.diskVersion')} rightLabel={t('conflict.yourVersion')} maxH="max-h-[50vh]" />
+          {diffLines.length ? <DiffView lines={diffLines} leftLabel={t('conflict.diskVersion')} rightLabel={t('conflict.yourVersion')} maxH="max-h-[50vh]" /> : <p className="p-6 text-sm text-gray-600 dark:text-gray-300">{t('conflict.reloadHint', 'Reload the latest disk version, then retry your edit.')}</p>}
         </div>
 
         {/* Actions */}
@@ -43,10 +42,10 @@ export default function FileConflictModal({ fileName, diffLines, onForceSave, on
             {t('common.cancel')}
           </button>
           <button
-            onClick={onForceSave}
+            onClick={onReload}
             className="px-5 py-2.5 bg-red-600 text-white font-bold rounded-xl hover:bg-red-700 shadow-lg shadow-red-200 dark:shadow-none transition-all active:scale-95 text-sm"
           >
-            {t('conflict.forceSave')}
+            {t('conflict.reload', 'Reload latest')}
           </button>
         </div>
       </div>

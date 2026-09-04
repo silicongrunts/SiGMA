@@ -322,7 +322,7 @@ function buildFontExtension(fontFamily, fontSize, lineHeight) {
 let _pendingCounter = 0
 function _genPendingId() { return `pending_${Date.now()}_${++_pendingCounter}` }
 
-const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll, onApplyDiffSave }, ref) => {
+const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnotationChanged, onAnnoNavScroll, onApplyDiffSave }, ref) => {
   const { t } = useTranslation()
   const containerRef = useRef(null); const viewRef = useRef(null); const cursorRef = useRef({ line: 1, column: 0 })
   const autoSaveTimerRef = useRef(null)
@@ -392,6 +392,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
   const fileVersion = useStore(s => s.fileVersion)
   const setIsTexFile = useStore(s => s.setIsTexFile)
   const setFileHash = useStore(s => s.setFileHash)
+  const setAnnotationCAS = useStore(s => s.setAnnotationCAS)
   const annotations = useStore(s => s.annotations)
   const addAnnotation = useStore(s => s.addAnnotation)
   const updateAnnotation = useStore(s => s.updateAnnotation)
@@ -414,8 +415,14 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     setEditorAppearance((prev) => ({ fontSize: prev.fontSize + delta }))
   }, [setEditorAppearance])
 
-  const callbacks = useRef({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll, onApplyDiffSave })
-  useEffect(() => { callbacks.current = { onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnoNavScroll, onApplyDiffSave } })
+  const callbacks = useRef({ onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnotationChanged, onAnnoNavScroll, onApplyDiffSave })
+  useEffect(() => { callbacks.current = { onContentChange, onScroll, onSave, onAutoSave, onLineChange, onCursorChange, onFileReady, onSaveBeforeAnnotationChat, onAnnotationChanged, onAnnoNavScroll, onApplyDiffSave } })
+  // Stable identity across renders: AnnotationPopup folds this into the
+  // consumeAnnotationStream deps, whose effect aborts/re-attaches the live
+  // annotation stream whenever the identity changes.
+  const handleAnnotationChanged = useCallback((filePath) => {
+    callbacks.current.onAnnotationChanged?.(filePath)
+  }, [])
 
   // ── Annotation helpers ──────────────────────────────────────────────
 
@@ -437,24 +444,22 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       || null
   }, [annotations])
 
-  // ── Save-time annotation sync ───────────────────────────────────────
-  // Called from handleSave (via imperative handle) BEFORE file content
-  // is written to disk. Matches annotations against current document,
-  // updates positions, deletes removed ones, and saves to backend.
-
-  /** Sync all persisted annotations: read decoration positions, update text, save. */
-  const syncAnnotationsNow = useCallback(async () => {
+  /** Build and persist the current file mutation. */
+  const syncAnnotationsNow = useCallback(async (documentContent = null) => {
     const view = viewRef.current
     const pid = useStore.getState().currentProject?.id
     const file = useStore.getState().currentFile
-    if (!view || !pid || !file) return
+    if (!pid || !file) return
+    if (!view) {
+      if (documentContent === null) return
+      return filesAPI.write(pid, file, documentContent, { hash: useStore.getState().fileHash }).then(result => ({ ...result, fileHash: result.hash }))
+    }
 
     const persisted = useStore.getState().annotations
-    if (persisted.length === 0) return
 
     const doc = view.state.doc.toString()
-    const toRemove = []   // decorations to delete
-    const resolved = []   // annotations to keep
+    const toRemove = []
+    const resolved = []
 
     for (const a of persisted) {
       // Skip orphan annotations — they have no match in the document and must
@@ -490,27 +495,35 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       })
     }
 
-    // Remove collapsed decorations
-    if (toRemove.length > 0) {
-      view.dispatch({ effects: toRemove.map(a => delAnnoEffect.of(a.id)) })
-      const activeId = useStore.getState().activeAnnotationId
-      if (activeId && toRemove.some(a => a.id === activeId)) {
-        setActiveAnnotationId(null)
-      }
-    }
-
-    // Update store + decorations
-    setAnnotations(resolved)
-    view.dispatch({ effects: setAnnosEffect.of(resolved) })
-    clampNavIndices()
-
-    // Save to backend. The backend preserves stored anchors for orphan
-    // annotations, so orphans are kept as-is without writing back positions.
     const toSave = resolved
-    if (toSave.length > 0 || toRemove.length > 0) {
-      try { await filesAPI.saveAnnotations(pid, file, toSave) } catch { /* non-critical */ }
+    const deleteIds = toRemove.map(a => a.id)
+    const cas = useStore.getState()
+    if (documentContent !== null) {
+      const result = await filesAPI.saveDocument(pid, file, documentContent, toSave, {
+        revision: cas.annotationRevision,
+        fileHash: cas.annotationFileHash || cas.fileHash,
+        deleteIds,
+      })
+      setAnnotations(resolved)
+      view.dispatch({ effects: setAnnosEffect.of(resolved) })
+      clampNavIndices()
+      setAnnotationCAS(result.revision, result.fileHash)
+      return result
     }
-  }, [clampNavIndices, getDecorationPosition, setAnnotations])
+    if (documentContent === null && (toSave.length > 0 || deleteIds.length > 0)) {
+      const result = await filesAPI.saveAnnotations(pid, file, toSave, {
+        revision: cas.annotationRevision,
+        fileHash: cas.annotationFileHash || cas.fileHash,
+        deleteIds,
+      })
+      setAnnotations(resolved)
+      view.dispatch({ effects: setAnnosEffect.of(resolved) })
+      clampNavIndices()
+      setAnnotationCAS(result.revision, result.fileHash)
+      return result
+    }
+    return { fileHash: cas.fileHash, revision: cas.annotationRevision }
+  }, [clampNavIndices, getDecorationPosition, setAnnotations, setAnnotationCAS])
 
   // ── Annotation CRUD ─────────────────────────────────────────────────
 
@@ -562,14 +575,8 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     const pending = pendingAnnosRef.current.find(a => a.id === pendingId)
     if (!pending) return null
 
-    // Get a real backend ID
-    const { id: backendId } = await filesAPI.createAnnotation(pid, file, {
-      from: pending.from,
-      to: pending.to,
-    })
-
     const persisted = {
-      id: backendId,
+      id: pendingId,
       from: pending.from,
       to: pending.to,
       originalText: pending.originalText,
@@ -581,26 +588,19 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       }],
     }
 
-    // Replace pending decoration with persisted one
-    view.dispatch({
-      effects: [
-        delAnnoEffect.of(pendingId),
-        addAnnoEffect.of({ id: backendId, from: pending.from, to: pending.to, status: 'valid' }),
-      ]
+    const cas = useStore.getState()
+    const saved = await filesAPI.saveAnnotations(pid, file, [persisted], {
+      revision: cas.annotationRevision,
+      fileHash: cas.annotationFileHash || cas.fileHash,
     })
-
-    const existingAnnotations = useStore.getState().annotations
-
-    // Move from pending ref to zustand store
+    view.dispatch({ effects: [delAnnoEffect.of(pendingId), addAnnoEffect.of({ id: pendingId, from: pending.from, to: pending.to, status: 'valid' })] })
     pendingAnnosRef.current = pendingAnnosRef.current.filter(a => a.id !== pendingId)
     addAnnotation(persisted)
-    setActiveAnnotationId(backendId)
+    setActiveAnnotationId(pendingId)
+    setAnnotationCAS(saved.revision, saved.fileHash)
 
-    // Save immediately (first reply = first persistence)
-    try { await filesAPI.saveAnnotations(pid, file, [...existingAnnotations, persisted]) } catch { /* non-critical */ }
-
-    return backendId
-  }, [addAnnotation])
+    return pendingId
+  }, [addAnnotation, setAnnotationCAS])
 
   /** User replied to a fuzzy/modified annotation, confirming the visible anchor. */
   const handleConfirmAnnotationAnchor = useCallback(async (annotationId) => {
@@ -629,12 +629,16 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       a.id === annotationId ? confirmed : a
     )
 
+    const cas = useStore.getState()
+    const result = await filesAPI.saveAnnotations(pid, file, [confirmed], {
+      revision: cas.annotationRevision,
+      fileHash: cas.annotationFileHash || cas.fileHash,
+    })
     setAnnotations(confirmedAnnotations)
     view.dispatch({ effects: setAnnosEffect.of(confirmedAnnotations) })
-
-    try { await filesAPI.saveAnnotations(pid, file, confirmedAnnotations) } catch { /* non-critical */ }
+    setAnnotationCAS(result.revision, result.fileHash)
     return true
-  }, [getDecorationPosition, setAnnotations])
+  }, [getDecorationPosition, setAnnotations, setAnnotationCAS])
 
   /** Cancel a pending annotation (popup closed without any reply). */
   const handleCancelPending = useCallback((pendingId) => {
@@ -643,6 +647,30 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     pendingAnnosRef.current = pendingAnnosRef.current.filter(a => a.id !== pendingId)
     setActiveAnnotationId(null)
     popupAnnoFromRef.current = null
+  }, [])
+
+  /** Re-match backend annotations against the current document text. */
+  const revalidateBackendAnnotations = useCallback((annos) => {
+    const view = viewRef.current
+    if (!view) return annos
+    const doc = view.state.doc.toString()
+    if (doc.length === 0) return annos.map(a => ({ ...a, status: 'modified' }))
+    return annos.map(a => {
+      const m = matchAnnotation(doc, { from: a.from, to: a.to, originalText: a.originalText })
+      if (m.status === 'orphan') {
+        // No match in the document — zero-width range, so no body decoration.
+        // Keep stored anchors intact (do NOT overwrite with the zero range);
+        // the backend preserves them and the broken-anchor list surfaces them.
+        return { ...a, status: 'orphan' }
+      }
+      return {
+        ...a,
+        from: m.from,
+        to: m.to,
+        originalText: m.originalText || a.originalText,
+        status: m.status === 'exact' ? 'valid' : 'modified',
+      }
+    })
   }, [])
 
   /** Delete an annotation. Handles both pending and persisted. */
@@ -655,21 +683,26 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       return
     }
 
-    // Persisted annotation
-    if (view) view.dispatch({ effects: delAnnoEffect.of(id) })
-
-    const updatedAnnotations = useStore.getState().annotations.filter(a => a.id !== id)
-    deleteAnnotation(id)
-    setActiveAnnotationId(null)
-    popupAnnoFromRef.current = null
-    clampNavIndices()
-
     try {
-      await filesAPI.saveAnnotations(currentProject.id, currentFile, updatedAnnotations)
+      const state = useStore.getState()
+      const result = await filesAPI.deleteAnnotation(currentProject.id, id, {
+        revision: state.annotationRevision,
+        fileHash: state.annotationFileHash || state.fileHash,
+      })
+      if (view) view.dispatch({ effects: delAnnoEffect.of(id) })
+      setActiveAnnotationId(null)
+      popupAnnoFromRef.current = null
+      clampNavIndices()
+      deleteAnnotation(id)
+      if (result?.revision != null) setAnnotationCAS(result.revision, result.fileHash)
     } catch (e) {
-      console.error('Failed to save annotations after delete', e)
+      toastError(e.status === 409 ? 'Annotation changed elsewhere. Reload and retry deletion.' : 'Could not delete annotation. It remains available for retry.')
+      const loaded = await filesAPI.loadAnnotations(currentProject.id, currentFile)
+      setAnnotationCAS(loaded.revision, loaded.fileHash)
+      setAnnotations(revalidateBackendAnnotations(loaded.annotations))
+      throw e
     }
-  }, [clampNavIndices, currentProject?.id, currentFile, deleteAnnotation, handleCancelPending])
+  }, [clampNavIndices, currentProject?.id, currentFile, deleteAnnotation, handleCancelPending, revalidateBackendAnnotations, setAnnotations, setAnnotationCAS])
 
   /** Apply a diff suggestion from an annotation reply. */
   const handleApplyDiff = useCallback(async (annotationId, diff) => {
@@ -779,29 +812,6 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     if (view) view.dispatch({ effects: flashEffect.of(null) })
   }, [])
 
-  const revalidateBackendAnnotations = useCallback((annos) => {
-    const view = viewRef.current
-    if (!view) return annos
-    const doc = view.state.doc.toString()
-    if (doc.length === 0) return annos.map(a => ({ ...a, status: 'modified' }))
-    return annos.map(a => {
-      const m = matchAnnotation(doc, { from: a.from, to: a.to, originalText: a.originalText })
-      if (m.status === 'orphan') {
-        // No match in the document — zero-width range, so no body decoration.
-        // Keep stored anchors intact (do NOT overwrite with the zero range);
-        // the backend preserves them and the broken-anchor list surfaces them.
-        return { ...a, status: 'orphan' }
-      }
-      return {
-        ...a,
-        from: m.from,
-        to: m.to,
-        originalText: m.originalText || a.originalText,
-        status: m.status === 'exact' ? 'valid' : 'modified',
-      }
-    })
-  }, [])
-
   /**
    * Re-derive the annotation index from viewport geometry. Called only on
    * user-driven (free) scrolls to keep the counter in sync. The scroll
@@ -839,12 +849,29 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     if (!view || !pid || !file) return null
 
     const loaded = await filesAPI.loadAnnotations(pid, file)
-    const validated = revalidateBackendAnnotations(loaded)
+    setAnnotationCAS(loaded.revision, loaded.fileHash)
+    const validated = revalidateBackendAnnotations(loaded.annotations)
     setAnnotations(validated)
     view.dispatch({ effects: setAnnosEffect.of(validated) })
     clampNavIndices()
     return annotationId ? validated.find(a => a.id === annotationId) || null : null
-  }, [clampNavIndices, revalidateBackendAnnotations, setAnnotations])
+  }, [clampNavIndices, revalidateBackendAnnotations, setAnnotations, setAnnotationCAS])
+
+  const reloadFromDisk = useCallback(async () => {
+    const state = useStore.getState()
+    const view = viewRef.current
+    if (!view || !state.currentProject?.id || !state.currentFile) return false
+    const data = await filesAPI.read(state.currentProject.id, state.currentFile)
+    const content = typeof data === 'string' ? data : (data.content || '')
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: content },
+      annotations: Transaction.addToHistory.of(false),
+    })
+    setFileHash(data?.hash ?? null)
+    useStore.getState().setHasUnsavedChanges(false)
+    await handleReloadAnnotations()
+    return true
+  }, [handleReloadAnnotations, setFileHash])
 
   // ── Editor click & popup ────────────────────────────────────────────
 
@@ -1166,8 +1193,9 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
       requestAnimationFrame(() => callbacks.current.onAnnoNavScroll?.())
     },
 
-    /** Save-time annotation sync: matches, updates, deletes, saves to backend. */
-    syncAnnotationsNow: () => syncAnnotationsNow(),
+    /** Persist the current editor mutation with annotation CAS metadata. */
+    syncAnnotationsNow: (content) => syncAnnotationsNow(content),
+    reloadFromDisk,
 
     /** Revalidate backend annotations against current document using matching algorithm. */
     revalidateBackendAnnos: revalidateBackendAnnotations,
@@ -1348,6 +1376,7 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
                     onPersist={handlePersistAnnotation}
                     onConfirmAnchor={handleConfirmAnnotationAnchor}
                     onReloadAnnotation={handleReloadAnnotations}
+                    onAnnotationChanged={handleAnnotationChanged}
                     onSaveBeforeAnnotationChat={() => callbacks.current.onSaveBeforeAnnotationChat?.()}
                     autoFocusReply={activeAnno.isPending && activeAnno.thread.length === 0}
                     popupStyle={popupStyle}

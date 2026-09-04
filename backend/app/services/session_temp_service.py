@@ -7,11 +7,8 @@ import shutil
 from pathlib import Path
 
 from app.core.config import settings
-from app.core.logging import get_logger
+from app.core.exceptions import FileSystemError
 from app.core.utils import is_within
-
-
-logger = get_logger(__name__)
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -39,9 +36,16 @@ class SessionTempService:
         if not target.exists():
             return
         if not target.is_dir():
-            logger.warning("Session temp path is not a directory: %s", target)
-            return
+            raise FileSystemError(
+                f"Session temporary storage is not a directory: {session_id}",
+                code="SESSION_TEMP_CLEANUP_FAILED",
+            )
         shutil.rmtree(target)
+        if target.exists():
+            raise FileSystemError(
+                f"Session temporary storage could not be removed: {session_id}",
+                code="SESSION_TEMP_CLEANUP_FAILED",
+            )
 
     def copy_session_dir(self, project_id: str, src_session_id: str, dst_session_id: str) -> None:
         """Copy one session's temp storage onto another session's directory.

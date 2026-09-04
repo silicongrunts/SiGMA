@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from app.core.config import Settings, dump_settings_yaml, load_settings_file, save_settings_yaml
 
@@ -19,14 +20,15 @@ def test_settings_yaml_round_trip(tmp_path: Path):
     assert loaded.SUPERVISOR_MODEL == "gpt-test"
     assert loaded.SUPERVISOR_PROVIDER == "openai"
     assert loaded.SUPERVISOR_API_KEY == "sk-test"
-    assert loaded.RAG_CANDIDATE_POOL_SIZE == 15
-    assert loaded.LIBRARY_WORKERS == 1
-    assert loaded.LIBRARY_QUEUE_BATCH_SIZE == 20
+    # Two representative defaults prove unrelated sections survive the
+    # round trip. Not every default constant gets its own pin: plain scalar
+    # fields with no serialization or migration subtleties (e.g.
+    # RAG_CANDIDATE_POOL_SIZE, LIBRARY_QUEUE_BATCH_SIZE, RETRY_DELAY,
+    # RETRY_MAX_DELAY) are intentionally left unpinned — the round-trip
+    # guarantee is structural, and pinning each default here would only
+    # duplicate config.py.
     assert loaded.LOG_LEVEL == "INFO"
-    assert loaded.LOG_RETENTION_DAYS == 14
     assert loaded.MAX_RETRIES == 10
-    assert loaded.RETRY_DELAY == 2.0
-    assert loaded.RETRY_MAX_DELAY == 64.0
     assert "stream:" not in path.read_text(encoding="utf-8")
 
 
@@ -86,9 +88,74 @@ def test_settings_yaml_accepts_logging_config():
     assert config.LOG_RETENTION_DAYS == 30
 
 
+def test_settings_yaml_accepts_background_cleanup_timeout(tmp_path: Path):
+    config = Settings.model_validate({
+        "background": {"library_scan_total_timeout_seconds": 90},
+    })
+
+    assert config.LIBRARY_SCAN_TOTAL_TIMEOUT_SECONDS == 90
+
+    # Round-trips through the canonical dump.
+    path = tmp_path / "settings.yaml"
+    path.write_text(dump_settings_yaml(config), encoding="utf-8")
+    assert load_settings_file(path).LIBRARY_SCAN_TOTAL_TIMEOUT_SECONDS == 90
+
+
+def test_settings_yaml_rejects_invalid_background_cleanup_timeout():
+    with pytest.raises(ValueError):
+        Settings.model_validate({
+            "background": {"library_scan_total_timeout_seconds": 0},
+        })
+
+
 def test_settings_yaml_rejects_invalid_logging_config():
     with pytest.raises(ValueError):
         Settings.model_validate({"logging": {"level": "verbose"}})
 
     with pytest.raises(ValueError):
         Settings.model_validate({"logging": {"retention_days": 0}})
+
+
+def test_load_settings_file_migrates_workers_atomically_and_idempotently(tmp_path: Path):
+    path = tmp_path / "settings.yaml"
+    path.write_text(
+        "workers:\n"
+        "  library_workers: 3\n"
+        "  task_cleanup_hours: 9\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_settings_file(path)
+    assert loaded.LIBRARY_CONCURRENCY == 3
+    assert loaded.BACKGROUND_TASK_CLEANUP_HOURS == 9
+    migrated = path.read_text(encoding="utf-8")
+    assert "workers" not in yaml.safe_load(migrated)
+
+    assert load_settings_file(path).LIBRARY_CONCURRENCY == 3
+    assert path.read_text(encoding="utf-8") == migrated
+
+
+def test_load_settings_file_migration_preserves_explicit_background_values(tmp_path: Path):
+    path = tmp_path / "settings.yaml"
+    path.write_text(
+        "workers:\n"
+        "  library_workers: 3\n"
+        "background:\n"
+        "  library_concurrency: 7\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_settings_file(path)
+
+    assert loaded.LIBRARY_CONCURRENCY == 7
+
+
+def test_invalid_settings_migration_leaves_original_file_unchanged(tmp_path: Path):
+    path = tmp_path / "settings.yaml"
+    original = "workers:\n  library_workers: invalid\n"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        load_settings_file(path)
+
+    assert path.read_text(encoding="utf-8") == original

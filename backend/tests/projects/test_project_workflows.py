@@ -15,17 +15,6 @@ from app.core.exceptions import DatabaseIncompatibleError
 from app.services.project_service import ProjectService
 
 
-@pytest.fixture
-def ps(tmp_path):
-    """Create a ProjectService pointing at a temp directory."""
-    svc = ProjectService()
-    svc.USERDATA_DIR = tmp_path
-    svc.SIGMA_DIR = tmp_path / ".SiGMA"
-    svc.SIGMA_DIR.mkdir(parents=True, exist_ok=True)
-    svc.PROJECTS_FILE = svc.SIGMA_DIR / "projects.json"
-    return svc
-
-
 # ---------------------------------------------------------------------------
 # Shared mock helpers
 # ---------------------------------------------------------------------------
@@ -148,9 +137,9 @@ async def test_open_project_returns_details_and_runs_snapshot_catchup(ps):
 # delete_project — test only the _update_projects delete path
 #
 # delete_project() touches UnitOfWork, DB manager, RAG cache, Jupyter,
-# stream_server etc.  Rather than mocking all of those, we test the
-# projects.json mutation directly via _update_projects, which is the
-# only part that changed in this round.
+# stream_hub etc.; the full orchestration is covered by
+# test_project_delete.py. Here we exercise the projects.json mutation
+# directly via _update_projects.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio

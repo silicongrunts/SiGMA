@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 # Canonical project root — the single source of truth for path resolution.
@@ -203,22 +209,43 @@ class TerminalSettings(BaseModel):
     grace_period: int = 600
 
 
-class WorkerSettings(BaseModel):
-    library_workers: int = 1
+class BackgroundSettings(BaseModel):
+    """In-process library queue runner tuning.
+
+    Library/RAG work runs as asyncio tasks inside the single web process
+    (``background_task_service``); there is no separate worker process.
+    """
+
+    library_concurrency: int = 1
     library_queue_batch_size: int = 20
     task_lease_seconds: int = 600
     task_cleanup_hours: int = 24
     library_scan_project_timeout_seconds: int = 30
+    # Wall-clock budget for one full daily-cleanup round. Its Chroma chunk
+    # scan loads the whole collection and can stall; without a bound it
+    # would keep the maintenance loop from reaching the next recovery sweep.
     library_scan_total_timeout_seconds: int = 120
 
     @field_validator(
-        "library_workers",
+        "library_concurrency",
         "library_queue_batch_size",
         "task_lease_seconds",
         "task_cleanup_hours",
         "library_scan_project_timeout_seconds",
         "library_scan_total_timeout_seconds",
     )
+    @classmethod
+    def _positive_int(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("must be a positive integer")
+        return value
+
+
+class FilesSettings(BaseModel):
+    # Size cap for project-file uploads (the Files module), not library documents.
+    upload_max_mb: int = 200
+
+    @field_validator("upload_max_mb")
     @classmethod
     def _positive_int(cls, value: int) -> int:
         if value <= 0:
@@ -238,6 +265,24 @@ class LibrarySettings(BaseModel):
     auto_ai_metadata_enabled: bool = True
     ai_metadata_max_input_tokens: int = 40_000
     ai_metadata_output_tokens: int = 20_000
+    # Size cap for library document uploads (ingestion/conversion), not Files-module uploads.
+    upload_max_mb: int = 100
+    upload_max_files: int = 100
+    upload_batch_max_mb: int = 500
+    # Per-conversion bound for the isolated Docling worker process. Large
+    # scanned PDFs can legitimately take several minutes; a hung conversion
+    # must not occupy a library worker slot for the full document budget.
+    conversion_timeout_seconds: float = Field(default=900.0, gt=0)
+    # Field extraction is a small LLM JSON call; a proportionate per-attempt
+    # bound keeps the synchronous route responsive.
+    ai_metadata_timeout_seconds: float = Field(default=120.0, gt=0)
+    # Worker threads shared by RAG init/indexing/search/reset, so a long
+    # rebuild does not stall user searches.
+    rag_executor_workers: int = 4
+    # Wall-clock budget for one document's full processing pipeline
+    # (conversion + AI extraction). With the default library concurrency
+    # of 1, a hung document would otherwise monopolize the queue runner.
+    max_processing_seconds: int = 4 * 60 * 60
 
     @field_validator(
         "top_k",
@@ -248,6 +293,11 @@ class LibrarySettings(BaseModel):
         "max_matches_per_doc",
         "ai_metadata_max_input_tokens",
         "ai_metadata_output_tokens",
+        "upload_max_mb",
+        "upload_max_files",
+        "upload_batch_max_mb",
+        "rag_executor_workers",
+        "max_processing_seconds",
     )
     @classmethod
     def _positive_int(cls, value: int) -> int:
@@ -267,7 +317,8 @@ class Settings(BaseModel):
     latex: LatexSettings = Field(default_factory=LatexSettings)
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     terminal: TerminalSettings = Field(default_factory=TerminalSettings)
-    workers: WorkerSettings = Field(default_factory=WorkerSettings)
+    background: BackgroundSettings = Field(default_factory=BackgroundSettings)
+    files: FilesSettings = Field(default_factory=FilesSettings)
     library: LibrarySettings = Field(default_factory=LibrarySettings)
 
     # NOTE: keep this model side-effect-free. Directories are created by
@@ -543,28 +594,28 @@ class Settings(BaseModel):
         return self.terminal.grace_period
 
     @property
-    def LIBRARY_WORKERS(self) -> int:
-        return self.workers.library_workers
+    def LIBRARY_CONCURRENCY(self) -> int:
+        return self.background.library_concurrency
 
     @property
     def LIBRARY_QUEUE_BATCH_SIZE(self) -> int:
-        return self.workers.library_queue_batch_size
+        return self.background.library_queue_batch_size
 
     @property
     def BACKGROUND_TASK_LEASE_SECONDS(self) -> int:
-        return self.workers.task_lease_seconds
+        return self.background.task_lease_seconds
 
     @property
     def BACKGROUND_TASK_CLEANUP_HOURS(self) -> int:
-        return self.workers.task_cleanup_hours
+        return self.background.task_cleanup_hours
 
     @property
     def LIBRARY_SCAN_PROJECT_TIMEOUT_SECONDS(self) -> int:
-        return self.workers.library_scan_project_timeout_seconds
+        return self.background.library_scan_project_timeout_seconds
 
     @property
     def LIBRARY_SCAN_TOTAL_TIMEOUT_SECONDS(self) -> int:
-        return self.workers.library_scan_total_timeout_seconds
+        return self.background.library_scan_total_timeout_seconds
 
     @property
     def RAG_TOP_K(self) -> int:
@@ -603,12 +654,36 @@ class Settings(BaseModel):
         return self.library.auto_ai_metadata_enabled
 
     @property
+    def FILE_UPLOAD_MAX_MB(self) -> int:
+        return self.files.upload_max_mb
+
+    @property
+    def LIBRARY_UPLOAD_MAX_MB(self) -> int:
+        return self.library.upload_max_mb
+
+    @property
     def AI_METADATA_MAX_INPUT_TOKENS(self) -> int:
         return self.library.ai_metadata_max_input_tokens
 
     @property
     def AI_METADATA_OUTPUT_TOKENS(self) -> int:
         return self.library.ai_metadata_output_tokens
+
+    @property
+    def LIBRARY_CONVERSION_TIMEOUT_SECONDS(self) -> float:
+        return self.library.conversion_timeout_seconds
+
+    @property
+    def AI_METADATA_TIMEOUT_SECONDS(self) -> float:
+        return self.library.ai_metadata_timeout_seconds
+
+    @property
+    def RAG_EXECUTOR_WORKERS(self) -> int:
+        return self.library.rag_executor_workers
+
+    @property
+    def LIBRARY_MAX_PROCESSING_SECONDS(self) -> int:
+        return self.library.max_processing_seconds
 
     def get_project_path(self, project_id: str) -> Path:
         return (self.USERDATA_DIR / project_id).resolve()
@@ -637,6 +712,41 @@ class Settings(BaseModel):
         return True
 
 
+def _validated_settings(raw: dict[str, Any]) -> Settings:
+    return Settings.model_validate(raw)
+
+
+def _migrate_workers(raw: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    if "workers" not in raw:
+        return raw, False
+
+    workers = raw["workers"]
+    if workers is None:
+        workers = {}
+    if not isinstance(workers, dict):
+        raise ValueError("settings.yaml 'workers' must be a mapping")
+
+    existing_background = raw.get("background")
+    if existing_background is None:
+        background: dict[str, Any] = {}
+    elif isinstance(existing_background, dict):
+        background = dict(existing_background)
+    else:
+        raise ValueError("settings.yaml 'background' must be a mapping")
+
+    for worker_key, value in workers.items():
+        background_key = (
+            "library_concurrency" if worker_key == "library_workers" else worker_key
+        )
+        background.setdefault(background_key, value)
+
+    migrated = dict(raw)
+    migrated.pop("workers")
+    if background:
+        migrated["background"] = background
+    return migrated, True
+
+
 def load_settings_file(path: Path = SETTINGS_FILE) -> Settings:
     if not path.exists():
         config = Settings()
@@ -650,7 +760,11 @@ def load_settings_file(path: Path = SETTINGS_FILE) -> Settings:
 
     if not isinstance(raw, dict):
         raise ValueError(f"{path} must contain a YAML mapping")
-    return Settings.model_validate(raw)
+    migrated, changed = _migrate_workers(raw)
+    config = _validated_settings(migrated)
+    if changed:
+        write_settings_file(config, path)
+    return config
 
 
 def dump_settings_yaml(config: Settings) -> str:
@@ -670,7 +784,7 @@ def validate_settings_yaml(content: str) -> Settings:
         raise ValueError("Invalid YAML") from exc
     if not isinstance(raw, dict):
         raise ValueError("settings.yaml must contain a YAML mapping")
-    return Settings.model_validate(raw)
+    return _validated_settings(raw)
 
 
 def write_settings_file(config: Settings, path: Path = SETTINGS_FILE) -> None:

@@ -11,7 +11,7 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import renderMathInElement from 'katex/dist/contrib/auto-render.mjs'
 import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
-import { ChevronDown, Cpu, CheckCircle2, Loader2, AlertCircle, AlertTriangle, FoldVertical, Search, FileText, X } from 'lucide-react'
+import { ChevronDown, Cpu, CheckCircle2, Loader2, AlertCircle, AlertTriangle, FoldVertical, PauseCircle, Search, FileText, X } from 'lucide-react'
 import TaskList from './TaskList'
 import DiffView from './DiffView'
 
@@ -97,9 +97,46 @@ export function decorateMarkdownLinks(html, projectId) {
     return changed ? doc.body.innerHTML : html
 }
 
-function isAgentToolName(tool) {
+export function isAgentToolName(tool) {
     return String(tool || '').toLowerCase() === 'agent'
 }
+
+// Replace-or-append the trailing transient hint in a process timeline.
+// Reasoning deltas and stream-status notices arrive as per-event chunks, so
+// each event must update ONE hint entry instead of appending a step per
+// token. `extra` carries the renderer flags (retry/error) of the fresh hint.
+export function withTransientHint(process, content, extra = {}) {
+    const hint = { type: 'hint', content, transient: true, ...extra }
+    if (process.length > 0) {
+        const last = process[process.length - 1]
+        if (last.type === 'hint' && last.transient) {
+            return [...process.slice(0, -1), hint]
+        }
+    }
+    return [...process.filter(s => !(s.type === 'hint' && s.transient && s.content === content)), hint]
+}
+
+// Human-readable text for a stream_status event: LLM retry notices carry the
+// attempt counters, other statuses pass the backend message through.
+export function streamStatusText(data, t) {
+    if (data?.status === 'retrying') {
+        return t('chat.llmRetrying', {
+            attempt: data.attempt || 1,
+            maxAttempts: data.max_attempts || data.maxAttempts || 1,
+        })
+    }
+    return data?.message || ''
+}
+
+// Drop-reconnect budget shared by the chat and annotation stream consumers:
+// give up after this many consecutive reconnects that applied no fresh event
+// (a connection that did apply progress resets its own counter).
+export const STREAM_RECOVERY_MAX_ATTEMPTS = 3
+
+// Delay between drop-reconnect attempts, shared by the chat and annotation
+// stream consumers so both pace their recovery identically instead of
+// retrying in a tight loop.
+export const STREAM_RECOVERY_DELAY_MS = 1000
 
 /**
  * Extract the subagent's instruction prompt from the agent tool step params.
@@ -384,11 +421,13 @@ function FileEditModal({ fe, onClose }) {
 
 /**
  * AgentToolStep — renders a nested timeline for an agent tool call.
- * Extracted from ThinkingStep to keep useState at the component top level
+ * Implemented as its own component so its useState hooks stay unconditional
  * (React hooks must not be called conditionally).
  */
 function AgentToolStep({ step }) {
-  const isRunning = step.status === 'running'
+  // A step reloaded from history while parked also pulses: its subagent
+  // resumes into it, and the awaiting state is alive, not finished.
+  const isRunning = step.status === 'running' || step.status === 'awaiting_input'
   const [agentOpen, setAgentOpen] = useState(isRunning)
   const agentLabel = step.agentType || 'agent'
   const prompt = agentPromptFromParams(step.params)
@@ -494,8 +533,14 @@ export const ThinkingStep = ({ step }) => {
             return <FileEditStep step={step} />
         }
 
-        const Icon = step.status === 'running' ? Loader2 : CheckCircle2
-        const iconCls = step.status === 'running' ? 'text-blue-400 animate-spin' : 'text-green-500'
+        const Icon = step.status === 'running' ? Loader2
+            : step.status === 'interrupted' ? AlertCircle
+            : step.status === 'awaiting_input' ? PauseCircle
+            : CheckCircle2
+        const iconCls = step.status === 'running' ? 'text-blue-400 animate-spin'
+            : step.status === 'interrupted' ? 'text-amber-500 dark:text-amber-400'
+            : step.status === 'awaiting_input' ? 'text-amber-500 dark:text-amber-400 animate-pulse'
+            : 'text-green-500'
         // A running edit/write shows its target path instead of raw truncated
         // JSON params; once done, the FileEditStep card or the error result
         // in the generic row below takes over.
@@ -506,6 +551,12 @@ export const ThinkingStep = ({ step }) => {
             <Icon className={`w-3 h-3 mt-0.5 flex-shrink-0 ${iconCls}`} />
             <div className="flex-1 min-w-0">
                 <span className="text-[10px] font-mono text-gray-500 dark:text-gray-400">{step.tool}</span>
+                {step.status === 'interrupted' && (
+                    <span className="text-[9px] text-amber-500 dark:text-amber-400 ml-1">{t('chat.interrupted')}</span>
+                )}
+                {step.status === 'awaiting_input' && (
+                    <span className="text-[9px] text-amber-600 dark:text-amber-400 font-medium ml-1">{t('chat.waitingInput')}</span>
+                )}
                 {pendingPath && <span className="text-[9px] font-mono text-gray-400 dark:text-gray-500 ml-1 truncate">{pendingPath}</span>}
                 {cleanParams && <span className="text-[9px] text-gray-400 dark:text-gray-500 ml-1 break-all">({cleanParams})</span>}
                 {step.result && (

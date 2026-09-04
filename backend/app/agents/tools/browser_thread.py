@@ -2,16 +2,16 @@
 Browser Thread — persistent event loop for Playwright operations.
 
 Playwright objects (Browser, Page, CDPSession) are bound to the asyncio
-event loop that created them.  Huey worker tasks each use asyncio.run()
-which creates a fresh loop, destroying all Playwright state.
+event loop that created them.  Any other thread that needs Playwright
+would have to build its own loop, fragmenting that state.
 
 This module solves that by owning a dedicated daemon thread with a
 never-stopping event loop.  All browser tool functions are dispatched
 to this loop via asyncio.run_coroutine_threadsafe().  Tab IDs, element
-refs, and virtual refs remain stable across Huey tasks.
+refs, and virtual refs remain stable for the process lifetime.
 
 Architecture:
-    Huey thread (any event loop)
+    Caller thread (any event loop)
         └── tool call → dispatch(coro)
                               │
                               ▼  run_coroutine_threadsafe
@@ -108,7 +108,7 @@ class BrowserThread:
     async def dispatch(self, coro):
         """Schedule *coro* on the browser thread's event loop.
 
-        Called from any event loop (typically a Huey worker's loop).
+        Called from any event loop outside the browser thread.
         Returns when the coroutine completes on the browser thread.
         """
         if self._shutting_down:

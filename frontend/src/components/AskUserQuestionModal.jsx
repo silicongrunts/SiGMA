@@ -9,7 +9,7 @@
  * State is keyed by question index (not header) to avoid key collisions.
  * Submits via streamInteractionRequest with interaction_response.
  */
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { X } from 'lucide-react'
 import { useStore } from '../store/useStore'
@@ -19,10 +19,13 @@ export default function AskUserQuestionModal() {
   const clearPendingInteraction = useStore(s => s.clearPendingInteraction)
   const interactionDismissed = useStore(s => s.interactionDismissed)
   const setInteractionDismissed = useStore(s => s.setInteractionDismissed)
+  const currentProject = useStore(s => s.currentProject)
 
   if (!pendingInteraction || pendingInteraction.type !== 'ask_user_question' || interactionDismissed) return null
+  if (pendingInteraction.projectId && pendingInteraction.projectId !== currentProject?.id) return null
 
   const { data, sessionId } = pendingInteraction
+  const projectId = pendingInteraction.projectId || currentProject?.id
   // Robust parsing: questions might be an array, JSON string, or wrapped in data
   const rawQuestions = (() => {
     let rq = data?.questions || data
@@ -33,21 +36,31 @@ export default function AskUserQuestionModal() {
   })()
 
   return (
+    // task_id is unique per parked interaction — the stable identity that
+    // forces a remount (fresh submit guard) when a new question arrives.
     <AskUserQuestionDialog
+      key={data?.task_id}
       rawQuestions={rawQuestions}
       sessionId={sessionId}
+      projectId={projectId}
+      taskId={data?.task_id}
+      interactionId={data?.interaction_id}
+      interactionType={data?.interaction_type}
       onClose={() => setInteractionDismissed(true)}
       onResolved={clearPendingInteraction}
     />
   )
 }
 
-function AskUserQuestionDialog({ rawQuestions, sessionId, onClose, onResolved }) {
+function AskUserQuestionDialog({ rawQuestions, sessionId, projectId, taskId, interactionId, interactionType, onClose, onResolved }) {
   const { t } = useTranslation()
   const [answers, setAnswers] = useState({})       // [i]: single→label, multi→[labels], text→string
   const [otherActive, setOtherActive] = useState({}) // [i]: single/multi only
   const [otherTexts, setOtherTexts] = useState({})   // [i]: single/multi only
-  const [submitting, setSubmitting] = useState(false)
+  // The handoff is fire-and-forget and the dialog unmounts as soon as the
+  // store consumes the request — a second click in the same frame must not
+  // enqueue a second response.
+  const submittedRef = useRef(false)
 
   const questionList = Array.isArray(rawQuestions) ? rawQuestions
     : (rawQuestions?.questions ? rawQuestions.questions : [])
@@ -86,40 +99,42 @@ function AskUserQuestionDialog({ rawQuestions, sessionId, onClose, onResolved })
     setAnswers(prev => ({ ...prev, [i]: value }))
   }
 
-  const handleSubmit = async () => {
+  const handleSubmit = () => {
+    if (submittedRef.current) return
     const finalAnswers = questionList.map((q, i) => {
       let answer
       if (q.type === 'text') {
         answer = (answers[i] || '').trim()
       } else if (q.type === 'multi') {
         const sel = Array.isArray(answers[i]) ? [...answers[i]] : []
-        if (otherActive[i] && otherTexts[i]) sel.push(otherTexts[i])
+        // The backend rejects blank entries, so whitespace-only Other text
+        // must not join real selections in the submitted array.
+        if (otherActive[i] && otherTexts[i]?.trim()) sel.push(otherTexts[i])
         answer = sel
       } else { // single (default)
         answer = otherActive[i] ? (otherTexts[i] || '') : (answers[i] || '')
       }
       return { question: q.question, answer }
     })
-    setSubmitting(true)
-    try {
-      // Signal ChatPanel to start a new SSE stream with interaction response
-      useStore.getState().setStreamInteractionRequest({
-        message: '',
-        resume: true,
-        session_id: sessionId,
-        interaction_response: { answers: finalAnswers },
-      })
-      onResolved()
-    } catch (e) {
-      console.error('Failed to submit response:', e)
-      setSubmitting(false)
-    }
+    submittedRef.current = true
+    // Signal ChatPanel to start a new SSE stream with interaction response
+    useStore.getState().setStreamInteractionRequest({
+      message: '',
+      resume: true,
+      session_id: sessionId,
+      projectId,
+      task_id: taskId,
+      interaction_response: { task_id: taskId, interaction_id: interactionId, interaction_type: interactionType || 'ask_user_question', answers: finalAnswers },
+    })
+    onResolved()
   }
 
   const canSubmit = questionList.length > 0 && questionList.every((q, i) => {
     if (q.type === 'text') return !!(answers[i] || '').trim()
     const sel = Array.isArray(answers[i]) ? answers[i] : (answers[i] ? [answers[i]] : [])
-    return sel.length > 0 || (otherActive[i] && otherTexts[i])
+    // Same trim rule as the backend validator: an Other answer counts only
+    // when it has non-whitespace content.
+    return sel.length > 0 || (otherActive[i] && otherTexts[i]?.trim())
   })
 
   return (
@@ -150,9 +165,9 @@ function AskUserQuestionDialog({ rawQuestions, sessionId, onClose, onResolved })
           <button onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors">
             {t('common.cancel')}
           </button>
-          <button onClick={handleSubmit} disabled={!canSubmit || submitting}
+          <button onClick={handleSubmit} disabled={!canSubmit}
             className="px-6 py-2 bg-sigma-600 text-white text-sm font-semibold rounded-xl hover:bg-sigma-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all">
-            {submitting ? t('common.sending') : t('common.submit')}
+            {t('common.submit')}
           </button>
         </div>
       </div>

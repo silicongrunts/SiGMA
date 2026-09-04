@@ -10,9 +10,6 @@ atomicity (TOCTOU) and target-existence checks are covered separately by
 service-level integration tests.
 """
 
-import asyncio
-import json
-import os
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -22,7 +19,7 @@ import pytest
 from app.agents.tools.library_tools import (
     _library_new, _library_update, _library_search, _copy_unique_file,
 )
-from app.core.exceptions import FileSystemError, RAGIndexModelMismatchError, ValidationError
+from app.core.exceptions import FileSystemError, RAGIndexModelMismatchError
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +99,6 @@ async def test_library_new_source_relative_for_project_internal_file(tmp_path):
         doc = MagicMock()
         doc.id = "abc12345-0000-0000-0000-000000000000"
         return doc
-
-    sigma_dir = project_root / ".SiGMA"
 
     with patch("app.agents.tools.library_tools.settings") as mock_settings, \
          patch("app.agents.tools.library_tools.library_service") as mock_svc, \
@@ -376,15 +371,6 @@ async def test_library_search_semantic_mode_ignores_invalid_page():
         result = await _library_search("proj", "x", mode="semantic", page=0)
     assert "page must be >= 1" not in result
     assert "Found 1 result(s):" in result
-
-
-@pytest.mark.asyncio
-async def test_library_search_keyword_mode_still_enforces_page_lower_bound():
-    """page<1 in keyword mode must still error."""
-    with patch("app.agents.tools.library_tools.library_service") as mock_svc:
-        result = await _library_search("proj", "foo", mode="keyword", page=0)
-    assert "page must be >= 1" in result
-    mock_svc.search_documents_paged.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -1,3 +1,12 @@
+"""Notebook route tests, driven through the route handlers.
+
+The routes guard on lazily-provisioned services (``_get_jupyter_service`` /
+``_get_nb_service`` raise ``JupyterNotInitializedError`` when Jupyter has not
+started). The guards are exercised indirectly by calling the routes with the
+underlying service missing or faked — the private helpers are never invoked
+directly.
+"""
+
 from types import SimpleNamespace
 
 import pytest
@@ -5,22 +14,30 @@ import pytest
 from app.core.exceptions import JupyterNotInitializedError
 from app.models.requests import CreateNotebookRequest, NotebookWriteRequest
 from app.routes import notebooks
+from app.services import notebook_service as nb_service_module
 
 
 @pytest.mark.route
-def test_get_jupyter_service_raises_when_uninitialized(monkeypatch):
+@pytest.mark.asyncio
+async def test_kill_kernel_requires_jupyter_service(monkeypatch):
+    """With Jupyter never started, the route raises the not-initialized
+    error instead of touching a missing service."""
     monkeypatch.setattr(notebooks, "get_jupyter", lambda: None)
 
     with pytest.raises(JupyterNotInitializedError):
-        notebooks._get_jupyter_service()
+        await notebooks.kill_kernel("kernel-1")
 
 
 @pytest.mark.route
-def test_get_notebook_service_raises_when_uninitialized(monkeypatch):
-    monkeypatch.setattr(notebooks.nb_service_module, "notebook_service", None)
+@pytest.mark.asyncio
+async def test_write_notebook_requires_notebook_service(monkeypatch):
+    monkeypatch.setattr(nb_service_module, "notebook_service", None)
 
     with pytest.raises(JupyterNotInitializedError):
-        notebooks._get_nb_service()
+        await notebooks.write_notebook(
+            "project-1",
+            NotebookWriteRequest(path="analysis.ipynb", notebook={"cells": []}),
+        )
 
 
 @pytest.mark.route
@@ -31,7 +48,7 @@ async def test_kill_kernel_returns_soft_status_when_jupyter_stopped(monkeypatch)
 
     monkeypatch.setattr(
         notebooks,
-        "_get_jupyter_service",
+        "get_jupyter",
         lambda: SimpleNamespace(is_running=is_running),
     )
 
@@ -49,11 +66,7 @@ async def test_write_notebook_passes_path_and_payload(monkeypatch):
         calls["write"] = (project_id, path, notebook)
         return {"path": path}
 
-    monkeypatch.setattr(
-        notebooks,
-        "_get_nb_service",
-        lambda: SimpleNamespace(write=write),
-    )
+    monkeypatch.setattr(nb_service_module, "notebook_service", SimpleNamespace(write=write))
 
     result = await notebooks.write_notebook(
         "project-1",
@@ -71,9 +84,9 @@ async def test_create_notebook_passes_path(monkeypatch):
         return {"project_id": project_id, "path": path}
 
     monkeypatch.setattr(
-        notebooks,
-        "_get_nb_service",
-        lambda: SimpleNamespace(create_empty=create_empty),
+        nb_service_module,
+        "notebook_service",
+        SimpleNamespace(create_empty=create_empty),
     )
 
     result = await notebooks.create_notebook(

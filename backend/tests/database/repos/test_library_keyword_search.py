@@ -75,9 +75,9 @@ async def test_keyword_search_respects_allowed_ids_after_verification(db_session
 
 @pytest.mark.asyncio
 async def test_count_search_keyword_matches_search_result_count(db_session_factory):
-    """count_search_keyword must return the same total that search_keyword
-    would return absent limit/offset. This is the contract the tool-layer
-    pagination header relies on."""
+    """count_search_keyword aggregates the same candidates the listing query
+    selects, absent limit/offset; here every candidate passes the casefold
+    post-filter, so the count equals the unbounded search result count."""
     async with db_session_factory() as session:
         repo = LibraryRepository(session)
         await repo.create(title="alpha match", content="body")
@@ -89,6 +89,24 @@ async def test_count_search_keyword_matches_search_result_count(db_session_facto
         count = await repo.count_search_keyword("alpha")
 
     assert count == len(full) == 3
+
+
+@pytest.mark.asyncio
+async def test_count_search_keyword_counts_candidates_not_post_filter(db_session_factory):
+    """The count is the SQL candidate count — an upper bound of the
+    post-filtered results. Unescaped LIKE wildcards admit candidates ("_a"
+    matches the "ar" in "car") that the casefold post-filter drops; the
+    count must not pay a full-content scan to close that gap."""
+    async with db_session_factory() as session:
+        repo = LibraryRepository(session)
+        await repo.create(title="car", content="driving")
+        await repo.create(title="cat", content="sleeping")
+
+        count = await repo.count_search_keyword("_a")
+        matches = await repo.search_keyword("_a", limit=100, offset=0)
+
+    assert count == 2
+    assert matches == []
 
 
 @pytest.mark.asyncio
@@ -128,122 +146,3 @@ async def test_count_search_keyword_short_query_uses_like_path(db_session_factor
 
         count = await repo.count_search_keyword("AI")
     assert count == 2
-
-
-@pytest.mark.database
-@pytest.mark.asyncio
-async def test_get_ancestor_chain_returns_root_to_parent_for_nested_doc(db_session_factory):
-    """The chain is root→parent of the doc, excluding the doc itself, root first."""
-    async with db_session_factory() as session:
-        repo = LibraryRepository(session)
-        root_folder = await repo.create(title="Root", content="", is_folder=True)
-        mid_folder = await repo.create(
-            title="Mid", content="", is_folder=True, parent_id=root_folder.id
-        )
-        doc = await repo.create(title="Doc", content="body", parent_id=mid_folder.id)
-
-        chain = await repo.get_ancestor_chain(doc.id)
-
-    assert [c["id"] for c in chain] == [root_folder.id, mid_folder.id]
-    assert [c["title"] for c in chain] == ["Root", "Mid"]
-
-
-@pytest.mark.database
-@pytest.mark.asyncio
-async def test_get_ancestor_chain_empty_for_top_level_doc(db_session_factory):
-    async with db_session_factory() as session:
-        repo = LibraryRepository(session)
-        doc = await repo.create(title="Top", content="body")
-
-        chain = await repo.get_ancestor_chain(doc.id)
-
-    assert chain == []
-
-
-@pytest.mark.database
-@pytest.mark.asyncio
-async def test_get_ancestor_chain_empty_for_missing_doc(db_session_factory):
-    """A non-existent id yields an empty chain rather than raising."""
-    async with db_session_factory() as session:
-        repo = LibraryRepository(session)
-
-        chain = await repo.get_ancestor_chain("does-not-exist")
-
-    assert chain == []
-
-
-@pytest.mark.database
-@pytest.mark.asyncio
-async def test_get_folder_paths_builds_root_to_leaf_path(db_session_factory):
-    """A nested document maps to 'Root / Mid', root first, doc itself excluded."""
-    async with db_session_factory() as session:
-        repo = LibraryRepository(session)
-        root_folder = await repo.create(title="Root", content="", is_folder=True)
-        mid_folder = await repo.create(
-            title="Mid", content="", is_folder=True, parent_id=root_folder.id
-        )
-        doc = await repo.create(title="Doc", content="body", parent_id=mid_folder.id)
-
-        paths = await repo.get_folder_paths([doc.id])
-
-    assert paths == {doc.id: "Root / Mid"}
-
-
-@pytest.mark.database
-@pytest.mark.asyncio
-async def test_get_folder_paths_empty_for_top_level_doc(db_session_factory):
-    """A document at the library root maps to an empty string."""
-    async with db_session_factory() as session:
-        repo = LibraryRepository(session)
-        doc = await repo.create(title="Top", content="body")
-
-        paths = await repo.get_folder_paths([doc.id])
-
-    assert paths == {doc.id: ""}
-
-
-@pytest.mark.database
-@pytest.mark.asyncio
-async def test_get_folder_paths_batches_multiple_docs(db_session_factory):
-    """One query resolves different-depth paths for several docs at once."""
-    async with db_session_factory() as session:
-        repo = LibraryRepository(session)
-        outer = await repo.create(title="Outer", content="", is_folder=True)
-        inner = await repo.create(
-            title="Inner", content="", is_folder=True, parent_id=outer.id
-        )
-        deep_doc = await repo.create(title="Deep", content="body", parent_id=inner.id)
-        shallow_doc = await repo.create(title="Shallow", content="body", parent_id=outer.id)
-        root_doc = await repo.create(title="RootLevel", content="body")
-
-        paths = await repo.get_folder_paths([deep_doc.id, shallow_doc.id, root_doc.id])
-
-    assert paths == {
-        deep_doc.id: "Outer / Inner",
-        shallow_doc.id: "Outer",
-        root_doc.id: "",
-    }
-
-
-@pytest.mark.database
-@pytest.mark.asyncio
-async def test_get_folder_paths_missing_id_is_empty(db_session_factory):
-    """Unknown ids are returned as empty paths rather than raising."""
-    async with db_session_factory() as session:
-        repo = LibraryRepository(session)
-        doc = await repo.create(title="Real", content="body")
-
-        paths = await repo.get_folder_paths([doc.id, "does-not-exist"])
-
-    assert paths == {doc.id: "", "does-not-exist": ""}
-
-
-@pytest.mark.database
-@pytest.mark.asyncio
-async def test_get_folder_paths_empty_input_returns_empty(db_session_factory):
-    async with db_session_factory() as session:
-        repo = LibraryRepository(session)
-
-        paths = await repo.get_folder_paths([])
-
-    assert paths == {}

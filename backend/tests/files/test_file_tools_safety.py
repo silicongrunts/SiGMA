@@ -3,6 +3,10 @@
 Covers virtual-filesystem root refusal and symlink-loop termination for
 glob, plus the bounded-read contracts: size caps, S_ISREG rejection, and
 truncation notes.
+
+The whole-read cap (``file_tools.MAX_TOOL_READ_BYTES``) is monkeypatched
+down for the range-read tests: the contract is behaviour at the size
+boundary, not the 10 MiB constant, so no test materializes a >10 MB file.
 """
 
 import os
@@ -21,23 +25,10 @@ from app.agents.tools.notebook_utils import (
     NotebookToolError, normalize_notebook_path, read_notebook_json,
     save_notebook_json,
 )
-from app.agents.tools.read_state import read_state_cache
 from app.core.chat_attachments import MAX_CHAT_IMAGE_BYTES
 from app.core.exceptions import FileSystemError
 from app.services.chat_attachments import read_image_path_base64
 from app.services.file_service import MAX_TOOL_READ_BYTES, MAX_UI_READ_BYTES, file_service
-
-
-@pytest.fixture(autouse=True)
-def _clear_read_state():
-    read_state_cache.clear("sess")
-    yield
-    read_state_cache.clear("sess")
-
-
-def _patch_file_service(monkeypatch, tmp_path):
-    """Point file_service at a sandbox rooted at tmp_path."""
-    monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
 
 
 def _patch_notebook_project(monkeypatch, tmp_path):
@@ -64,19 +55,17 @@ def _sparse_file(path, size: int):
 
 @pytest.mark.regression
 @pytest.mark.asyncio
-async def test_glob_refuses_root_path(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
+async def test_glob_refuses_root_path(sandbox):
     result = await _glob_search("proj", "**/*.txt", "/")
     assert result.startswith("Error:")
     assert "refusing to search" in result
     # The refusal suggests the concrete project directory instead.
-    assert str(tmp_path) in result
+    assert str(sandbox) in result
 
 
 @pytest.mark.regression
 @pytest.mark.asyncio
-async def test_glob_refuses_proc_path(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
+async def test_glob_refuses_proc_path(sandbox):
     result = await _glob_search("proj", "*", "/proc")
     assert result.startswith("Error:")
     assert "refusing to search" in result
@@ -84,27 +73,24 @@ async def test_glob_refuses_proc_path(tmp_path, monkeypatch):
 
 @pytest.mark.regression
 @pytest.mark.asyncio
-async def test_glob_refuses_proc_absolute_pattern(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
+async def test_glob_refuses_proc_absolute_pattern(sandbox):
     result = await _glob_search("proj", "/proc/**/environ")
     assert result.startswith("Error:")
     assert "refusing to search" in result
 
 
 @pytest.mark.asyncio
-async def test_glob_absolute_pattern_on_real_dir(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("a")
-    result = await _glob_search("proj", str(tmp_path / "**" / "*.txt"))
-    assert str(tmp_path / "a.txt") in result
+async def test_glob_absolute_pattern_on_real_dir(sandbox):
+    (sandbox / "a.txt").write_text("a")
+    result = await _glob_search("proj", str(sandbox / "**" / "*.txt"))
+    assert str(sandbox / "a.txt") in result
 
 
 # ── grep: virtual-filesystem roots are refused too ──────────────────
 
 @pytest.mark.regression
 @pytest.mark.asyncio
-async def test_grep_refuses_proc_path(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
+async def test_grep_refuses_proc_path(sandbox):
     result = await _grep_search("proj", "needle", "/proc")
     assert result.startswith("Error:")
     assert "refusing to search" in result
@@ -132,9 +118,8 @@ def _symlink_loop_tree(tmp_path):
 
 @pytest.mark.regression
 @pytest.mark.asyncio
-async def test_glob_symlink_loop_terminates_rg_path(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    _symlink_loop_tree(tmp_path)
+async def test_glob_symlink_loop_terminates_rg_path(sandbox):
+    _symlink_loop_tree(sandbox)
 
     result = await _glob_search("proj", "**/*.txt", ".")
     lines = result.split("\n")
@@ -145,9 +130,8 @@ async def test_glob_symlink_loop_terminates_rg_path(tmp_path, monkeypatch):
 
 @pytest.mark.regression
 @pytest.mark.asyncio
-async def test_glob_symlink_loop_terminates_fallback_walk(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    _symlink_loop_tree(tmp_path)
+async def test_glob_symlink_loop_terminates_fallback_walk(sandbox, monkeypatch):
+    _symlink_loop_tree(sandbox)
 
     async def _rg_missing(*args, **kwargs):
         raise FileNotFoundError("rg")
@@ -163,11 +147,10 @@ async def test_glob_symlink_loop_terminates_fallback_walk(tmp_path, monkeypatch)
 @pytest.mark.regression
 @pytest.mark.asyncio
 async def test_glob_fallback_trailing_doublestar_filters_hidden(
-        tmp_path, monkeypatch):
+        sandbox, monkeypatch):
     """A trailing '**' in the fallback walker applies the same hidden-entry
     rule as every other branch (rg parity)."""
-    _patch_file_service(monkeypatch, tmp_path)
-    _symlink_loop_tree(tmp_path)
+    _symlink_loop_tree(sandbox)
 
     async def _rg_missing(*args, **kwargs):
         raise FileNotFoundError("rg")
@@ -205,9 +188,8 @@ async def test_run_bounded_search_output_cap(monkeypatch):
 
 @pytest.mark.regression
 @pytest.mark.asyncio
-async def test_glob_budget_exceeded_returns_error(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("a")
+async def test_glob_budget_exceeded_returns_error(sandbox, monkeypatch):
+    (sandbox / "a.txt").write_text("a")
     monkeypatch.setattr(file_tools, "_GLOB_TIMEOUT_SECONDS", 0.001)
 
     result = await _glob_search("proj", "*.txt", ".")
@@ -217,9 +199,7 @@ async def test_glob_budget_exceeded_returns_error(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_glob_budget_exceeded_with_partial_results_notes(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-
+async def test_glob_budget_exceeded_with_partial_results_notes(sandbox, monkeypatch):
     async def _partial(*args, **kwargs):
         return (["a.txt"], True, False)
 
@@ -231,9 +211,8 @@ async def test_glob_budget_exceeded_with_partial_results_notes(tmp_path, monkeyp
 
 @pytest.mark.regression
 @pytest.mark.asyncio
-async def test_grep_timeout_returns_error_and_kills(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("needle")
+async def test_grep_timeout_returns_error_and_kills(sandbox, monkeypatch):
+    (sandbox / "a.txt").write_text("needle")
     monkeypatch.setattr(file_tools, "_GREP_TIMEOUT_SECONDS", 0.001)
 
     start = time.monotonic()
@@ -246,12 +225,11 @@ async def test_grep_timeout_returns_error_and_kills(tmp_path, monkeypatch):
 @pytest.mark.regression
 @pytest.mark.asyncio
 async def test_grep_fallback_timeout_kills_and_reports(
-        tmp_path, monkeypatch):
+        sandbox, monkeypatch):
     """The grep fallback shares the bounded engine: a timeout kills the
     process (no orphaned grep) and returns within the bound, not after the
     command's own runtime."""
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("needle")
+    (sandbox / "a.txt").write_text("needle")
 
     async def _rg_missing(cmd, *, cwd, timeout):
         raise FileNotFoundError("rg")
@@ -323,21 +301,19 @@ async def test_read_fifo_rejected_by_regular_file_check(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_read_sandbox_oversize_rejected(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    _sparse_file(tmp_path / "big.txt", MAX_TOOL_READ_BYTES + 1)
+async def test_read_sandbox_oversize_rejected(sandbox):
+    _sparse_file(sandbox / "big.txt", MAX_TOOL_READ_BYTES + 1)
     with pytest.raises(FileSystemError) as exc_info:
         await file_service.read_file("proj", "big.txt", max_bytes=MAX_TOOL_READ_BYTES)
     assert exc_info.value.code == "FILE_TOO_LARGE"
 
 
 @pytest.mark.asyncio
-async def test_read_ui_cap_rejects_oversize_text(tmp_path, monkeypatch):
+async def test_read_ui_cap_rejects_oversize_text(sandbox):
     """The UI content route's 5 MiB cap rejects oversized text before any
     byte is read — the editor degrades to a download panel instead of
     loading a tab-freezing document."""
-    _patch_file_service(monkeypatch, tmp_path)
-    _sparse_file(tmp_path / "huge.json", MAX_UI_READ_BYTES + 1)
+    _sparse_file(sandbox / "huge.json", MAX_UI_READ_BYTES + 1)
     with pytest.raises(FileSystemError) as exc_info:
         await file_service.read_file("proj", "huge.json", max_bytes=MAX_UI_READ_BYTES)
     assert exc_info.value.code == "FILE_TOO_LARGE"
@@ -345,61 +321,64 @@ async def test_read_ui_cap_rejects_oversize_text(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_read_ui_cap_boundary_exact_limit_reads(tmp_path, monkeypatch):
+async def test_read_ui_cap_boundary_exact_limit_reads(sandbox):
     """A file exactly at the cap is readable — the limit is exclusive."""
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "edge.txt").write_text("a" * MAX_UI_READ_BYTES, encoding="utf-8")
+    (sandbox / "edge.txt").write_text("a" * MAX_UI_READ_BYTES, encoding="utf-8")
     text = await file_service.read_file("proj", "edge.txt", max_bytes=MAX_UI_READ_BYTES)
     assert len(text) == MAX_UI_READ_BYTES
 
 
 @pytest.mark.asyncio
-async def test_read_file_tool_big_text_file_reads_window(tmp_path):
+async def test_read_file_tool_big_text_file_reads_window(
+        tmp_path, monkeypatch):
     """Files over the whole-read cap stay readable via the streaming range
     reader — only the requested window is accumulated."""
-    # ~13 MB (>MAX_TOOL_READ_BYTES) so the streaming range reader is used.
-    lines = [f"line-{i:07d} {'x' * 32}" for i in range(300_000)]
+    monkeypatch.setattr(file_tools, "MAX_TOOL_READ_BYTES", 16 * 1024)
+    # ~45 KB (> the patched cap) so the streaming range reader is used.
     big = tmp_path / "big.log"
-    big.write_text("\n".join(lines))
+    big.write_text("\n".join(
+        f"line-{i:07d} {'x' * 32}" for i in range(1000)))
+    assert big.stat().st_size > 16 * 1024
 
     result = await _read_file("proj", "sess", str(big))
     assert not result.startswith("Error")
     assert result.split("\n")[0].startswith("1\tline-0000000")
-    assert "Showing lines 1-200 of 300000" in result
+    assert "Showing lines 1-200 of 1000" in result
 
     # A window in the middle keeps absolute line numbers.
-    middle = await _read_file("proj", "sess", str(big), offset=299_990, limit=5)
-    assert "299991\tline-0299990" in middle
-    assert "299995\tline-0299994" in middle
+    middle = await _read_file("proj", "sess", str(big), offset=990, limit=5)
+    assert "991\tline-0000990" in middle
+    assert "995\tline-0000994" in middle
 
     # Negative limit returns the last lines of a big file, and nothing else.
     tail = await _read_file("proj", "sess", str(big), limit=-3)
-    assert "299998\tline-0299997" in tail
-    assert "line-0299990" not in tail
+    assert "998\tline-0000997" in tail
+    assert "line-0000990" not in tail
 
 
 @pytest.mark.asyncio
-async def test_read_big_utf16_file_reads_window(tmp_path):
+async def test_read_big_utf16_file_reads_window(tmp_path, monkeypatch):
     """BOM'd UTF-16 files over the whole-read cap stay window-readable: the
     range reader splits on the 2-byte newline unit of the file's byte order
     instead of cutting between code units."""
+    monkeypatch.setattr(file_tools, "MAX_TOOL_READ_BYTES", 16 * 1024)
     big = tmp_path / "big-u16.log"
     with open(big, "wb") as f:
         f.write("\n".join(
-            f"line-{i:07d} {'x' * 32}" for i in range(300_000)
+            f"line-{i:07d} {'x' * 32}" for i in range(1000)
         ).encode("utf-16"))  # codec prepends the LE BOM
-    assert big.stat().st_size > MAX_TOOL_READ_BYTES
+    assert big.stat().st_size > 16 * 1024
 
     result = await _read_file("proj", "sess", str(big))
     assert not result.startswith("Error")
     assert result.split("\n")[0].startswith("1\tline-0000000")
-    assert "Showing lines 1-200 of 300000" in result
+    assert "Showing lines 1-200 of 1000" in result
 
-    middle = await _read_file("proj", "sess", str(big), offset=299_990, limit=2)
-    assert "299991\tline-0299990" in middle
+    middle = await _read_file("proj", "sess", str(big), offset=990, limit=2)
+    assert "991\tline-0000990" in middle
 
     tail = await _read_file("proj", "sess", str(big), limit=-2)
-    assert "300000\tline-0299999" in tail
+    assert "1000\tline-0000999" in tail
 
 
 @pytest.mark.asyncio
@@ -461,34 +440,31 @@ async def test_list_files_truncates_large_directory(tmp_path):
     result = await _list_files("proj", str(tmp_path))
     lines = result.split("\n")
     assert len(lines) == file_tools._MAX_LIST_ENTRIES + 1
-    assert lines[-1].startswith(f"... +5 more entries not shown")
+    assert lines[-1].startswith("... +5 more entries not shown")
     assert all(not l.startswith(".") for l in lines[:-1])
 
 
 @pytest.mark.asyncio
-async def test_list_files_truncates_large_sandbox_directory(
-        tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    sub = tmp_path / "sub"
+async def test_list_files_truncates_large_sandbox_directory(sandbox):
+    sub = sandbox / "sub"
     sub.mkdir()
     _many_files(sub, file_tools._MAX_LIST_ENTRIES + 5)
 
     result = await _list_files("proj", "sub")
     lines = result.split("\n")
     assert len(lines) == file_tools._MAX_LIST_ENTRIES + 1
-    assert lines[-1].startswith(f"... +5 more entries not shown")
+    assert lines[-1].startswith("... +5 more entries not shown")
     assert lines[0] == "f00000.txt"
 
 
 @pytest.mark.asyncio
-async def test_list_files_truncates_large_project_tree(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    _many_files(tmp_path, file_tools._MAX_LIST_ENTRIES + 5)
+async def test_list_files_truncates_large_project_tree(sandbox):
+    _many_files(sandbox, file_tools._MAX_LIST_ENTRIES + 5)
 
     result = await _list_files("proj", "")
     lines = result.split("\n")
     assert len(lines) == file_tools._MAX_LIST_ENTRIES + 1
-    assert lines[-1].startswith(f"... +5 more entries not shown")
+    assert lines[-1].startswith("... +5 more entries not shown")
 
 
 # ── image reads: stat-first byte cap ─────────────────────────────────

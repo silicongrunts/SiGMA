@@ -1,28 +1,62 @@
-"""
-Tests for latex_service.get_pdf_filename() (migrated from compile_service).
+"""LaTeX service tests: latexmk compilation, synctex round-trips, preemption.
+
+Covers the compile pipeline (engine flags, output classification, temp-file
+backup/restore, TeX Live bin resolution, timeout teardown), the SyncTeX
+forward/backward contract, and compile_project preemption/cancellation.
+External effects (latexmk/synctex subprocesses, project metadata, settings
+paths) are faked; everything else runs the real LaTeXService code.
 """
 
 import asyncio
 import gzip
 import signal
+from pathlib import Path
 from unittest.mock import patch, AsyncMock
 
 import pytest
+from pydantic import ValidationError
 
+from app.models.requests import SyncTeXRequest
 from app.services.latex_service import LaTeXService, latex_service
 import app.services.latex_service as latex_service_module
 import app.services.project_service as project_service_module
+
+
+def _fake_settings(project_path, default_engine="pdflatex"):
+    """Settings stand-in with a fixed engine list and an injected project path.
+
+    ``default_engine=None`` omits ``DEFAULT_LATEX_ENGINE`` for tests that
+    must not depend on the default-engine fallback.
+    """
+    class FakeSettings:
+        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
+        if default_engine is not None:
+            DEFAULT_LATEX_ENGINE = default_engine
+
+        def get_project_path(self, project_id):
+            return project_path
+
+    return FakeSettings()
+
+
+def _patched_get_project(main_file, engine=None):
+    """Patch project_service.get_project to return a minimal project record."""
+    record = {"id": "x", "main_file": main_file}
+    if engine is not None:
+        record["engine"] = engine
+    return patch.object(
+        project_service_module.project_service,
+        "get_project",
+        new_callable=AsyncMock,
+        return_value=record,
+    )
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
 async def test_get_pdf_filename_from_paper_tex():
     """Returns output.pdf when project main_file is paper.tex."""
-    with patch.object(
-        project_service_module.project_service, "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "paper.tex"},
-    ):
+    with _patched_get_project("paper.tex"):
         result = await latex_service.get_pdf_filename("any-id")
     assert result == "output.pdf"
 
@@ -31,11 +65,7 @@ async def test_get_pdf_filename_from_paper_tex():
 @pytest.mark.timeout(10)
 async def test_get_pdf_filename_no_main_file():
     """Returns output.pdf when project has no main_file."""
-    with patch.object(
-        project_service_module.project_service, "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": ""},
-    ):
+    with _patched_get_project(""):
         result = await latex_service.get_pdf_filename("any-id")
     assert result == "output.pdf"
 
@@ -44,11 +74,7 @@ async def test_get_pdf_filename_no_main_file():
 @pytest.mark.timeout(10)
 async def test_get_pdf_filename_nested_main_file():
     """Returns correct output PDF path for nested main_file paths."""
-    with patch.object(
-        project_service_module.project_service, "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "chapters/main.tex"},
-    ):
+    with _patched_get_project("chapters/main.tex"):
         result = await latex_service.get_pdf_filename("any-id")
     assert result == "chapters/output.pdf"
 
@@ -78,56 +104,51 @@ async def test_get_pdf_filename_exception_fallback():
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
 async def test_compile_engines_use_latexmk_flags(tmp_path, monkeypatch, engine, compiler_flag):
-    """Compilation uses latexmk engine flags for every supported engine."""
+    """Compilation launches the real _run_latexmk argv for every supported
+    engine: fixed jobname/synctex/batchmode flags plus the engine's flag."""
     project_path = tmp_path / "project"
     project_path.mkdir()
     (project_path / "main.tex").write_text(
         "\\documentclass{article}\\begin{document}Hello\\end{document}",
         encoding="utf-8",
     )
-    calls = []
+    captured_cmds = []
 
-    async def fake_run_latexmk(compile_dir_arg, main_name, engine_arg):
-        cmd = [
-            "latexmk",
-            "-cd",
-            "-jobname=output",
-            "-synctex=1",
-            "-interaction=batchmode",
-            "-time",
-            "-f",
-            latex_service_module.LATEXMK_COMPILER_FLAGS[engine_arg],
-            main_name,
-        ]
-        calls.append(cmd)
-        (compile_dir_arg / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
-        return True, "latexmk ok", ""
+    class FakeProcess:
+        returncode = 0
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
+        async def communicate(self):
+            return b"ok", b""
 
-        def get_project_path(self, project_id):
-            return project_path
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured_cmds.append(args)
+        (Path(kwargs["cwd"]) / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
+        return FakeProcess()
 
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
+    monkeypatch.setattr(
+        latex_service_module.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
     service = LaTeXService()
-    monkeypatch.setattr(service, "_run_latexmk", fake_run_latexmk)
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "main.tex", "engine": engine},
-    ):
+    with _patched_get_project("main.tex", engine=engine):
         result = await service.compile("x")
 
     assert result["success"] is True
     assert result["pdf_path"] == "output.pdf"
-    assert calls[0][0] == "latexmk"
-    assert "-jobname=output" in calls[0]
-    assert not any(arg.startswith("-outdir=") or arg.startswith("-auxdir=") for arg in calls[0])
-    assert compiler_flag in calls[0]
+    assert captured_cmds, "latexmk must be launched exactly once"
+    cmd = list(captured_cmds[0])
+    assert cmd[0] == "latexmk"
+    assert "-cd" in cmd
+    assert f"-jobname={latex_service_module.LATEX_OUTPUT_BASE}" in cmd
+    assert "-synctex=1" in cmd
+    assert "-interaction=batchmode" in cmd
+    assert "-f" in cmd
+    assert compiler_flag in cmd
+    assert cmd[-1] == "main.tex"
+    assert not any(arg.startswith("-outdir=") or arg.startswith("-auxdir=") for arg in cmd)
 
 
 @pytest.mark.asyncio
@@ -151,23 +172,11 @@ async def test_compile_returns_pdf_path_when_errors_but_pdf_usable(tmp_path, mon
         (compile_dir_arg / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
         return False, error_log, ""
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     service = LaTeXService()
     monkeypatch.setattr(service, "_run_latexmk", fake_run_latexmk)
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "main.tex", "engine": "pdflatex"},
-    ):
+    with _patched_get_project("main.tex", engine="pdflatex"):
         result = await service.compile("x")
 
     assert result["success"] is False
@@ -191,23 +200,11 @@ async def test_compile_no_pdf_path_when_errors_and_no_pdf(tmp_path, monkeypatch)
     async def fake_run_latexmk(compile_dir_arg, main_name, engine_arg):
         return False, error_log, ""
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     service = LaTeXService()
     monkeypatch.setattr(service, "_run_latexmk", fake_run_latexmk)
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "main.tex", "engine": "pdflatex"},
-    ):
+    with _patched_get_project("main.tex", engine="pdflatex"):
         result = await service.compile("x")
 
     assert result["success"] is False
@@ -232,23 +229,11 @@ async def test_failed_compile_with_usable_pdf_keeps_pdf(tmp_path, monkeypatch):
         (compile_dir_arg / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
         return False, error_log, ""
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     service = LaTeXService()
     monkeypatch.setattr(service, "_run_latexmk", fake_run_latexmk)
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "main.tex", "engine": "pdflatex"},
-    ):
+    with _patched_get_project("main.tex", engine="pdflatex"):
         result = await service.compile("x")
 
     assert result["success"] is False
@@ -283,23 +268,11 @@ async def test_compile_no_pdf_path_when_previous_pdf_left_untouched(tmp_path, mo
         # Failed run — no PDF written.
         return False, error_log, ""
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     service = LaTeXService()
     monkeypatch.setattr(service, "_run_latexmk", fake_run_latexmk)
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "main.tex", "engine": "pdflatex"},
-    ):
+    with _patched_get_project("main.tex", engine="pdflatex"):
         result = await service.compile("x")
 
     assert result["success"] is False
@@ -324,23 +297,11 @@ async def test_compile_runs_in_nested_main_file_directory(tmp_path, monkeypatch)
         (compile_dir_arg / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
         return True, "latexmk ok", ""
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     service = LaTeXService()
     monkeypatch.setattr(service, "_run_latexmk", fake_run_latexmk)
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "chapters/main.tex", "engine": "pdflatex"},
-    ):
+    with _patched_get_project("chapters/main.tex", engine="pdflatex"):
         result = await service.compile("x")
 
     assert result["success"] is True
@@ -431,14 +392,7 @@ def test_get_pdf_path_allows_nested_output_pdf(tmp_path, monkeypatch):
     source_dir.mkdir(parents=True)
     (source_dir / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     service = LaTeXService()
 
     assert service.get_pdf_path("x", "chapters/output.pdf") == source_dir / "output.pdf"
@@ -452,22 +406,10 @@ async def test_get_compile_status_uses_nested_main_file(tmp_path, monkeypatch):
     source_dir.mkdir(parents=True)
     (source_dir / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     service = LaTeXService()
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "chapters/main.tex"},
-    ):
+    with _patched_get_project("chapters/main.tex"):
         result = await service.get_compile_status("x")
 
     assert result == {"has_pdf": True, "pdf_files": ["chapters/output.pdf"]}
@@ -492,13 +434,6 @@ async def test_synctex_backward_parses_input_file_after_line_number(tmp_path, mo
     (source_dir / "main.tex").write_text("", encoding="utf-8")
     (source_dir / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
     class FakeProcess:
         returncode = 0
 
@@ -509,7 +444,11 @@ async def test_synctex_backward_parses_input_file_after_line_number(tmp_path, mo
         assert kwargs["cwd"] == str(source_dir)
         return FakeProcess()
 
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
+    # Scope note for every ``latex_service_module.asyncio`` patch below:
+    # that reference IS the shared asyncio module, so the fake subprocess
+    # constructor is visible process-wide until monkeypatch undoes it at
+    # teardown. Safe in this serial, single-process suite.
     monkeypatch.setattr(
         latex_service_module.asyncio,
         "create_subprocess_exec",
@@ -517,15 +456,10 @@ async def test_synctex_backward_parses_input_file_after_line_number(tmp_path, mo
     )
     service = LaTeXService()
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "chapters/main.tex"},
-    ):
+    with _patched_get_project("chapters/main.tex"):
         result = await service.run_synctex(
             "x",
-            type("SyncData", (), {"type": "backward", "page": 1, "x": 0, "y": 0})(),
+            SyncTeXRequest(type="backward", page=1, x=0, y=0),
         )
 
     assert result["file"] == "chapters/main.tex"
@@ -541,13 +475,6 @@ async def test_synctex_backward_parses_input_file_without_line_number(tmp_path, 
     (source_dir / "main.tex").write_text("", encoding="utf-8")
     (source_dir / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
     class FakeProcess:
         returncode = 0
 
@@ -557,7 +484,7 @@ async def test_synctex_backward_parses_input_file_without_line_number(tmp_path, 
     async def fake_create_subprocess_exec(*args, **kwargs):
         return FakeProcess()
 
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     monkeypatch.setattr(
         latex_service_module.asyncio,
         "create_subprocess_exec",
@@ -565,15 +492,10 @@ async def test_synctex_backward_parses_input_file_without_line_number(tmp_path, 
     )
     service = LaTeXService()
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "chapters/main.tex"},
-    ):
+    with _patched_get_project("chapters/main.tex"):
         result = await service.run_synctex(
             "x",
-            type("SyncData", (), {"type": "backward", "page": 1, "x": 0, "y": 0})(),
+            SyncTeXRequest(type="backward", page=1, x=0, y=0),
         )
 
     assert result["file"] == "chapters/main.tex"
@@ -588,13 +510,6 @@ async def test_synctex_backward_parses_absolute_input_file(tmp_path, monkeypatch
     source_dir.mkdir(parents=True)
     (source_dir / "main.tex").write_text("", encoding="utf-8")
     (source_dir / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
-
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
 
     class FakeProcess:
         returncode = 0
@@ -613,7 +528,7 @@ async def test_synctex_backward_parses_absolute_input_file(tmp_path, monkeypatch
     async def fake_create_subprocess_exec(*args, **kwargs):
         return FakeProcess()
 
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     monkeypatch.setattr(
         latex_service_module.asyncio,
         "create_subprocess_exec",
@@ -621,15 +536,10 @@ async def test_synctex_backward_parses_absolute_input_file(tmp_path, monkeypatch
     )
     service = LaTeXService()
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "chapters/main.tex"},
-    ):
+    with _patched_get_project("chapters/main.tex"):
         result = await service.run_synctex(
             "x",
-            type("SyncData", (), {"type": "backward", "page": 1, "x": 0, "y": 0})(),
+            SyncTeXRequest(type="backward", page=1, x=0, y=0),
         )
 
     assert result["file"] == "chapters/main.tex"
@@ -656,13 +566,6 @@ async def test_synctex_backward_ignores_generated_files(tmp_path, monkeypatch):
     project_path.mkdir()
     (project_path / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
     class FakeProcess:
         returncode = 0
 
@@ -672,7 +575,7 @@ async def test_synctex_backward_ignores_generated_files(tmp_path, monkeypatch):
     async def fake_create_subprocess_exec(*args, **kwargs):
         return FakeProcess()
 
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     monkeypatch.setattr(
         latex_service_module.asyncio,
         "create_subprocess_exec",
@@ -680,16 +583,11 @@ async def test_synctex_backward_ignores_generated_files(tmp_path, monkeypatch):
     )
     service = LaTeXService()
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "main.tex"},
-    ):
+    with _patched_get_project("main.tex"):
         with pytest.raises(latex_service_module.SyncTeXError, match="No source location found"):
             await service.run_synctex(
                 "x",
-                type("SyncData", (), {"type": "backward", "page": 1, "x": 0, "y": 0})(),
+                SyncTeXRequest(type="backward", page=1, x=0, y=0),
             )
 
 
@@ -702,13 +600,6 @@ async def test_synctex_forward_uses_absolute_source_path(tmp_path, monkeypatch):
     (source_dir / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
     commands = []
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
     class FakeProcess:
         returncode = 0
 
@@ -719,7 +610,7 @@ async def test_synctex_forward_uses_absolute_source_path(tmp_path, monkeypatch):
         commands.append(args)
         return FakeProcess()
 
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     monkeypatch.setattr(
         latex_service_module.asyncio,
         "create_subprocess_exec",
@@ -727,54 +618,26 @@ async def test_synctex_forward_uses_absolute_source_path(tmp_path, monkeypatch):
     )
     service = LaTeXService()
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "chapters/main.tex"},
-    ):
+    with _patched_get_project("chapters/main.tex"):
         result = await service.run_synctex(
             "x",
-            type("SyncData", (), {
-                "type": "forward",
-                "file": "chapters/main.tex",
-                "line": 7,
-                "column": 3,
-            })(),
+            SyncTeXRequest(type="forward", file="chapters/main.tex", line=7, column=3),
         )
 
     assert result["success"] is True
     assert f"7:3:{source_dir / 'main.tex'}" in commands[0]
 
 
-@pytest.mark.asyncio
-@pytest.mark.timeout(10)
-async def test_synctex_rejects_unknown_type(tmp_path, monkeypatch):
-    project_path = tmp_path / "project"
-    project_path.mkdir()
-    (project_path / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
+def test_synctex_request_rejects_unknown_type():
+    """The request schema admits only forward/backward.
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
-    service = LaTeXService()
-
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "main.tex"},
-    ):
-        with pytest.raises(latex_service_module.SyncTeXError, match="Unsupported SyncTeX type"):
-            await service.run_synctex(
-                "x",
-                type("SyncData", (), {"type": "sideways", "page": 1, "x": 0, "y": 0})(),
-            )
+    An unknown type is a pydantic ValidationError (HTTP 422 at the API
+    edge) and never reaches run_synctex; the service's own "Unsupported
+    SyncTeX type" branch stays as defense for internal callers, which
+    cannot be exercised through the real request schema.
+    """
+    with pytest.raises(ValidationError):
+        SyncTeXRequest(type="sideways", page=1, x=0, y=0)
 
 
 @pytest.mark.asyncio
@@ -783,13 +646,6 @@ async def test_synctex_reports_nonzero_exit(tmp_path, monkeypatch):
     project_path = tmp_path / "project"
     project_path.mkdir()
     (project_path / "output.pdf").write_bytes(b"%PDF" + b"x" * 1200)
-
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
 
     class FakeProcess:
         returncode = 1
@@ -800,7 +656,7 @@ async def test_synctex_reports_nonzero_exit(tmp_path, monkeypatch):
     async def fake_create_subprocess_exec(*args, **kwargs):
         return FakeProcess()
 
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     monkeypatch.setattr(
         latex_service_module.asyncio,
         "create_subprocess_exec",
@@ -808,21 +664,11 @@ async def test_synctex_reports_nonzero_exit(tmp_path, monkeypatch):
     )
     service = LaTeXService()
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "main.tex"},
-    ):
+    with _patched_get_project("main.tex"):
         with pytest.raises(latex_service_module.SyncTeXError, match="bad synctex"):
             await service.run_synctex(
                 "x",
-                type("SyncData", (), {
-                    "type": "backward",
-                    "page": 1,
-                    "x": 0,
-                    "y": 0,
-                })(),
+                SyncTeXRequest(type="backward", page=1, x=0, y=0),
             )
 
 
@@ -866,13 +712,7 @@ def test_resolve_main_file_rejects_multiple_candidates(tmp_path, monkeypatch):
     (project_path / "a" / "main.tex").write_text("", encoding="utf-8")
     (project_path / "b" / "main.tex").write_text("", encoding="utf-8")
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-
-        def get_project_path(self, project_id):
-            return project_path
-
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path, default_engine=None))
     service = LaTeXService()
 
     with pytest.raises(latex_service_module.LaTeXCompilationError, match="Multiple files named main.tex"):
@@ -997,17 +837,10 @@ async def test_compile_reports_missing_latexmk(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    class FakeSettings:
-        LATEX_ENGINES = ["pdflatex", "xelatex", "lualatex", "latex"]
-        DEFAULT_LATEX_ENGINE = "pdflatex"
-
-        def get_project_path(self, project_id):
-            return project_path
-
     async def fake_create_subprocess_exec(*args, **kwargs):
         raise FileNotFoundError
 
-    monkeypatch.setattr(latex_service_module, "settings", FakeSettings())
+    monkeypatch.setattr(latex_service_module, "settings", _fake_settings(project_path))
     monkeypatch.setattr(
         latex_service_module.asyncio,
         "create_subprocess_exec",
@@ -1015,12 +848,7 @@ async def test_compile_reports_missing_latexmk(tmp_path, monkeypatch):
     )
     service = LaTeXService()
 
-    with patch.object(
-        project_service_module.project_service,
-        "get_project",
-        new_callable=AsyncMock,
-        return_value={"id": "x", "main_file": "main.tex", "engine": "pdflatex"},
-    ):
+    with _patched_get_project("main.tex", engine="pdflatex"):
         result = await service.compile("x")
 
     assert result["success"] is False

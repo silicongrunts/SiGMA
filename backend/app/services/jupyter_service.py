@@ -1,5 +1,4 @@
 import os
-import re
 import subprocess
 import secrets
 import asyncio
@@ -319,21 +318,39 @@ class JupyterService:
 
     async def kill_project_kernels(self, project_id: str):
         """Kill all Jupyter kernels associated with a project."""
-        if not await self.is_running():
+        from app.core.exceptions import JupyterKernelError
+
+        managed_process = self.process
+        if managed_process is None or managed_process.poll() is not None:
             return
+        try:
+            running = await self.is_running()
+        except Exception as exc:
+            raise JupyterKernelError(
+                project_id, 503, "Managed Jupyter API is unavailable",
+            ) from exc
+        if not running:
+            raise JupyterKernelError(
+                project_id, 503, "Managed Jupyter API is unavailable",
+            )
         async with httpx.AsyncClient(timeout=10) as client:
             sessions_resp = await client.get(self._api_url(f"sessions?token={self.token}"))
+            if not 200 <= sessions_resp.status_code < 300:
+                raise JupyterKernelError(
+                    project_id, sessions_resp.status_code, sessions_resp.text,
+                )
             for s in sessions_resp.json():
                 nb_path = (s.get("notebook", {}) or {}).get("path", "")
                 if nb_path.startswith(f"{project_id}/"):
                     kernel_id = (s.get("kernel", {}) or {}).get("id")
                     if kernel_id:
-                        try:
-                            await client.delete(
-                                self._api_url(f"kernels/{kernel_id}?token={self.token}")
+                        response = await client.delete(
+                            self._api_url(f"kernels/{kernel_id}?token={self.token}")
+                        )
+                        if not 200 <= response.status_code < 300:
+                            raise JupyterKernelError(
+                                kernel_id, response.status_code, response.text,
                             )
-                        except Exception:
-                            logger.debug("Failed to delete Jupyter kernel %s", kernel_id, exc_info=True)
 
     async def kill_kernel(self, kernel_id: str) -> None:
         """Kill a specific kernel via Jupyter API."""
@@ -653,44 +670,14 @@ _jupyter_instance = None
 
 
 def get_jupyter():
-    """Get the global Jupyter service instance.
+    """Return the global Jupyter service instance.
 
-    In the Huey worker process, ``set_jupyter`` is never called because
-    ``start_jupyter`` runs inside the FastAPI web process.  This function
-    falls back to lazy-initialising from the config file written by the
-    web process so that tools (notebook_run_cell, notebook_read, …) can
-    still reach the running Jupyter server.
+    ``set_jupyter`` runs during application startup, before the app serves
+    any request; ``None`` therefore only surfaces if startup was skipped
+    (e.g. in a bare interpreter) and callers treat it as "Jupyter
+    unavailable".
     """
-    global _jupyter_instance
-    if _jupyter_instance is not None:
-        return _jupyter_instance
-
-    # Lazy init from config file (Huey worker path)
-    try:
-        config_path = settings.SIGMA_DIR / "jupyter" / "jupyter_server_config.py"
-        if not config_path.exists():
-            return None
-        content = config_path.read_text(encoding="utf-8")
-        match = re.search(r"c\.IdentityProvider\.token\s*=\s*'([^']+)'", content)
-        if not match:
-            match = re.search(r"c\.NotebookApp\.token\s*=\s*'([^']+)'", content)
-        if not match:
-            return None
-        token = match.group(1)
-
-        # Extract port from config
-        port_match = re.search(r"c\.ServerApp\.port\s*=\s*(\d+)", content)
-        if not port_match:
-            port_match = re.search(r"c\.NotebookApp\.port\s*=\s*(\d+)", content)
-        port = int(port_match.group(1)) if port_match else 8890
-
-        svc = JupyterService(base_dir=str(settings.USERDATA_DIR), port=port)
-        svc.token = token
-        _jupyter_instance = svc
-        return svc
-    except Exception:
-        logger.debug("get_jupyter lazy-init failed", exc_info=True)
-        return None
+    return _jupyter_instance
 
 
 def set_jupyter(svc):

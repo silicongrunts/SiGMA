@@ -173,14 +173,24 @@ async def test_future_commit_date_arms_capped_timer(
     monkeypatch, tmp_path, fast_timers
 ):
     # A commit date skewed into the future makes elapsed negative and the
-    # remaining time exceed the full interval; the delay must stay capped.
+    # remaining time (interval - elapsed) grow with the skew. The armed
+    # delay must stay capped at one full interval, so a skewed clock can
+    # only ever postpone the re-check, not silence it for hours.
     t0 = utcnow()
-    _patch_deps(monkeypatch, [t0 + timedelta(hours=1), t0 + timedelta(hours=1)], tmp_path)
+    _patch_deps(monkeypatch, [t0 + timedelta(hours=3), t0 + timedelta(hours=3)], tmp_path)
 
     svc = SnapshotService()
     await svc.maybe_snapshot("p1")
 
-    assert svc._pending.get("p1") is not None
+    task = svc._pending.get("p1")
+    assert task is not None
+    # The timer is suspended inside asyncio.sleep(delay_sec) (or not yet
+    # started), so the effective delay is readable from the coroutine frame.
+    delay_sec = task.get_coro().cr_frame.f_locals["delay_sec"]
+    # Raw remaining would be ~3h + interval; the cap pins it to interval*60s.
+    assert delay_sec == pytest.approx(60.0), (
+        f"timer delay must be capped at one interval, got {delay_sec}s"
+    )
 
     await svc.shutdown()
     assert svc._pending == {}

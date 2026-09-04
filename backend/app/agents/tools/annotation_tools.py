@@ -225,11 +225,11 @@ async def _annotation_rm(project_id: str, id) -> str:
 
     parts = []
     for anno_id in ids:
-        success, err = await annotation_service.delete_annotation(project_id, anno_id)
-        if success:
+        result = await annotation_service.delete_annotation(project_id, anno_id)
+        if result.get("deleted"):
             parts.append(f"Annotation {anno_id} deleted")
         else:
-            parts.append(f"Error for {anno_id}: {err}")
+            parts.append(f"Error for {anno_id}: {result.get('error', 'delete failed')}")
 
     return "\n".join(parts)
 

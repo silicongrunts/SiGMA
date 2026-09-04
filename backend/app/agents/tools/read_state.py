@@ -105,15 +105,6 @@ class ReadStateCache:
             coverage=coverage,
         )
 
-    def was_read_full(self, session_id: str, file_path: str) -> bool:
-        """True iff *file_path* was read in *session_id*.
-
-        Kept for compatibility with older call sites; paginated reads now
-        satisfy the must-read-first contract.
-        """
-        entry = self._store.get(session_id, {}).get(file_path)
-        return entry is not None
-
     def get(self, session_id: str, file_path: str) -> Optional[ReadStateEntry]:
         """Return the recorded entry, or ``None`` if not read in this session."""
         return self._store.get(session_id, {}).get(file_path)

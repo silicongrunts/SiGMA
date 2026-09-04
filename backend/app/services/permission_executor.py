@@ -20,74 +20,26 @@ When approval is needed, ``execute_with_permission`` raises
 ``PermissionRequestPause``. The LLM loop runner catches it, parks the task as
 ``awaiting_input`` (same mechanism used by interactive tools like
 ``ask_user_question``), and the user's response arrives via the resume path
-(``POST /chat/stream`` with ``resume=true``). This makes permission pauses
-crash-safe: a worker restart or page refresh does not lose the pending request,
-because it is persisted in ``interaction_state`` rather than held in process
-memory.
+(``POST /chat/stream`` with ``resume=true``). The pending request is durable
+because it lives in the persisted ``interaction_state`` column of the task
+row: a process restart or page refresh cannot lose it — the row is the
+source of truth, and the resume path re-reads it from the database.
 """
 
+import hashlib
 from typing import Any, Optional
 
 from app.agents.tools.bash_permissions import check_bash_permission
+from app.agents.tools.read_state import record_path_read
 from app.agents.tools.registry import tool_registry
 from app.agents.tools.schema_validation import validate_tool_args
 from app.core.logging import get_logger
 from app.core.text_diff import DIFF_LINE_SOFT_LIMIT, compute_diff_lines
 from app.services.file_service import PathAccessLevel, file_service
 from app.services.llm_loop_runner import LLMLoopRunner
+from app.services.pauses import PermissionRequestPause
 
 logger = get_logger(__name__)
-
-
-class PermissionRequestPause(Exception):
-    """Raised when a tool needs user approval before it can execute.
-
-    Carries the full context needed to render the approval dialog and to resume
-    the task after the user responds. The LLM loop runner catches this, persists
-    a checkpoint via ``mark_awaiting_input``, and emits an ``awaiting_input``
-    SSE event. The user's response flows back through the resume path
-    (``QueryLoop._resume_from_permission``).
-    """
-
-    def __init__(
-        self,
-        *,
-        tool: str,
-        tool_name: str = "",
-        path: str = "",
-        operation: str = "",
-        content: str = "",
-        description: str = "",
-        diff_lines: list | None = None,
-        diff_truncated: bool = False,
-    ):
-        self.tool = tool              # category: file_external/file_internal/bash/notebook
-        self.tool_name = tool_name    # concrete tool invoked: write/edit/bash/...
-        self.path = path
-        self.operation = operation
-        self.content = content
-        self.description = description
-        # Structured diff for the ``edit`` tool (old_string -> new_string);
-        # ``None`` for other tools, which fall back to the flat ``content``.
-        # ``diff_truncated`` is set when the diff exceeded DIFF_LINE_SOFT_LIMIT.
-        self.diff_lines = diff_lines
-        self.diff_truncated = diff_truncated
-        # Set by the runner when the pause propagates out of a subagent, so
-        # the parent loop knows which agent tool_call to attach the result to.
-        self.parent_tool_call_id = ""
-        # Enriched by agent_service when the pause escapes a subagent, so the
-        # checkpoint can be saved as a subagent interaction and the subagent
-        # resumed mid-loop after the user responds (same pattern as
-        # InteractiveToolPause). Empty for direct (main-loop) tool pauses.
-        self.agent_session_id = ""
-        self.agent_type = ""
-        self.agent_usage_baseline: dict | None = None
-        self.inner_tool_call_id = ""
-        # The full tool_args of the paused tool call. Set by the runner when it
-        # catches the pause (the runner has the LLM-produced args). Needed to
-        # re-execute the tool on resume after user approval.
-        self.tool_args: dict = {}
-        super().__init__(f"Permission required for {tool_name or tool}: {operation} {path}")
 
 
 # The four permission categories. Tools map onto one of these (see
@@ -98,6 +50,11 @@ class PermissionRequestPause(Exception):
 PERMISSION_CATEGORIES: tuple[str, ...] = (
     "file_external", "file_internal", "bash", "notebook",
 )
+
+# Categories whose approval carries a resolved-target snapshot. For these an
+# empty snapshot means the target could not be resolved at approval time, so
+# the resume path must refuse execution instead of running blind.
+FILE_PERMISSION_CATEGORIES: tuple[str, ...] = ("file_external", "file_internal")
 
 
 async def execute_with_permission(
@@ -206,6 +163,153 @@ async def _is_auto_approved(project_id: str, category: str) -> bool:
     return val == "true"
 
 
+def write_target_arg(tool_args: dict) -> str:
+    """The filesystem path a write-category tool targets.
+
+    Shared by the approval gate and the resume-side target-drift check so
+    both extract — and therefore resolve — the same argument.
+    """
+    return (
+        tool_args.get("file_path") or tool_args.get("path")
+        or tool_args.get("notebook_path") or ""
+    )
+
+
+def approved_target_drift_error(
+    project_id: str, approved_resolved: str, tool_args: dict, category: str = "",
+) -> str:
+    """Return the not-executed error when the approved write target drifted.
+
+    Re-resolves the tool's target path and compares it with the snapshot
+    taken when the approval dialog was shown. Returns ``""`` when the target
+    is unchanged. A file-category approval whose snapshot is empty (the
+    target could not be resolved at approval time) is refused like a drift —
+    an unresolvable target must be re-requested, never executed against an
+    unvalidated path. bash / notebook categories carry no snapshot and
+    always pass.
+    """
+    if not approved_resolved:
+        if category in FILE_PERMISSION_CATEGORIES:
+            return (
+                "Error: the approved target could not be re-resolved; "
+                "the operation was not executed. Re-request the operation "
+                "with a resolvable path."
+            )
+        return ""
+    current = file_service.resolve_write_target(
+        project_id, write_target_arg(tool_args),
+    )
+    current_str = str(current) if current is not None else "<unresolvable>"
+    if current_str == approved_resolved:
+        return ""
+    return (
+        "Error: the approved target changed since approval "
+        f"(approved target: {approved_resolved}; "
+        f"current target: {current_str}). "
+        "The operation was not executed. Ask the user to approve the "
+        "current target if it is still needed."
+    )
+
+
+_NOTEBOOK_DRIFT_TAIL = (
+    "The operation was not executed. Re-request the cell execution "
+    "if it is still needed."
+)
+
+
+async def approved_notebook_drift_error(
+    project_id: str, tool_args: dict, approved_sha256: str,
+) -> str:
+    """Return the not-executed error when the approved notebook cell changed.
+
+    A notebook approval snapshots the sha256 of the cell's full source —
+    hashed before the dialog's CONTENT_SOFT_LIMIT truncation, so the digest
+    always describes what the user reviewed. On resume the current source is
+    re-hashed and compared, so a cell edited while the task was parked cannot
+    execute under an approval granted for the old code. Checkpoints saved
+    before the snapshot existed carry no hash and pass unchanged.
+    """
+    if not approved_sha256:
+        return ""
+    notebook_path = tool_args.get("notebook_path", "")
+    cell_id = tool_args.get("cell_id", "")
+    if not notebook_path or not cell_id:
+        return ""
+    from app.agents.tools.notebook_utils import (
+        cell_source_text, find_cell_index, read_notebook_json,
+    )
+    try:
+        notebook, _location = await read_notebook_json(notebook_path, project_id)
+    except Exception:
+        # The tool re-reads the notebook itself and will surface the read
+        # failure as its own error result; there is nothing extra to refuse.
+        logger.warning(
+            "Failed to re-read notebook %s to verify the approved cell",
+            notebook_path, exc_info=True,
+        )
+        return ""
+    idx = find_cell_index(notebook.get("cells", []), cell_id)
+    if idx < 0:
+        return (
+            f"Error: the approved notebook cell was removed since approval "
+            f"(cell {cell_id}). {_NOTEBOOK_DRIFT_TAIL}"
+        )
+    current = hashlib.sha256(
+        cell_source_text(notebook["cells"][idx]).encode("utf-8"),
+    ).hexdigest()
+    if current == approved_sha256:
+        return ""
+    return (
+        f"Error: the approved notebook cell changed since approval "
+        f"(cell {cell_id} no longer matches the approved content). "
+        f"{_NOTEBOOK_DRIFT_TAIL}"
+    )
+
+
+# Tools whose bodies enforce the must-read-first contract against the
+# in-memory per-session read-state cache (read_state.py). An approval pause
+# for one of these can only be raised after the tool's preflight must-read
+# check passed, so the model had read the target when the approval was
+# granted; the cache itself is process-local and does not survive the restart
+# that makes an approval resume necessary.
+_MUST_READ_TOOLS: frozenset[str] = frozenset({
+    "write", "edit", "notebook_edit", "notebook_run_cell",
+})
+
+
+def restore_approved_read_state(
+    tool_name: str, tool_args: dict, project_id: str, session_id: str,
+) -> None:
+    """Re-record the approved target as read before the approved execution.
+
+    Without this, a write/edit/notebook approval resumed after a process
+    restart would be rejected by the tool's own must-read check — the user's
+    approval consumed with nothing executed. A pause implies the target was
+    read (or did not yet exist) under this session, so re-recording it
+    restores the exact cache state the approval was granted under. Scoped to
+    the approved target and session only: every other file keeps requiring
+    its own prior read, including after the resume.
+    """
+    if tool_name not in _MUST_READ_TOOLS or not session_id:
+        return
+    target = write_target_arg(tool_args)
+    if not target:
+        return
+    if tool_name.startswith("notebook"):
+        from app.agents.tools.notebook_utils import (
+            NotebookToolError, normalize_notebook_path,
+        )
+        try:
+            resolved = normalize_notebook_path(target, project_id).absolute_path
+        except NotebookToolError:
+            return
+    else:
+        resolved = file_service.resolve_write_target(project_id, target)
+        if resolved is None:
+            return
+    record_path_read(session_id, resolved, content="", is_partial=False)
+
+
 async def _check_bash(
     tool_args: dict, project_id: str,
 ) -> Optional[str]:
@@ -242,10 +346,13 @@ async def _check_notebook_run(
     tool_args: dict, project_id: str,
 ) -> Optional[str]:
     """Require approval to execute a notebook cell. The cell's source code is
-    shown in the approval dialog as preview content."""
+    shown in the approval dialog as preview content, and the sha256 of the
+    full source is snapshotted so the resume path can refuse to execute a
+    cell that changed while the task was parked."""
     notebook_path = tool_args.get("notebook_path", "")
     cell_id = tool_args.get("cell_id", "")
     code = ""
+    source_sha256 = ""
     if notebook_path and cell_id:
         try:
             from app.agents.tools.notebook_utils import (
@@ -260,13 +367,15 @@ async def _check_notebook_run(
             if cell.get("cell_type") != "code":
                 return f"Error: Cell {cell_id} is not a code cell."
             code = cell_source_text(cell)
+            source_sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
         except NotebookToolError as exc:
             return f"Error: {exc}"
-        except Exception:
-            logger.debug(
-                "Failed to read notebook cell source for permission prompt",
-                exc_info=True,
+        except Exception as exc:
+            logger.warning(
+                "Failed to read notebook cell %s for permission prompt",
+                cell_id, exc_info=True,
             )
+            return f"Error: Unable to read cell {cell_id} for approval: {exc}"
 
     # Auto-approve short-circuits before pausing.
     if await _is_auto_approved(project_id, "notebook"):
@@ -278,6 +387,7 @@ async def _check_notebook_run(
         path=notebook_path,
         operation="execute code in",
         content=code or f"(cell {cell_id})",
+        content_sha256=source_sha256,
     )
 
 
@@ -289,12 +399,12 @@ async def _check_write(
     """Require approval for filesystem writes, classifying the target into the
     ``file_internal`` (sandbox /tmp) or ``file_external`` category.
 
+    The checkpoint carries a resolved-target snapshot (``resolved_path``) so
+    the resume path can detect a target that moved while the task was parked.
+
     For the ``edit`` tool, the before/after strings are composed into the preview.
     """
-    target_path = (
-        tool_args.get("file_path") or tool_args.get("path")
-        or tool_args.get("notebook_path") or ""
-    )
+    target_path = write_target_arg(tool_args)
     if not target_path:
         return None
 
@@ -331,6 +441,14 @@ async def _check_write(
                 diff_lines = diff_lines[:DIFF_LINE_SOFT_LIMIT]
                 diff_truncated = True
 
+    # Snapshot the resolved target at approval time; the resume path
+    # re-resolves and compares against it (approved_target_drift_error). An
+    # empty snapshot (unresolvable target) is persisted as-is: the dialog
+    # still shows the requested path, and the resume path refuses execution
+    # for file categories so the operation is re-requested with a resolvable
+    # target instead of running blind.
+    resolved = file_service.resolve_write_target(project_id, target_path)
+
     raise PermissionRequestPause(
         tool=category,
         tool_name=tool_name,
@@ -339,4 +457,5 @@ async def _check_write(
         content=content or "",
         diff_lines=diff_lines,
         diff_truncated=diff_truncated,
+        resolved_path=str(resolved) if resolved is not None else "",
     )

@@ -1,6 +1,5 @@
 /**
  * ProjectsView — project listing page (home screen).
- * Extracted from App.jsx (originally lines 50-458).
  */
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'

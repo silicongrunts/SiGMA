@@ -7,18 +7,23 @@ import pytest
 from app.core.exceptions import SessionNotFoundError, ValidationError
 import app.services.ai_service as ai_service_module
 from app.services.ai_service import (
-    _build_fork_rewrite_pairs,
     _collect_referenced_agent_ids,
     _resolve_fork_cutoff,
 )
+from tests.ai.conftest import (
+    FakeSessionRepo,
+    FakeSessionTempService,
+    FakeTaskStateRepo,
+    make_fake_uow,
+)
 
 
-def _msg(mid, seq, role, content="", tool_calls=None):
+def _msg(mid, seq, role, content="", tool_calls=None, created_at=None):
     return SimpleNamespace(
         id=mid, seq=seq, role=role, content=content,
         tool_calls=tool_calls, tool_call_id=None, reasoning_content=None,
         token_count=0, cached_tokens=0, input_tokens=0,
-        is_boundary=False, created_at=None,
+        is_boundary=False, created_at=created_at,
     )
 
 
@@ -67,61 +72,12 @@ def test_collect_referenced_agent_ids_requires_prefix_reference():
     assert _collect_referenced_agent_ids(prefix[:3], ["a1", "a2", "a3"]) == ["a1", "a2"]
 
 
-def test_build_fork_rewrite_pairs_id_pairs_rewrite_paths_and_tags():
-    pairs = _build_fork_rewrite_pairs({"old-parent": "new-parent"})
-    assert pairs == [("old-parent", "new-parent")]
-    content = (
-        ".SiGMA/sessions/old-parent/chat_attachments/a.png"
-        " <resume_id>old-parent</resume_id>"
-    )
-    for old, new in pairs:
-        content = content.replace(old, new)
-    assert content == (
-        ".SiGMA/sessions/new-parent/chat_attachments/a.png"
-        " <resume_id>new-parent</resume_id>"
-    )
-
-
 # ---------------------------------------------------------------------------
 # fork_session orchestration (fake UnitOfWork / repos / temp service)
 # ---------------------------------------------------------------------------
 
-class _FakeSessionRow(SimpleNamespace):
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "title": self.title,
-            "session_kind": getattr(self, "session_kind", "chat"),
-        }
-
-
-class _FakeSessionRepo:
-    def __init__(self, sessions, descendants):
-        self.sessions = sessions
-        self.descendants = descendants
-        self.staged = []
-        self.deleted = []
-
-    async def get_by_id(self, session_id):
-        return self.sessions.get(session_id)
-
-    async def collect_descendant_session_ids(self, session_id):
-        return self.descendants[session_id]
-
-    async def stage_create(self, project_id, **fields):
-        self.staged.append(fields)
-        row = _FakeSessionRow(
-            id=fields.get("session_id"),
-            **{k: v for k, v in fields.items() if k != "session_id"},
-        )
-        self.sessions[row.id] = row
-        return row
-
-    async def delete(self, session_id):
-        self.deleted.append(session_id)
-        return True
-
-
+# Stays local: the fork orchestration contract is stage_copy_messages with
+# rewrite pairs — a copy-recording shape no other test needs.
 class _FakeMessageRepo:
     def __init__(self, messages_by_session):
         self.messages_by_session = messages_by_session
@@ -134,45 +90,20 @@ class _FakeMessageRepo:
         self.copies.append((dst_session_id, [m.id for m in messages], rewrite_pairs))
 
 
-class _FakeTempService:
-    def __init__(self):
-        self.copied = []
-        self.deleted = []
-        self.fail_after = None  # raise once this many copies succeeded
+class _AgentResumesDuringFork(_FakeMessageRepo):
+    def __init__(self, messages_by_session):
+        super().__init__(messages_by_session)
+        self._source_reads = 0
 
-    def copy_session_dir(self, project_id, src, dst):
-        if self.fail_after is not None and len(self.copied) >= self.fail_after:
-            raise RuntimeError("disk full")
-        self.copied.append((src, dst))
-
-    def delete_session_dir(self, project_id, session_id):
-        self.deleted.append(session_id)
-
-
-class _FakeUnitOfWork:
-    """Stand-in for UnitOfWork: hands out one fake UoW per context."""
-    session_repo = None
-    message_repo = None
-    fail_atomic = False
-
-    def __init__(self, project_id):
-        self.uow = SimpleNamespace(
-            sessions=self.session_repo, messages=self.message_repo,
-        )
-
-    async def __aenter__(self):
-        return self.uow
-
-    async def __aexit__(self, *args):
-        return False
-
-    @classmethod
-    async def execute_atomic(cls, project_id, operation):
-        uow = cls(project_id).uow
-        result = await operation(uow)
-        if cls.fail_atomic:
-            raise RuntimeError("commit failed")  # staged, then the commit broke
-        return result
+    async def get_messages(self, session_id):
+        messages = await super().get_messages(session_id)
+        if session_id == "s1":
+            self._source_reads += 1
+            if self._source_reads == 2:
+                self.messages_by_session["a1"].append(
+                    _msg("am1", 1, "assistant", "resumed after fork point")
+                )
+        return messages
 
 
 def _build_source():
@@ -200,24 +131,29 @@ def _build_source():
     return source, agent1, agent2, messages, agent_messages
 
 
-def _install(monkeypatch, source, agents, messages, agent_messages):
-    session_repo = _FakeSessionRepo(
+def _install(
+    monkeypatch, source, agents, messages, agent_messages,
+    message_repo=None, fail_atomic=False,
+):
+    session_repo = FakeSessionRepo(
         {source.id: source, **{a.id: a for a in agents}},
         descendants={
             source.id: [source.id] + [a.id for a in agents],
             **{a.id: [a.id] for a in agents},
         },
     )
-    message_repo = _FakeMessageRepo({
-        source.id: messages,
-        **{a.id: agent_messages for a in agents},
-    })
-    _FakeUnitOfWork.session_repo = session_repo
-    _FakeUnitOfWork.message_repo = message_repo
-    _FakeUnitOfWork.fail_atomic = False
-
-    temp = _FakeTempService()
-    monkeypatch.setattr(ai_service_module, "UnitOfWork", _FakeUnitOfWork)
+    if message_repo is None:
+        message_repo = _FakeMessageRepo({
+            source.id: messages,
+            **{a.id: agent_messages for a in agents},
+        })
+    temp = FakeSessionTempService()
+    uow_cls = make_fake_uow(
+        sessions=session_repo, messages=message_repo,
+        task_state=FakeTaskStateRepo(),  # every fork test runs on an idle session
+        fail_atomic=fail_atomic,
+    )
+    monkeypatch.setattr(ai_service_module, "UnitOfWork", uow_cls)
     monkeypatch.setattr(ai_service_module, "session_temp_service", temp)
     return session_repo, message_repo, temp
 
@@ -269,6 +205,46 @@ async def test_fork_session_copies_prefix_and_referenced_agents(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_fork_agent_history_stops_at_parent_fork_boundary(monkeypatch):
+    source, agent1, agent2, messages, _ = _build_source()
+    messages[1].created_at = 2
+    messages[2].created_at = 4
+    agent_messages = [
+        _msg("am0", 0, "user", "agent prompt", created_at=3),
+        _msg("am1", 1, "assistant", "resume after parent fork", created_at=5),
+    ]
+    session_repo, message_repo, _ = _install(
+        monkeypatch, source, [agent1, agent2], messages, agent_messages,
+    )
+
+    await ai_service_module.ai_service.fork_session("p1", "s1", "m1")
+
+    new_agent_id = next(
+        s["session_id"] for s in session_repo.staged if s.get("session_kind") == "agent"
+    )
+    agent_copy = next(c for c in message_repo.copies if c[0] == new_agent_id)
+    assert agent_copy[1] == ["am0"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_fork_rejects_agent_resume_after_snapshot(monkeypatch):
+    source, agent1, agent2, messages, agent_messages = _build_source()
+    session_repo, _, _ = _install(
+        monkeypatch, source, [agent1, agent2], messages, agent_messages,
+        message_repo=_AgentResumesDuringFork({
+            source.id: messages, agent1.id: agent_messages, agent2.id: agent_messages,
+        }),
+    )
+
+    with pytest.raises(ValidationError, match="agent changed"):
+        await ai_service_module.ai_service.fork_session("p1", "s1", "m1")
+
+    assert not [row for row in session_repo.staged if row.get("session_kind") == "agent"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_fork_session_falls_back_to_source_title(monkeypatch):
     source, agent1, agent2, messages, agent_messages = _build_source()
     session_repo, _, _ = _install(
@@ -285,8 +261,8 @@ async def test_fork_session_cleans_up_after_atomic_failure(monkeypatch):
     source, agent1, agent2, messages, agent_messages = _build_source()
     session_repo, _, temp = _install(
         monkeypatch, source, [agent1], messages, agent_messages,
+        fail_atomic=True,
     )
-    _FakeUnitOfWork.fail_atomic = True
 
     with pytest.raises(RuntimeError):
         await ai_service_module.ai_service.fork_session("p1", "s1", "m1")
@@ -304,7 +280,7 @@ async def test_fork_session_cleans_up_after_temp_copy_failure(monkeypatch):
     session_repo, _, temp = _install(
         monkeypatch, source, [agent1], messages, agent_messages,
     )
-    temp.fail_after = 1  # parent dir copies, the referenced agent's dir fails
+    temp.fail_copy_after = 1  # parent dir copies, the agent dir copy fails
 
     with pytest.raises(RuntimeError):
         await ai_service_module.ai_service.fork_session("p1", "s1", "m1")

@@ -32,6 +32,7 @@ import { useSave } from '../hooks/useSave'
 import { useFileActions } from '../hooks/useFileActions'
 import { useAutoCompile } from '../hooks/useAutoCompile'
 import FileConflictModal from '../components/FileConflictModal'
+import { reloadConflict } from './conflictActions'
 import TerminalPanel from '../components/TerminalPanel'
 import { storage } from '../utils/storage'
 import { joinCitationTexts } from '../utils/citations'
@@ -85,6 +86,7 @@ export default function EditorView() {
   const setLeftTab = useStore(s => s.setLeftTab)
   const setPendingAutoMessage = useStore(s => s.setPendingAutoMessage)
   const setAnnotations = useStore(s => s.setAnnotations)
+  const setAnnotationCAS = useStore(s => s.setAnnotationCAS)
   const incrementFileVersion = useStore(s => s.incrementFileVersion)
   const incrementNotebookVersion = useStore(s => s.incrementNotebookVersion)
   const leftTab = useStore(s => s.leftTab)
@@ -137,7 +139,14 @@ export default function EditorView() {
 
   // ── Shared hooks ──
   const handleCompileRef = useRef(null)
-  const { handleSave, conflictState, resolveConflict } = useSave({ projectId, editorRef, handleCompileRef })
+  const { handleSave, conflictState, dismissConflict } = useSave({ projectId, editorRef, handleCompileRef })
+  const handleConflictReload = useCallback(async () => {
+    await reloadConflict({
+      reload: () => editorRef.current?.reloadFromDisk?.(),
+      dismiss: dismissConflict,
+      report: error => toastError(error.message || t('conflict.reloadFailed', 'Could not reload the latest version.')),
+    })
+  }, [dismissConflict, editorRef, t])
   const { handleCompile } = useCompile({ projectId, handleSave })
   const { handleFileSelect, handleExitNotebook } = useFileActions({ projectId, editorRef, previewRef, handleSave })
   handleCompileRef.current = handleCompile
@@ -438,13 +447,14 @@ export default function EditorView() {
       // validating annotations against stale document content.
       ;(editorRef.current?.whenReady?.() || Promise.resolve()).then(() => {
         filesAPI.loadAnnotations(projectId, cur).then(data => {
-          const validated = editorRef.current?.revalidateBackendAnnos?.(data) ?? data
+          setAnnotationCAS(data.revision, data.fileHash)
+          const validated = editorRef.current?.revalidateBackendAnnos?.(data.annotations) ?? data.annotations
           setAnnotations(validated)
           editorRef.current?.dispatchSetAnnos?.(validated)
         }).catch(e => console.warn('Failed to refresh annotations:', e))
       })
     }
-  }, [projectId])
+  }, [projectId, setAnnotationCAS])
 
   // ── Load project on mount ──
   useEffect(() => {
@@ -515,7 +525,8 @@ export default function EditorView() {
   const handleFileReady = useCallback((pid, file) => {
     if (!pid || !file) return
     filesAPI.loadAnnotations(pid, file).then(data => {
-      const validated = editorRef.current?.revalidateBackendAnnos?.(data) ?? data
+      setAnnotationCAS(data.revision, data.fileHash)
+      const validated = editorRef.current?.revalidateBackendAnnos?.(data.annotations) ?? data.annotations
       setAnnotations(validated)
       editorRef.current?.dispatchSetAnnos?.(validated)
     }).catch(e => console.warn('Failed to load annotations on file ready:', e))
@@ -678,6 +689,7 @@ export default function EditorView() {
                 handleExitNotebook={handleExitNotebook}
                 onFileReady={handleFileReady}
                 onSaveBeforeAnnotationChat={saveBeforeChat}
+                onAnnotationChanged={handleAnnotationChanged}
                 onApplyDiffSave={saveAfterApplyDiff}
                 onOpenPath={openProjectPath}
               />
@@ -696,8 +708,8 @@ export default function EditorView() {
           <FileConflictModal
             fileName={conflictState.fileName}
             diffLines={conflictState.diffLines}
-            onForceSave={() => resolveConflict(true)}
-            onCancel={() => resolveConflict(false)}
+            onReload={handleConflictReload}
+            onCancel={dismissConflict}
           />
         )}
         <TerminalPanel projectId={projectId} visible={showTerminal} />

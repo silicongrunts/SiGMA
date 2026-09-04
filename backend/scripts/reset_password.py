@@ -93,17 +93,18 @@ def _read_new_password() -> str:
 
 
 def _restart_services() -> bool:
-    """Restart web + worker via supervisorctl. Return False if unavailable.
+    """Restart the web program via supervisorctl. Return False if unavailable.
 
-    Matches the POST /system/restart flow. Outside supervisord (dev box) the
-    caller is told to restart manually — guessing/killing a host uvicorn would
-    be fragile and unsafe.
+    Matches the POST /system/restart flow, which restarts the single ``web``
+    program defined in docker/supervisord.conf. Outside supervisord (dev box)
+    the caller is told to restart manually — guessing/killing a host uvicorn
+    would be fragile and unsafe.
     """
     if not _SUPERVISOR_SOCKET.exists() or not shutil.which("supervisorctl"):
         return False
     try:
         result = subprocess.run(
-            ["supervisorctl", "restart", "web", "worker"],
+            ["supervisorctl", "restart", "web"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -168,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     # restarted or the change has no effect.
     print("\nRestarting services...")
     if _restart_services():
-        print("  web + worker restarted. The new password is now active.")
+        print("  web restarted. The new password is now active.")
         return 0
     print(
         "  supervisorctl unavailable (not under supervisord?). Restart SiGMA\n"

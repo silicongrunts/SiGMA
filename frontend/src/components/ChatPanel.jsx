@@ -8,7 +8,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import { useClickOutside } from '../hooks/useClickOutside'
-import { MarkdownContent, ThinkingProcess, CompactSummaryNote } from './ChatShared'
+import { MarkdownContent, ThinkingProcess, CompactSummaryNote, STREAM_RECOVERY_MAX_ATTEMPTS, STREAM_RECOVERY_DELAY_MS, isAgentToolName, streamStatusText, withTransientHint } from './ChatShared'
 import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2, GitBranch, Search, AlertTriangle } from 'lucide-react'
 import { toastError, toastSuccess } from './Toast'
 import { ModalOverlay, ConfirmModal } from './Modal'
@@ -30,21 +30,6 @@ function formatTokenCount(value) {
   return String(n)
 }
 
-function isAgentToolName(tool) {
-  return String(tool || '').toLowerCase() === 'agent'
-}
-
-function withTransientHint(process, content, extra = {}) {
-  const hint = { type: 'hint', content, transient: true, ...extra }
-  if (process.length > 0) {
-    const last = process[process.length - 1]
-    if (last.type === 'hint' && last.transient) {
-      return [...process.slice(0, -1), hint]
-    }
-  }
-  return [...process.filter(s => !(s.type === 'hint' && s.transient && s.content === content)), hint]
-}
-
 // Mark a running tool step done; edit/write calls additionally carry the
 // backend's file_edit diff metadata for the timeline card.
 function finishToolStep(step, payload) {
@@ -53,11 +38,43 @@ function finishToolStep(step, payload) {
   return done
 }
 
+// Strip parked-turn "waiting for input" markers from a process timeline —
+// at the top level and inside every tool step's subSteps. Called when the
+// user answers the dialog: the pause is over, and the resumed stream's live
+// events take over the rendering.
+function stripAwaitingSteps(process) {
+  if (!Array.isArray(process)) return process
+  const kept = []
+  for (const step of process) {
+    if (step.type === 'awaiting_input') continue
+    if (Array.isArray(step.subSteps) && step.subSteps.some(s => s.type === 'awaiting_input')) {
+      kept.push({ ...step, subSteps: stripAwaitingSteps(step.subSteps) })
+      continue
+    }
+    kept.push(step)
+  }
+  return kept
+}
+
 // Live reasoning window tuning: the flush throttle keeps token-frequency SSE
 // chunks from re-rendering the panel every few milliseconds, and the tail
 // slice bounds how much text enters React state per flush.
 const THINK_FLUSH_MS = 120
 const THINK_TAIL_CHARS = 800
+
+// Stream-liveness tuning: while a stream is open, a periodic backend
+// cross-check catches zombie streams whose terminal event was lost; when a
+// stream drops without one, reconnect to the still-running task a bounded
+// number of times before giving up and reloading history. The probe itself
+// gets a hard timeout so a blackholed connection cannot hang the check; only
+// after consecutive timed-out probes is the stream treated as dead.
+const STREAM_WATCHDOG_INTERVAL_MS = 10000
+const STREAM_PROBE_TIMEOUT_MS = 5000
+const STREAM_PROBE_MAX_FAILURES = 2
+// Consecutive getActive probes a recovery may spend while the network is
+// still down before it gives up and surfaces the loss to the user. Sized so
+// a ~30s outage stays inside the recovery window (5s probe timeout each).
+const STREAM_PROBE_RECOVERY_ATTEMPTS = 5
 
 // Events that never interrupt an open thinking segment — bookkeeping or
 // out-of-band notifications arriving mid-thought.
@@ -112,16 +129,6 @@ function formatDurationMs(ms) {
   return `${Math.floor(s / 60)}m ${s % 60}s`
 }
 
-function streamStatusText(data, t) {
-  if (data?.status === 'retrying') {
-    return t('chat.llmRetrying', {
-      attempt: data.attempt || 1,
-      maxAttempts: data.max_attempts || data.maxAttempts || 1,
-    })
-  }
-  return data?.message || ''
-}
-
 function parseMillionTokenBudget(value) {
   const raw = String(value || '').trim()
   if (!/^\d+(?:\.\d+)?$/.test(raw)) return null
@@ -130,18 +137,6 @@ function parseMillionTokenBudget(value) {
   const padded = (frac + '000000').slice(0, 6)
   const tokens = Number(whole) * 1_000_000 + Number(padded)
   return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : null
-}
-
-function stripLeadingSlashCommand(text) {
-  const trimmed = text.trimStart()
-  const match = trimmed.match(/^\/[a-zA-Z][\w-]*(?=\s|$)/)
-  if (!match) return text
-  return trimmed.slice(match[0].length).trimStart()
-}
-
-function replaceLeadingSlashCommand(text, command) {
-  const body = stripLeadingSlashCommand(text)
-  return `${command}${body ? ` ${body}` : ' '}`
 }
 
 /**
@@ -171,9 +166,12 @@ function getSlashSuggestions(text) {
   return SLASH_COMMANDS.filter(cmd => cmd.command.slice(1).toLowerCase().startsWith(q))
 }
 
+// Display text of a user message: a bare /plan renders as the localized plan
+// label (callers pass t('chat.planDisplay')); /plan <text> renders the text
+// after the command.
 function displayMessageText(text, planLabel) {
   const stripped = text.trim()
-  if (stripped === '/plan') return planLabel || 'Create a plan for the current task.'
+  if (stripped === '/plan') return planLabel
   if (stripped.startsWith('/plan ') || stripped.startsWith('/plan\t')) {
     return stripped.slice(5).trimStart()
   }
@@ -294,7 +292,11 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     const el = thinkBoxRef.current
     if (el && thinkFollowRef.current) el.scrollTop = el.scrollHeight
   }, [thinkingLive])
-  const abortRef = useRef(null)
+  // Identity of the CURRENT stream, { gen, controller, lastSeq }: gen is the
+  // generation captured at turn start (ownership across session switches),
+  // controller aborts the fetch, lastSeq is the highest applied SSE event id
+  // (cursor for resuming a dropped stream).
+  const streamHandleRef = useRef(null)
   const textareaRef = useRef(null)
   const imageInputRef = useRef(null)
   const pendingInteractionRef = useRef(null)  // deferred dispatch to avoid cross-render setState
@@ -304,6 +306,11 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   // navigation buttons — they are useless on a chat short enough to fit.
   const [chatScrollable, setChatScrollable] = useState(false)
   const taskIdRef = useRef(null)  // current backend task ID for cancellation
+  // The live streaming bubble carries a locally-generated `localId` and events
+  // target it by that id, so SSE handling survives mid-stream array mutations
+  // (history merges, reorderings) instead of depending on "last element".
+  const liveTurnIdRef = useRef(null)
+  const liveTurnSeqRef = useRef(0)
   const stopAbortTimerRef = useRef(null)
   const stopRequestedRef = useRef(false)
   const abnormalTerminalRef = useRef(false)
@@ -338,6 +345,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   // the pending-jump effect against firing on the previous session's
   // still-rendered messages.
   const messagesOwnerRef = useRef(null)
+  const historyGenerationRef = useRef(0)
+  const panelOwnerRef = useRef(null)
   // Archive-modal focus target from a search hit: consumed once the target
   // session's messages render (see the archivedFocus effect).
   const archivedFocusRef = useRef(null)
@@ -414,10 +423,14 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   }, [chatInput, loadEnabledSkills])
 
   // ---- Load sessions list ----
+  // The list includes archived sessions: the dropdown filters them out, the
+  // archived counter reads them, and pruneSessionState must see every known
+  // session id — pruning against the active-only subset would erase the
+  // token budgets of archived sessions.
   const loadSessions = useCallback(async () => {
     if (!projectId) return
     try {
-      const list = await chatAPI.listSessions(projectId)
+      const list = await chatAPI.listSessions(projectId, { include_archived: true })
       storage.pruneSessionState(projectId, list.map(s => s.id))
       setSessions(list)
       if (sessionId) {
@@ -450,7 +463,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     let cancelled = false
 
     const resolve = async () => {
-      // Reuse in-flight initialization if another ChatPanel is already resolving
+      // Reuse an in-flight initialization for this project (StrictMode remounts
+      // the effect while the first resolve is still running)
       let lock = sessionInitLocks.get(projectId)
       if (lock) {
         const sid = await lock
@@ -459,23 +473,26 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       }
 
       const promise = (async () => {
+        // Pruning must cover archived sessions too (their budgets live in the
+        // same map); session selection below stays scoped to active ones.
         let sid = storage.getSession(projectId)
         if (sid) {
           try {
-            const list = await chatAPI.listSessions(projectId)
+            const list = await chatAPI.listSessions(projectId, { include_archived: true })
             storage.pruneSessionState(projectId, list.map(s => s.id))
-            const found = list.find(s => s.id === sid)
+            const found = list.find(s => s.id === sid && !s.is_archived)
             if (!found) sid = null
             else setSessionTitle(found.title || '')
           } catch { sid = null }
         }
         if (!sid) {
           try {
-            const list = await chatAPI.listSessions(projectId)
+            const list = await chatAPI.listSessions(projectId, { include_archived: true })
             storage.pruneSessionState(projectId, list.map(s => s.id))
-            if (list && list.length > 0) {
-              sid = list[0].id
-              setSessionTitle(list[0].title || '')
+            const active = list.filter(s => !s.is_archived)
+            if (active.length > 0) {
+              sid = active[0].id
+              setSessionTitle(active[0].title || '')
             }
           } catch { /* fall through to create */ }
         }
@@ -505,8 +522,23 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
   function normalizeHistoryPage(response) {
     const messages = Array.isArray(response?.messages) ? response.messages : []
+    // Backfill the live-stream match keys from the backend's tool_call_id so
+    // a resumed stream (tool_end / agent_event) can re-attach to a step that
+    // was loaded from history after a refresh and finish it in place.
+    const normalized = messages.map(m => {
+      if (!Array.isArray(m?.process)) return m
+      let touched = false
+      const process = m.process.map(s => {
+        if (s?.type === 'tool' && s.tool_call_id && !s.toolCallId) {
+          touched = true
+          return { ...s, toolCallId: s.tool_call_id, _toolCallId: s.tool_call_id }
+        }
+        return s
+      })
+      return touched ? { ...m, process } : m
+    })
     return {
-      messages,
+      messages: normalized,
       has_more: Boolean(response?.has_more),
       next_before_seq: response?.next_before_seq ?? null,
       boundary_seq: response?.boundary_seq ?? null,
@@ -557,25 +589,163 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   }
 
   async function fetchHistoryPage(beforeSeq = null) {
+    const generation = historyGenerationRef.current
+    const ownerProjectId = projectId
+    const ownerSessionId = sessionId
     const params = { limit: HISTORY_PAGE_SIZE }
     if (beforeSeq !== null) params.beforeSeq = beforeSeq
-    return normalizeHistoryPage(await chatAPI.history(projectId, sessionId, params))
+    const page = normalizeHistoryPage(await chatAPI.history(ownerProjectId, ownerSessionId, params))
+    return generation === historyGenerationRef.current && ownerProjectId === projectId && ownerSessionId === sessionId
+      ? page
+      : null
   }
 
   async function refreshLatestHistory({ dropLocal = true } = {}) {
     if (!projectId || !sessionId) return []
     const page = await fetchHistoryPage()
+    if (!page) return []
     if (historyModeRef.current === 'latest') setHistoryPaging(page)
     setMessages(prev => mergeHistoryMessages(prev, page.messages, { dropLocal }))
     return page.messages
   }
 
+  function nextLiveTurnId() {
+    liveTurnSeqRef.current += 1
+    const id = `live-turn-${liveTurnSeqRef.current}`
+    liveTurnIdRef.current = id
+    return id
+  }
+
+  /** Index of the bubble live SSE events apply to: the locally-tagged
+   * streaming bubble when present, else the trailing SiGMA bubble (a
+   * resume/reconnect rebuilt it without the tag). -1 when there is none. */
+  function findLiveTargetIndex(msgs) {
+    const liveId = liveTurnIdRef.current
+    if (liveId) {
+      const idx = msgs.findIndex(m => m.localId === liveId)
+      if (idx >= 0) return idx
+    }
+    const lastIdx = msgs.length - 1
+    if (lastIdx >= 0 && msgs[lastIdx].role === 'SiGMA') return lastIdx
+    return -1
+  }
+
+  /** Register the single active stream. Aborts any leftover stream first:
+   *  after a lost terminal event its connection can hang indefinitely,
+   *  leaking the fetch and its watchdog interval. */
+  /** Token sums to carry onto a rebuilt live bubble: the trailing SiGMA
+   *  entries being popped are the in-progress turn's persisted rows, and
+   *  the usage line under the bubble should survive the rebuild (the next
+   *  turn_usage event overwrites it with authoritative totals). */
+  function collectTurnUsageSums(entries) {
+    return entries.reduce((acc, e) => ({
+      token_count: (acc.token_count || 0) + (e.token_count || 0),
+      cached_tokens: (acc.cached_tokens || 0) + (e.cached_tokens || 0),
+      input_tokens: (acc.input_tokens || 0) + (e.input_tokens || 0),
+    }), {})
+  }
+
+  function beginStreamHandle(controller = new AbortController()) {
+    const handle = { gen: genRef.current, controller, lastSeq: 0, probeFailures: 0, probeDead: false, recoveryGaveUp: false }
+    streamHandleRef.current?.controller.abort()
+    streamHandleRef.current = handle
+    return handle
+  }
+
+  /** Lower the streaming flag only while *handle* still owns the live
+   *  stream: a superseded turn's cleanup (its connection was aborted when a
+   *  new stream took over, see beginStreamHandle) must not clobber the
+   *  successor's state. A recovery that exhausted its budget while the task
+   *  is still running (recoveryGaveUp) keeps the flag instead: spinner and
+   *  stop button stay truthful and Stop remains a way out — dropping to idle
+   *  would invite sends the backend rejects with 409. */
+  function releaseStreaming(handle) {
+    if (streamHandleRef.current !== handle) return
+    if (handle.recoveryGaveUp) return
+    setIsStreaming(false)
+  }
+
+  /** End-of-turn cleanup shared by every send path: refresh server history
+   *  (real message IDs, can_edit flags) unless the turn parked for input —
+   *  then the live process array is the source of truth and a refresh would
+   *  discard the anonymous streaming bubble — then lower the streaming flag
+   *  if this handle still owns it. */
+  async function finalizeStreamTurn(handle, { refreshHistory = true } = {}) {
+    if (genRef.current !== handle.gen) return
+    const pausing = !!(
+      useStore.getState().pendingPermission
+      || useStore.getState().pendingInteraction
+      || pendingInteractionRef.current
+    )
+    if (refreshHistory && !pausing && !handle.controller.signal.aborted && projectId && sessionId) {
+      try {
+        if (genRef.current === handle.gen) await refreshLatestHistory()
+      } catch { /* best-effort */ }
+    }
+    releaseStreaming(handle)
+  }
+
+  /** Restore a pending interaction checkpoint that the live stream failed to
+   * deliver (dropped chunk / lost connection): without it the turn sits paused
+   * with no dialog to answer. Returns true when a dialog was restored.
+   * force=true overwrites any dialog already showing (session-load path). */
+  function restoreInteractionFromActive(active, { force = false } = {}) {
+    if (!active?.active || !['awaiting_input', 'interaction_failed'].includes(active.status) || !active.interaction) return false
+    if (!force && (
+      useStore.getState().pendingPermission
+      || useStore.getState().pendingInteraction
+      || pendingInteractionRef.current
+    )) return false
+    const interactionType = active.interaction.interaction_type
+      || active.interaction.interaction_data?.interaction_type
+    // Parked turns own no stream, so this is the only place the cancel
+    // entry can learn the backend task id from.
+    taskIdRef.current = active.task_id || null
+    if (interactionType === 'permission') {
+      useStore.getState().setPendingPermission({
+        ...active.interaction.interaction_data,
+        project_id: projectId,
+        session_id: sessionId,
+      })
+    } else {
+      useStore.getState().setPendingInteraction({
+        type: interactionType,
+        data: active.interaction.interaction_data || active.interaction,
+        sessionId,
+        projectId,
+      })
+    }
+    return true
+  }
+
   // ---- Effect 2: Load data + reconnect SSE (reacts to sessionId changes) ----
   useEffect(() => {
+    historyGenerationRef.current += 1
     if (!projectId || !sessionId) return
-    const gen = ++genRef.current
+    // Session switch: drop every session-scoped interaction/global synchronously —
+    // the async load below restores the new session's own state (e.g. a parked
+    // interaction checkpoint); stale dialogs from the previous session must not
+    // survive until then.
+    pendingInteractionRef.current = null
+    const sharedState = useStore.getState()
+    const previousOwner = panelOwnerRef.current
+    const ownsPrevious = value => previousOwner && value && (
+      value.projectId || value.project_id
+    ) === previousOwner.projectId && (
+      value.sessionId || value.session_id
+    ) === previousOwner.sessionId
+    if (ownsPrevious(sharedState.pendingInteraction)) sharedState.clearPendingInteraction()
+    if (previousOwner && sharedState.pendingPermission?.project_id === previousOwner.projectId && sharedState.pendingPermission?.session_id === previousOwner.sessionId) {
+      sharedState.clearPendingPermission()
+    }
+    if (ownsPrevious(sharedState.streamInteractionRequest)) sharedState.setStreamInteractionRequest(null)
+    panelOwnerRef.current = { projectId, sessionId }
+    // The id belongs to the previous session's task.
+    taskIdRef.current = null
+    setPendingAttachments([])
+    // Invalidate prior generations: their cleanups must stop owning state.
+    genRef.current += 1
     let cancelled = false
-    const abortController = new AbortController()
 
     const load = async () => {
       // Always reset — new session starts clean
@@ -590,8 +760,10 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       let history = []
       try {
         const page = await fetchHistoryPage()
-        history = page.messages
-        setHistoryPaging(page)
+        if (page) {
+          history = page.messages
+          setHistoryPaging(page)
+        }
       } catch (e) {
         console.error('Failed to load chat history:', e)
       }
@@ -600,34 +772,46 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
       // 2. Load sessions list
       try {
-        const list = await chatAPI.listSessions(projectId)
-        setSessions(list)
-        const cur = list.find(s => s.id === sessionId)
-        if (cur) setSessionTitle(cur.title || '')
+        const list = await chatAPI.listSessions(projectId, { include_archived: true })
+        // Stale-response gate: a response landing after another session
+        // switch must not overwrite the new session's list/title.
+        if (!cancelled) {
+          setSessions(list)
+          const cur = list.find(s => s.id === sessionId)
+          if (cur) setSessionTitle(cur.title || '')
+        }
       } catch { /* ignore */ }
 
       // Load tasks for this session
       try {
         const tasks = await chatAPI.getTasks(projectId, sessionId)
-        if (Array.isArray(tasks) && tasks.length > 0) {
+        if (!cancelled && Array.isArray(tasks) && tasks.length > 0) {
           useStore.getState().setTaskList(tasks)
           useStore.getState().setExpandedTasks(true)
         }
       } catch { /* ignore */ }
 
       // 3. Check for active background task BEFORE committing messages.
+      // A 503 (TASK_STATE_UNAVAILABLE) means the read itself failed — the
+      // session is NOT known to be idle. Retry with backoff and surface the
+      // recoverable error instead of falling through to the idle path.
       let active = null
       let activeCheckFailed = false
-      try {
-        active = await chatAPI.getActive(projectId, sessionId)
-      } catch (e) {
-        activeCheckFailed = true
-        console.error('Failed to check active task:', e)
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          active = await chatAPI.getActive(projectId, sessionId)
+          break
+        } catch (e) {
+          if (e?.status === 503 && !cancelled && attempt < STREAM_PROBE_RECOVERY_ATTEMPTS - 1) {
+            await new Promise(resolve => setTimeout(resolve, STREAM_RECOVERY_DELAY_MS))
+            continue
+          }
+          if (e?.status === 503) toastError(t('chat.toast.taskStateUnavailable'))
+          activeCheckFailed = true
+          console.error('Failed to check active task:', e)
+          break
+        }
       }
-      if (isActiveStateUnknown(active)) {
-        activeCheckFailed = true
-      }
-
       if (cancelled) return
 
       // Determine whether the last SiGMA bubble looks like an incomplete turn
@@ -640,25 +824,19 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       )
 
       if (active?.active && active.session_id === sessionId) {
-        if (active.status === 'awaiting_input' && active.interaction) {
-          const interactionType = active.interaction.interaction_type
-            || active.interaction.interaction_data?.interaction_type
-          if (interactionType === 'permission') {
-            // Permission approval checkpoint — restore the PermissionDialog.
-            // The payload fields (tool/path/operation/content/description) are
-            // nested under interaction_data; spreading the outer wrapper would
-            // lose them.
-            useStore.getState().setPendingPermission({
-              ...active.interaction.interaction_data,
-              session_id: sessionId,
-            })
-          } else {
-            useStore.getState().setPendingInteraction({
-              type: interactionType,
-              data: active.interaction.interaction_data || active.interaction,
-              sessionId,
-            })
+        if (['awaiting_input', 'interaction_failed'].includes(active.status) && active.interaction) {
+          // Permission approval checkpoint — restore the PermissionDialog.
+          // The payload fields (tool/path/operation/content/description) are
+          // nested under interaction_data; spreading the outer wrapper would
+          // lose them. force=true: a fresh session load replaces any dialog
+          // left over from a previous session.
+          if (active.status === 'interaction_failed') {
+            toastError(active.error || t(
+              'chat.toast.interactionRecovery',
+              'This interaction needs recovery. Review the prompt and try again.',
+            ))
           }
+          restoreInteractionFromActive(active, { force: true })
         } else {
           // Task active but not awaiting input — drop any stale interaction state
           useStore.getState().clearPendingInteraction()
@@ -667,35 +845,40 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
         if (active.status === 'running' || active.status === 'queued' || active.status === 'cancelling') {
           const preserved = []
+          const poppedEntries = []
           while (history.length > 0 && history[history.length - 1].role === 'SiGMA') {
             const popped = history.pop()
+            poppedEntries.push(popped)
             if (Array.isArray(popped.process)) {
               preserved.unshift(...popped.process)
             }
           }
           const cleanProcess = preserved.filter(s => !s.transient)
-          history.push({ role: 'SiGMA', content: '', process: cleanProcess })
+          history.push({
+            role: 'SiGMA', content: '', process: cleanProcess,
+            localId: nextLiveTurnId(),
+            ...collectTurnUsageSums(poppedEntries),
+          })
         }
-      } else if (active?.status === 'stale' && active.session_id === sessionId) {
-        const staleMessage = active.message || t('chat.staleFallback')
-        history.push({
-          role: 'SiGMA',
-          content: '',
-          process: [{ type: 'hint', content: staleMessage }],
-        })
       } else if (activeCheckFailed && looksIncomplete) {
         // getActive failed (network error, etc.) but the last entry looks like
         // a checkpoint artefact.  Conservatively pop it and rebuild so the
         // user sees a "working" state instead of stale intermediate text.
         const preserved = []
+        const poppedEntries = []
         while (history.length > 0 && history[history.length - 1].role === 'SiGMA') {
           const popped = history.pop()
+          poppedEntries.push(popped)
           if (Array.isArray(popped.process)) {
             preserved.unshift(...popped.process)
           }
         }
         const cleanProcess = preserved.filter(s => !s.transient)
-        history.push({ role: 'SiGMA', content: '', process: cleanProcess })
+        history.push({
+          role: 'SiGMA', content: '', process: cleanProcess,
+          localId: nextLiveTurnId(),
+          ...collectTurnUsageSums(poppedEntries),
+        })
       } else {
         // No active task for this session — clear stale interaction state so
         // modals from a previous session don't bleed across.
@@ -721,50 +904,47 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       // 4. Reconnect to live SSE stream if a task is running
       if (active?.active && (active.status === 'running' || active.status === 'queued' || active.status === 'cancelling')) {
         if (cancelled) return
+        // The handle owns the connection for its whole lifetime: a probeDead
+        // recovery swaps handle.controller, so the cleanup below aborts
+        // through the ref instead of a captured controller that the swap
+        // would leave behind.
+        const handle = beginStreamHandle()
         setIsStreaming(true)
         // Reconnecting mid-task: assume thinking until the next SSE event
         // reports the actual phase.
         setStreamPhase('thinking')
-        abortRef.current = abortController
         try {
-          const body = await chatAPI.resumeStream(active.task_id, abortController.signal)
+          const body = await chatAPI.resumeStream(projectId, active.task_id, handle.controller.signal)
           if (cancelled) return
           const reader = body.getReader()
           const decoder = new TextDecoder()
-          await processSSEStream(reader, decoder, abortController.signal)
+          await processSSEStream(reader, decoder, handle)
         } catch {
-          // resumeStream or reader failed
+          if (cancelled || handle.controller.signal.aborted) return
+          // The first subscription failed right after the task was confirmed
+          // running — recover through the same bounded pipeline a mid-stream
+          // drop uses (shared retry budget, backoff, give-up toast) instead
+          // of silently dropping to a false idle.
+          await recoverFailedConnect(handle)
         } finally {
-          // Only update if this effect is still current
-          if (genRef.current === gen) {
-            // Skip history reload when pausing for input — the live process
-            // array (including subagent subSteps) is the source of truth for
-            // the pending interaction, and refreshLatestHistory({ dropLocal })
-            // would discard the anonymous streaming bubble.
-            const pausing = !!(
-              useStore.getState().pendingPermission
-              || useStore.getState().pendingInteraction
-              || pendingInteractionRef.current
-            )
-            if (!pausing && !abortController.signal.aborted && projectId && sessionId) {
-              try {
-                if (genRef.current === gen) await refreshLatestHistory()
-              } catch { /* best-effort */ }
-            }
-            setIsStreaming(false)
-          }
+          await finalizeStreamTurn(handle)
         }
       }
     }
     load()
     return () => {
       cancelled = true
-      abortController.abort()
-      // Also abort any user-initiated stream (handleSendMessage etc.)
-      if (abortRef.current && abortRef.current !== abortController) {
-        abortRef.current.abort()
-      }
-      abortRef.current = null
+      // Abort at the owning handle's CURRENT controller: a probeDead recovery
+      // swaps handle.controller in place, so the ref — not a captured
+      // closure controller — is the only abort source that still reaches the
+      // live connection. The ref holds only the owning handle (a superseded
+      // one was aborted at takeover), and no newer handle can exist yet since
+      // cleanups run before the next effect creates one, so a session switch
+      // never aborts the incoming session's stream. This also aborts any
+      // user-initiated stream (handleSendMessage etc.) and detaches it: its
+      // finally must see the abort instead of owning the flag.
+      streamHandleRef.current?.controller.abort()
+      streamHandleRef.current = null
     }
   }, [projectId, sessionId])
 
@@ -793,6 +973,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     setIsLoadingHistory(true)
     try {
       const page = await fetchHistoryPage(cursor)
+      if (!page) return
       historyModeRef.current = 'expanded'
       setHistoryPaging(page)
       if (page.messages.length > 0) {
@@ -1186,51 +1367,75 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   const dismissedAny = interactionDismissed
   const reopenTarget = pendingInteraction ? 'interaction' : null
 
+  /** Recover after a failed first connection to a turn's stream (interaction
+   *  handoff, or the post-refresh reconnect): without it a still-running task
+   *  would be dropped to a false idle. The probe in resumeBrokenStream
+   *  branches on live server state — a parked checkpoint is restored into the
+   *  dialog, a still-running task is reattached with a cursor resume, and a
+   *  finished turn falls through to the caller's history refresh. */
+  async function recoverFailedConnect(handle) {
+    // sessionIdRef guards a session switch that landed while the failed
+    // resume was unwinding: the checkpoint belongs to the old session.
+    if (!projectId || !sessionId || sessionIdRef.current !== sessionId) return
+    const resumed = await resumeBrokenStream(handle)
+    if (!resumed) return
+    // Reattached mid-task: assume thinking until the next SSE event reports
+    // the actual phase.
+    setStreamPhase('thinking')
+    await processSSEStream(resumed.reader, resumed.decoder, handle)
+  }
+
   async function handleInteractionStream(streamBody) {
     setIsStreaming(true)
     setStreamPhase('thinking')
     resetThinkingLive()
-    const gen = genRef.current
-    // Immediately remove awaiting_input step on user submission
+    // Remove every awaiting_input marker on user submission — top level and
+    // inside agent subSteps (a subagent park drops its marker there, and the
+    // resumed stream must not leave a stale "waiting for input" chip behind
+    // while the loop keeps running).
     setMessages(prev => {
       const newMsgs = [...prev]
       const lastIdx = newMsgs.length - 1
       if (lastIdx >= 0) {
         const lastMsg = { ...newMsgs[lastIdx] }
-        lastMsg.process = (lastMsg.process || []).filter(s => s.type !== 'awaiting_input')
+        lastMsg.process = stripAwaitingSteps(lastMsg.process)
         newMsgs[lastIdx] = lastMsg
       }
       return newMsgs
     })
-    const controller = new AbortController()
-    abortRef.current = controller
+    // beginStreamHandle aborts any leftover stream: after a lost terminal
+    // event its connection can hang indefinitely (blackholed network path),
+    // leaking the fetch and its watchdog interval. Aborting lets that loop
+    // exit and clean up; its finally cannot clobber this turn because
+    // releaseStreaming only lowers the flag while it still owns the handle.
+    const handle = beginStreamHandle()
     try {
-      const body = await chatAPI.stream(projectId, streamBody, controller.signal)
+      const body = await chatAPI.stream(projectId, streamBody, handle.controller.signal)
       const reader = body.getReader()
       const decoder = new TextDecoder()
-      await processSSEStream(reader, decoder, controller.signal)
+      await processSSEStream(reader, decoder, handle)
     } catch (e) {
-      toastError(e.message || t('chat.toast.resumeFailed'))
-    } finally {
-      if (genRef.current === gen) {
-        // Do NOT call refreshLatestHistory here. The resume stream appends to
-        // the existing (anonymous) streaming bubble, which carries the live
-        // process array — including subagent subSteps — that has no server-side
-        // counterpart. refreshLatestHistory({ dropLocal: true }) would discard
-        // it, erasing all subagent content from the UI. The pendingPermission/
-        // pendingInteraction guards added elsewhere are ineffective here because
-        // the dialog's onResolved() clears them before this function starts.
-        // Server history syncs on the next natural message-send completion.
-        setIsStreaming(false)
+      if (e.name !== 'AbortError') {
+        toastError(e.message || t('chat.toast.staleInteraction', 'This prompt is no longer current. Refresh the chat to recover it.'))
+        // The dialog already closed when it handed off — recover the turn:
+        // restore the parked checkpoint, reattach to the still-running task,
+        // or let the finally's history refresh settle a finished turn.
+        await recoverFailedConnect(handle)
       }
+    } finally {
+      await finalizeStreamTurn(handle)
     }
   }
 
   useEffect(() => {
     if (!streamInteractionRequest) return
+    // The resume must target the checkpoint of the session that opened the
+    // dialog; a request belonging to another session is not this panel's to
+    // destroy — leave it so the panel showing that session consumes it.
+    if (streamInteractionRequest.session_id !== sessionId) return
     useStore.getState().setStreamInteractionRequest(null)
     handleInteractionStream(streamInteractionRequest)
-  }, [streamInteractionRequest])
+  }, [streamInteractionRequest, sessionId])
 
   // ---- Handle auto-message triggered from outside (e.g. LogModal "Ask SiGMA") ----
   const pendingAutoMessage = useStore(s => s.pendingAutoMessage)
@@ -1240,7 +1445,12 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     useStore.getState().setPendingAutoMessage(null)
     // Read the latest streaming/awaiting state from refs; the closure values
     // here are from the render when the message arrived and can be stale.
-    if (isStreamingRef.current || awaitingRef.current) return
+    if (isStreamingRef.current || awaitingRef.current) {
+      // The message is not queued anywhere — dropping it silently would
+      // lose the caller's request, so say why it was not sent.
+      toastError(t('chat.toast.autoMessageBusy'))
+      return
+    }
     handleDirectSend(pendingAutoMessage.text)
   }, [pendingAutoMessage])
 
@@ -1248,45 +1458,30 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   async function handleDirectSend(text) {
     if (!text || isStreamingRef.current || awaitingRef.current || !projectId || !sessionId) return
     setIsStreaming(true)
-    const gen = genRef.current
-      setMessages(prev => [...prev, { role: 'user', content: displayMessageText(text, t('chat.planDisplay')), created_at: new Date().toISOString() }])
-    setMessages(prev => [...prev, { role: 'SiGMA', content: '', process: [] }])
+    setMessages(prev => [...prev, { role: 'user', content: displayMessageText(text, t('chat.planDisplay')), created_at: new Date().toISOString() }])
+    setMessages(prev => [...prev, { role: 'SiGMA', content: '', process: [], localId: nextLiveTurnId() }])
     setStreamPhase('thinking')
     resetThinkingLive()
-    const controller = new AbortController()
-    abortRef.current = controller
+    const handle = beginStreamHandle()
     try {
       const body = await chatAPI.stream(projectId, {
         message: text,
         session_id: sessionId,
         ...(getUserState ? { user_state: getUserState() } : {}),
         ...(tokenBudget ? { token_budget: tokenBudget } : {}),
-      }, controller.signal)
-      if (controller.signal.aborted) return
+      }, handle.controller.signal)
+      if (handle.controller.signal.aborted) return
       const reader = body.getReader()
       const decoder = new TextDecoder()
-      await processSSEStream(reader, decoder, controller.signal)
+      await processSSEStream(reader, decoder, handle)
     } catch (err) {
       if (err.name === 'AbortError') return
       toastError(t('chat.toast.connectionFailed', { message: err.message || '' }))
     } finally {
-      if (genRef.current === gen) {
-        // Reload history to get real message IDs and can_edit flags from server.
-        // Must happen before setIsStreaming(false) so the edit buttons only
-        // appear on messages with real server IDs.
-        // Skip when pausing for input — see handleSendMessage for rationale.
-        const pausing = !!(
-          useStore.getState().pendingPermission
-          || useStore.getState().pendingInteraction
-          || pendingInteractionRef.current
-        )
-        if (!pausing && !controller.signal.aborted && projectId && sessionId) {
-          try {
-            if (genRef.current === gen) await refreshLatestHistory()
-          } catch { /* best-effort */ }
-        }
-        setIsStreaming(false)
-      }
+      // Refresh history to get real message IDs and can_edit flags from the
+      // server before the streaming flag drops — guarded against pausing by
+      // the shared helper.
+      await finalizeStreamTurn(handle)
     }
   }
   function startEditTitle() {
@@ -1474,8 +1669,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   }, [showArchived, archivedMessages, flashMessage])
 
   // Global Ctrl/Cmd+K opens chat search — the dropdown entry is two clicks
-  // away. Only a visible panel responds: multiple ChatPanels can be mounted
-  // (one per module view) and hidden ones have no offsetParent.
+  // away. Only a visible panel responds: the shared panel is display:none
+  // while its tab is inactive, and hidden elements have no offsetParent.
   useEffect(() => {
     const handler = (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
@@ -1577,295 +1772,537 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     setThinkingLive('')
   }
 
-  async function processSSEStream(reader, decoder, abortSignal) {
+  /** Cross-check the backend while a stream is open: if the server reports no
+   *  active task but no terminal event ever arrived (lost done, zombie stream),
+   *  finalize from server truth instead of spinning forever. Restores a missed
+   *  interaction checkpoint on the way. */
+  async function verifyStreamAlive(handle) {
+    if (handle.controller.signal.aborted || !projectId || !sessionId) return
+    let active = null
+    try {
+      active = await chatAPI.getActive(projectId, sessionId, { signal: AbortSignal.timeout(STREAM_PROBE_TIMEOUT_MS) })
+    } catch {
+      // A blackholed connection hangs this probe too. Count consecutive
+      // failures and only give up after several: a single blip must not tear
+      // down a healthy stream. Once exceeded, abort the handle so the stuck
+      // read loop unblocks and runs the normal drop recovery (resume).
+      handle.probeFailures += 1
+      if (handle.probeFailures < STREAM_PROBE_MAX_FAILURES) return
+      if (streamHandleRef.current !== handle) return
+      handle.probeDead = true
+      handle.controller.abort()
+      return
+    }
+    handle.probeFailures = 0
+    // Aborted, or a newer stream owns the handle slot now (interaction
+    // resume, next turn) — stand down instead of touching their state.
+    if (handle.controller.signal.aborted || streamHandleRef.current !== handle) return
+    if (restoreInteractionFromActive(active)) return
+    if (active?.active) return
+    try {
+      await refreshLatestHistory()
+    } catch { /* best-effort */ }
+    // Re-check ownership: a takeover may have landed during the refresh.
+    if (streamHandleRef.current !== handle) return
+    setIsStreaming(false)
+    handle.controller.abort()
+  }
+
+  /** Reopen the SSE stream after it dropped without a terminal event. Gives up
+   *  (returning null) when the turn finished server-side, paused for input, or
+   *  cannot be resumed — the caller's finally reloads history either way. A
+   *  failing probe means the network is still down, not that the turn ended,
+   *  so it is retried before giving up; the final give-up is toasted. */
+  async function resumeBrokenStream(handle) {
+    if (!projectId || !sessionId) return null
+    // A probe abort only unblocks the read loop — the resume itself needs a
+    // live connection, so swap in a fresh controller. Any other abort is
+    // user/session-initiated: do not resume over it.
+    if (handle.controller.signal.aborted) {
+      if (!handle.probeDead) return null
+      handle.probeDead = false
+      handle.controller = new AbortController()
+      handle.probeFailures = 0
+    }
+    await new Promise(resolve => setTimeout(resolve, STREAM_RECOVERY_DELAY_MS))
+    if (handle.controller.signal.aborted || streamHandleRef.current !== handle) return null
+    let active = null
+    let probeFailures = 0
+    while (true) {
+      try {
+        active = await chatAPI.getActive(projectId, sessionId, { signal: AbortSignal.timeout(STREAM_PROBE_TIMEOUT_MS) })
+        break
+      } catch {
+        probeFailures += 1
+        if (probeFailures >= STREAM_PROBE_RECOVERY_ATTEMPTS
+          || handle.controller.signal.aborted
+          || streamHandleRef.current !== handle) {
+          if (streamHandleRef.current === handle && !handle.controller.signal.aborted) {
+            toastError(t('chat.toast.resumeFailed'))
+            // Budget exhausted while the task is (at best) still running —
+            // keep the streaming state instead of dropping to a false idle.
+            handle.recoveryGaveUp = true
+          }
+          return null
+        }
+        await new Promise(resolve => setTimeout(resolve, STREAM_RECOVERY_DELAY_MS))
+      }
+    }
+    if (handle.controller.signal.aborted || streamHandleRef.current !== handle) return null
+    if (restoreInteractionFromActive(active)) return null
+    if (!active?.active) return null
+    // Reattach only while the task is still executing (same gate as session
+    // load). An awaiting_input task has a parked stream: subscribing to it
+    // yields nothing until the server idle-timeout surfaces a terminal error
+    // that would clobber the finished turn.
+    if (active.status !== 'running' && active.status !== 'queued' && active.status !== 'cancelling') return null
+    // Prefer the id our stream reported; the active-task payload covers a
+    // drop before the task_id event was processed.
+    const taskId = taskIdRef.current || active.task_id
+    if (!taskId) return null
+    try {
+      // Cursor resume: only events with id > lastSeq are replayed, so
+      // nothing already applied is duplicated and nothing after the drop
+      // is lost.
+      const body = await chatAPI.resumeStream(projectId, taskId, handle.controller.signal, handle.lastSeq)
+      if (handle.controller.signal.aborted) return null
+      // Fresh connection and a clean probe budget for the next watchdog cycle.
+      handle.probeFailures = 0
+      return { reader: body.getReader(), decoder: new TextDecoder() }
+    } catch (err) {
+      if (handle.controller.signal.aborted || streamHandleRef.current !== handle) return null
+      // The task is still running but the reconnect failed — say so instead
+      // of silently freezing on a half-rendered turn, and keep the streaming
+      // state so the UI matches the server.
+      toastError(err?.message || t('chat.toast.resumeFailed'))
+      handle.recoveryGaveUp = true
+      return null
+    }
+  }
+
+  /** Open an interaction checkpoint delivered by awaiting_input: permission
+   * gates go straight to the store dialog; other interactive tools defer
+   * through the ref consumed by the dispatch effect below. */
+  function dispatchInteraction(interactionData) {
+    if (interactionData.interaction_type === 'permission') {
+      useStore.getState().setPendingPermission({ ...interactionData, project_id: projectId, session_id: sessionId })
+    } else {
+      pendingInteractionRef.current = { type: interactionData.interaction_type, data: { ...interactionData, project_id: projectId }, sessionId, projectId }
+    }
+  }
+
+  async function processSSEStream(reader, decoder, handle) {
     resetThinkingLive()
-    const parser = createSSEStreamParser({
-      onEvent(type, data) {
-        const isTerminal = type === 'done' || type === 'error' || type === 'cancelled'
-        if (isTerminal) {
-          clearStopAbortTimer()
-          taskIdRef.current = null
-          stopRequestedRef.current = false
-        }
-        // Capture backend task_id for cancellation
-        if (type === 'task_id') {
-          taskIdRef.current = data.task_id
-          stopRequestedRef.current = false
-          abnormalTerminalRef.current = false
-          return
-        }
-        if (type === 'context_stats') {
-          setContextStats(data)
-          return
-        }
-        // Task list updates — Zustand only, no messages to modify
-        if (type === 'task_list') {
-          const tasks = data.tasks || []
-          useStore.getState().setTaskList(tasks)
-          if (tasks.length > 0) {
-            useStore.getState().setExpandedTasks(true)
-          }
-          return
-        }
-        // Progressive usage update — refresh token stats after each LLM call
-        if (type === 'turn_usage') {
-          if (data.usage) {
-            setMessages(prev => {
-              const newMsgs = [...prev]
-              const lastIdx = newMsgs.length - 1
-              if (lastIdx >= 0 && newMsgs[lastIdx].role === 'SiGMA') {
-                newMsgs[lastIdx] = { ...newMsgs[lastIdx], usage: data.usage }
+    let sawTerminal = false
+    let reconnects = 0
+    let appliedAny = false
+    // True between a gap frame and the checkpoint reload it triggers: the
+    // reconnecting cursor predates the oldest buffered event, so mid-events
+    // were evicted and the live view has a hole replay cannot fill.
+    // replayUntil is the gap frame's highest replayed seq: replayed frames up
+    // to it are already covered by the reloaded checkpoint, so the seq gate —
+    // not reload completion — decides when appending resumes. A missing value
+    // falls back to dropping until the reload completes.
+    let reloadingAfterGap = false
+    let replayUntil = null
+    const watchdogTimer = setInterval(() => {
+      void verifyStreamAlive(handle)
+    }, STREAM_WATCHDOG_INTERVAL_MS)
+    try {
+      while (true) {
+        sawTerminal = false
+        appliedAny = false
+        const parser = createSSEStreamParser({
+          onEvent: (type, data, id) => {
+            if (streamHandleRef.current !== handle) return   // stale stream — drop
+            if (Number.isInteger(id)) {
+              // While a gap reload is in flight — and for every replayed
+              // frame up to the gap's replay_until, even after the reload
+              // lands — the reloaded checkpoint already covers the event:
+              // drop it but keep the cursor advancing so frames arriving
+              // after the replay batch pass the gate. Frames beyond
+              // replay_until are genuinely live and append even mid-reload.
+              // The small hole at the seam is corrected by the finalize-time
+              // history refresh.
+              if (reloadingAfterGap || (replayUntil !== null && id <= replayUntil)) {
+                handle.lastSeq = id
+                return
               }
-              return newMsgs
-            })
+              // Overlapping replay (full-buffer resume, duplicated delivery):
+              // skip anything already applied so rendered text never doubles.
+              if (id <= handle.lastSeq) return
+              handle.lastSeq = id
+              appliedAny = true
+            } else {
+              // Control frames are never entered into the server's replay
+              // buffer, so the seq gate above cannot apply to them. Known
+              // control types are handled here; anything else is dropped
+              // loudly instead of guessed at.
+              if (type === 'error' && data?.reason === 'idle_timeout') {
+                // Stream-health signal, not a failure: the server merely
+                // stopped seeing traffic. Neither render the error nor end
+                // the turn — the reconnect below reattaches to the
+                // still-running task with the cursor.
+                return
+              }
+              if (type === 'gap') {
+                // Rebuild the turn from the server's authoritative history
+                // (the persisted checkpoint covers the evicted range), then
+                // resume appending once the stale replay batch has passed.
+                // replay_until bounds that batch; recompute per gap so a
+                // later reconnect's gap always governs its own batch.
+                replayUntil = Number.isInteger(data?.replay_until) ? data.replay_until : null
+                if (!reloadingAfterGap) {
+                  reloadingAfterGap = true
+                  refreshLatestHistory()
+                    .catch(() => { /* best-effort: the finalize-time refresh reconciles */ })
+                    .finally(() => { reloadingAfterGap = false })
+                }
+                return
+              }
+              if (type !== 'task_id' && type !== 'done' && type !== 'error' && type !== 'cancelled') {
+                console.warn('[Chat] Dropping SSE frame without a seq id:', type)
+                return
+              }
+            }
+            if (type === 'done' || type === 'error' || type === 'cancelled') sawTerminal = true
+            handleStreamEvent(type, data)
+          },
+        })
+        await parser.start(reader, decoder, handle.controller.signal)
+        if (sawTerminal) return
+        // The controller aborts on session switch / takeover (stop resuming)
+        // and on a watchdog probe timeout (blackholed connection — the abort
+        // only unblocks the read below; the resume rebuilds the connection).
+        if (handle.controller.signal.aborted && !handle.probeDead) return
+        // Stream ended with no terminal event — the connection dropped
+        // mid-turn. Reconnect while the server still reports an active task;
+        // give up after a few consecutive unproductive tries and let the
+        // caller reload history. A connection that replayed at least one
+        // fresh (not already applied) event made real progress, so it does
+        // not count toward the bound.
+        if (appliedAny) reconnects = 0
+        reconnects += 1
+        if (reconnects > STREAM_RECOVERY_MAX_ATTEMPTS) {
+          if (streamHandleRef.current === handle && !handle.controller.signal.aborted) {
+            toastError(t('chat.toast.resumeFailed'))
+            // Budget exhausted while the task was just re-probed as active —
+            // keep the streaming state instead of dropping to a false idle.
+            handle.recoveryGaveUp = true
           }
           return
         }
-        // Auto-generate title on first exchange completion
-        if (type === 'done') {
-          if (!abnormalTerminalRef.current) maybeGenerateTitle()
-        } else if (type === 'error' || type === 'cancelled') {
-          abnormalTerminalRef.current = true
-        }
-        // Reasoning deltas — feed the live thinking window shown under the
-        // spinner while the phase is "thinking". Each stretch of reasoning is
-        // one segment: opened on the first delta, dropped (never appended to
-        // the timeline) when a later non-reasoning event closes it. The
-        // window only re-renders on the flush cadence.
-        if (type === 'thought' && data.content) {
-          setStreamPhase('thinking')
-          const now = Date.now()
-          if (!segOpenRef.current) {
-            segOpenRef.current = true
-            liveBufferRef.current = ''
-          }
-          liveBufferRef.current += data.content
-          if (now - liveFlushAtRef.current >= THINK_FLUSH_MS) {
-            liveFlushAtRef.current = now
-            setThinkingLive(thinkingTail(liveBufferRef.current))
-          }
-          return
-        }
-        // A non-passive event ends reasoning — the live window is transient
-        // by design (shown while thinking, dropped the moment it ends), so
-        // just reset the segment; nothing is appended to the timeline.
-        if (type !== 'thought' && !THINK_PASSTHROUGH_TYPES.has(type)) {
-          resetThinkingLive()
-        }
-        if (type in STREAM_PHASE_BY_EVENT) setStreamPhase(STREAM_PHASE_BY_EVENT[type])
+        const resumed = await resumeBrokenStream(handle)
+        if (!resumed) return
+        reader = resumed.reader
+        decoder = resumed.decoder
+        // Reconnecting mid-task: assume thinking until the next SSE event
+        // reports the actual phase.
+        setStreamPhase('thinking')
+      }
+    } finally {
+      clearInterval(watchdogTimer)
+    }
+  }
+
+  function handleStreamEvent(type, data) {
+    const isTerminal = type === 'done' || type === 'error' || type === 'cancelled'
+    if (isTerminal) {
+      clearStopAbortTimer()
+      taskIdRef.current = null
+      stopRequestedRef.current = false
+    }
+    // Capture backend task_id for cancellation
+    if (type === 'task_id') {
+      taskIdRef.current = data.task_id
+      stopRequestedRef.current = false
+      abnormalTerminalRef.current = false
+      return
+    }
+    if (type === 'context_stats') {
+      setContextStats(data)
+      return
+    }
+    // Task list updates — Zustand only, no messages to modify
+    if (type === 'task_list') {
+      const tasks = data.tasks || []
+      useStore.getState().setTaskList(tasks)
+      if (tasks.length > 0) {
+        useStore.getState().setExpandedTasks(true)
+      }
+      return
+    }
+    // Progressive usage update — refresh token stats after each LLM call
+    if (type === 'turn_usage') {
+      if (data.usage) {
         setMessages(prev => {
           const newMsgs = [...prev]
-          const lastIdx = newMsgs.length - 1
-          if (lastIdx < 0) return prev
-          const lastMsg = { ...newMsgs[lastIdx] }
-          const currentProcess = [...(lastMsg.process || [])]
-
-          if (type === 'stream_status') {
-            const statusMessage = streamStatusText(data, t)
-            if (statusMessage) {
-              const processForStatus = data.status === 'retrying'
-                ? currentProcess.filter(s => s.type !== 'streaming_text')
-                : currentProcess
-              lastMsg.process = withTransientHint(processForStatus, statusMessage, {
-                retry: data.status === 'retrying',
-                error: data.status === 'retrying' ? data.error : undefined,
-              })
-            } else {
-              lastMsg.process = currentProcess
-            }
-          } else if (type === 'delta') {
-            const streamIdx = currentProcess.findLastIndex(s => s.type === 'streaming_text')
-            if (streamIdx >= 0) {
-              currentProcess[streamIdx] = { ...currentProcess[streamIdx], content: currentProcess[streamIdx].content + data.content }
-            } else {
-              currentProcess.push({ type: 'streaming_text', content: data.content })
-            }
-            lastMsg.process = currentProcess
-          } else if (type === 'tool_start') {
-            const finalProcess = currentProcess.map(s =>
-              s.type === 'streaming_text' ? { type: 'hint', content: s.content } : s
-            )
-            const toolStep = { type: 'tool', tool: data.tool, params: data.params, status: 'running' }
-            // Store tool_call_id for agent_event matching
-            if (data.tool_call_id) {
-              toolStep._toolCallId = data.tool_call_id
-              toolStep.toolCallId = data.tool_call_id
-            }
-            finalProcess.push(toolStep)
-            lastMsg.process = finalProcess
-          } else if (type === 'tool_end') {
-            const updated = currentProcess.map(s => {
-              // Match by tool_call_id first, then by tool name + running status
-              if (data.tool_call_id && s._toolCallId === data.tool_call_id) {
-                return finishToolStep(s, data)
-              }
-              if (s.type === 'tool' && s.tool === data.tool && s.status === 'running' && !data.tool_call_id) {
-                return finishToolStep(s, data)
-              }
-              return s
-            })
-            lastMsg.process = updated
-          } else if (type === 'compact_start') {
-            lastMsg.process = withTransientHint(currentProcess, t('chat.compacting'))
-          } else if (type === 'compact_done') {
-            setContextStats(data)
-            // With the summary the step renders as the same expandable card
-            // the history view shows after refresh; backends that predate the
-            // summary field get the plain hint.
-            currentProcess.push(data.summary
-              ? { type: 'compact', content: data.summary }
-              : { type: 'hint', content: t('chat.compacted'), plain: true })
-            lastMsg.process = currentProcess
-            refreshCanEditFlags()
-          } else if (type === 'agent_event') {
-            // Subagent SSE event — nest inside the agent tool step with matching tool_call_id
-            const parentTcId = data.parent_tool_call_id
-            let agentStepIdx = -1
-            if (parentTcId) {
-              // Match by tool_call_id (robust)
-              agentStepIdx = currentProcess.findIndex(
-                s => s.type === 'tool' && isAgentToolName(s.tool) && s.toolCallId === parentTcId
-              )
-              if (agentStepIdx < 0) {
-                // Fallback: match by tool_call_id stored at tool_start time
-                agentStepIdx = currentProcess.findIndex(
-                  s => s.type === 'tool' && isAgentToolName(s.tool) && s.status === 'running' && s._toolCallId === parentTcId
-                )
-              }
-            }
-            if (agentStepIdx < 0) {
-              // Last resort: match the last running Agent step
-              agentStepIdx = currentProcess.findLastIndex(
-                s => s.type === 'tool' && isAgentToolName(s.tool) && s.status === 'running'
-              )
-            }
-            if (agentStepIdx >= 0) {
-              const agentStep = { ...currentProcess[agentStepIdx] }
-              const subSteps = [...(agentStep.subSteps || [])]
-              const innerType = data.inner_type
-              const innerData = data.inner_data || {}
-
-              if (innerType === 'delta') {
-                const lastSub = subSteps.length > 0 ? subSteps[subSteps.length - 1] : null
-                if (lastSub && lastSub.type === 'streaming_text') {
-                  subSteps[subSteps.length - 1] = { ...lastSub, content: lastSub.content + (innerData.content || '') }
-                } else {
-                  subSteps.push({ type: 'streaming_text', content: innerData.content || '' })
-                }
-              } else if (innerType === 'compact_start') {
-                subSteps.splice(0, subSteps.length, ...withTransientHint(subSteps, t('chat.compacting')))
-              } else if (innerType === 'compact_done') {
-                subSteps.push(innerData.summary
-                  ? { type: 'compact', content: innerData.summary }
-                  : { type: 'hint', content: t('chat.compacted') })
-                refreshCanEditFlags()
-              } else if (innerType === 'stream_status') {
-                const statusMessage = streamStatusText(innerData, t)
-                if (statusMessage) {
-                  const subStepsForStatus = innerData.status === 'retrying'
-                    ? subSteps.filter(s => s.type !== 'streaming_text')
-                    : subSteps
-                  subSteps.splice(0, subSteps.length, ...withTransientHint(subStepsForStatus, statusMessage))
-                }
-              } else if (innerType === 'tool_start') {
-                const subStep = { type: 'tool', tool: innerData.tool, params: innerData.params, status: 'running' }
-                if (innerData.tool_call_id) {
-                  subStep._toolCallId = innerData.tool_call_id
-                }
-                subSteps.push(subStep)
-              } else if (innerType === 'tool_end') {
-                // Match by tool_call_id first, then by tool name
-                let matched = false
-                if (innerData.tool_call_id) {
-                  for (let i = subSteps.length - 1; i >= 0; i--) {
-                    if (subSteps[i].type === 'tool' && subSteps[i]._toolCallId === innerData.tool_call_id) {
-                      subSteps[i] = finishToolStep(subSteps[i], innerData)
-                      matched = true
-                      break
-                    }
-                  }
-                }
-                if (!matched) {
-                  for (let i = subSteps.length - 1; i >= 0; i--) {
-                    if (subSteps[i].type === 'tool' && subSteps[i].tool === innerData.tool && subSteps[i].status === 'running') {
-                      subSteps[i] = finishToolStep(subSteps[i], innerData)
-                      break
-                    }
-                  }
-                }
-              } else if (innerType === 'awaiting_input') {
-                subSteps.push({ type: 'awaiting_input', interaction_type: innerData.interaction_type, data: innerData, transient: true })
-                if (innerData.interaction_type === 'permission') {
-                  useStore.getState().setPendingPermission({ ...innerData, session_id: sessionId })
-                } else {
-                  pendingInteractionRef.current = { type: innerData.interaction_type, data: innerData, sessionId }
-                }
-              }
-
-              agentStep.subSteps = subSteps
-              agentStep.agentType = data.agent_type
-              agentStep.agentRunId = data.agent_run_id
-              currentProcess[agentStepIdx] = agentStep
-            }
-            lastMsg.process = currentProcess
-          } else if (type === 'awaiting_input') {
-            currentProcess.push({ type: 'awaiting_input', interaction_type: data.interaction_type, data: data, transient: true })
-            lastMsg.process = currentProcess
-            if (data.interaction_type === 'permission') {
-              useStore.getState().setPendingPermission({ ...data, session_id: sessionId })
-            } else {
-              pendingInteractionRef.current = { type: data.interaction_type, data: data, sessionId }
-            }
-          } else if (type === 'done') {
-            const streamIdx = currentProcess.findLastIndex(s => s.type === 'streaming_text')
-            if (streamIdx >= 0) {
-              lastMsg.content = currentProcess[streamIdx].content
-            } else if (!lastMsg.content && currentProcess.some(s => s.type === 'compact' || s.content === t('chat.compacted'))) {
-              lastMsg.content = t('chat.compacted')
-            }
-            lastMsg.created_at = new Date().toISOString()
-            const duration = turnDurationMs(newMsgs, lastIdx)
-            if (duration != null) lastMsg.durationMs = duration
-            if (data.usage) {
-              lastMsg.usage = data.usage
-            }
-            const lastStep = currentProcess[currentProcess.length - 1]
-            const isPausingForInput = lastStep?.type === 'awaiting_input'
-            if (isPausingForInput) {
-              lastMsg.process = currentProcess.filter(s => s.type !== 'streaming_text')
-            } else {
-              lastMsg.process = currentProcess.filter(s => !s.transient && s.type !== 'streaming_text')
-            }
-          } else if (type === 'error') {
-            const content = data.content || data.error || data.message || t('chat.toast.unknownError')
-            lastMsg.content = content
-            lastMsg.created_at = new Date().toISOString()
-            const duration = turnDurationMs(newMsgs, lastIdx)
-            if (duration != null) lastMsg.durationMs = duration
-            lastMsg.process = currentProcess.filter(s => !s.transient && s.type !== 'streaming_text')
-            if (data.usage) {
-              lastMsg.usage = data.usage
-            }
-          } else if (type === 'cancelled') {
-            lastMsg.interrupted = true
-            const duration = turnDurationMs(newMsgs, lastIdx)
-            if (duration != null) lastMsg.durationMs = duration
-            if (data.usage) {
-              lastMsg.usage = data.usage
-            }
-          } else if (type === 'file_changed') {
-            if (onFileChanged) onFileChanged(data.paths || [])
-          } else if (type === 'annotation_changed') {
-            if (onAnnotationChanged) onAnnotationChanged(data.file_name || '')
-          }
-
-          newMsgs[lastIdx] = lastMsg
+          const targetIdx = findLiveTargetIndex(newMsgs)
+          if (targetIdx < 0) return prev
+          newMsgs[targetIdx] = { ...newMsgs[targetIdx], usage: data.usage }
           return newMsgs
         })
-      },
-    })
+      }
+      return
+    }
+    // Auto-generate title on first exchange completion
+    if (type === 'done') {
+      if (!abnormalTerminalRef.current) maybeGenerateTitle()
+    } else if (type === 'error' || type === 'cancelled') {
+      abnormalTerminalRef.current = true
+    }
+    // Reasoning deltas — feed the live thinking window shown under the
+    // spinner while the phase is "thinking". Each stretch of reasoning is
+    // one segment: opened on the first delta, dropped (never appended to
+    // the timeline) when a later non-reasoning event closes it. The
+    // window only re-renders on the flush cadence.
+    if (type === 'thought' && data.content) {
+      setStreamPhase('thinking')
+      const now = Date.now()
+      if (!segOpenRef.current) {
+        segOpenRef.current = true
+        liveBufferRef.current = ''
+      }
+      liveBufferRef.current += data.content
+      if (now - liveFlushAtRef.current >= THINK_FLUSH_MS) {
+        liveFlushAtRef.current = now
+        setThinkingLive(thinkingTail(liveBufferRef.current))
+      }
+      return
+    }
+    // A non-passive event ends reasoning — the live window is transient
+    // by design (shown while thinking, dropped the moment it ends), so
+    // just reset the segment; nothing is appended to the timeline.
+    if (type !== 'thought' && !THINK_PASSTHROUGH_TYPES.has(type)) {
+      resetThinkingLive()
+    }
+    if (type in STREAM_PHASE_BY_EVENT) setStreamPhase(STREAM_PHASE_BY_EVENT[type])
+    setMessages(prev => {
+      const newMsgs = [...prev]
+      const targetIdx = findLiveTargetIndex(newMsgs)
+      if (targetIdx < 0) return prev
+      const targetMsg = { ...newMsgs[targetIdx] }
+      const currentProcess = [...(targetMsg.process || [])]
 
-    await parser.start(reader, decoder, abortSignal)
+      if (type === 'stream_status') {
+        const statusMessage = streamStatusText(data, t)
+        if (statusMessage) {
+          const processForStatus = data.status === 'retrying'
+            ? currentProcess.filter(s => s.type !== 'streaming_text')
+            : currentProcess
+          targetMsg.process = withTransientHint(processForStatus, statusMessage, {
+            retry: data.status === 'retrying',
+            error: data.status === 'retrying' ? data.error : undefined,
+          })
+        } else {
+          targetMsg.process = currentProcess
+        }
+      } else if (type === 'delta') {
+        const streamIdx = currentProcess.findLastIndex(s => s.type === 'streaming_text')
+        if (streamIdx >= 0) {
+          currentProcess[streamIdx] = { ...currentProcess[streamIdx], content: currentProcess[streamIdx].content + data.content }
+        } else {
+          currentProcess.push({ type: 'streaming_text', content: data.content })
+        }
+        targetMsg.process = currentProcess
+      } else if (type === 'tool_start') {
+        const finalProcess = currentProcess.map(s =>
+          s.type === 'streaming_text' ? { type: 'hint', content: s.content } : s
+        )
+        const toolStep = { type: 'tool', tool: data.tool, params: data.params, status: 'running' }
+        // Store tool_call_id for agent_event matching
+        if (data.tool_call_id) {
+          toolStep._toolCallId = data.tool_call_id
+          toolStep.toolCallId = data.tool_call_id
+        }
+        // Upsert by tool_call_id: a replayed tool_start (cursor resume,
+        // duplicated delivery) must not render a second step.
+        const dupIdx = data.tool_call_id
+          ? finalProcess.findIndex(s => s.type === 'tool' && s._toolCallId === data.tool_call_id)
+          : -1
+        if (dupIdx >= 0) finalProcess[dupIdx] = toolStep
+        else finalProcess.push(toolStep)
+        targetMsg.process = finalProcess
+      } else if (type === 'tool_end') {
+        const updated = currentProcess.map(s => {
+          // Match by tool_call_id first, then by tool name + running status
+          if (data.tool_call_id && s._toolCallId === data.tool_call_id) {
+            return finishToolStep(s, data)
+          }
+          if (s.type === 'tool' && s.tool === data.tool && s.status === 'running' && !data.tool_call_id) {
+            return finishToolStep(s, data)
+          }
+          return s
+        })
+        targetMsg.process = updated
+      } else if (type === 'compact_start') {
+        targetMsg.process = withTransientHint(currentProcess, t('chat.compacting'))
+      } else if (type === 'compact_done') {
+        // With the summary the step renders as the same expandable card
+        // the history view shows after refresh; backends that predate the
+        // summary field get the plain hint.
+        currentProcess.push(data.summary
+          ? { type: 'compact', content: data.summary }
+          : { type: 'hint', content: t('chat.compacted'), plain: true })
+        targetMsg.process = currentProcess
+      } else if (type === 'agent_event') {
+        // Subagent SSE event — nest inside the agent tool step with matching tool_call_id
+        const parentTcId = data.parent_tool_call_id
+        let agentStepIdx = -1
+        if (parentTcId) {
+          // Match by tool_call_id (robust)
+          agentStepIdx = currentProcess.findIndex(
+            s => s.type === 'tool' && isAgentToolName(s.tool) && s.toolCallId === parentTcId
+          )
+          if (agentStepIdx < 0) {
+            // Fallback: match by tool_call_id stored at tool_start time
+            agentStepIdx = currentProcess.findIndex(
+              s => s.type === 'tool' && isAgentToolName(s.tool) && s.status === 'running' && s._toolCallId === parentTcId
+            )
+          }
+        }
+        if (agentStepIdx < 0) {
+          // Last resort: the last agent step still able to receive events —
+          // running live, or reloaded from history while parked (its subagent
+          // resumes into it; the history-built step carries a tool_call_id).
+          agentStepIdx = currentProcess.findLastIndex(
+            s => s.type === 'tool' && isAgentToolName(s.tool)
+              && (s.status === 'running' || s.status === 'awaiting_input')
+          )
+        }
+        if (agentStepIdx >= 0) {
+          const agentStep = { ...currentProcess[agentStepIdx] }
+          const subSteps = [...(agentStep.subSteps || [])]
+          const innerType = data.inner_type
+          const innerData = data.inner_data || {}
+
+          if (innerType === 'delta') {
+            const lastSub = subSteps.length > 0 ? subSteps[subSteps.length - 1] : null
+            if (lastSub && lastSub.type === 'streaming_text') {
+              subSteps[subSteps.length - 1] = { ...lastSub, content: lastSub.content + (innerData.content || '') }
+            } else {
+              subSteps.push({ type: 'streaming_text', content: innerData.content || '' })
+            }
+          } else if (innerType === 'compact_start') {
+            subSteps.splice(0, subSteps.length, ...withTransientHint(subSteps, t('chat.compacting')))
+          } else if (innerType === 'compact_done') {
+            subSteps.push(innerData.summary
+              ? { type: 'compact', content: innerData.summary }
+              : { type: 'hint', content: t('chat.compacted') })
+          } else if (innerType === 'stream_status') {
+            const statusMessage = streamStatusText(innerData, t)
+            if (statusMessage) {
+              const subStepsForStatus = innerData.status === 'retrying'
+                ? subSteps.filter(s => s.type !== 'streaming_text')
+                : subSteps
+              subSteps.splice(0, subSteps.length, ...withTransientHint(subStepsForStatus, statusMessage))
+            }
+          } else if (innerType === 'tool_start') {
+            const subStep = { type: 'tool', tool: innerData.tool, params: innerData.params, status: 'running' }
+            if (innerData.tool_call_id) {
+              subStep._toolCallId = innerData.tool_call_id
+            }
+            // Upsert by tool_call_id: a replayed subagent tool_start must not
+            // render a second step (same duplicate risk as the top level).
+            const dupIdx = innerData.tool_call_id
+              ? subSteps.findIndex(s => s.type === 'tool' && s._toolCallId === innerData.tool_call_id)
+              : -1
+            if (dupIdx >= 0) subSteps[dupIdx] = subStep
+            else subSteps.push(subStep)
+          } else if (innerType === 'tool_end') {
+            // Match by tool_call_id first, then by tool name
+            let matched = false
+            if (innerData.tool_call_id) {
+              for (let i = subSteps.length - 1; i >= 0; i--) {
+                if (subSteps[i].type === 'tool' && subSteps[i]._toolCallId === innerData.tool_call_id) {
+                  subSteps[i] = finishToolStep(subSteps[i], innerData)
+                  matched = true
+                  break
+                }
+              }
+            }
+            if (!matched) {
+              for (let i = subSteps.length - 1; i >= 0; i--) {
+                if (subSteps[i].type === 'tool' && subSteps[i].tool === innerData.tool && subSteps[i].status === 'running') {
+                  subSteps[i] = finishToolStep(subSteps[i], innerData)
+                  break
+                }
+              }
+            }
+          } else if (innerType === 'awaiting_input') {
+            subSteps.push({ type: 'awaiting_input', interaction_type: innerData.interaction_type, data: innerData, transient: true })
+          }
+
+          agentStep.subSteps = subSteps
+          agentStep.agentType = data.agent_type
+          agentStep.agentRunId = data.agent_run_id
+          currentProcess[agentStepIdx] = agentStep
+        }
+        targetMsg.process = currentProcess
+      } else if (type === 'awaiting_input') {
+        currentProcess.push({ type: 'awaiting_input', interaction_type: data.interaction_type, data: data, transient: true })
+        targetMsg.process = currentProcess
+      } else if (type === 'done') {
+        const streamIdx = currentProcess.findLastIndex(s => s.type === 'streaming_text')
+        if (streamIdx >= 0) {
+          targetMsg.content = currentProcess[streamIdx].content
+        } else if (!targetMsg.content && currentProcess.some(s => s.type === 'compact' || (s.type === 'hint' && s.plain))) {
+          targetMsg.content = t('chat.compacted')
+        }
+        targetMsg.created_at = new Date().toISOString()
+        const duration = turnDurationMs(newMsgs, targetIdx)
+        if (duration != null) targetMsg.durationMs = duration
+        if (data.usage) {
+          targetMsg.usage = data.usage
+        }
+        const lastStep = currentProcess[currentProcess.length - 1]
+        const isPausingForInput = lastStep?.type === 'awaiting_input'
+        if (isPausingForInput) {
+          targetMsg.process = currentProcess.filter(s => s.type !== 'streaming_text')
+        } else {
+          targetMsg.process = currentProcess.filter(s => !s.transient && s.type !== 'streaming_text')
+        }
+      } else if (type === 'error') {
+        const content = data.content || data.error || data.message || t('chat.toast.unknownError')
+        targetMsg.content = content
+        targetMsg.created_at = new Date().toISOString()
+        const duration = turnDurationMs(newMsgs, targetIdx)
+        if (duration != null) targetMsg.durationMs = duration
+        targetMsg.process = currentProcess.filter(s => !s.transient && s.type !== 'streaming_text')
+        if (data.usage) {
+          targetMsg.usage = data.usage
+        }
+      } else if (type === 'cancelled') {
+        targetMsg.interrupted = true
+        const duration = turnDurationMs(newMsgs, targetIdx)
+        if (duration != null) targetMsg.durationMs = duration
+        if (data.usage) {
+          targetMsg.usage = data.usage
+        }
+      }
+
+      newMsgs[targetIdx] = targetMsg
+      return newMsgs
+    })
+    // Side effects are decided from type/data only — never from values
+    // written inside the setMessages updater, which React may not run
+    // until the next render when updates are batched. The interaction
+    // dispatch is unconditional even for agent_event: the dialog must
+    // open even when its visual step cannot attach to an agent bubble.
+    if (type === 'compact_done') {
+      setContextStats(data)
+      refreshCanEditFlags()
+    } else if (type === 'agent_event' && data.inner_type === 'compact_done') {
+      setContextStats(data.inner_data || {})
+      refreshCanEditFlags()
+    }
+    if (type === 'awaiting_input') {
+      dispatchInteraction(data)
+    } else if (type === 'agent_event' && data.inner_type === 'awaiting_input') {
+      dispatchInteraction(data.inner_data || {})
+    }
+    if (type === 'file_changed' && onFileChanged) onFileChanged(data.paths || [])
+    if (type === 'annotation_changed' && onAnnotationChanged) onAnnotationChanged(data.file_path || '')
   }
 
   function clearStopAbortTimer() {
@@ -1886,9 +2323,15 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     }
   }
 
-  async function abortStoppedStream(controller) {
-    controller.abort()
-    abortRef.current = null
+  async function abortStoppedStream(handle) {
+    handle.controller.abort()
+    // Only tear down UI ownership while this handle still owns the stream:
+    // an interaction answer racing the stop may have replaced it, and the
+    // successor must keep its streaming state.
+    if (streamHandleRef.current === handle) {
+      streamHandleRef.current = null
+      setIsStreaming(false)
+    }
     stopAbortTimerRef.current = null
     stopRequestedRef.current = false
     if (projectId && sessionId) {
@@ -1896,11 +2339,6 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         await refreshLatestHistory()
       } catch { /* best-effort */ }
     }
-    setIsStreaming(false)
-  }
-
-  function isActiveStateUnknown(active) {
-    return active?.status === 'unknown'
   }
 
   // ---- Stop an ongoing stream ----
@@ -1908,23 +2346,19 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     if (stopRequestedRef.current) return
 
     let taskId = taskIdRef.current
-    const controller = abortRef.current
+    const handle = streamHandleRef.current
     if (!projectId) {
-      abortRef.current = null
+      streamHandleRef.current = null
       clearStopAbortTimer()
       stopRequestedRef.current = false
       setIsStreaming(false)
       return
     }
-    if (!controller) {
+    if (!handle) {
       stopRequestedRef.current = true
       if (sessionId) {
         try {
           const active = await chatAPI.getActive(projectId, sessionId)
-          if (isActiveStateUnknown(active)) {
-            await showStopStillRunning()
-            return
-          }
           if (active?.active) {
             const activeTaskId = active.task_id || taskId
             if (activeTaskId) {
@@ -1970,29 +2404,29 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     }
 
     if (!taskId) {
-      await showStopStillRunning()
+      // No backend task to cancel (e.g. the stream request never reached the
+      // server). Abort the held connection and reset the streaming state —
+      // the same cleanup the no-handle path performs — so a wedged turn is
+      // always recoverable instead of staying stuck behind a toast.
+      await abortStoppedStream(handle)
       return
     }
 
     try { await chatAPI.cancel(projectId, taskId) } catch (e) { console.warn('Failed to cancel task:', e) }
 
     // Keep the SSE stream open so the backend can deliver cancelled/error
-    // usage. If the worker stays active, surface that instead of pretending
-    // the stop succeeded.
+    // events. If the in-process task is still running after the cancel
+    // request, surface that instead of pretending the stop succeeded.
     const scheduleStopFallback = (attempt = 0) => {
       clearStopAbortTimer()
       stopAbortTimerRef.current = setTimeout(async () => {
-        if (abortRef.current !== controller) return
+        if (streamHandleRef.current !== handle) return
         if (!sessionId) {
           await showStopStillRunning()
           return
         }
         try {
           const active = await chatAPI.getActive(projectId, sessionId)
-          if (isActiveStateUnknown(active)) {
-            await showStopStillRunning()
-            return
-          }
           if (active?.active) {
             const activeTaskId = active.task_id || taskId
             if (activeTaskId) {
@@ -2010,10 +2444,47 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
           await showStopStillRunning()
           return
         }
-        await abortStoppedStream(controller)
+        await abortStoppedStream(handle)
       }, 10000)
     }
     scheduleStopFallback()
+  }
+
+  /** Cancel a turn parked on user input (awaiting_input). No SSE stream is
+   *  attached to a parked turn, so the keep-stream-open logic in handleStop
+   *  does not apply: request the cancel, then drop the dialog state right
+   *  away. The backend turns awaiting_input into cancelled and clears the
+   *  checkpoint, so the history refresh below settles the turn as idle. */
+  async function handleCancelAwaiting() {
+    if (!projectId || !sessionId) return
+    let taskId = taskIdRef.current
+    if (!taskId) {
+      try {
+        const active = await chatAPI.getActive(projectId, sessionId)
+        if (active?.active && active.task_id) {
+          taskId = active.task_id
+          taskIdRef.current = taskId
+        }
+      } catch (e) { console.warn('Failed to check active task:', e) }
+    }
+    if (taskId) {
+      try {
+        await chatAPI.cancel(projectId, taskId)
+      } catch (e) {
+        console.warn('Failed to cancel task:', e)
+        // The checkpoint may still be answerable — keep the dialogs open.
+        return
+      }
+    }
+    useStore.getState().clearPendingInteraction()
+    useStore.getState().clearPendingPermission()
+    useStore.getState().setStreamInteractionRequest(null)
+    taskIdRef.current = null
+    clearStopAbortTimer()
+    stopRequestedRef.current = false
+    try {
+      await refreshLatestHistory()
+    } catch { /* best-effort */ }
   }
 
   async function copyMessage(message) {
@@ -2027,11 +2498,17 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     }
   }
 
-  /** Best-effort: reload can_edit flags from the server after compaction. */
+  /** Best-effort: refresh can_edit flags after compaction. Flag updates only —
+   * never merges server rows into the live array: mid-turn the server page
+   * holds half-shaped turns (empty in-progress bubbles, a not-yet-followed
+   * boundary card), and merging those into the streaming timeline would show
+   * them as stray empty bubbles and detached cards. The full reload happens
+   * when the stream ends. */
   async function refreshCanEditFlags() {
     if (!projectId || !sessionId) return
     try {
       const page = await fetchHistoryPage()
+      if (!page) return
       const canEditMap = new Map()
       for (const m of page.messages) {
         if (m.id) canEditMap.set(m.id, m.can_edit)
@@ -2039,20 +2516,17 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       // Server's last-boundary seq: covers user messages from older pages
       // that aren't in canEditMap.
       const boundarySeq = page.boundary_seq
-      setMessages(prev => {
-        const updated = prev.map(m => {
-          if (m.id && canEditMap.has(m.id)) {
-            const nextCanEdit = canEditMap.get(m.id)
-            return m.can_edit === nextCanEdit ? m : { ...m, can_edit: nextCanEdit }
-          }
-          const seq = messageSeq(m)
-          if (m.role === 'user' && Number.isFinite(boundarySeq) && seq !== null && seq <= boundarySeq) {
-            return m.can_edit === false ? m : { ...m, can_edit: false }
-          }
-          return m
-        })
-        return mergeHistoryMessages(updated, page.messages, { dropLocal: false })
-      })
+      setMessages(prev => prev.map(m => {
+        if (m.id && canEditMap.has(m.id)) {
+          const nextCanEdit = canEditMap.get(m.id)
+          return m.can_edit === nextCanEdit ? m : { ...m, can_edit: nextCanEdit }
+        }
+        const seq = messageSeq(m)
+        if (m.role === 'user' && Number.isFinite(boundarySeq) && seq !== null && seq <= boundarySeq) {
+          return m.can_edit === false ? m : { ...m, can_edit: false }
+        }
+        return m
+      }))
     } catch { /* best-effort: don't disrupt streaming */ }
   }
 
@@ -2073,6 +2547,9 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     const messageId = editingMessageId
     const originalMessage = messages.find(m => m.id === messageId)
     const attachments = originalMessage?.attachments || []
+    // Claim the streaming slot before the awaited save: a second submit while
+    // onSaveBeforeChat runs must not pass the guard above.
+    isStreamingRef.current = true
     if (onSaveBeforeChat) {
       try { await onSaveBeforeChat() } catch { /* don't block chat on save failure */ }
     }
@@ -2081,9 +2558,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     setIsStreaming(true)
     setStreamPhase('thinking')
     resetThinkingLive()
-    const gen = genRef.current
-    const controller = new AbortController()
-    abortRef.current = controller
+    const handle = beginStreamHandle()
     let streamStarted = false
     try {
       const body = await chatAPI.editMessage(projectId, sessionId, {
@@ -2092,8 +2567,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         attachments,
         ...(getUserState ? { user_state: getUserState() } : {}),
         ...(tokenBudget ? { token_budget: tokenBudget } : {}),
-      }, controller.signal)
-      if (controller.signal.aborted) return
+      }, handle.controller.signal)
+      if (handle.controller.signal.aborted) return
       streamStarted = true
       setMessages(prev => {
         const idx = prev.findIndex(m => m.id === messageId)
@@ -2101,34 +2576,28 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         return [
           ...kept,
           { role: 'user', content: displayMessageText(text, t('chat.planDisplay')), attachments, created_at: new Date().toISOString() },
-          { role: 'SiGMA', content: '', process: [] },
+          { role: 'SiGMA', content: '', process: [], localId: nextLiveTurnId() },
         ]
       })
       cancelEditMessage()
       const reader = body.getReader()
       const decoder = new TextDecoder()
-      await processSSEStream(reader, decoder, controller.signal)
+      await processSSEStream(reader, decoder, handle)
     } catch (err) {
       if (err.name !== 'AbortError') {
         toastError(t('chat.toast.editFailed', { message: err.message || '' }))
         if (editIndex >= 0) {
+          // Reconcile with the server page instead of replacing the array:
+          // older pages the user already scrolled up to load must survive.
           try {
-            const page = await fetchHistoryPage()
-            historyModeRef.current = 'latest'
-            setHistoryPaging(page)
-            setMessages(page.messages)
-          } catch { /* keep optimistic state */ }
+            await refreshLatestHistory()
+          } catch { /* keep the current messages */ }
         }
       }
     } finally {
-      if (genRef.current === gen) {
-        if (streamStarted && !controller.signal.aborted && projectId && sessionId) {
-          try {
-            if (genRef.current === gen) await refreshLatestHistory()
-          } catch { /* best-effort */ }
-        }
-        setIsStreaming(false)
-      }
+      // Refresh only when the stream began: a fetch failure before that is
+      // handled by the catch, which already restored the history page.
+      await finalizeStreamTurn(handle, { refreshHistory: streamStarted })
     }
   }
 
@@ -2153,10 +2622,12 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       toastError(t('chat.toast.chatNotReady'))
       return
     }
+    // Attachments belong to the session they were uploaded to — a mid-upload session switch must not inject them into the new session's composer.
+    const gen = genRef.current
     setIsUploadingAttachment(true)
     try {
       const uploaded = await Promise.all(imageFiles.map(file => chatAPI.uploadAttachment(projectId, sessionId, file)))
-      setPendingAttachments(prev => [...prev, ...uploaded])
+      if (genRef.current === gen) setPendingAttachments(prev => [...prev, ...uploaded])
     } catch (err) {
       toastError(err.message || t('chat.toast.imageUploadFailed'))
     } finally {
@@ -2183,7 +2654,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     const msg = chatInput.trim()
     const submittedInput = chatInput
     const attachments = pendingAttachments
-    if ((!msg && attachments.length === 0) || isStreaming || isUploadingAttachment || awaiting || !projectId) return
+    if ((!msg && attachments.length === 0) || isStreamingRef.current || isUploadingAttachment || awaiting || !projectId) return
 
     // Session-management slash commands: pure actions — no message bubble, no stream.
     if (msg === '/clear')  { setChatInput(''); clearCurrentSession();            return }
@@ -2198,12 +2669,20 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
     const isCompactCommand = msg === '/compact'
 
+    // Claim the streaming slot before the awaited save: a second Enter during
+    // onSaveBeforeChat must not pass the guard above (which reads the ref).
+    isStreamingRef.current = true
+
     // Save editor content before sending so AI sees the latest file
     if (onSaveBeforeChat) {
       try {
         const saved = await onSaveBeforeChat()
-        if (!saved) return
+        if (!saved) {
+          isStreamingRef.current = false
+          return
+        }
       } catch {
+        isStreamingRef.current = false
         return
       }
     }
@@ -2214,19 +2693,17 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       textareaRef.current.style.height = 'auto'
     }
     setIsStreaming(true)
-    const gen = genRef.current
 
     setMessages(prev => [...prev, {
       role: 'user', content: displayMessageText(msg, t('chat.planDisplay')), attachments, created_at: new Date().toISOString(),
       ...(citations.length > 0 ? { citation: joinCitationTexts(citations) } : {}),
     }])
-    setMessages(prev => [...prev, { role: 'SiGMA', content: '', process: [] }])
+    setMessages(prev => [...prev, { role: 'SiGMA', content: '', process: [], localId: nextLiveTurnId() }])
 
     setStreamPhase(isCompactCommand ? 'compacting' : 'thinking')
     resetThinkingLive()
 
-    const controller = new AbortController()
-    abortRef.current = controller
+    const handle = beginStreamHandle()
     let streamStarted = false
 
     try {
@@ -2235,35 +2712,20 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       if (!isCompactCommand && attachments.length > 0) streamBody.attachments = attachments
       if (!isCompactCommand && getUserState) streamBody.user_state = getUserState()
       if (!isCompactCommand && tokenBudget) streamBody.token_budget = tokenBudget
-      if (!isCompactCommand && onClearCitations) onClearCitations()
 
-      const body = await chatAPI.stream(projectId, streamBody, controller.signal)
-      if (controller.signal.aborted) return
+      const body = await chatAPI.stream(projectId, streamBody, handle.controller.signal)
+      if (handle.controller.signal.aborted) return
       streamStarted = true
+      // Clear the citation strip only once the stream is actually
+      // established: a failed establish restores input and attachments, and
+      // the citations must survive that failure alongside them.
+      if (!isCompactCommand && onClearCitations) onClearCitations()
       const reader = body.getReader()
       const decoder = new TextDecoder()
-      processSSEStream(reader, decoder, controller.signal).finally(async () => {
-        if (genRef.current !== gen) return
-        // Reload history to get real message IDs and can_edit flags.
-        // Skip for compact commands — their bubbles are local-only (not persisted)
-        // and would be lost if we replaced messages with server data.
-        // Skip when pausing for input (awaiting_input / permission) — the live
-        // process array (including subagent subSteps) is the source of truth for
-        // the pending interaction, and refreshLatestHistory({ dropLocal: true })
-        // would discard the anonymous streaming bubble, erasing all subagent
-        // progress from the UI. Server history syncs on the next natural end.
-        const pausing = !!(
-          useStore.getState().pendingPermission
-          || useStore.getState().pendingInteraction
-          || pendingInteractionRef.current
-        )
-        if (!isCompactCommand && !pausing && !controller.signal.aborted && projectId && sessionId) {
-          try {
-            if (genRef.current === gen) await refreshLatestHistory()
-          } catch { /* best-effort */ }
-        }
-        setIsStreaming(false)
-      })
+      // Compact commands skip the history refresh: their bubbles are
+      // local-only (not persisted) and would be lost if server data
+      // replaced messages.
+      processSSEStream(reader, decoder, handle).finally(() => finalizeStreamTurn(handle, { refreshHistory: !isCompactCommand }))
     } catch (err) {
       if (err.name === 'AbortError') return
       if (!streamStarted) {
@@ -2280,7 +2742,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       setChatInput(prev => prev || submittedInput)
       setPendingAttachments(attachments)
       toastError(t('chat.toast.connectionFailed', { message: err.message || '' }))
-      if (genRef.current === gen) setIsStreaming(false)
+      if (streamHandleRef.current === handle) setIsStreaming(false)
     }
   }
 
@@ -2311,9 +2773,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
   function applySlashSuggestion(command) {
     // Suggestions are only shown when the input is exactly `/` or `/word` with
-    // nothing after, so we can replace the whole input. (Using
-    // replaceLeadingSlashCommand here would treat a bare `/` as body content
-    // and produce `/compact /`.)
+    // nothing after, so we can replace the whole input.
     setChatInput(`${command} `)
     requestAnimationFrame(() => {
       textareaRef.current?.focus()
@@ -2485,10 +2945,15 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               )
             }
             return (
-              <div key={m.id || i} data-chat-msg="" data-msg-id={m.id} data-msg-role={m.role} className={`group/message flex flex-col rounded-2xl transition-colors duration-700 ${m.role === 'user' ? 'items-end' : 'items-start'} ${m.id === flashMessageId ? 'bg-amber-100/60 dark:bg-amber-900/25' : ''}`}>
+              // localId first: the live streaming bubble has no server id yet,
+              // and an index key would remount it whenever a history merge
+              // reorders the array mid-stream.
+              <div key={m.localId || m.id || i} data-chat-msg="" data-msg-id={m.id} data-msg-role={m.role} className={`group/message flex flex-col rounded-2xl transition-colors duration-700 ${m.role === 'user' ? 'items-end' : 'items-start'} ${m.id === flashMessageId ? 'bg-amber-100/60 dark:bg-amber-900/25' : ''}`}>
                 <div className="flex items-center gap-2 mb-1.5 px-1">
                   {m.role === 'SiGMA' ? <Zap className="w-3 h-3 text-sigma-600" /> : <User className="w-3 h-3 text-gray-400 dark:text-gray-500" />}
-                  <span className="text-[10px] font-black uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.role}</span>
+                  <span className="text-[10px] font-black uppercase tracking-widest text-gray-400 dark:text-gray-500">
+                    {t(m.role === 'SiGMA' ? 'chat.roleSigma' : 'chat.roleUser')}
+                  </span>
                   {m.created_at && (
                     <span className="text-[9px] text-gray-300 select-none">
                       {formatTimestamp(m.created_at)}
@@ -2875,10 +3340,11 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             className="flex-1 bg-transparent text-sm outline-none py-1.5 resize-none max-h-[200px] overflow-y-auto text-gray-800 dark:text-gray-200 placeholder:text-gray-400 dark:placeholder:text-gray-500"
           />
           )}
-          <button onClick={isStreaming ? handleStop : handleSendMessage}
-            disabled={isUploadingAttachment || awaiting}
-            className={`p-2 text-white rounded-xl transition-all active:scale-95 disabled:opacity-50 ${isStreaming ? 'bg-red-500 hover:bg-red-600' : 'bg-sigma-600 hover:bg-sigma-700'}`}>
-            {isStreaming ? <Square className="w-4 h-4" /> : isUploadingAttachment ? <RotateCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+          <button onClick={isStreaming ? handleStop : awaiting ? handleCancelAwaiting : handleSendMessage}
+            disabled={isUploadingAttachment}
+            title={awaiting ? t('chat.cancelWaiting') : undefined}
+            className={`p-2 text-white rounded-xl transition-all active:scale-95 disabled:opacity-50 ${isStreaming || awaiting ? 'bg-red-500 hover:bg-red-600' : 'bg-sigma-600 hover:bg-sigma-700'}`}>
+            {isStreaming || awaiting ? <Square className="w-4 h-4" /> : isUploadingAttachment ? <RotateCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
           </button>
           </div>
         </div>
@@ -3124,7 +3590,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                         ) : (
                         <div key={mi} data-archived-msg-id={m.id} className={`flex flex-col rounded-lg transition-colors duration-700 ${m.role === 'user' ? 'items-end' : 'items-start'} ${m.id === flashMessageId ? 'bg-amber-100/60 dark:bg-amber-900/25' : ''}`}>
                           <div className="flex items-center gap-1.5 mb-1">
-                            <span className="text-[9px] font-black uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.role === 'SiGMA' ? t('chat.roleSigma') : m.role}</span>
+                            <span className="text-[9px] font-black uppercase tracking-widest text-gray-400 dark:text-gray-500">{t(m.role === 'SiGMA' ? 'chat.roleSigma' : 'chat.roleUser')}</span>
                             {m.created_at && <span className="text-[8px] text-gray-300 dark:text-gray-600">{formatTimestamp(m.created_at)}</span>}
                           </div>
                           <div className={`max-w-full px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-sigma-100 dark:bg-sigma-600/20 text-sigma-800 dark:text-sigma-300' : 'bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 text-gray-600 dark:text-gray-400'}`}>

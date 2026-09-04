@@ -99,8 +99,10 @@ async def download_item(project_id: str, path: str = Query("")):
 
 @router.post("/{project_id}/upload")
 async def upload_files(project_id: str, file: UploadFile, path: str = Form(""), overwrite: bool = Form(False)):
-    content = await file.read()
-    filename = await file_service.save_upload(project_id, file.filename, content, path, overwrite=overwrite)
+    # The service streams the body straight to disk in bounded chunks, so an
+    # oversized upload is rejected with 413 without ever being buffered in
+    # memory.
+    filename = await file_service.save_upload(project_id, file.filename, file, path, overwrite=overwrite)
     return ok({"filename": filename})
 
 

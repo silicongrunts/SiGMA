@@ -6,6 +6,8 @@ Covers:
 - ``_run_bash`` validates timeout, kills timed-out subprocesses, returns the
   timeout note promptly (without blocking for the command's full duration),
   and uses the unified format on success/failure/timeout.
+- spawn/execute failures surface as a ``Bash error:`` string instead of
+  escaping into the agent loop.
 """
 
 import asyncio
@@ -149,6 +151,21 @@ async def test_run_bash_failure_returns_nonzero_exit_code():
     assert "stderr: fail" in result
 
 
+# ── _run_bash: exceptions must not escape to the loop ───────────────
+
+@pytest.mark.asyncio
+async def test_run_bash_spawn_failure_returns_error_string():
+    """A spawn/execute exception must surface as a structured
+    ``Bash error:`` string for the LLM — it must never propagate into the
+    loop runner and abort the conversation turn."""
+    with patch("app.agents.tools.bash.asyncio.create_subprocess_shell",
+               new=AsyncMock(side_effect=OSError("fd exhausted"))):
+        result = await _run_bash("proj", "echo hi")
+
+    assert result.startswith("Bash error:")
+    assert "fd exhausted" in result
+
+
 # ── _run_bash: timeout kills subprocess ─────────────────────────────
 
 @pytest.mark.asyncio
@@ -233,7 +250,7 @@ async def test_run_bash_timeout_returns_even_if_wait_raises():
 
 @pytest.mark.asyncio
 async def test_run_bash_timeout_returns_within_timeout_not_command_duration(
-    tmp_path, monkeypatch
+    project_root,
 ):
     """Regression: a timed-out command must return within ~timeout seconds,
     not wait for the command's own full duration.
@@ -244,13 +261,6 @@ async def test_run_bash_timeout_returns_within_timeout_not_command_duration(
     asserts the wall-clock elapsed time is bounded well below the command
     duration.
     """
-    from types import SimpleNamespace
-    from app.agents.tools import bash as bash_mod
-    monkeypatch.setattr(
-        bash_mod, "settings",
-        SimpleNamespace(get_project_path=lambda pid: tmp_path),
-    )
-
     loop = asyncio.get_running_loop()
     t0 = loop.time()
     result = await _run_bash("proj", "sleep 30", timeout=2)

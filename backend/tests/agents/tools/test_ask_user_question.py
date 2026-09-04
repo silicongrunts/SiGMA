@@ -27,13 +27,11 @@ def test_valid_multi_passes():
     assert validate_questions([_single(type="multi")]) is None
 
 
-def test_valid_text_passes():
+def test_valid_text_type_ignores_options():
+    # A text question neither requires nor validates options: it passes
+    # without them and with an otherwise-valid option list attached.
     assert validate_questions([{"question": "Name?", "type": "text"}]) is None
-
-
-def test_valid_text_ignores_options():
-    # text type does not require options; their absence is fine
-    assert validate_questions([{"question": "x", "type": "text"}]) is None
+    assert validate_questions([_single(question="Name?", type="text")]) is None
 
 
 def test_valid_max_questions_passes():

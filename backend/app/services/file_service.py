@@ -7,6 +7,7 @@ import zipfile
 import tarfile
 import io
 import json
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from enum import Enum
@@ -16,15 +17,21 @@ from app.core.exceptions import (
 )
 from app.core.config import settings
 from app.core.atomic_file import (
-    ProjectFileLock, atomic_write_text, atomic_write_bytes, atomic_replace_bytes,
+    ProjectFileLock, atomic_write_text, atomic_replace_bytes,
     AtomicFileExistsError,
 )
 from app.core.text_diff import compute_diff_lines
+from app.core.uploads import write_upload_bounded
 from app.core.utils import is_within, sanitize_filename
 from app.core.logging import get_logger
 from app.services.snapshot_service import snapshot_service
 
 logger = get_logger(__name__)
+
+MAX_ARCHIVE_MEMBERS = 10_000
+MAX_ARCHIVE_MEMBER_BYTES = 100 * 1024 * 1024
+MAX_ARCHIVE_TOTAL_BYTES = 1 * 1024 * 1024 * 1024
+MAX_ARCHIVE_COMPRESSION_RATIO = 1_000
 
 MAX_TREE_DEPTH = 64
 MAX_TREE_NODES = 10000
@@ -302,12 +309,29 @@ class FileService:
             # still get a deterministic answer rather than crashing.
             return p.resolve()
 
+    def resolve_write_target(self, project_id: str, path: str) -> Optional[Path]:
+        """Resolve a path exactly as write classification resolves it.
+
+        Single resolution primitive for the write-approval flow: the
+        permission gate snapshots the resolved target when the approval
+        dialog is shown, and the resume path re-resolves the same path to
+        detect target drift while the task was parked awaiting input.
+        Returns ``None`` when the path cannot be resolved (relative path
+        escaping the sandbox, or a resolution error) — callers treat that
+        as "no known target" rather than a crash.
+        """
+        try:
+            return self._resolve_for_check(project_id, path)
+        except (FileSystemError, OSError, ValueError):
+            return None
+
     def classify_path(self, project_id: str, path: str) -> PathAccessLevel:
         """Classify a path into an access level."""
-        try:
-            resolved = self._resolve_for_check(project_id, path)
-        except FileSystemError:
-            # Relative path escaped the sandbox via traversal — treat as external.
+        resolved = self.resolve_write_target(project_id, path)
+        if resolved is None:
+            # Unresolvable (a relative path escaping the sandbox, or a
+            # resolution failure) — treat as external so a write still
+            # requires approval.
             return PathAccessLevel.EXTERNAL
 
         try:
@@ -376,6 +400,12 @@ class FileService:
         exactly like their relative-path counterparts. Writes outside the
         sandbox (e.g. to ``/tmp``) do not trigger snapshot.
         """
+        from app.services.project_service import project_service
+        if not project_service.is_project_active(project_id):
+            raise FileSystemError(
+                f"Project {project_id} is not accepting writes.",
+                code="PROJECT_LIFECYCLE_BLOCKED",
+            )
         p = Path(path).resolve()
         atomic_write_text(p, content, encoding)
 
@@ -700,17 +730,29 @@ class FileService:
     # Upload / download
     # ------------------------------------------------------------------
 
-    async def save_upload(self, project_id: str, filename: str, content: bytes, path: str = "", overwrite: bool = False) -> str:
-        """Save an uploaded file. Returns the saved filename."""
+    async def save_upload(self, project_id: str, filename: str, file, path: str = "", overwrite: bool = False) -> str:
+        """Stream an uploaded file to ``path`` under the project root.
+
+        The body goes straight to disk in bounded chunks and is never fully
+        buffered in memory; a body over the configured upload cap is rejected
+        with 413 (FILE_TOO_LARGE) and leaves no file behind. The destination
+        name is claimed atomically once the body is complete, so two
+        concurrent uploads of one name with ``overwrite=False`` cannot
+        overwrite each other — the loser gets FileAlreadyExistsError and its
+        temp file is removed. Returns the saved filename.
+        """
         safe_name = sanitize_filename(filename)
         root = self.get_project_path(project_id)
         dest_dir = self.safe_join(root, path)
-        dest_dir.mkdir(parents=True, exist_ok=True)
         dest_path = dest_dir / safe_name
-        try:
-            atomic_write_bytes(dest_path, content, fail_if_exists=not overwrite)
-        except AtomicFileExistsError:
-            raise FileAlreadyExistsError(safe_name)
+        await write_upload_bounded(
+            file,
+            dest_path,
+            settings.FILE_UPLOAD_MAX_MB * 1024 * 1024,
+            message=f"File exceeds the {settings.FILE_UPLOAD_MAX_MB} MB upload limit",
+            code="FILE_TOO_LARGE",
+            overwrite=overwrite,
+        )
         await self._after_file_mutation(project_id)
         return safe_name
 
@@ -835,6 +877,11 @@ class FileService:
                 for info in zf.infolist():
                     if info.is_dir():
                         continue
+                    if info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+                        raise FileSystemError("Archive member exceeds the 100 MB limit", code="INVALID_REQUEST")
+                    members_count = len(members) + 1
+                    if members_count > MAX_ARCHIVE_MEMBERS:
+                        raise FileSystemError("Archive contains too many files", code="INVALID_REQUEST")
                     clean = self.sanitize_member(info.filename)
                     if clean:
                         members.append(clean)
@@ -843,6 +890,10 @@ class FileService:
                 for m in tf.getmembers():
                     if not m.isfile():
                         continue
+                    if m.size > MAX_ARCHIVE_MEMBER_BYTES:
+                        raise FileSystemError("Archive member exceeds the 100 MB limit", code="INVALID_REQUEST")
+                    if len(members) + 1 > MAX_ARCHIVE_MEMBERS:
+                        raise FileSystemError("Archive contains too many files", code="INVALID_REQUEST")
                     clean = self.sanitize_member(m.name)
                     if clean:
                         members.append(clean)
@@ -851,10 +902,41 @@ class FileService:
                 for m in tf.getmembers():
                     if not m.isfile():
                         continue
+                    if m.size > MAX_ARCHIVE_MEMBER_BYTES:
+                        raise FileSystemError("Archive member exceeds the 100 MB limit", code="INVALID_REQUEST")
+                    if len(members) + 1 > MAX_ARCHIVE_MEMBERS:
+                        raise FileSystemError("Archive contains too many files", code="INVALID_REQUEST")
                     clean = self.sanitize_member(m.name)
                     if clean:
                         members.append(clean)
         return members
+
+    def _validate_archive_limits(self, full_path: Path) -> None:
+        """Reject archive bombs before creating any destination files."""
+        name = full_path.name
+        total = 0
+        compressed = 0
+        if name.endswith('.zip'):
+            with zipfile.ZipFile(full_path, 'r') as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    total += info.file_size
+                    compressed += info.compress_size
+        elif name.endswith('.tar.gz') or name.endswith('.tgz'):
+            with tarfile.open(full_path, 'r:gz') as archive:
+                total = sum(member.size for member in archive.getmembers() if member.isfile())
+            compressed = full_path.stat().st_size
+        elif name.endswith('.tar'):
+            with tarfile.open(full_path, 'r:') as archive:
+                total = sum(member.size for member in archive.getmembers() if member.isfile())
+            compressed = full_path.stat().st_size
+        else:
+            raise FileSystemError(f"Unsupported archive format: {name}", code="INVALID_REQUEST")
+        if total > MAX_ARCHIVE_TOTAL_BYTES:
+            raise FileSystemError("Archive expands beyond the 1 GB limit", code="INVALID_REQUEST")
+        if total and (not compressed or total / compressed > MAX_ARCHIVE_COMPRESSION_RATIO):
+            raise FileSystemError("Archive compression ratio is too high", code="INVALID_REQUEST")
 
     async def check_extract_conflicts(self, project_id: str, path: str) -> list[str]:
         """Return list of relative paths that would be overwritten by extraction."""
@@ -862,6 +944,9 @@ class FileService:
         full_path = self.safe_join(root, path)
         if not full_path.exists():
             raise FileMissingError(path)
+
+        self._validate_archive_limits(full_path)
+        self._list_archive_members(full_path)
 
         target_dir = full_path.parent / self._archive_target_dirname(full_path.name)
         conflicts = []
@@ -908,13 +993,87 @@ class FileService:
         if not self._ensure_parent_dirs(dest, overwrite):
             return False
         try:
-            data = src_file.read()
-            atomic_write_bytes(dest, data, fail_if_exists=not overwrite)
+            fd, temp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=".extract_")
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    copied = 0
+                    while True:
+                        chunk = src_file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if copied > MAX_ARCHIVE_MEMBER_BYTES:
+                            raise FileSystemError(
+                                "Archive member exceeds the 100 MB limit",
+                                code="INVALID_REQUEST",
+                            )
+                        out.write(chunk)
+                    out.flush()
+                    os.fsync(out.fileno())
+                if overwrite:
+                    os.replace(temp_name, dest)
+                else:
+                    os.link(temp_name, dest)
+                    os.unlink(temp_name)
+            finally:
+                Path(temp_name).unlink(missing_ok=True)
             return True
         except AtomicFileExistsError:
             return False
         except (OSError, NotADirectoryError):
             return False
+
+    def _extract_archive_members(
+        self, full_path: Path, staging_dir: Path, root: Path, overwrite: bool,
+    ) -> int:
+        count = 0
+        name = full_path.name
+        if name.endswith('.zip'):
+            with zipfile.ZipFile(full_path, 'r') as zf:
+                members = zf.infolist()
+                for info in members:
+                    if info.is_dir():
+                        continue
+                    clean = self.sanitize_member(info.filename)
+                    if not clean:
+                        continue
+                    dest = staging_dir / clean
+                    if not self._validate_extract_dest(dest, staging_dir, root):
+                        continue
+                    with zf.open(info) as src:
+                        if self._extract_member(src, dest, overwrite):
+                            count += 1
+        elif name.endswith('.tar.gz') or name.endswith('.tgz'):
+            with tarfile.open(full_path, 'r:gz') as tf:
+                for member in tf.getmembers():
+                    if not member.isfile():
+                        continue
+                    clean = self.sanitize_member(member.name)
+                    if not clean:
+                        continue
+                    dest = staging_dir / clean
+                    if not self._validate_extract_dest(dest, staging_dir, root):
+                        continue
+                    src = tf.extractfile(member)
+                    if src and self._extract_member(src, dest, overwrite):
+                        count += 1
+        elif name.endswith('.tar'):
+            with tarfile.open(full_path, 'r:') as tf:
+                for member in tf.getmembers():
+                    if not member.isfile():
+                        continue
+                    clean = self.sanitize_member(member.name)
+                    if not clean:
+                        continue
+                    dest = staging_dir / clean
+                    if not self._validate_extract_dest(dest, staging_dir, root):
+                        continue
+                    src = tf.extractfile(member)
+                    if src and self._extract_member(src, dest, overwrite):
+                        count += 1
+        else:
+            raise FileSystemError(f"Unsupported archive format: {name}", code="INVALID_REQUEST")
+        return count
 
     async def extract_archive(self, project_id: str, path: str, overwrite: bool = False) -> dict:
         """Extract a zip/tar archive into a folder named after the archive."""
@@ -936,56 +1095,23 @@ class FileService:
                 target_dir.unlink()
             else:
                 raise FileAlreadyExistsError(target_dirname)
-        target_dir.mkdir(parents=True, exist_ok=True)
+        staging_dir = full_path.parent / f".extracting-{os.getpid()}-{hashlib.sha256(path.encode()).hexdigest()[:12]}"
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        staging_dir.mkdir(parents=True, exist_ok=False)
 
-        name = full_path.name
-        count = 0
+        try:
+            count = self._extract_archive_members(full_path, staging_dir, root, overwrite)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
 
-        if name.endswith('.zip'):
-            with zipfile.ZipFile(full_path, 'r') as zf:
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    clean = self.sanitize_member(info.filename)
-                    if not clean:
-                        continue
-                    dest = target_dir / clean
-                    if not self._validate_extract_dest(dest, target_dir, root):
-                        continue
-                    with zf.open(info) as src:
-                        if self._extract_member(src, dest, overwrite):
-                            count += 1
-        elif name.endswith('.tar.gz') or name.endswith('.tgz'):
-            with tarfile.open(full_path, 'r:gz') as tf:
-                for m in tf.getmembers():
-                    if not m.isfile():
-                        continue
-                    clean = self.sanitize_member(m.name)
-                    if not clean:
-                        continue
-                    dest = target_dir / clean
-                    if not self._validate_extract_dest(dest, target_dir, root):
-                        continue
-                    src = tf.extractfile(m)
-                    if src and self._extract_member(src, dest, overwrite):
-                        count += 1
-        elif name.endswith('.tar'):
-            with tarfile.open(full_path, 'r:') as tf:
-                for m in tf.getmembers():
-                    if not m.isfile():
-                        continue
-                    clean = self.sanitize_member(m.name)
-                    if not clean:
-                        continue
-                    dest = target_dir / clean
-                    if not self._validate_extract_dest(dest, target_dir, root):
-                        continue
-                    src = tf.extractfile(m)
-                    if src and self._extract_member(src, dest, overwrite):
-                        count += 1
-        else:
-            raise FileSystemError(f"Unsupported archive format: {name}", code="INVALID_REQUEST")
-
+        if target_dir.exists():
+            if not overwrite:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                raise FileAlreadyExistsError(target_dirname)
+            shutil.rmtree(target_dir, ignore_errors=True)
+        os.replace(staging_dir, target_dir)
         await self._after_file_mutation(project_id)
         return {"extracted_to": target_dirname, "file_count": count}
 

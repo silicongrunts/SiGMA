@@ -9,7 +9,8 @@ from app.core.config import settings, ModelSettings
 
 
 # ---------------------------------------------------------------------------
-# Preflight checks — must return friendly strings, never raise
+# In-tool input validation (the draw tool's own pre-checks, distinct from the
+# permission-gate preflight) — must return friendly strings, never raise
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio

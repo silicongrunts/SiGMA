@@ -26,6 +26,44 @@ logger = get_logger(__name__)
 STREAM_FIRST_CHUNK_TIMEOUT_SECONDS = 900.0
 STREAM_IDLE_TIMEOUT_SECONDS = 300.0
 STREAM_ABSOLUTE_TIMEOUT_SECONDS = 3600.0
+PROVIDER_CLOSE_TIMEOUT_SECONDS = 5.0
+
+
+class _StreamAttemptError(Exception):
+    def __init__(self, error: BaseException, visible_output: bool):
+        super().__init__(str(error))
+        self.error = error
+        self.visible_output = visible_output
+
+
+async def _run_provider_call(call, timeout: float):
+    task = asyncio.create_task(call())
+    try:
+        return await asyncio.wait_for(task, timeout=timeout)
+    except BaseException:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
+
+async def _close_async_iterator(iterator) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    close_task = asyncio.create_task(close())
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(close_task), timeout=PROVIDER_CLOSE_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        close_task.cancel()
+        await asyncio.gather(close_task, return_exceptions=True)
+        raise
+    except BaseException:
+        close_task.cancel()
+        await asyncio.gather(close_task, return_exceptions=True)
+        return
 
 
 def _session_headers(session_id: str | None) -> dict:
@@ -41,6 +79,65 @@ def _session_headers(session_id: str | None) -> dict:
     if not session_id:
         return {}
     return {"extra_headers": {"x-session-id": session_id}}
+
+
+# Injected as the result of tool calls whose outcome never arrived. The
+# effect is unknown — the operation may have run without its result being
+# recorded (a crash between execution and persistence) — so the copy tells
+# the model to verify state first and re-issue only if still needed, never
+# to blindly retry a possibly-executed side effect.
+INTERRUPTED_TOOL_RESULT = (
+    "Error: execution was interrupted before this tool call's result was "
+    "recorded. The operation may or may not have taken effect — verify the "
+    "current state first and only re-issue the call if it is still needed."
+)
+
+
+def with_complete_tool_results(messages: list[dict]) -> list[dict]:
+    """Answer every tool call that has no recorded result before sending.
+
+    The chat protocol requires each ``tool_calls`` entry of an assistant
+    message to be answered by a following ``tool`` message carrying the same
+    ``tool_call_id``; providers reject the whole request otherwise
+    (BadRequest: "No tool output found for function call ...").
+
+    SiGMA's stores legitimately hold unpaired states — a permission pause
+    checkpoints the assistant message before any sibling call of a parallel
+    batch ran, and a process crash between tool execution and message
+    persistence can leave a result row missing — so the repair belongs at
+    this single outbound boundary rather than in every writer.
+    Stored history is never modified; fully paired lists are returned
+    unchanged.
+    """
+    out: list[dict] = []
+    changed = False
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        out.append(msg)
+        i += 1
+        if msg.get("role") != "assistant":
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not tool_calls:
+            continue
+        answered = set()
+        while i < len(messages) and messages[i].get("role") == "tool":
+            answered.add(messages[i].get("tool_call_id"))
+            out.append(messages[i])
+            i += 1
+        missing = [
+            tc.get("id") for tc in tool_calls
+            if isinstance(tc, dict) and tc.get("id") and tc["id"] not in answered
+        ]
+        if missing:
+            changed = True
+            out.extend({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": INTERRUPTED_TOOL_RESULT,
+            } for call_id in missing)
+    return out if changed else messages
 
 
 def _with_single_leading_system(messages: list[dict]) -> list[dict]:
@@ -234,7 +331,7 @@ class LLMService:
         messages: list[dict],
         model_role: str = "supervisor",
         tools: list[dict] | None = None,
-        timeout: float = 300.0,
+        timeout: float | None = None,
         delta_queue: "asyncio.Queue | None" = None,
         max_tokens: int | None = None,
         session_id: str | None = None,
@@ -248,6 +345,9 @@ class LLMService:
         so the provider can pin sticky routing. This is required for prompt/KV
         cache hits on multi-instance providers (e.g. OpenRouter): without it the
         cache only activates after a hit, which never happens under round-robin.
+        ``timeout`` is the whole-call deadline, including stream creation and
+        all chunks. When omitted, the stream uses the long-session default
+        absolute deadline while retaining separate first-chunk and idle limits.
         """
         endpoint = self._require_endpoint(model_role)
         litellm = self._litellm()
@@ -256,7 +356,9 @@ class LLMService:
 
         payload = {
             "model": endpoint.litellm_model,
-            "messages": _with_single_leading_system(messages),
+            "messages": with_complete_tool_results(
+                _with_single_leading_system(messages)
+            ),
             "stream": True,
             "stream_options": {"include_usage": True},
             "drop_params": True,
@@ -270,22 +372,35 @@ class LLMService:
 
         max_attempts = max(1, settings.MAX_RETRIES)
         last_error: LLMException | None = None
+        loop = asyncio.get_running_loop()
+        whole_call_timeout = (
+            STREAM_ABSOLUTE_TIMEOUT_SECONDS if timeout is None else float(timeout)
+        )
+        deadline = loop.time() + whole_call_timeout
 
         for attempt in range(1, max_attempts + 1):
+            if deadline <= loop.time():
+                raise LLMTimeoutError(whole_call_timeout)
             try:
                 return await self._stream_chat_once(
                     litellm=litellm,
                     payload=payload,
                     timeout=timeout,
                     delta_queue=delta_queue,
+                    deadline=deadline,
                 )
             except asyncio.CancelledError:
                 raise
-            except asyncio.TimeoutError as exc:
-                last_error = LLMTimeoutError(timeout)
-                mapped_message = last_error.message
-                if attempt >= max_attempts:
-                    raise last_error from exc
+            except _StreamAttemptError as attempt_error:
+                mapped = self._map_litellm_error(attempt_error.error)
+                last_error = mapped
+                mapped_message = mapped.message
+                if (
+                    attempt_error.visible_output
+                    or not self._is_retryable_error(mapped)
+                    or attempt >= max_attempts
+                ):
+                    raise mapped from attempt_error.error
             except Exception as exc:
                 mapped = self._map_litellm_error(exc)
                 last_error = mapped
@@ -309,7 +424,10 @@ class LLMService:
                         "error": mapped_message,
                     },
                 ))
-            await asyncio.sleep(self._retry_delay(attempt))
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise LLMTimeoutError(whole_call_timeout) from last_error
+            await asyncio.sleep(min(self._retry_delay(attempt), remaining))
 
         raise last_error or LLMException("LLM stream failed after retries")
 
@@ -318,71 +436,90 @@ class LLMService:
         *,
         litellm,
         payload: dict,
-        timeout: float,
+        timeout: float | None,
         delta_queue: "asyncio.Queue | None",
+        deadline: float | None = None,
     ) -> tuple[str, str, list[dict], dict | None]:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         raw_tool_calls: dict[int, dict[str, Any]] = {}
         usage = None
-
-        first_chunk_timeout = max(float(timeout), STREAM_FIRST_CHUNK_TIMEOUT_SECONDS)
-        stream = await asyncio.wait_for(
-            litellm.acompletion(**payload), timeout=first_chunk_timeout,
-        )
-        stream_iter = stream.__aiter__()
+        visible_output = False
 
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + STREAM_ABSOLUTE_TIMEOUT_SECONDS
+        whole_call_timeout = (
+            STREAM_ABSOLUTE_TIMEOUT_SECONDS if timeout is None else float(timeout)
+        )
+        if deadline is None:
+            deadline = loop.time() + whole_call_timeout
+        stream_iter = None
         seen_chunk = False
-
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise LLMTimeoutError(STREAM_ABSOLUTE_TIMEOUT_SECONDS)
-
-            chunk_timeout = (
-                STREAM_IDLE_TIMEOUT_SECONDS if seen_chunk else first_chunk_timeout
+        try:
+            first_chunk_timeout = min(
+                STREAM_FIRST_CHUNK_TIMEOUT_SECONDS, whole_call_timeout,
             )
-            chunk_timeout = min(chunk_timeout, remaining)
-            try:
-                chunk = await asyncio.wait_for(
-                    stream_iter.__anext__(), timeout=chunk_timeout,
+            stream = await _run_provider_call(
+                lambda: litellm.acompletion(**payload),
+                timeout=first_chunk_timeout,
+            )
+            stream_iter = stream.__aiter__()
+
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise LLMTimeoutError(whole_call_timeout)
+
+                chunk_timeout = min(
+                    STREAM_IDLE_TIMEOUT_SECONDS if seen_chunk else first_chunk_timeout,
+                    remaining,
                 )
-            except StopAsyncIteration:
-                break
-            except asyncio.TimeoutError as exc:
-                raise LLMTimeoutError(chunk_timeout) from exc
+                try:
+                    chunk = await asyncio.wait_for(
+                        stream_iter.__anext__(), timeout=chunk_timeout,
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as exc:
+                    raise LLMTimeoutError(chunk_timeout) from exc
 
-            seen_chunk = True
-            chunk_dict = self._to_dict(chunk)
-            if chunk_dict.get("usage"):
-                usage = chunk_dict["usage"]
+                seen_chunk = True
+                chunk_dict = self._to_dict(chunk)
+                if chunk_dict.get("usage"):
+                    usage = chunk_dict["usage"]
 
-            choices = chunk_dict.get("choices") or []
-            if not choices:
-                continue
-            choice = self._to_dict(choices[0])
-            if choice.get("usage"):
-                usage = choice["usage"]
-            delta = self._to_dict(choice.get("delta") or {})
+                choices = chunk_dict.get("choices") or []
+                if not choices:
+                    continue
+                choice = self._to_dict(choices[0])
+                if choice.get("usage"):
+                    usage = choice["usage"]
+                delta = self._to_dict(choice.get("delta") or {})
 
-            text = self._extract_text_delta(delta)
-            if text:
-                text_parts.append(text)
-                if delta_queue is not None:
-                    await delta_queue.put(("delta", text))
+                text = self._extract_text_delta(delta)
+                if text:
+                    text_parts.append(text)
+                    if delta_queue is not None:
+                        await delta_queue.put(("delta", text))
+                        visible_output = True
 
-            reasoning = self._extract_reasoning_delta(delta)
-            if reasoning:
-                reasoning_parts.append(reasoning)
-                if delta_queue is not None:
-                    await delta_queue.put(("reasoning_delta", reasoning))
+                reasoning = self._extract_reasoning_delta(delta)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    if delta_queue is not None:
+                        await delta_queue.put(("reasoning_delta", reasoning))
+                        visible_output = True
 
-            self._merge_tool_call_deltas(delta.get("tool_calls") or [], raw_tool_calls)
+                self._merge_tool_call_deltas(delta.get("tool_calls") or [], raw_tool_calls)
 
-        parsed_tool_calls = self._parse_tool_calls(raw_tool_calls)
-        return "".join(text_parts), "".join(reasoning_parts), parsed_tool_calls, usage
+            parsed_tool_calls = self._parse_tool_calls(raw_tool_calls)
+            return "".join(text_parts), "".join(reasoning_parts), parsed_tool_calls, usage
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            raise _StreamAttemptError(exc, visible_output) from exc
+        finally:
+            if stream_iter is not None:
+                await _close_async_iterator(stream_iter)
 
     async def _completion_with_retries(
         self,
@@ -402,7 +539,9 @@ class LLMService:
             litellm = self._litellm()
             payload = {
                 "model": endpoint.litellm_model,
-                "messages": _with_single_leading_system(messages),
+                "messages": with_complete_tool_results(
+                    _with_single_leading_system(messages)
+                ),
                 "stream": stream,
                 "drop_params": True,
                 **endpoint.litellm_kwargs(),
@@ -425,7 +564,7 @@ class LLMService:
             should_retry = False
             mapped_message = ""
             try:
-                return await asyncio.wait_for(call(), timeout=timeout)
+                return await _run_provider_call(call, timeout=timeout)
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:

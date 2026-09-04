@@ -1,32 +1,38 @@
 /**
- * Unified SSE stream parser.
+ * Shared SSE stream parser used by every streaming consumer (chat, annotation
+ * replies, settings checks).
  *
- * Consolidates three separate SSE parsing implementations that previously
- * existed in:
- *   - App.jsx (inline while(true) + split('\n\n'))
- *   - ChatPanel.jsx (recursive pump() + parseSSE helper)
- *   - api/index.js agentsAPI.streamResponse (line-by-line, multi-line data)
+ * Wire contract:
+ *   - Events are separated by a blank line ("\n\n"); a trailing chunk that
+ *     ends mid-event is kept in the buffer until the boundary arrives.
+ *   - A `data: ` payload may span multiple lines; the lines are joined with
+ *     "\n" and parsed as a single JSON document.
+ *   - Each event carries `id: <seq>`, a monotonic sequence number per task
+ *     stream. The parser surfaces that integer to onEvent; callers track the
+ *     last applied seq and pass it back as the `cursor` query parameter when
+ *     reconnecting, and the server replays only events with a higher seq.
  *
- * Design decisions:
- *   - Uses the "\n\n" (double-newline) event boundary from App.jsx/ChatPanel
- *     which is standard SSE spec.
- *   - Accumulates multi-line data fields like api/index.js streamResponse
- *     (needed when a data payload contains embedded newlines).
- *   - Provides a single `parseSSEEvent(rawText)` helper for pre-split events.
- *   - Provides `createSSEStreamParser` for streaming ReadableStream usage.
+ * `parseSSEEvent` parses one pre-split event block;
+ * `createSSEStreamParser` drains a fetch ReadableStream and dispatches
+ * parsed events to its callbacks.
  */
 
 /**
- * Parse a single SSE event string (one event: + data: block separated by \n\n).
- * Returns { type, data } or null if unparseable.
+ * Parse a single SSE event string (one id:/event: + data: block separated by
+ * \n\n). Returns { type, data, id } or null if unparseable. `id` is the
+ * integer parsed from the `id: ` line, or null when absent/unparseable.
  */
 export function parseSSEEvent(rawText) {
   const lines = rawText.split('\n')
   let eventType = null
   let dataLines = []
+  let id = null
 
   for (const line of lines) {
-    if (line.startsWith('event: ')) {
+    if (line.startsWith('id: ')) {
+      const parsedId = Number.parseInt(line.slice(4).trim(), 10)
+      id = Number.isInteger(parsedId) ? parsedId : null
+    } else if (line.startsWith('event: ')) {
       eventType = line.slice(7).trim()
     } else if (line.startsWith('data: ')) {
       dataLines.push(line.slice(6))
@@ -42,7 +48,7 @@ export function parseSSEEvent(rawText) {
     return null
   }
 
-  return { type: eventType, data }
+  return { type: eventType, data, id }
 }
 
 /**
@@ -50,7 +56,7 @@ export function parseSSEEvent(rawText) {
  *
  * Usage:
  *   const parser = createSSEStreamParser({
- *     onEvent: (type, data) => { ... },
+ *     onEvent: (type, data, id) => { ... },
  *     onError: (err) => { ... },
  *     onDone: () => { ... },
  *   })
@@ -59,7 +65,7 @@ export function parseSSEEvent(rawText) {
  *   await parser.start(reader, decoder, signal)
  *
  * @param {object} callbacks
- * @param {function} callbacks.onEvent  — (eventType: string, data: object) => void
+ * @param {function} callbacks.onEvent  — (eventType: string, data: object, id: number|null) => void
  * @param {function} callbacks.onError  — (error: Error) => void
  * @param {function} callbacks.onDone   — () => void
  * @returns {{ start: (reader, decoder, abortSignal?) => Promise<void> }}
@@ -88,13 +94,17 @@ export function createSSEStreamParser({ onEvent, onError, onDone }) {
           const ev = parseSSEEvent(part)
           if (!ev) continue
 
-          if (ev.type === 'done') {
+          // done / error / cancelled are all terminal: the server ends the
+          // subscription after delivering one, so any of them suppresses the
+          // synthetic onDone and a future onDone consumer cannot
+          // double-finalize the turn.
+          if (ev.type === 'done' || ev.type === 'error' || ev.type === 'cancelled') {
             receivedDoneEvent = true
           }
 
           if (onEvent) {
             try {
-              onEvent(ev.type, ev.data)
+              onEvent(ev.type, ev.data, ev.id)
             } catch (e) {
               console.error('[SSE] Callback error:', e)
             }

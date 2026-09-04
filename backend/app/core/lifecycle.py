@@ -13,9 +13,8 @@ from app.services.jupyter_service import JupyterService, set_jupyter
 from app.core.logging import get_logger
 logger = get_logger(__name__)
 
-# Module-level singletons
+# Module-level singleton
 jupyter_service: JupyterService = JupyterService(base_dir=str(settings.USERDATA_DIR))
-stream_server = None  # set at startup
 
 
 async def startup_event():
@@ -37,6 +36,10 @@ async def startup_event():
     # before they can confuse later scans or leak disk.
     from app.services.project_service import project_service
     try:
+        await project_service.reconcile_lifecycle()
+    except Exception as exc:
+        logger.warning("Project lifecycle reconciliation failed: %s", exc, exc_info=True)
+    try:
         swept = project_service.cleanup_interrupted_imports()
         if swept:
             logger.info("Cleaned up %d interrupted import(s)", swept)
@@ -44,15 +47,24 @@ async def startup_event():
         logger.warning("Interrupted-import cleanup failed: %s", exc, exc_info=True)
     await db_mgr.migrate_all_projects()
 
-    # ---- Stream Server (TCP relay for Huey Worker → SSE) ----
-    global stream_server
-    from app.workers.stream_server import stream_server as _ss
-    stream_server = _ss
+    from app.core.project_registry import iter_project_ids
+    from app.services.annotation_service import annotation_service
+    for project_id in iter_project_ids():
+        try:
+            await annotation_service.recover_transactions(project_id)
+        except Exception as exc:
+            logger.warning("Annotation transaction recovery failed for %s: %s", project_id, exc, exc_info=True)
+
+    # ---- Fail tasks left active by a previous run ----
+    from app.services import task_runtime
     try:
-        await stream_server.start()
-        logger.info("StreamServer started on %s:%s", stream_server.host, stream_server.port)
+        await task_runtime.startup_reconcile()
     except Exception as e:
-        logger.warning("Failed to start StreamServer: %s", e, exc_info=True)
+        logger.warning("Startup task reconciliation failed: %s", e, exc_info=True)
+    try:
+        task_runtime.start_stranded_sweep()
+    except Exception as e:
+        logger.warning("Failed to start stranded task sweep: %s", e, exc_info=True)
 
     # ---- Browser service ----
     from app.services.browser_service import get_browser_service
@@ -76,13 +88,6 @@ async def startup_event():
     except Exception as e:
         logger.warning("Failed to start browser thread: %s", e, exc_info=True)
 
-    # ---- Document processing service (library) ----
-    from app.services.document_processing_service import document_processing_service
-    try:
-        await document_processing_service.start()
-    except Exception as e:
-        logger.warning("Failed to start document processing service: %s", e, exc_info=True)
-
     # ---- RAG service ----
     from app.services.rag_service import rag_service
     try:
@@ -97,9 +102,14 @@ async def startup_event():
     except Exception as e:
         logger.warning("Git startup maintenance failed: %s", e, exc_info=True)
 
-    # ---- Index builder ----
-    from app.services.index_builder import index_builder
-    index_builder.start()
+    # ---- Library task handler registration ----
+    # These imports register the library background task handlers via their
+    # module-level registries; no service-level start/stop is needed since
+    # the background runner owns the execution lifecycle.
+    from importlib import import_module
+
+    import_module("app.services.document_processing_service")
+    import_module("app.services.index_builder")
 
     # ---- Terminal session reaper ----
     from app.services.terminal_service import terminal_service
@@ -108,25 +118,45 @@ async def startup_event():
     except Exception as e:
         logger.warning("Failed to start terminal reaper: %s", e, exc_info=True)
 
+    # ---- Library background runner and maintenance loop ----
+    # Started last: the library task handlers register themselves at the
+    # document-processing / index-builder imports above.
+    from app.services.background_task_service import (
+        background_task_service,
+        library_task_runner,
+    )
+    library_task_runner.start()
+    background_task_service.start_maintenance()
+
     logger.info("SiGMA startup complete")
 
 
 async def shutdown_event():
     """Run once when the FastAPI application shuts down."""
-    # ---- Stream server ----
-    global stream_server
-    if stream_server:
-        try:
-            await stream_server.stop()
-        except Exception as e:
-            logger.warning("Failed to stop StreamServer: %s", e, exc_info=True)
-
-    # ---- Index builder ----
-    from app.services.index_builder import index_builder
+    # ---- Streaming chat/annotation tasks (producers first) ----
+    from app.services import task_runtime
     try:
-        index_builder.stop()
+        await task_runtime.shutdown_all()
     except Exception as e:
-        logger.warning("Failed to stop index builder: %s", e, exc_info=True)
+        logger.warning("Failed to shut down task runtime: %s", e, exc_info=True)
+    try:
+        await task_runtime.stop_stranded_sweep()
+    except Exception as e:
+        logger.warning("Failed to stop stranded task sweep: %s", e, exc_info=True)
+
+    # ---- Library maintenance loop and background runner ----
+    from app.services.background_task_service import (
+        background_task_service,
+        library_task_runner,
+    )
+    try:
+        await background_task_service.stop_maintenance()
+    except Exception as e:
+        logger.warning("Failed to stop library maintenance loop: %s", e, exc_info=True)
+    try:
+        await library_task_runner.stop()
+    except Exception as e:
+        logger.warning("Failed to stop library background runner: %s", e, exc_info=True)
 
     # ---- Jupyter ----
     jupyter_service.stop()
@@ -153,13 +183,6 @@ async def shutdown_event():
         get_tab_reaper().stop()
     except Exception:
         logger.debug("Failed to stop tab reaper", exc_info=True)
-
-    # ---- Document processing service ----
-    from app.services.document_processing_service import document_processing_service
-    try:
-        await document_processing_service.stop()
-    except Exception as e:
-        logger.warning("Failed to stop document processing service: %s", e, exc_info=True)
 
     # ---- Pending auto-snapshot timers ----
     from app.services.snapshot_service import snapshot_service

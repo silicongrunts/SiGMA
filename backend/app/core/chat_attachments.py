@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 
-ATTACHMENTS_DIR = ".SiGMA/chat_attachments"
 SUPPORTED_IMAGE_MIME_TYPES = {
     "image/png": ".png",
     "image/jpeg": ".jpg",

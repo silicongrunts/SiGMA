@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from app.core.config import settings
-from app.core.document_status import ACTIVE_STATUSES
 from app.core.utils import is_within, to_iso, utcnow
 from app.core.atomic_file import ProjectFileLock, atomic_write_json, safe_read_json
 from app.core.exceptions import FileSystemError, ProjectNotFoundError
@@ -128,8 +127,8 @@ class ProjectService:
         """Return True only when the global registry allows project work.
 
         Delegates the raw registry read to ``core.project_registry`` so
-        that lower layers (DB manager, workers) can consult the same
-        source without depending on this service.
+        that lower layers (DB manager, cross-project sweeps) can consult
+        the same source without depending on this service.
         """
         from app.core.project_registry import is_project_active as _is_active
         return _is_active(project_id)
@@ -915,129 +914,108 @@ class ProjectService:
     # Delete project — helpers + orchestration
     # ------------------------------------------------------------------
 
-    async def _collect_running_doc_ids_async(self, project_id: str) -> list:
-        """Collect IDs of documents still being processed."""
-        running = []
-        try:
-            from app.database.unit_of_work import UnitOfWork
-            async with UnitOfWork(project_id, allow_inactive=True) as uow:
-                all_docs = await uow.library.get_all()
-            for doc in all_docs:
-                if not doc.is_folder and doc.processing_status in ACTIVE_STATUSES:
-                    running.append(doc.id)
-        except Exception as exc:
-            logger.warning(
-                "Failed to collect running doc IDs for project %s: %s",
-                project_id,
-                exc,
-                exc_info=True,
-            )
-        return running
+    async def _cancel_library_tasks(self, project_id: str) -> bool:
+        """Cancel the project's queued/running durable library background tasks.
 
-    async def _cancel_library_tasks(self, project_id: str, doc_ids: list) -> None:
-        """Cancel queued/running durable library background tasks."""
+        ``cancel_project_tasks`` covers every active task row in the project
+        database — there is no per-document work left to do on top of it.
+        """
         try:
-            from app.services.background_task_service import background_task_service
-        except ImportError:
-            logger.warning("background_task_service not available, skipping task cancellation")
-            return
-        try:
-            await background_task_service.cancel_project_tasks(project_id)
-        except Exception as exc:
-            logger.warning(
-                "Failed to cancel project background tasks for %s: %s",
-                project_id,
-                exc,
-                exc_info=True,
+            from app.services.background_task_service import (
+                background_task_service,
+                library_task_runner,
             )
-        for doc_id in doc_ids:
-            try:
-                await background_task_service.cancel_document_tasks(project_id, doc_id)
-            except Exception as exc:
-                logger.warning("Failed to cancel task for doc %s: %s", doc_id, exc, exc_info=True)
+        except ImportError:
+            raise FileSystemError(
+                "Background task runtime is unavailable; lifecycle remains blocked.",
+                code="PROJECT_DRAIN_UNAVAILABLE",
+            )
+        await background_task_service.cancel_project_tasks(project_id)
+        library_task_runner.cancel_project(project_id)
+        drained = await library_task_runner.wait_for_project(project_id)
+        if not drained:
+            raise FileSystemError(
+                f"Project {project_id} still has running library work; retry later.",
+                code="PROJECT_DRAIN_TIMEOUT",
+            )
+        return True
 
     async def _evict_project_caches(self, project_id: str, db_manager) -> None:
         """Evict in-memory caches (RAG, DB engine)."""
-        try:
-            from app.services.rag_service import rag_service
-            rag_service.evict_project(project_id)
-        except Exception as exc:
-            logger.warning("Failed to evict RAG cache for project %s: %s", project_id, exc, exc_info=True)
+        from app.services.rag_service import rag_service
+        rag_service.evict_project(project_id)
         await db_manager.cleanup_project(project_id)
 
     def _delete_project_directory(self, project_id: str) -> None:
         """Delete the project directory from disk."""
         p_path = self.USERDATA_DIR / project_id
-        try:
-            shutil.rmtree(p_path, ignore_errors=True)
-        except Exception as exc:
-            logger.warning("Failed to delete directory for project %s: %s", project_id, exc, exc_info=True)
+        if not p_path.exists():
+            return
+        shutil.rmtree(p_path)
+        if p_path.exists():
+            raise FileSystemError(
+                f"Project directory could not be removed: {project_id}",
+                code="PROJECT_DELETE_INCOMPLETE",
+            )
 
     async def _kill_project_kernels(self, project_id: str) -> None:
         """Kill Jupyter kernels belonging to a project."""
-        try:
-            from app.services.jupyter_service import get_jupyter
-            jupyter_svc = get_jupyter()
-            if jupyter_svc:
-                await jupyter_svc.kill_project_kernels(project_id)
-        except Exception as exc:
-            logger.warning("Failed to kill Jupyter kernels for project %s: %s", project_id, exc, exc_info=True)
+        from app.services.jupyter_service import get_jupyter
 
-    async def _cleanup_worker_state(self, project_id: str) -> None:
-        """Cancel queued Huey tasks and active stream sessions for a project.
+        jupyter_svc = get_jupyter()
+        if jupyter_svc:
+            await jupyter_svc.kill_project_kernels(project_id)
 
-        Best-effort: each step logs and swallows its own failure so the
-        surrounding project cleanup (deletion or reset) continues. Shared
-        by ``delete_project`` and ``reset_database`` to keep their
-        worker-cleanup contract identical.
-        """
+    async def _cleanup_project_resources(self, project_id: str) -> None:
+        """Stop project-scoped interactive resources before destructive work."""
+        from app.services.terminal_service import terminal_service
+
+        if terminal_service.list_project_sessions(project_id):
+            await terminal_service.kill_project_sessions(project_id)
+        await self._kill_project_kernels(project_id)
+
+    async def _cleanup_worker_state(self, project_id: str) -> bool:
+        """Cancel project tasks and report whether runners drained."""
         try:
-            from app.workers.huey_tasks import purge_project_tasks
-            purge_project_tasks(project_id)
+            from app.services import task_runtime
+            task_runtime.cancel_project(project_id)
+            drained = await task_runtime.wait_for_project(project_id)
+            if not drained:
+                logger.error(
+                    "Project %s chat/annotation runners exceeded shutdown grace; "
+                    "they were isolated",
+                    project_id,
+                )
+            return drained
         except Exception as exc:
             logger.warning(
-                "Failed to purge Huey tasks for project %s: %s",
+                "Failed to cancel tasks for project %s: %s",
                 project_id, exc, exc_info=True,
             )
-        try:
-            from app.workers.stream_server import stream_server
-            await stream_server.cancel_project(project_id)
-        except Exception as exc:
-            logger.warning(
-                "Failed to cancel streams for project %s: %s",
-                project_id, exc, exc_info=True,
-            )
+            return False
 
     async def delete_project(self, project_id: str):
-        """Delete a project and all associated data.
-
-        Order matters:
-        1. Mark deleting in the global registry (cross-process barrier)
-        2. Collect running doc IDs through the internal inactive-project path
-        3. Cancel durable library tasks while project DB is still accessible
-        4. Mark the DB manager deleted so no new sessions can open
-        5. Cancel queued Huey tasks and active stream sessions
-        6. Evict in-memory caches
-        7. Delete project directory
-        8. Mark deleted and kill Jupyter kernels
-        """
+        """Delete a project after the durable barrier and resource drain."""
         from app.database.manager import get_db_manager
 
         self.mark_project_deleting(project_id)
 
-        running_doc_ids = await self._collect_running_doc_ids_async(project_id)
+        await self._cancel_library_tasks(project_id)
 
-        await self._cancel_library_tasks(project_id, running_doc_ids)
+        await self._cleanup_project_resources(project_id)
 
         db_manager = await get_db_manager()
         db_manager.mark_deleted(project_id)
 
-        await self._cleanup_worker_state(project_id)
+        if not await self._cleanup_worker_state(project_id):
+            raise FileSystemError(
+                f"Project {project_id} still has running task work; retry later.",
+                code="PROJECT_DRAIN_TIMEOUT",
+            )
 
         await self._evict_project_caches(project_id, db_manager)
         self._delete_project_directory(project_id)
         self.mark_project_deleted(project_id)
-        await self._kill_project_kernels(project_id)
 
     async def reset_database(self, project_id: str) -> None:
         """Delete the project's SQLite database so it is recreated fresh on next access.
@@ -1048,17 +1026,72 @@ class ProjectService:
         from app.database.manager import get_db_manager
 
         self.mark_project_resetting(project_id)
+        reset_succeeded = False
         try:
-            running_doc_ids = await self._collect_running_doc_ids_async(project_id)
-            await self._cancel_library_tasks(project_id, running_doc_ids)
-            await self._cleanup_worker_state(project_id)
+            await self._cancel_library_tasks(project_id)
+            await self._cleanup_project_resources(project_id)
+            drained = await self._cleanup_worker_state(project_id)
+            if not drained:
+                raise FileSystemError(
+                    f"Project {project_id} still has running task work; retry later.",
+                    code="PROJECT_DRAIN_TIMEOUT",
+                )
 
             db_manager = await get_db_manager()
             await self._evict_project_caches(project_id, db_manager)
             await db_manager.reset_project_database(project_id)
             logger.info("Reset database for project %s", project_id)
+            reset_succeeded = True
         finally:
-            self.mark_project_active(project_id)
+            if reset_succeeded:
+                self.mark_project_active(project_id)
+
+    async def reconcile_lifecycle(self) -> None:
+        """Retry interrupted barriers; failures leave them in place."""
+        from app.database.manager import get_db_manager
+
+        projects = self._load_projects_readonly()
+        for project_id, entry in projects.items():
+            if not isinstance(entry, dict):
+                continue
+            status = self._status_of(entry)
+            if status == PROJECT_STATUS_DELETING:
+                try:
+                    await self._cancel_library_tasks(project_id)
+                    await self._cleanup_project_resources(project_id)
+                    db_manager = await get_db_manager()
+                    db_manager.mark_deleted(project_id)
+                    if not await self._cleanup_worker_state(project_id):
+                        raise FileSystemError(
+                            f"Project {project_id} still has running task work; retry later.",
+                            code="PROJECT_DRAIN_TIMEOUT",
+                        )
+                    await self._evict_project_caches(project_id, db_manager)
+                    self._delete_project_directory(project_id)
+                    self.mark_project_deleted(project_id)
+                except Exception:
+                    logger.error(
+                        "Could not recover deleting project %s; barrier remains",
+                        project_id, exc_info=True,
+                    )
+            elif status == PROJECT_STATUS_RESETTING:
+                try:
+                    await self._cancel_library_tasks(project_id)
+                    await self._cleanup_project_resources(project_id)
+                    if not await self._cleanup_worker_state(project_id):
+                        raise FileSystemError(
+                            f"Project {project_id} still has running task work; retry later.",
+                            code="PROJECT_DRAIN_TIMEOUT",
+                        )
+                    db_manager = await get_db_manager()
+                    await self._evict_project_caches(project_id, db_manager)
+                    await db_manager.reset_project_database(project_id)
+                    self.mark_project_active(project_id)
+                except Exception:
+                    logger.error(
+                        "Could not recover resetting project %s; barrier remains",
+                        project_id, exc_info=True,
+                    )
 
 
 # Singleton

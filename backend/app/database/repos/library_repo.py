@@ -9,13 +9,13 @@ import json
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
-from sqlalchemy import select, or_, asc, desc, func, text, bindparam
+from sqlalchemy import select, or_, asc, desc, func, text, bindparam, update, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import LibraryDocument, parse_keywords
-from app.core.document_status import STATUS_COMPLETED, STATUS_FAILED, STATUS_PENDING
+from app.core.document_status import STATUS_COMPLETED, STATUS_FAILED, STATUS_PENDING, STATUS_INDEXING
 from app.core.logging import get_logger
-from app.core.utils import generate_id, to_iso, utcnow
+from app.core.utils import CONTENT_BLANK_CHARS, generate_id, to_iso, utcnow
 
 logger = get_logger(__name__)
 
@@ -157,6 +157,9 @@ class LibraryRepository:
                 LibraryDocument.doc_type.label("doc_type"),
                 LibraryDocument.keywords.label("keywords"),
                 LibraryDocument.revision.label("revision"),
+                LibraryDocument.indexed_revision.label("indexed_revision"),
+                LibraryDocument.indexed_generation.label("indexed_generation"),
+                LibraryDocument.index_generation.label("index_generation"),
                 LibraryDocument.processing_status.label("processing_status"),
                 LibraryDocument.processing_started_at.label("processing_started_at"),
                 LibraryDocument.processing_completed_at.label("processing_completed_at"),
@@ -182,7 +185,10 @@ class LibraryRepository:
             "source": row["source"],
             "doc_type": row["doc_type"],
             "keywords": parse_keywords(row["keywords"]),
-            "revision": row["revision"],
+                "revision": row["revision"],
+            "indexed_revision": row["indexed_revision"],
+            "indexed_generation": row["indexed_generation"],
+            "index_generation": row["index_generation"],
             "processing_status": row["processing_status"],
             "processing_started_at": to_iso(row["processing_started_at"]),
             "processing_completed_at": to_iso(row["processing_completed_at"]),
@@ -217,6 +223,9 @@ class LibraryRepository:
                 setattr(doc, field, value)
         if should_bump_revision:
             doc.revision += 1
+            doc.indexed_revision = None
+            doc.indexed_generation = None
+            doc.index_generation += 1
 
         await self._session.commit()
         await self._session.refresh(doc)
@@ -281,13 +290,7 @@ class LibraryRepository:
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         query = query.strip()
-        docs = None
-        if len(query) >= KEYWORD_TRIGRAM_MIN_CHARS:
-            docs = await self._search_keyword_fts(query, allowed_ids, limit, offset)
-
-        if docs is None:
-            docs = await self._search_keyword_like(query, allowed_ids, limit, offset)
-
+        docs = await self._keyword_candidates(query, allowed_ids, limit, offset)
         matches = []
         for doc in docs:
             doc_matches = _keyword_matches(doc, query)
@@ -300,11 +303,13 @@ class LibraryRepository:
         query: str,
         allowed_ids: Optional[List[str]] = None,
     ) -> int:
-        """Count documents matching the keyword query.
+        """Count keyword-query candidates as a SQL aggregation.
 
-        Mirrors the FTS/LIKE branching of ``search_keyword`` so the count
-        is consistent with what search would return absent limit/offset.
-        FTS count returns None on DB error so the caller can fall back to LIKE.
+        The count runs the same candidate query as ``search_keyword``
+        (without limit/offset), so it is an upper bound of the
+        post-filtered results: raw FTS/LIKE candidates include near-matches
+        — e.g. unescaped LIKE wildcards — that the casefold post-filter
+        drops, the same slack listing pagination already tolerates.
         """
         query = query.strip()
         if len(query) >= KEYWORD_TRIGRAM_MIN_CHARS:
@@ -357,16 +362,35 @@ class LibraryRepository:
         try:
             result = await self._session.execute(text(sql), params)
         except Exception:
-            logger.debug("Library FTS count failed; falling back to caller", exc_info=True)
+            logger.debug("Library FTS count failed; falling back to LIKE", exc_info=True)
             return None
         return result.scalar_one()
+
+    async def _keyword_candidates(
+        self,
+        query: str,
+        allowed_ids: Optional[List[str]],
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> List[LibraryDocument]:
+        """Candidate documents for a keyword query, before the post-filter.
+
+        FTS when the query is long enough (None → DB error → LIKE fallback),
+        LIKE otherwise. ``limit``/``offset`` bound the candidates for the
+        listing path.
+        """
+        if len(query) >= KEYWORD_TRIGRAM_MIN_CHARS:
+            docs = await self._search_keyword_fts(query, allowed_ids, limit, offset)
+            if docs is not None:
+                return docs
+        return await self._search_keyword_like(query, allowed_ids, limit, offset)
 
     async def _search_keyword_like(
         self,
         query: str,
         allowed_ids: Optional[List[str]],
-        limit: int,
-        offset: int,
+        limit: Optional[int],
+        offset: int = 0,
     ) -> List[LibraryDocument]:
         q = select(LibraryDocument).where(
             or_(
@@ -379,7 +403,9 @@ class LibraryRepository:
             if not allowed_ids:
                 return []
             q = q.where(LibraryDocument.id.in_(allowed_ids))
-        q = q.order_by(LibraryDocument.updated_at.desc()).limit(limit).offset(offset)
+        q = q.order_by(LibraryDocument.updated_at.desc())
+        if limit is not None:
+            q = q.limit(limit).offset(offset)
         result = await self._session.execute(q)
         return list(result.scalars().all())
 
@@ -387,8 +413,8 @@ class LibraryRepository:
         self,
         query: str,
         allowed_ids: Optional[List[str]],
-        limit: int,
-        offset: int,
+        limit: Optional[int],
+        offset: int = 0,
     ) -> Optional[List[LibraryDocument]]:
         fts_query = '"' + query.replace('"', '""') + '"'
         sql = """
@@ -397,7 +423,7 @@ class LibraryRepository:
             JOIN library_documents ld ON ld.rowid = f.rowid
             WHERE library_documents_fts MATCH :query
         """
-        params: dict[str, Any] = {"query": fts_query, "limit": limit, "offset": offset}
+        params: dict[str, Any] = {"query": fts_query}
         if allowed_ids is not None:
             if not allowed_ids:
                 return []
@@ -407,7 +433,10 @@ class LibraryRepository:
                 placeholders.append(f":{key}")
                 params[key] = doc_id
             sql += f" AND ld.id IN ({', '.join(placeholders)})"
-        sql += " ORDER BY rank LIMIT :limit OFFSET :offset"
+        if limit is not None:
+            params["limit"] = limit
+            params["offset"] = offset
+            sql += " ORDER BY rank LIMIT :limit OFFSET :offset"
         try:
             result = await self._session.execute(text(sql), params)
         except Exception:
@@ -557,10 +586,43 @@ class LibraryRepository:
         started_at: Optional[datetime] = None,
         completed_at: Optional[datetime] = None,
         log_append: str = "",
-    ) -> None:
+        expected_revision: Optional[int] = None,
+    ) -> bool:
+        """Transition a document's processing status.
+
+        When ``expected_revision`` is given, the transition is skipped and
+        False returned if the document was edited (revision bumped) since
+        the caller snapshotted it, so a stale task cannot overwrite newer
+        state. Returns True when the transition was applied.
+        """
+        if expected_revision is not None:
+            values = {
+                "processing_status": status,
+            }
+            if started_at:
+                values["processing_started_at"] = started_at
+            if completed_at:
+                values["processing_completed_at"] = completed_at
+            if log_append:
+                values["processing_log"] = func.trim(
+                    func.coalesce(LibraryDocument.processing_log, "")
+                    + "\n"
+                    + log_append
+                )
+            result = await self._session.execute(
+                update(LibraryDocument)
+                .where(
+                    LibraryDocument.id == doc_id,
+                    LibraryDocument.revision == expected_revision,
+                )
+                .values(**values)
+            )
+            await self._session.commit()
+            return result.rowcount == 1
+
         doc = await self.get_by_id(doc_id)
         if not doc:
-            return
+            return False
         if log_append:
             old_log = doc.processing_log or ""
             doc.processing_log = (old_log + "\n" + log_append).strip()
@@ -571,6 +633,7 @@ class LibraryRepository:
             doc.processing_completed_at = completed_at
         self._session.add(doc)
         await self._session.commit()
+        return True
 
     async def update_processing_log(self, doc_id: str, log_append: str) -> None:
         doc = await self.get_by_id(doc_id)
@@ -582,10 +645,15 @@ class LibraryRepository:
         self._session.add(doc)
         await self._session.commit()
 
-    async def update_content(self, doc_id: str, content: str) -> Optional[LibraryDocument]:
+    async def update_content(
+        self, doc_id: str, content: str,
+        expected_revision: Optional[int] = None,
+    ) -> Optional[LibraryDocument]:
         doc = await self.get_by_id(doc_id)
         if not doc:
             return None
+        if expected_revision is not None and doc.revision != expected_revision:
+            return doc
         doc.content = content
         self._session.add(doc)
         await self._session.commit()
@@ -600,9 +668,12 @@ class LibraryRepository:
         keywords: Optional[list] = None,
         source: Optional[str] = None,
         bump_revision: bool = False,
+        expected_revision: Optional[int] = None,
     ) -> None:
         doc = await self.get_by_id(doc_id)
         if not doc:
+            return
+        if expected_revision is not None and doc.revision != expected_revision:
             return
         should_bump_revision = False
         if title is not None:
@@ -617,13 +688,52 @@ class LibraryRepository:
             doc.source = source
         if bump_revision and should_bump_revision:
             doc.revision += 1
+            doc.indexed_revision = None
+            doc.indexed_generation = None
+            doc.index_generation += 1
         self._session.add(doc)
         await self._session.commit()
 
-    async def mark_failed(self, doc_id: str, log_append: str = "") -> None:
+    async def mark_failed(
+        self,
+        doc_id: str,
+        log_append: str = "",
+        expected_revision: Optional[int] = None,
+    ) -> bool:
+        """Mark a document failed.
+
+        When ``expected_revision`` is given, the transition is skipped and
+        False returned if the document was edited (revision bumped) since
+        the caller snapshotted it, so a stale task cannot overwrite newer
+        state. Returns True when the transition was applied.
+        """
+        if expected_revision is not None:
+            timestamp = utcnow().strftime("%H:%M:%S")
+            log_entry = f"[{timestamp}] {log_append}" if log_append else ""
+            values = {
+                "processing_status": STATUS_FAILED,
+                "processing_completed_at": utcnow(),
+            }
+            if log_entry:
+                values["processing_log"] = func.trim(
+                    func.coalesce(LibraryDocument.processing_log, "")
+                    + "\n"
+                    + log_entry
+                )
+            result = await self._session.execute(
+                update(LibraryDocument)
+                .where(
+                    LibraryDocument.id == doc_id,
+                    LibraryDocument.revision == expected_revision,
+                )
+                .values(**values)
+            )
+            await self._session.commit()
+            return result.rowcount == 1
+
         doc = await self.get_by_id(doc_id)
         if not doc:
-            return
+            return False
         doc.processing_status = STATUS_FAILED
         old_log = doc.processing_log or ""
         timestamp = utcnow().strftime("%H:%M:%S")
@@ -631,17 +741,80 @@ class LibraryRepository:
         doc.processing_completed_at = utcnow()
         self._session.add(doc)
         await self._session.commit()
+        return True
 
-    async def reset_processing(self, doc_id: str, status: str = STATUS_PENDING) -> None:
+    async def reset_processing(self, doc_id: str, status: str = STATUS_PENDING) -> Optional[int]:
         doc = await self.get_by_id(doc_id)
         if not doc:
             return
         doc.processing_status = status
+        doc.revision += 1
+        doc.indexed_revision = None
+        doc.indexed_generation = None
+        doc.index_generation += 1
         doc.processing_started_at = utcnow()
         doc.processing_completed_at = None
-        doc.processing_log = "Reprocessing started..."
+        # Append below the existing log so the previous failure reason stays
+        # visible while the new run's entries accumulate after it.
+        doc.processing_log = ((doc.processing_log or "") + "\nReprocessing started...").strip()
         self._session.add(doc)
         await self._session.commit()
+        return doc.revision
+
+    async def bulk_reset_processing(self, targets: Dict[str, str]) -> None:
+        """Reset processing state for many documents in one transaction.
+
+        ``targets`` maps document IDs to their target status. Each mapped
+        document gets the same reset as :meth:`reset_processing`; IDs that no
+        longer exist are skipped. Committing once keeps intermediate crashes
+        from leaving part of the set invisible to the maintenance sweep.
+        """
+        if not targets:
+            return
+        docs = await self.get_by_ids(list(targets))
+        now = utcnow()
+        for doc in docs:
+            doc.processing_status = targets[doc.id]
+            doc.revision += 1
+            doc.indexed_revision = None
+            doc.indexed_generation = None
+            doc.index_generation += 1
+            doc.processing_started_at = now
+            doc.processing_completed_at = None
+            doc.processing_log = "Reprocessing started..."
+            self._session.add(doc)
+        await self._session.commit()
+
+    async def publish_index(
+        self, doc_id: str, expected_revision: int, expected_generation: int,
+    ) -> bool:
+        """Atomically publish this generation and complete its document."""
+        result = await self._session.execute(
+            update(LibraryDocument)
+            .where(
+                LibraryDocument.id == doc_id,
+                LibraryDocument.revision == expected_revision,
+                LibraryDocument.index_generation == expected_generation,
+                or_(
+                    LibraryDocument.processing_status == STATUS_INDEXING,
+                    and_(
+                        LibraryDocument.processing_status == STATUS_COMPLETED,
+                        or_(
+                            LibraryDocument.indexed_revision != expected_revision,
+                            LibraryDocument.indexed_generation != expected_generation,
+                        ),
+                    ),
+                ),
+            )
+            .values(
+                indexed_revision=expected_revision,
+                indexed_generation=expected_generation,
+                processing_status="completed",
+                processing_completed_at=utcnow(),
+            )
+        )
+        await self._session.commit()
+        return result.rowcount == 1
 
     # ------------------------------------------------------------------
     # Bulk queries
@@ -654,6 +827,53 @@ class LibraryRepository:
             .order_by(LibraryDocument.updated_at.desc())
         )
         return list(result.scalars().all())
+
+    async def list_status_projection(self, statuses) -> List[Any]:
+        """Lightweight id/status/timestamp projection of documents by status.
+
+        The periodic maintenance sweep calls this every 60 seconds; selecting
+        columns instead of ORM entities keeps the (large) content column out
+        of every scan. Callers that need full rows keep using
+        :meth:`list_by_status` / :meth:`get_by_ids`.
+        """
+        result = await self._session.execute(
+            select(
+                LibraryDocument.id,
+                LibraryDocument.processing_status,
+                LibraryDocument.processing_started_at,
+            )
+            .where(LibraryDocument.processing_status.in_(list(statuses)))
+            .order_by(LibraryDocument.updated_at.desc())
+        )
+        return list(result.all())
+
+    async def list_ids(self) -> List[str]:
+        """All document/folder IDs, without loading full rows."""
+        result = await self._session.execute(select(LibraryDocument.id))
+        return [row[0] for row in result.all()]
+
+    async def list_ids_with_content(self, status: str) -> List[str]:
+        """IDs of non-folder documents in *status* with non-blank content.
+
+        Blank content is filtered in SQL so callers such as the sweep's
+        re-index self-heal never load the content column just to check that
+        it is non-empty. The trim uses ``CONTENT_BLANK_CHARS`` so this SQL
+        predicate and the Python-side ``is_blank_content`` check in the
+        indexing pipeline are exactly equivalent — see the equivalence
+        contract on that constant. A divergent judgment here would make the
+        sweep re-enqueue documents the pipeline completes with zero chunks,
+        forever.
+        """
+        result = await self._session.execute(
+            select(LibraryDocument.id).where(
+                LibraryDocument.processing_status == status,
+                LibraryDocument.is_folder.is_(False),
+                func.trim(
+                    func.coalesce(LibraryDocument.content, ""), CONTENT_BLANK_CHARS
+                ) != "",
+            )
+        )
+        return [row[0] for row in result.all()]
 
     async def get_by_ids(self, doc_ids: List[str]) -> List[LibraryDocument]:
         """Fetch multiple documents by their IDs."""

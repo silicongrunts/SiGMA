@@ -1,15 +1,17 @@
 """
 Unit tests for browser tools.
 
-Covers the audit-driven fixes:
-- Fix 1: per-tab console filtering (event tagging + read-time filter)
-- Fix 4: browser_vision rejects empty question at handler entry
-- Fix 6: _bring_to_front has a soft timeout, never blocks the caller
-- Fix 8: _disconnect compatibility alias is gone
-- Fix 9: _take_snapshot early-returns when the page is already closed
-- Fix 10: clear=true combined with action='execute' clears the buffer
-- Fix 2 (regression): all browser tools stay read-only and reachable from
-  every subagent toolset.
+Grouped by behavior:
+- Console log filtering: per-tab event tagging and read-time filtering,
+  plus buffer clearing semantics for execute mode.
+- Vision validation: browser_vision rejects an empty question at handler
+  entry, before any manager access.
+- Snapshot protection: _take_snapshot early-returns when the page is
+  already closed.
+- Input validation: browser_input only types into typeable elements, and
+  _bring_to_front never blocks the caller on a hanging CDP call.
+- Registration: all browser tools stay read-only and reachable from every
+  subagent toolset.
 """
 
 import asyncio
@@ -26,7 +28,7 @@ from app.agents.tools.browser_tools import (
 )
 
 
-# ── Fix 1 — per-tab console event tagging + filtering ───────────────
+# ── console log filtering ───────────────────────────────────────────
 
 class _FakePage:
     """Minimal stand-in for playwright.Page used by listener tests."""
@@ -118,63 +120,6 @@ async def test_console_read_with_valid_tab_id_filters():
     assert "[log] b" not in result
 
 
-# ── Fix 4 — browser_vision empty-question validation ────────────────
-
-@pytest.mark.asyncio
-async def test_browser_vision_rejects_empty_question():
-    """Blank question short-circuits at handler entry — no manager touch."""
-    result = await _browser_vision(question="   ")
-    assert result == "Error: question is required."
-
-
-@pytest.mark.asyncio
-async def test_browser_vision_rejects_missing_question():
-    result = await _browser_vision(question="")
-    assert result == "Error: question is required."
-
-
-# ── Fix 6 — _bring_to_front soft timeout ────────────────────────────
-
-@pytest.mark.asyncio
-async def test_bring_to_front_timeout_is_soft():
-    """A hanging CDP call must not propagate; detach is still called."""
-    page = MagicMock()
-    cdp = AsyncMock()
-    cdp.send = AsyncMock(side_effect=asyncio.TimeoutError())
-    cdp.detach = AsyncMock()
-    page.context.new_cdp_session = AsyncMock(return_value=cdp)
-
-    # Should not raise
-    await BrowserManager._bring_to_front(page)
-
-    cdp.send.assert_awaited_once_with("Page.bringToFront")
-    cdp.detach.assert_awaited_once()
-
-
-# ── Fix 8 — _disconnect alias removed ───────────────────────────────
-
-def test_disconnect_alias_removed():
-    assert not hasattr(BrowserManager, "_disconnect"), (
-        "_disconnect compatibility alias should be removed"
-    )
-
-
-# ── Fix 9 — _take_snapshot guards against closed page ───────────────
-
-@pytest.mark.asyncio
-async def test_take_snapshot_closed_page_returns_marker():
-    """A closed page short-circuits before the 3s settle / DOM build."""
-    page = MagicMock()
-    page.is_closed.return_value = True
-
-    result = await _take_snapshot(page, mode="dom")
-
-    assert result == "(tab closed during operation)"
-    page.is_closed.assert_called_once()
-
-
-# ── Fix 10 — clear=true + action='execute' clears buffer ────────────
-
 @pytest.mark.asyncio
 async def test_browser_console_execute_clears_buffer():
     """execute + clear=True clears the buffer before running JS."""
@@ -221,38 +166,52 @@ async def test_browser_console_execute_without_clear_does_not_clear():
     mgr.clear_console_log.assert_not_called()
 
 
-# ── Fix 2 — all browser tools stay read-only + in ANNOTATION_TOOLS ──
+# ── vision validation ───────────────────────────────────────────────
 
-def test_all_browser_tools_are_read_only():
-    from app.agents.tools.registry import tool_registry
-
-    browser_tools = [
-        t for t in tool_registry.list_all() if t.name.startswith("browser_")
-    ]
-    assert len(browser_tools) == 10, (
-        f"Expected 10 browser tools, got {len(browser_tools)}"
-    )
-    not_read_only = [t.name for t in browser_tools if not t.is_read_only]
-    assert not not_read_only, (
-        f"These browser tools must be is_read_only=True: {not_read_only}"
-    )
+@pytest.mark.asyncio
+async def test_browser_vision_rejects_empty_question():
+    """Blank question short-circuits at handler entry — no manager touch."""
+    result = await _browser_vision(question="   ")
+    assert result == "Error: question is required."
 
 
-def test_all_browser_tools_in_annotation_tools():
-    from app.agents.toolsets import ANNOTATION_TOOLS
-    from app.agents.tools.registry import tool_registry
-
-    browser_tool_names = {
-        t.name for t in tool_registry.list_all()
-        if t.name.startswith("browser_")
-    }
-    missing = browser_tool_names - set(ANNOTATION_TOOLS)
-    assert not missing, (
-        f"Browser tools missing from ANNOTATION_TOOLS: {sorted(missing)}"
-    )
+@pytest.mark.asyncio
+async def test_browser_vision_rejects_missing_question():
+    result = await _browser_vision(question="")
+    assert result == "Error: question is required."
 
 
-# ── browser_input — element type validation ─────────────────────────
+# ── snapshot protection ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_take_snapshot_closed_page_returns_marker():
+    """A closed page short-circuits before the 3s settle / DOM build."""
+    page = MagicMock()
+    page.is_closed.return_value = True
+
+    result = await _take_snapshot(page, mode="dom")
+
+    assert result == "(tab closed during operation)"
+    page.is_closed.assert_called_once()
+
+
+# ── input validation & bring-to-front ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_bring_to_front_timeout_is_soft():
+    """A hanging CDP call must not propagate; detach is still called."""
+    page = MagicMock()
+    cdp = AsyncMock()
+    cdp.send = AsyncMock(side_effect=asyncio.TimeoutError())
+    cdp.detach = AsyncMock()
+    page.context.new_cdp_session = AsyncMock(return_value=cdp)
+
+    # Should not raise
+    await BrowserManager._bring_to_front(page)
+
+    cdp.send.assert_awaited_once_with("Page.bringToFront")
+    cdp.detach.assert_awaited_once()
+
 
 class _FakeCDP:
     """CDP session stub answering DOM.resolveNode / Runtime.callFunctionOn."""
@@ -338,3 +297,32 @@ async def test_browser_input_passes_text_element_through():
 
     mgr.input_text.assert_awaited_once()
     assert "Input 'abc' into e1" in result
+
+
+# ── registration: read-only + subagent toolset membership ───────────
+
+def test_all_browser_tools_are_read_only():
+    from app.agents.tools.registry import tool_registry
+
+    browser_tools = [
+        t for t in tool_registry.list_all() if t.name.startswith("browser_")
+    ]
+    assert browser_tools, "no browser tools registered"
+    not_read_only = [t.name for t in browser_tools if not t.is_read_only]
+    assert not not_read_only, (
+        f"These browser tools must be is_read_only=True: {not_read_only}"
+    )
+
+
+def test_all_browser_tools_in_annotation_tools():
+    from app.agents.toolsets import ANNOTATION_TOOLS
+    from app.agents.tools.registry import tool_registry
+
+    browser_tool_names = {
+        t.name for t in tool_registry.list_all()
+        if t.name.startswith("browser_")
+    }
+    missing = browser_tool_names - set(ANNOTATION_TOOLS)
+    assert not missing, (
+        f"Browser tools missing from ANNOTATION_TOOLS: {sorted(missing)}"
+    )

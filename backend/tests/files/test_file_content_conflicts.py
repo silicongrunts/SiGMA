@@ -1,18 +1,17 @@
+"""Frontend-save hash conflicts vs the tool write path.
+
+Both go through ``file_service.write_file``; the frontend variant demands a
+matching ``expected_hash`` for existing files while the agent tool variant
+may still overwrite without one.
+"""
 import pytest
 
 from app.services.file_service import file_service
 
 
-async def noop_snapshot(project_id, paths=None):
-    return None
-
-
 @pytest.mark.asyncio
-async def test_frontend_save_requires_hash_for_existing_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(file_service, "get_project_path", lambda project_id: tmp_path)
-    monkeypatch.setattr(file_service, "_after_file_mutation", noop_snapshot)
-
-    path = tmp_path / "main.tex"
+async def test_frontend_save_requires_hash_for_existing_file(sandbox_without_snapshots):
+    path = sandbox_without_snapshots / "main.tex"
     path.write_text("disk version\n", encoding="utf-8")
 
     result = await file_service.write_file(
@@ -27,11 +26,8 @@ async def test_frontend_save_requires_hash_for_existing_file(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_frontend_save_conflicts_on_stale_hash(tmp_path, monkeypatch):
-    monkeypatch.setattr(file_service, "get_project_path", lambda project_id: tmp_path)
-    monkeypatch.setattr(file_service, "_after_file_mutation", noop_snapshot)
-
-    path = tmp_path / "main.tex"
+async def test_frontend_save_conflicts_on_stale_hash(sandbox_without_snapshots):
+    path = sandbox_without_snapshots / "main.tex"
     base_hash = file_service.compute_hash("base\n")
     path.write_text("disk version\n", encoding="utf-8")
 
@@ -48,11 +44,10 @@ async def test_frontend_save_conflicts_on_stale_hash(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tool_write_can_still_update_existing_file_without_hash(tmp_path, monkeypatch):
-    monkeypatch.setattr(file_service, "get_project_path", lambda project_id: tmp_path)
-    monkeypatch.setattr(file_service, "_after_file_mutation", noop_snapshot)
-
-    path = tmp_path / "main.tex"
+async def test_tool_write_can_still_update_existing_file_without_hash(
+    sandbox_without_snapshots,
+):
+    path = sandbox_without_snapshots / "main.tex"
     path.write_text("disk version\n", encoding="utf-8")
 
     result = await file_service.write_file("project", "main.tex", "tool version\n")

@@ -24,7 +24,7 @@ from typing import Literal
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
-LogProcess = Literal["web", "worker"]
+LogProcess = Literal["web"]
 
 # Context var for request-scoped request_id
 request_id_ctx: ContextVar[str] = ContextVar("request_id_ctx", default="")
@@ -189,8 +189,8 @@ def setup_logging(
         retention_days: Optional override. Defaults to settings.logging.retention_days.
         force: Reconfigure even if SiGMA logging was already initialized.
     """
-    if process not in ("web", "worker"):
-        raise ValueError("process must be 'web' or 'worker'")
+    if process != "web":
+        raise ValueError("process must be 'web'")
 
     root = logging.getLogger()
     configured_process = getattr(root, "_sigma_logging_process", None)

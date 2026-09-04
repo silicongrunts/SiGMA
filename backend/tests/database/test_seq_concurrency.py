@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.database.models import Session, Annotation, Task, Message
+from app.database.models import Session, Annotation, Message
 from app.database.repos.message_repo import MessageRepository
 from app.database.repos.task_repo import TaskRepository
 from app.database.unit_of_work import UnitOfWork
@@ -30,7 +30,7 @@ async def test_concurrent_session_message_seq(db_session_factory):
     """3 concurrent message creates produce unique seqs 0-2."""
     session_id = generate_id()
     async with db_session_factory() as s:
-        s.add(Session(id=session_id, project_id="test"))
+        s.add(Session(id=session_id))
         await s.commit()
 
     seqs: list[int] = []
@@ -85,7 +85,7 @@ async def test_message_requires_exactly_one_owner(db_session_factory):
     session_id = generate_id()
     anno_id = generate_id()
     async with db_session_factory() as s:
-        s.add(Session(id=session_id, project_id="test"))
+        s.add(Session(id=session_id))
         s.add(Annotation(id=anno_id, file_path="/test.tex", from_pos=0, to_pos=10))
         await s.commit()
 
@@ -115,7 +115,7 @@ async def test_concurrent_task_seq(db_session_factory):
     """3 concurrent task creates produce unique seqs."""
     session_id = generate_id()
     async with db_session_factory() as s:
-        s.add(Session(id=session_id, project_id="test"))
+        s.add(Session(id=session_id))
         await s.commit()
 
     seqs: list[int] = []
@@ -142,7 +142,7 @@ async def test_task_replace_all_atomic(db_session_factory):
     """replace_all deletes old and inserts new tasks atomically."""
     session_id = generate_id()
     async with db_session_factory() as s:
-        s.add(Session(id=session_id, project_id="test"))
+        s.add(Session(id=session_id))
         await s.commit()
 
     # Seed initial tasks
@@ -172,11 +172,13 @@ async def test_task_replace_all_atomic(db_session_factory):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_replace_all_rollback_on_failure(db_session_factory):
-    """If replace_all's commit fails, old tasks remain intact."""
+async def test_replace_all_rollback_on_failure(db_session_factory, monkeypatch):
+    """A failing commit leaves old tasks intact: replace_all stages the
+    delete and the inserts in a single transaction, so nothing is persisted
+    when the commit fails and the failure propagates to the caller."""
     session_id = generate_id()
     async with db_session_factory() as s:
-        s.add(Session(id=session_id, project_id="test"))
+        s.add(Session(id=session_id))
         await s.commit()
 
     # Seed initial tasks
@@ -185,28 +187,28 @@ async def test_replace_all_rollback_on_failure(db_session_factory):
         await repo.create(session_id=session_id, subject="old_1")
         await repo.create(session_id=session_id, subject="old_2")
 
-    # Replace the session's commit with one that fails on first call
+    # Replace the session's commit with one that always fails
     async with db_session_factory() as s:
         repo = TaskRepository(s)
-        real_commit = s.commit
 
-        async def fail_once():
-            await s.rollback()
+        async def fail_commit():
             raise Exception("boom")
 
-        s.commit = fail_once
-        try:
+        monkeypatch.setattr(s, "commit", fail_commit)
+        # The commit failure must propagate; nothing inside replace_all is
+        # allowed to swallow it.
+        with pytest.raises(Exception, match="boom"):
             await repo.replace_all(session_id, [{"content": "new_a"}])
-        except Exception:
-            pass
 
-    # Old tasks must still be there (rollback undid the delete)
+    # The delete was staged in the same transaction as the inserts, so the
+    # failed commit must leave the old tasks untouched in the database.
     async with db_session_factory() as s:
         repo = TaskRepository(s)
         all_tasks = await repo.list_active(session_id)
         subjects = [t.subject for t in all_tasks]
         assert "old_1" in subjects, f"old_1 lost! Got: {subjects}"
         assert "old_2" in subjects, f"old_2 lost! Got: {subjects}"
+        assert "new_a" not in subjects, f"partial write survived: {subjects}"
 
 
 @pytest.mark.asyncio
@@ -215,7 +217,7 @@ async def test_execute_atomic_stages_message_and_session_touch(db_session_factor
     """Staged message create and session touch commit as one transaction."""
     session_id = generate_id()
     async with db_session_factory() as s:
-        s.add(Session(id=session_id, project_id="project-a"))
+        s.add(Session(id=session_id))
         await s.commit()
 
     class FakeDbManager:
@@ -245,17 +247,36 @@ async def test_execute_atomic_stages_message_and_session_touch(db_session_factor
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_staged_message_rolls_back_with_failed_touch(db_session_factory):
-    """A failure after staging a message rolls back the whole transaction."""
+async def test_execute_atomic_rolls_back_staged_steps_when_a_later_step_fails(
+    db_session_factory, monkeypatch,
+):
+    """A failure in a later step of an atomic operation must roll back the
+    already-staged earlier steps: the staged message must not survive."""
     session_id = generate_id()
     async with db_session_factory() as s:
-        s.add(Session(id=session_id, project_id="project-a"))
+        s.add(Session(id=session_id))
         await s.commit()
 
-    async with db_session_factory() as s:
-        repo = MessageRepository(s)
-        await repo.stage_create(session_id=session_id, role="user", content="hello")
-        await s.rollback()
+    class FakeDbManager:
+        async def ensure_db_exists(self, project_id, *, allow_inactive=False):
+            pass
+
+        async def get_session(self, project_id, *, allow_inactive=False):
+            return db_session_factory()
+
+    async def fake_get_db_manager():
+        return FakeDbManager()
+
+    monkeypatch.setattr("app.database.unit_of_work.get_db_manager", fake_get_db_manager)
+
+    async def operation(uow):
+        await uow.messages.stage_create(session_id=session_id, role="user", content="hello")
+        raise RuntimeError("second step failed")
+
+    # execute_atomic only retries IntegrityError/OperationalError; any other
+    # failure propagates after the UnitOfWork's rollback on exit.
+    with pytest.raises(RuntimeError, match="second step failed"):
+        await UnitOfWork.execute_atomic("project-a", operation)
 
     async with db_session_factory() as s:
         result = await s.execute(select(Message).where(Message.session_id == session_id))

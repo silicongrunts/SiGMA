@@ -5,8 +5,13 @@ Thread replies are stored as Message rows (annotation_id FK)
 via UnitOfWork → message_repo.
 """
 
-from typing import Any, Dict, List
+import asyncio
+import json
+from typing import Any, AsyncGenerator, Dict, List
 
+from sqlalchemy.exc import IntegrityError
+
+from app.core.exceptions import AnnotationConflictError, TaskActiveError, ValidationError
 from app.core.logging import get_logger
 from app.core.message_format import (
     build_assistant_turn,
@@ -14,17 +19,15 @@ from app.core.message_format import (
     finalize_assistant_turn,
 )
 from app.core.utils import generate_id, to_iso
-from app.core.task_status import (
-    STATUS_AWAITING_INPUT,
-    STATUS_CANCELLING,
-    STATUS_QUEUED,
-    STATUS_RUNNING,
-)
 from app.database.unit_of_work import UnitOfWork
 from app.services.file_service import file_service
 from app.services.project_service import project_service
 
 logger = get_logger(__name__)
+
+
+def _text_content(raw) -> str:
+    return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
 
 
 def serialize_annotation(annotation) -> Dict[str, Any]:
@@ -113,11 +116,24 @@ class AnnotationService:
         self,
         project_id: str,
         file_path: str,
-    ) -> List[Dict]:
-        """Return all annotations for *file_path* as plain dicts."""
-        async with UnitOfWork(project_id) as uow:
+    ) -> Dict[str, Any]:
+        """Return a published annotation snapshot for *file_path*."""
+        await self.recover_transactions(project_id)
+        async with UnitOfWork(project_id, immediate=True) as uow:
             annotations = await uow.annotations.get_by_file(file_path)
-            return [serialize_annotation(a) for a in annotations]
+            file_content = await file_service.read_file(project_id, file_path)
+            file_hash = file_service.compute_hash(_text_content(file_content))
+            state = await uow.annotations.ensure_file_state(file_path, file_hash)
+            if state.file_hash != file_hash:
+                state.file_hash = file_hash
+                state.revision += 1
+            serialized = [serialize_annotation(a) for a in annotations]
+            await uow.commit()
+            return {
+                "annotations": serialized,
+                "revision": state.revision,
+                "fileHash": state.file_hash,
+            }
 
     async def add_annotation(
         self,
@@ -129,39 +145,28 @@ class AnnotationService:
         role: str = "assistant",
     ) -> Dict:
         """Create a new annotation with an initial reply."""
-        # Read original text from the file via file_service
-        try:
-            file_content = await file_service.read_file(project_id, file_path)
-            original_text = file_content[from_pos:to_pos]
-        except Exception:
-            logger.warning("Failed to read annotation source text from %s; original_text snapshot will be empty", file_path, exc_info=True)
-            original_text = ""
-
         anno_id = generate_id()
-
-        async with UnitOfWork(project_id) as uow:
-            annotation = await uow.annotations.create(
-                file_path=file_path,
-                from_pos=from_pos,
-                to_pos=to_pos,
-                original_text=original_text,
-                annotation_id=anno_id,
+        async with UnitOfWork(project_id, immediate=True) as uow:
+            file_content = _text_content(await file_service.read_file(project_id, file_path))
+            original_text = file_content[from_pos:to_pos]
+            if from_pos < 0 or to_pos <= from_pos or not original_text.strip():
+                raise ValidationError("Annotation range must contain non-blank file text")
+            file_hash = file_service.compute_hash(file_content)
+            state = await uow.annotations.ensure_file_state(file_path, file_hash)
+            verification = _text_content(await file_service.read_file(project_id, file_path))
+            verified_hash = file_service.compute_hash(verification)
+            if verified_hash != file_hash:
+                raise AnnotationConflictError(
+                    details={"revision": state.revision, "fileHash": verified_hash},
+                )
+            await uow.annotations.apply_mutation_cas(
+                file_path, [{"id": anno_id, "from": from_pos, "to": to_pos,
+                             "originalText": original_text,
+                             "thread": [{"role": role, "content": text}]}], [],
+                state.revision, file_hash,
             )
-            await uow.messages.create_for_annotation(
-                annotation_id=annotation.id,
-                role=role,
-                content=text,
-            )
-
-            # Re-fetch to include the message in the returned dict
-            refreshed = await uow.annotations.get_by_id(annotation.id)
-            created = serialize_annotation(refreshed) if refreshed else {
-                "id": anno_id,
-                "from": from_pos,
-                "to": to_pos,
-                "originalText": original_text,
-                "success": True,
-            }
+            refreshed = await uow.annotations.get_by_id(anno_id)
+            created = serialize_annotation(refreshed)
 
         project_service.touch_project(project_id)
         return created
@@ -171,51 +176,193 @@ class AnnotationService:
         project_id: str,
         file_path: str,
         annotations: List[Dict],
+        expected_revision: int | None = None,
+        expected_file_hash: str | None = None,
+        delete_ids: List[str] | None = None,
     ) -> Dict:
-        """Replace all annotations for *file_path* with the provided list."""
-        async with UnitOfWork(project_id) as uow:
-            existing_annotations = await uow.annotations.get_by_file(file_path)
-            existing_by_id = {annotation.id: annotation for annotation in existing_annotations}
-
-            # ``existing_by_id`` lets orphan placeholders keep their stored
-            # anchors while still participating in replace-style saves.
-            persistable_annotations = []
-            for annotation in annotations:
-                annotation_to_save = annotation
-                if annotation.get("status") == "orphan":
-                    existing_annotation = existing_by_id.get(annotation.get("id"))
-                    if existing_annotation:
-                        annotation_to_save = {
-                            **annotation,
-                            "from": existing_annotation.from_pos,
-                            "to": existing_annotation.to_pos,
-                            "originalText": existing_annotation.original_text,
-                        }
-                if self._is_persistable_annotation(annotation_to_save):
-                    persistable_annotations.append(annotation_to_save)
-
-            # save_all only manages annotation rows (CASCADE deletes old messages)
-            await uow.annotations.save_all(file_path, persistable_annotations)
-
-            # Create initial messages only for newly persisted draft annotations.
-            # Existing annotation threads are append-only and must not be rebuilt
-            # during position sync, especially while an AI reply is streaming.
-            for anno_data in persistable_annotations:
-                anno_id = anno_data.get("id")
-                if not anno_id or anno_id in existing_by_id:
-                    continue
-                for reply_data in anno_data.get("thread", []):
-                    role = reply_data.get("role", "user")
-                    content = reply_data.get("content", "")
-                    if not content.strip():
-                        continue
-                    await uow.messages.create_for_annotation(
-                        annotation_id=anno_id,
-                        role=role,
-                        content=content,
-                    )
+        """Apply explicit anchor updates; never infer deletion from omission."""
+        await self.recover_transactions(project_id)
+        if expected_revision is None or expected_file_hash is None:
+            snapshot = await self.get_annotations(project_id, file_path)
+            expected_revision = snapshot["revision"]
+            expected_file_hash = snapshot["fileHash"]
+        await self._drain_annotation_tasks(project_id, delete_ids or [])
+        file_content = await file_service.read_file(project_id, file_path)
+        current_hash = file_service.compute_hash(_text_content(file_content))
+        async with UnitOfWork(project_id, immediate=True) as uow:
+            state = await uow.annotations.ensure_file_state(file_path, current_hash)
+            revision = expected_revision
+            file_hash = expected_file_hash
+            if current_hash != file_hash or state.revision != revision:
+                raise AnnotationConflictError(details={
+                    "revision": state.revision,
+                    "fileHash": current_hash,
+                })
+            try:
+                next_state = await uow.annotations.apply_mutation_cas(
+                    file_path, annotations, delete_ids or [], revision, file_hash,
+                )
+            except ValueError as exc:
+                raise AnnotationConflictError() from exc
         project_service.touch_project(project_id)
-        return {"success": True}
+        await self._cleanup_annotation_task_state(project_id, delete_ids or [])
+        return {"success": True, "revision": next_state.revision, "fileHash": current_hash}
+
+    async def save_document(
+        self, project_id: str, file_path: str, content: str,
+        expected_file_hash: str, expected_revision: int, annotations: List[Dict],
+        delete_ids: List[str] | None = None,
+    ) -> Dict:
+        """Commit a file and its anchor updates through a durable journal."""
+        await self.recover_transactions(project_id)
+        await self._drain_annotation_tasks(project_id, delete_ids or [])
+        old_bytes = await file_service.read_file(project_id, file_path)
+        old_content = _text_content(old_bytes)
+        current_hash = file_service.compute_hash(old_content)
+        if current_hash != expected_file_hash:
+            raise AnnotationConflictError(details={"revision": expected_revision, "fileHash": current_hash})
+        new_hash = file_service.compute_hash(content)
+        transaction_id = generate_id()
+        mutations = {"upserts": annotations, "deleteIds": delete_ids or []}
+        async with UnitOfWork(project_id, immediate=True) as uow:
+            state = await uow.annotations.get_file_state(file_path)
+            if state is None:
+                state = await uow.annotations.ensure_file_state(file_path, expected_file_hash)
+            if state.revision != expected_revision or state.file_hash != expected_file_hash:
+                raise AnnotationConflictError(details={"revision": state.revision if state else 0, "fileHash": current_hash})
+            await uow.annotations.create_transaction(
+                id=transaction_id, file_path=file_path,
+                expected_revision=expected_revision, expected_file_hash=expected_file_hash,
+                new_file_hash=new_hash, old_content=old_content,
+                mutations=json.dumps(mutations),
+            )
+        write_result = await file_service.write_file(
+            project_id, file_path, content, expected_hash=expected_file_hash,
+            require_expected_hash=True,
+        )
+        if write_result.get("conflict"):
+            async with UnitOfWork(project_id, immediate=True) as uow:
+                await uow.annotations.delete_transaction(transaction_id)
+            raise AnnotationConflictError(details={"revision": expected_revision, "fileHash": current_hash})
+        try:
+            async with UnitOfWork(project_id, immediate=True) as uow:
+                next_state = await uow.annotations.apply_mutation_cas(
+                    file_path, annotations, delete_ids or [], expected_revision,
+                    expected_file_hash, resulting_file_hash=new_hash,
+                )
+                await uow.annotations.delete_transaction(transaction_id)
+        except ValueError as exc:
+            await self.recover_transactions(project_id)
+            raise AnnotationConflictError(
+                details={"revision": expected_revision, "fileHash": new_hash},
+            ) from exc
+        project_service.touch_project(project_id)
+        await self._cleanup_annotation_task_state(project_id, delete_ids or [])
+        return {"success": True, "revision": next_state.revision, "fileHash": new_hash}
+
+    async def _drain_annotation_tasks(
+        self, project_id: str, annotation_ids: List[str],
+    ) -> None:
+        from app.services import task_runtime
+
+        for annotation_id in dict.fromkeys(annotation_ids):
+            async with UnitOfWork(project_id, immediate=True) as uow:
+                active = await uow.task_state.get_active_by_owner(
+                    "annotation", annotation_id,
+                )
+                task_id = active["task_id"] if active else None
+                if task_id:
+                    status = await uow.task_state.request_cancel(task_id)
+                    if status == "awaiting_input":
+                        await uow.task_state.mark_cancelled(task_id)
+            if not task_id:
+                continue
+            task_runtime.cancel(task_id)
+            if not await task_runtime.wait_for_task(task_id):
+                raise TaskActiveError(task_id=task_id)
+
+    async def _cleanup_annotation_task_state(
+        self, project_id: str, annotation_ids: List[str],
+    ) -> None:
+        for annotation_id in dict.fromkeys(annotation_ids):
+            async with UnitOfWork(project_id) as uow:
+                await uow.task_state.delete_by_owner("annotation", annotation_id)
+
+    async def _restore_transaction_file(
+        self, project_id: str, transaction,
+    ) -> None:
+        """Restore a failed save only while the journal version is on disk."""
+        await file_service.write_file(
+            project_id,
+            transaction.file_path,
+            transaction.old_content,
+            expected_hash=transaction.new_file_hash,
+            require_expected_hash=True,
+        )
+
+    async def recover_transactions(self, project_id: str) -> int:
+        """Recover journaled saves without replacing an unrelated disk version."""
+        recovered = 0
+        async with UnitOfWork(project_id) as uow:
+            transactions = await uow.annotations.get_transactions()
+        for transaction in transactions:
+            raw = await file_service.read_file(project_id, transaction.file_path)
+            disk_content = _text_content(raw)
+            disk_hash = file_service.compute_hash(disk_content)
+            mutations = json.loads(transaction.mutations)
+            async with UnitOfWork(project_id, immediate=True) as uow:
+                state = await uow.annotations.get_file_state(transaction.file_path)
+                if disk_hash == transaction.expected_file_hash:
+                    await uow.annotations.delete_transaction(transaction.id)
+                    continue
+                if state and (
+                    state.revision == transaction.expected_revision + 1
+                    and state.file_hash == transaction.new_file_hash
+                ):
+                    await uow.annotations.delete_transaction(transaction.id)
+                    continue
+                if state and (
+                    state.revision == transaction.expected_revision
+                    and state.file_hash == transaction.expected_file_hash
+                    and disk_hash == transaction.new_file_hash
+                ):
+                    try:
+                        await uow.annotations.apply_mutation_cas(
+                            transaction.file_path, mutations.get("upserts", []),
+                            mutations.get("deleteIds", []), transaction.expected_revision,
+                            transaction.expected_file_hash, transaction.new_file_hash,
+                        )
+                    except ValueError:
+                        continue
+                    await uow.annotations.delete_transaction(transaction.id)
+                    recovered += 1
+                    continue
+                if disk_hash != transaction.new_file_hash:
+                    await uow.annotations.delete_transaction(transaction.id)
+                    continue
+            if disk_hash == transaction.new_file_hash:
+                async with UnitOfWork(project_id, immediate=True) as uow:
+                    state = await uow.annotations.get_file_state(transaction.file_path)
+                    is_other_mutation = state and (
+                        state.revision > transaction.expected_revision
+                        and state.file_hash == transaction.expected_file_hash
+                    )
+                    if not is_other_mutation:
+                        continue
+                    await self._restore_transaction_file(project_id, transaction)
+                    try:
+                        restored = _text_content(
+                            await file_service.read_file(project_id, transaction.file_path)
+                        )
+                    except Exception:
+                        continue
+                    restored_hash = file_service.compute_hash(restored)
+                    if restored_hash == transaction.new_file_hash:
+                        continue
+                    await uow.annotations.delete_transaction(transaction.id)
+            # A third-party disk version, or a failed guarded restore, keeps
+            # the journal as recovery evidence for the next access/startup.
+        return recovered
 
     async def reply_annotation(
         self,
@@ -225,27 +372,36 @@ class AnnotationService:
         content: str,
         role: str = "assistant",
     ) -> Dict:
-        """Append a reply to an existing annotation."""
+        """Append one message without changing the annotation anchor snapshot."""
         if not content.strip():
             return {"error": "Annotation reply content cannot be empty.", "success": False}
 
-        async with UnitOfWork(project_id) as uow:
-            if file_path:
-                annotation = await uow.annotations.get_annotation(
-                    file_path, anno_id
-                )
-            else:
-                annotation = await uow.annotations.get_by_id(anno_id)
-            if not annotation:
+        resolved, error = await self.resolve_annotation(project_id, anno_id)
+        if not resolved or (file_path and resolved.file_path != file_path):
+            return {"error": error or f"Annotation {anno_id} not found.", "success": False}
+        await self.get_annotations(project_id, resolved.file_path)
+        async with UnitOfWork(project_id, immediate=True) as uow:
+            annotation = await uow.annotations.get_by_id(anno_id)
+            if not annotation or (file_path and annotation.file_path != file_path):
                 return {"error": f"Annotation {anno_id} not found.", "success": False}
-
-            await uow.messages.create_for_annotation(
+            raw = await file_service.read_file(project_id, annotation.file_path)
+            file_hash = file_service.compute_hash(_text_content(raw))
+            state = await uow.annotations.ensure_file_state(annotation.file_path, file_hash)
+            if state.file_hash != file_hash:
+                raise AnnotationConflictError(
+                    details={"revision": state.revision, "fileHash": file_hash},
+                )
+            await uow.messages.stage_create_for_annotation(
                 annotation_id=anno_id,
                 role=role,
                 content=content,
             )
+            await uow.commit()
         project_service.touch_project(project_id)
-        return {"success": True, "anno_id": anno_id}
+        return {
+            "success": True, "anno_id": anno_id,
+            "revision": state.revision, "fileHash": state.file_hash,
+        }
 
     async def get_active_reply_task(
         self, project_id: str, annotation_id: str
@@ -256,28 +412,10 @@ class AnnotationService:
                 active = await uow.task_state.get_active_annotation_reply(annotation_id)
                 if not active:
                     return {"active": False, "task_id": None, "status": None}
-                liveness = await uow.task_state.check_liveness(active["task_id"])
-            if liveness == "stale":
-                return {
-                    "active": False,
-                    "task_id": active["task_id"],
-                    "status": "stale",
-                    "task_type": active.get("task_type"),
-                    "annotation_id": annotation_id,
-                    "recoverable": True,
-                    "message": (
-                        "The previous annotation task stopped sending heartbeats "
-                        "before it produced a final response."
-                    ),
-                }
-
             return {
-                "active": liveness in (
-                    STATUS_QUEUED, STATUS_RUNNING,
-                    STATUS_AWAITING_INPUT, STATUS_CANCELLING,
-                ),
+                "active": True,
                 "task_id": active["task_id"],
-                "status": liveness,
+                "status": active["status"],
                 "task_type": active.get("task_type"),
                 "annotation_id": annotation_id,
             }
@@ -306,17 +444,52 @@ class AnnotationService:
             return await uow.annotations.get_by_file(file_path)
 
     async def delete_annotation(
-        self, project_id: str, annotation_id: str
-    ) -> tuple:
-        """Delete an annotation by exact ID.
+        self, project_id: str, annotation_id: str,
+        expected_revision: int | None = None,
+        expected_file_hash: str | None = None,
+    ) -> Dict[str, Any]:
+        """Delete one annotation and return the committed CAS snapshot."""
+        await self.recover_transactions(project_id)
+        if expected_revision is None and expected_file_hash is None:
+            annotation = await self.resolve_annotation(project_id, annotation_id)
+            if annotation[0] is None:
+                return {"deleted": False, "error": annotation[1]}
+            snapshot = await self.get_annotations(project_id, annotation[0].file_path)
+            expected_revision = snapshot["revision"]
+            expected_file_hash = snapshot["fileHash"]
+        await self._drain_annotation_tasks(project_id, [annotation_id])
 
-        Returns (success: bool, error_message: str|None).
-        """
-        async with UnitOfWork(project_id) as uow:
-            deleted, error = await uow.annotations.delete_by_id(annotation_id)
-        if deleted:
-            project_service.touch_project(project_id)
-        return deleted, error
+        async with UnitOfWork(project_id, immediate=True) as uow:
+            annotation = await uow.annotations.get_by_id(annotation_id)
+            if not annotation:
+                return {
+                    "deleted": False,
+                    "error": f"No annotation found with ID '{annotation_id}'",
+                }
+            file_content = await file_service.read_file(project_id, annotation.file_path)
+            current_hash = file_service.compute_hash(_text_content(file_content))
+            state = await uow.annotations.ensure_file_state(annotation.file_path, current_hash)
+            if expected_revision is not None and state.revision != expected_revision:
+                raise AnnotationConflictError(details={"revision": state.revision, "fileHash": current_hash})
+            if expected_file_hash is not None and current_hash != expected_file_hash:
+                raise AnnotationConflictError(details={"revision": state.revision, "fileHash": current_hash})
+            try:
+                next_state = await uow.annotations.apply_mutation_cas(
+                    annotation.file_path, [], [annotation_id], state.revision,
+                    current_hash,
+                )
+            except ValueError as exc:
+                raise AnnotationConflictError(
+                    details={"revision": state.revision, "fileHash": current_hash},
+                ) from exc
+        await self._cleanup_annotation_task_state(project_id, [annotation_id])
+        project_service.touch_project(project_id)
+        return {
+            "deleted": True,
+            "error": None,
+            "revision": next_state.revision,
+            "fileHash": next_state.file_hash,
+        }
 
     async def start_ai_reply_stream(
         self,
@@ -331,23 +504,67 @@ class AnnotationService:
         framework imports.
         """
         from app.services.ai_service import ai_service
-        from app.workers.huey_tasks import run_annotation_reply
+        from app.services.annotation_loop import AnnotationLoop
+        from app.services import task_runtime
 
         task_id = generate_id()
-        async with UnitOfWork(project_id) as uow:
-            await uow.task_state.set_queued(
-                task_id,
-                task_type="annotation_reply",
-                owner_type="annotation",
-                owner_id=annotation_id,
+        try:
+            async with UnitOfWork(project_id) as uow:
+                # Terminal rows are never read back for an annotation
+                # (arbitration uses the partial unique index over runnable
+                # statuses only); prune the old ones so the table does not
+                # grow without bound.
+                await uow.task_state.prune_terminal_by_owner("annotation", annotation_id)
+                await uow.task_state.set_queued(
+                    task_id,
+                    task_type="annotation_reply",
+                    owner_type="annotation",
+                    owner_id=annotation_id,
+                )
+        except IntegrityError:
+            # The partial unique index over runnable rows per owner rejects a
+            # concurrent second submit; surface the same user-facing error the
+            # chat path raises instead of an unhandled 500.
+            async with UnitOfWork(project_id) as uow:
+                existing = await uow.task_state.get_active_annotation_reply(
+                    annotation_id
+                )
+            raise TaskActiveError(
+                task_id=existing["task_id"] if existing else "",
             )
 
-        run_annotation_reply(
-            task_id=task_id,
-            project_id=project_id,
-            file_path=file_path,
-            annotation_id=annotation_id,
-        )
+        try:
+            task_runtime.launch(
+                task_id=task_id,
+                project_id=project_id,
+                source_factory=lambda cancel_event: AnnotationLoop(
+                    project_id=project_id,
+                    file_path=file_path,
+                    annotation_id=annotation_id,
+                    cancel_event=cancel_event,
+                ).run(),
+            )
+        except BaseException as e:
+            # The queued row was committed above and now owns the annotation:
+            # a failure between the claim and the runner launch — including a
+            # CancelledError from a disconnecting client, which ``except
+            # Exception`` would let through — must finalize the row before
+            # propagating, or it would strand until the stranded-row sweep.
+            if isinstance(e, asyncio.CancelledError):
+                error = "Task was cancelled before it started."
+            else:
+                error = f"Failed to start annotation task: {e}"
+            try:
+                async with UnitOfWork(project_id) as uow:
+                    await uow.task_state.mark_failed(task_id, error)
+            except Exception:
+                # Best-effort cleanup: the original launch failure must not
+                # be masked by a failure to finalize the task row.
+                logger.warning(
+                    "Failed to finalize annotation task %s after launch error",
+                    task_id, exc_info=True,
+                )
+            raise
 
         return task_id, ai_service.sse_listen(task_id, project_id=project_id)
 

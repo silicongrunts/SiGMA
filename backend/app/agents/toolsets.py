@@ -63,9 +63,6 @@ PLAN_TOOLS: frozenset[str] = READ_ONLY_TOOLS | {
     "agent", "ask_user_question", "submit_plan_for_approval",
 }
 
-# Explore agent: read-only only
-EXPLORE_TOOLS: frozenset[str] = READ_ONLY_TOOLS
-
 # Fork mode keeps the parent tool schema visible for request-shape stability,
 # but these tools remain blocked at runtime.
 FORK_FORBIDDEN_TOOLS: frozenset[str] = frozenset({"agent"}) | TASK_TOOLS
@@ -87,8 +84,6 @@ ANNOTATION_TOOLS: frozenset[str] = frozenset({
     "notebook_read",
     # Skills (read-only)
     "skill_load",
-    # Agent (explore only — enforced at runtime)
-    "agent",
     # Utility
     "sleep",
     # Internal (synthetic tool for diff validation)
@@ -100,6 +95,9 @@ ANNOTATION_TOOLS: frozenset[str] = frozenset({
 # Which agent_types can be spawned from each context
 ALLOWED_AGENT_TYPES: dict[str, frozenset[str]] = {
     "main": frozenset({"general", "explore", "plan", ""}),  # "" = fork
-    "annotation": frozenset({"explore"}),
+    # Annotation loops deliberately cannot spawn subagents or reach any
+    # interactive/permission workflow; this keeps their UI state local to the
+    # annotation thread and makes awaiting_input unreachable by construction.
+    "annotation": frozenset(),
     "plan": frozenset({"explore"}),
 }

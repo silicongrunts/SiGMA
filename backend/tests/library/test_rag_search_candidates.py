@@ -1,12 +1,24 @@
+"""Query-time retrieval behavior of RAGService:
+
+- candidate pool sizing (over-fetch) and reranker fan-out/fallback
+- the BM25 chunk-token cache (tokenize once per chunk, invalidate on change)
+
+Index-side behavior (metadata guard, chunk identity, generation-scoped
+purge/sync cleanup) lives in ``test_rag_index_maintenance.py``.
+"""
+
+import threading
 from types import SimpleNamespace
 
 import pytest
 
-from app.core.config import Settings, settings
-from app.core.exceptions import RAGIndexModelMismatchError
-from app.core.model_config import ModelEndpoint
+from app.core.config import settings
 from app.services.rag_service import RAGService
 
+
+# ---------------------------------------------------------------------------
+# Candidate pool sizing and reranker fan-out
+# ---------------------------------------------------------------------------
 
 class FakeIndex:
     def __init__(self, count: int):
@@ -48,13 +60,30 @@ class SearchOnlyRAGService(RAGService):
         super().__init__()
         self._initialized = True
         self._reranker = reranker
-        self._state = SimpleNamespace(index=index)
+        # BM25 attributes so _sync_search takes the healthy no-BM25-hits path
+        # instead of raising AttributeError inside _bm25_search and quietly
+        # riding the swallowed "BM25 search failed" fallback.
+        self._state = SimpleNamespace(
+            index=index,
+            all_nodes=[],
+            bm25_index=None,
+            all_nodes_lock=threading.Lock(),
+        )
 
     def _get_project(self, project_id):
         return self._state
 
     def _chunk_count(self, state):
         return 100
+
+
+@pytest.fixture(autouse=True)
+def no_silent_bm25_failure(caplog):
+    """_sync_search degrades BM25 errors to a warning. These tests exercise
+    the candidate/rerank contract on the healthy path, so the warning must
+    never fire — otherwise a BM25 wiring regression would pass unnoticed."""
+    yield
+    assert "BM25 search failed" not in caplog.text
 
 
 @pytest.fixture(autouse=True)
@@ -105,6 +134,10 @@ def test_candidate_pool_size_is_never_smaller_than_top_k(monkeypatch):
     assert len(results) == 3
 
 
+# ---------------------------------------------------------------------------
+# BM25 chunk-token cache
+# ---------------------------------------------------------------------------
+
 def test_bm25_search_reuses_cached_chunk_tokens():
     service = RAGService()
     service._initialized = True
@@ -131,6 +164,7 @@ def test_bm25_search_reuses_cached_chunk_tokens():
             FakeNode("doc-2", "doc beta target"),
         ],
         bm25_index=None,
+        all_nodes_lock=threading.Lock(),
     )
 
     first = service._bm25_search(state, "target", fetch_k=2)
@@ -143,64 +177,3 @@ def test_bm25_search_reuses_cached_chunk_tokens():
     service._invalidate_bm25(state)
     service._bm25_search(state, "target", fetch_k=2)
     assert doc_tokenizations == 4
-
-
-class FakeCollection:
-    def __init__(self, count=0, metadata=None):
-        self._count = count
-        self.metadata = metadata or {}
-        self.modified_metadata = None
-
-    def count(self):
-        return self._count
-
-    def modify(self, metadata):
-        self.modified_metadata = metadata
-        self.metadata = metadata
-
-
-def _identity(model: str = "embed-a") -> dict:
-    endpoint = ModelEndpoint(role="embedding", model=model)
-    return RAGService._build_embedding_identity(endpoint, query_instruction=None)
-
-
-def test_rag_metadata_written_for_empty_collection(tmp_path, monkeypatch):
-    monkeypatch.setattr(Settings, "get_sigma_path", lambda self, project_id: tmp_path)
-    service = RAGService()
-    service._embedding_identity = _identity("embed-a")
-    collection = FakeCollection(count=0)
-
-    service._ensure_index_metadata("project", collection)
-
-    assert (tmp_path / "rag_index_metadata.json").exists()
-    assert collection.metadata["embedding_model"] == "embed-a"
-
-
-def test_rag_metadata_rejects_nonempty_unknown_index(tmp_path, monkeypatch):
-    monkeypatch.setattr(Settings, "get_sigma_path", lambda self, project_id: tmp_path)
-    service = RAGService()
-    service._embedding_identity = _identity("embed-a")
-
-    with pytest.raises(RAGIndexModelMismatchError):
-        service._ensure_index_metadata("project", FakeCollection(count=1))
-
-
-def test_rag_metadata_rejects_changed_embedding_model(tmp_path, monkeypatch):
-    monkeypatch.setattr(Settings, "get_sigma_path", lambda self, project_id: tmp_path)
-    service = RAGService()
-    service._embedding_identity = _identity("embed-a")
-    service._write_index_metadata("project")
-
-    service._embedding_identity = _identity("embed-b")
-    with pytest.raises(RAGIndexModelMismatchError):
-        service._ensure_index_metadata("project", FakeCollection(count=1))
-
-
-def test_extract_chunk_identity_uses_node_content_when_doc_id_is_none_string():
-    meta = {
-        "doc_id": "None",
-        "doc_revision": None,
-        "_node_content": '{"metadata": {"doc_id": "doc-1", "doc_revision": 7}}',
-    }
-
-    assert RAGService._extract_chunk_identity(meta) == ("doc-1", 7)

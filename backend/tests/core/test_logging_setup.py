@@ -57,37 +57,36 @@ def test_setup_logging_writes_daily_file_and_splits_console(tmp_path, capsys):
 
 
 def test_setup_logging_is_idempotent_without_force(tmp_path):
-    setup_logging(process="worker", log_dir=tmp_path, level="INFO")
+    setup_logging(process="web", log_dir=tmp_path, level="INFO")
     root = logging.getLogger()
     first_handlers = root.handlers[:]
 
     setup_logging(process="web", log_dir=tmp_path, level="INFO")
 
     assert root.handlers == first_handlers
-    assert getattr(root, "_sigma_logging_process") == "worker"
+    assert getattr(root, "_sigma_logging_process") == "web"
 
 
 def test_setup_logging_force_reconfigures_process(tmp_path):
-    setup_logging(process="worker", log_dir=tmp_path, level="INFO")
+    setup_logging(process="web", log_dir=tmp_path, level="INFO")
     setup_logging(process="web", log_dir=tmp_path, level="INFO", force=True)
 
     logging.getLogger("sigma.test").info("web log")
 
     today = utcnow().date().isoformat()
     assert (tmp_path / f"web-{today}.log").read_text(encoding="utf-8")
-    assert not (tmp_path / f"worker-{today}.log").exists()
     assert getattr(logging.getLogger(), "_sigma_logging_process") == "web"
 
 
 def test_setup_logging_removes_expired_logs(tmp_path):
     old_date = (utcnow().date() - timedelta(days=14)).isoformat()
     kept_date = (utcnow().date() - timedelta(days=13)).isoformat()
-    old_log = tmp_path / f"worker-{old_date}.log"
-    kept_log = tmp_path / f"worker-{kept_date}.log"
+    old_log = tmp_path / f"web-{old_date}.log"
+    kept_log = tmp_path / f"web-{kept_date}.log"
     old_log.write_text("old", encoding="utf-8")
     kept_log.write_text("kept", encoding="utf-8")
 
-    setup_logging(process="worker", log_dir=tmp_path)
+    setup_logging(process="web", log_dir=tmp_path)
 
     assert not old_log.exists()
     assert kept_log.exists()

@@ -13,14 +13,14 @@ async def test_stage_create_persists_only_on_commit(db_session_factory):
         sessions = SessionRepository(db)
 
         staged = await sessions.stage_create(
-            "project-1", session_id="fork-1", title="Forked",
+            session_id="fork-1", title="Forked",
         )
         assert staged.id == "fork-1"
         await db.rollback()  # staged rows vanish without a commit
         assert await sessions.get_by_id("fork-1") is None
 
         await sessions.stage_create(
-            "project-1", session_id="fork-1", title="Forked",
+            session_id="fork-1", title="Forked",
         )
         await db.commit()
         found = await sessions.get_by_id("fork-1")
@@ -35,8 +35,10 @@ async def test_stage_create_agent_fields_round_trip(db_session_factory):
     async with db_session_factory() as db:
         sessions = SessionRepository(db)
 
+        # sessions.parent_session_id has a production-enforced FK to
+        # sessions.id, so the parent row must exist before the agent row.
+        await sessions.stage_create(session_id="parent-1", title="Parent")
         await sessions.stage_create(
-            "project-1",
             session_id="agent-2",
             title="Agent: general",
             session_kind="agent",
@@ -59,8 +61,8 @@ async def test_stage_copy_messages_preserves_fields_and_applies_rewrites(db_sess
         sessions = SessionRepository(db)
         messages = MessageRepository(db)
 
-        src = await sessions.create("project-1", title="Source")
-        dst = await sessions.create("project-1", title="Fork")
+        src = await sessions.create(title="Source")
+        dst = await sessions.create(title="Fork")
         src_id, dst_id = src.id, dst.id  # rows expire on rollback below
         await messages.create(
             src_id, role="user",
@@ -111,12 +113,12 @@ async def test_collect_descendant_session_ids_orders_children_first(db_session_f
     async with db_session_factory() as db:
         sessions = SessionRepository(db)
 
-        root = await sessions.create("project-1", title="Root")
+        root = await sessions.create(title="Root")
         child = await sessions.create_agent_session(
-            "project-1", "general", parent_session_id=root.id,
+            "general", parent_session_id=root.id,
         )
         grandchild = await sessions.create_agent_session(
-            "project-1", "general", parent_session_id=child.id,
+            "general", parent_session_id=child.id,
         )
 
         ids = await sessions.collect_descendant_session_ids(root.id)

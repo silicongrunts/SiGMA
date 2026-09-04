@@ -12,6 +12,7 @@ the next LLM call are shortened.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from dataclasses import dataclass
@@ -268,6 +269,7 @@ class CompactionService:
         tools: list[dict] | None = None,
         token_budget_tracker=None,
         session_id: str | None = None,
+        cancel_event: "asyncio.Event | None" = None,
     ) -> CompactionResult:
         """Generate a compacted context view.
 
@@ -276,6 +278,9 @@ class CompactionService:
         ``session_id`` enables sticky routing for the compaction call so it can
         read the already-cached conversation prefix for free (no cache_control
         is created here — compaction only reads, never creates a cache entry).
+
+        ``cancel_event``, when provided, aborts the in-flight summary call the
+        moment it fires (see ``_summarize_with_cancel``).
         """
         if not messages:
             raise ValueError("Cannot compact an empty message list")
@@ -294,13 +299,12 @@ class CompactionService:
             compact_request.append(entry)
         compact_request.append({"role": "user", "content": COMPACT_PROMPT})
 
-        summary, compact_usage = await llm_service.call_chat_text(
-            messages=compact_request,
+        summary, compact_usage = await self._summarize_with_cancel(
+            compact_request,
             model_role=model_role,
-            timeout=300.0,
-            max_tokens=self.budget_for_role(model_role).compact_response_max_tokens,
             tools=tools,
             session_id=session_id,
+            cancel_event=cancel_event,
         )
 
         if token_budget_tracker and compact_usage:
@@ -325,6 +329,52 @@ class CompactionService:
             usage=compact_usage,
         )
 
+    async def _summarize_with_cancel(
+        self,
+        compact_request: list[dict],
+        *,
+        model_role: str,
+        tools: list[dict] | None,
+        session_id: str | None,
+        cancel_event: "asyncio.Event | None",
+    ) -> tuple[str, dict | None]:
+        """Run the summary LLM call, aborting it the moment cancel_event fires.
+
+        Racing the call against ``cancel_event.wait()`` is what makes a user
+        stop effective during compaction: without the race, a /compact on a
+        large session keeps running to completion after the cancel. On cancel
+        this raises ``asyncio.CancelledError`` so the task runner finalizes the
+        row as cancelled instead of streaming a result nobody asked for. The
+        aborted LLM task is cancelled too, so no orphaned request keeps
+        consuming the provider after the row is finalized.
+        """
+        call_task = asyncio.create_task(llm_service.call_chat_text(
+            messages=compact_request,
+            model_role=model_role,
+            timeout=300.0,
+            max_tokens=self.budget_for_role(model_role).compact_response_max_tokens,
+            tools=tools,
+            session_id=session_id,
+        ))
+        if cancel_event is None:
+            return await call_task
+        cancel_task = asyncio.create_task(cancel_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {call_task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_event.is_set() or cancel_task in done:
+                raise asyncio.CancelledError()
+            if call_task in done:
+                return call_task.result()
+            raise asyncio.CancelledError()
+        finally:
+            for task in (call_task, cancel_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(call_task, cancel_task, return_exceptions=True)
+
     @staticmethod
     def _build_compacted_messages(messages: list[dict], boundary_content: str) -> list[dict]:
         system_messages = [m for m in messages if m.get("role") == "system"]
@@ -337,12 +387,24 @@ class CompactionService:
         uow: UnitOfWork,
         session_id: str,
         boundary_content: str,
+        usage: dict | None = None,
     ) -> None:
+        """Stage the compaction boundary row.
+
+        ``usage`` is the summarization call's own token spend: the boundary
+        row is the only durable place inside the turn that can carry it, so
+        the turn token stats keep counting compaction across pause/resume
+        cycles and the history sums stay equal to the live display.
+        """
+        usage = usage or {}
         await uow.messages.stage_create(
             session_id=session_id,
             role="system",
             content=boundary_content,
             is_boundary=True,
+            token_count=int(usage.get("output") or 0),
+            input_tokens=int(usage.get("input") or 0),
+            cached_tokens=int(usage.get("cached") or 0),
         )
 
     async def insert_annotation_boundary(

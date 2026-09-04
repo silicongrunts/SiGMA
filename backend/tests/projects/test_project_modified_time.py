@@ -13,17 +13,6 @@ import pytest
 from app.services.project_service import ProjectService, PROJECT_STATUS_DELETING
 
 
-@pytest.fixture
-def ps(tmp_path):
-    """Create a ProjectService pointing at a temp directory."""
-    svc = ProjectService()
-    svc.USERDATA_DIR = tmp_path
-    svc.SIGMA_DIR = tmp_path / ".SiGMA"
-    svc.SIGMA_DIR.mkdir(parents=True, exist_ok=True)
-    svc.PROJECTS_FILE = svc.SIGMA_DIR / "projects.json"
-    return svc
-
-
 def _add_project(ps, pid, modified=None, status=None):
     (ps.USERDATA_DIR / pid).mkdir()
     entry = {"name": pid}

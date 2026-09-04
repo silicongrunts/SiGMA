@@ -140,3 +140,56 @@ async def test_get_document_ancestors_missing_doc_raises_not_found(monkeypatch):
 
     with pytest.raises(DocumentNotFoundError):
         await library.get_document_ancestors("project-1", "missing")
+
+
+# ---------------------------------------------------------------------------
+# Error translation (HTTP level): service exceptions must reach the client as
+# the exception's status code with the unified error envelope
+# {"request_id", "success", "error", "data"}.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_missing_document_translates_to_404_error_envelope(client, no_password, monkeypatch):
+    async def get_document(project_id, doc_id, include_content=True):
+        return None
+
+    monkeypatch.setattr(
+        library,
+        "library_service",
+        SimpleNamespace(get_document=get_document),
+    )
+
+    r = await client.get("/api/v1/library/project-1/documents/missing")
+
+    assert r.status_code == 404
+    body = r.json()
+    assert set(body) == {"request_id", "success", "error", "data"}
+    assert body["success"] is False
+    assert body["error"] == "Document not found: missing"
+    assert body["data"] is None
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_duplicate_title_translates_to_409_error_envelope(client, no_password, monkeypatch):
+    async def update_document(project_id, doc_id, data):
+        raise ValueError("A document titled 'Existing' already exists")
+
+    monkeypatch.setattr(
+        library,
+        "library_service",
+        SimpleNamespace(update_document=update_document),
+    )
+
+    r = await client.put(
+        "/api/v1/library/project-1/documents/doc-1",
+        json={"title": "Existing"},
+    )
+
+    assert r.status_code == 409
+    body = r.json()
+    assert set(body) == {"request_id", "success", "error", "data"}
+    assert body["success"] is False
+    assert body["error"] == "A document titled 'Existing' already exists"
+    assert body["data"] is None

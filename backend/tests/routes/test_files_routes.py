@@ -5,6 +5,7 @@ import pytest
 from app.models.requests import FileContent, FileExtractRequest
 from app.routes import files
 from app.services.file_service import MAX_UI_READ_BYTES
+from tests.factories.uploads import ChunkedUpload
 
 
 @pytest.mark.route
@@ -117,3 +118,65 @@ async def test_extract_archive_skip_conflicts_bypasses_preflight(monkeypatch):
     assert result["success"] is True
     assert result["data"] == {"extracted": ["new.txt"]}
     assert calls["check"] == 0
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_upload_files_streams_upload_to_service(monkeypatch):
+    """The route hands the raw upload stream to save_upload instead of
+    buffering the body in memory; the service owns the size cap."""
+    calls = {}
+
+    async def save_upload(project_id, filename, file, path, overwrite=False):
+        calls["args"] = (project_id, filename, file, path)
+        calls["overwrite"] = overwrite
+        return "data.bin"
+
+    fake_service = SimpleNamespace(save_upload=save_upload)
+    monkeypatch.setattr(files, "file_service", fake_service)
+
+    upload = ChunkedUpload(b"payload", filename="data.bin")
+
+    result = await files.upload_files("project-1", upload, path="docs", overwrite=True)
+
+    assert result["success"] is True
+    assert result["data"] == {"filename": "data.bin"}
+    assert calls["args"] == ("project-1", "data.bin", upload, "docs")
+    assert calls["overwrite"] is True
+
+
+# ---------------------------------------------------------------------------
+# Error translation (HTTP level): service exceptions must reach the client as
+# the exception's status code with the unified error envelope
+# {"request_id", "success", "error", "data"}.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_oversize_upload_translates_to_413_error_envelope(client, no_password, monkeypatch):
+    """The upload size cap lives in the service: a body over the limit raises
+    FileSystemError(FILE_TOO_LARGE, 413) (mirroring write_upload_bounded).
+    The route must surface it as an HTTP 413 with the unified envelope and
+    not swallow it into a 200."""
+    from app.core.exceptions import FileSystemError
+
+    async def save_upload(project_id, filename, file, path, overwrite=False):
+        raise FileSystemError(
+            "File exceeds the upload limit",
+            code="FILE_TOO_LARGE",
+            status_code=413,
+        )
+
+    monkeypatch.setattr(files, "file_service", SimpleNamespace(save_upload=save_upload))
+
+    r = await client.post(
+        "/api/v1/files/project-1/upload",
+        files={"file": ("big.bin", b"x" * 16, "application/octet-stream")},
+    )
+
+    assert r.status_code == 413
+    body = r.json()
+    assert set(body) == {"request_id", "success", "error", "data"}
+    assert body["success"] is False
+    assert body["error"] == "File exceeds the upload limit"
+    assert body["data"] is None

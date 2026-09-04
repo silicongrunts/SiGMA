@@ -5,12 +5,8 @@ import time
 
 import pytest
 
+from app.agents.tools import file_tools
 from app.agents.tools.file_tools import _glob_search, _grep_fallback, _grep_search
-
-
-def _patch_file_service(monkeypatch, tmp_path):
-    from app.services.file_service import file_service
-    monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
 
 
 def _set_mtime(path, mtime):
@@ -18,13 +14,30 @@ def _set_mtime(path, mtime):
     os.utime(path, (st.st_atime, mtime))
 
 
+@pytest.fixture(autouse=True)
+def _relaxed_search_deadlines(monkeypatch):
+    """Widen the bounded-search wall-clock deadlines for this file.
+
+    The rg/grep budgets in file_tools (15s grep / 20s glob) are production
+    constants with no settings or parameter injection. They bound a full
+    directory walk, but the deadline clock also covers process spawn and
+    event-loop scheduling; on a loaded machine (e.g. a real SiGMA instance
+    running alongside the suite) a one-file sandbox search has been observed
+    to burn the whole budget, turning a deterministic search into a
+    spurious "search timed out" (no-match tests) or truncated output. These
+    searches cover a handful of tiny files, so a generous deadline only
+    delays pathological cases; no assertion depends on the timeout value.
+    """
+    monkeypatch.setattr(file_tools, "_GREP_TIMEOUT_SECONDS", 60.0)
+    monkeypatch.setattr(file_tools, "_GLOB_TIMEOUT_SECONDS", 60.0)
+
+
 # ── glob: sorting ─────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_glob_sorts_by_mtime_desc(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    old = tmp_path / "old.txt"
-    new = tmp_path / "new.txt"
+async def test_glob_sorts_by_mtime_desc(sandbox):
+    old = sandbox / "old.txt"
+    new = sandbox / "new.txt"
     old.write_text("a")
     new.write_text("b")
     _set_mtime(old, time.time() - 1000)
@@ -37,11 +50,10 @@ async def test_glob_sorts_by_mtime_desc(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_glob_alphabetical_tiebreak(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
+async def test_glob_alphabetical_tiebreak(sandbox):
     same_time = time.time()
     for name in ["c.txt", "a.txt", "b.txt"]:
-        p = tmp_path / name
+        p = sandbox / name
         p.write_text("x")
         _set_mtime(p, same_time)
 
@@ -52,9 +64,8 @@ async def test_glob_alphabetical_tiebreak(tmp_path, monkeypatch):
 # ── glob: subdirectory path prefix ──────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_glob_relative_subdir_prepends_prefix(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    sub = tmp_path / "src"
+async def test_glob_relative_subdir_prepends_prefix(sandbox):
+    sub = sandbox / "src"
     sub.mkdir()
     (sub / "foo.ts").write_text("")
     (sub / "bar.ts").write_text("")
@@ -68,10 +79,9 @@ async def test_glob_relative_subdir_prepends_prefix(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_glob_root_path_returns_unprefixed(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "top.txt").write_text("")
-    sub = tmp_path / "src"
+async def test_glob_root_path_returns_unprefixed(sandbox):
+    (sandbox / "top.txt").write_text("")
+    sub = sandbox / "src"
     sub.mkdir()
     (sub / "nested.txt").write_text("")
 
@@ -82,9 +92,8 @@ async def test_glob_root_path_returns_unprefixed(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_glob_absolute_path_returns_absolute_sorted_by_mtime(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    sub = tmp_path / "src"
+async def test_glob_absolute_path_returns_absolute_sorted_by_mtime(sandbox):
+    sub = sandbox / "src"
     sub.mkdir()
     older = sub / "aa.py"  # alphabetically first, but older
     newer = sub / "zz.py"
@@ -100,20 +109,17 @@ async def test_glob_absolute_path_returns_absolute_sorted_by_mtime(tmp_path, mon
 # ── glob: truncation marker ─────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_glob_truncation_marker(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
+async def test_glob_truncation_marker(sandbox):
     # Create more than 100 files
     for i in range(120):
-        (tmp_path / f"f{i:03d}.txt").write_text("")
+        (sandbox / f"f{i:03d}.txt").write_text("")
 
     result = await _glob_search("proj", "*.txt", ".")
-    assert "more matches not shown" in result
-    assert "20" in result  # 120 - 100
+    assert "... (20 more matches not shown)" in result
 
 
 @pytest.mark.asyncio
-async def test_glob_empty_returns_no_files_message(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
+async def test_glob_empty_returns_no_files_message(sandbox):
     result = await _glob_search("proj", "*.nonexistent", ".")
     assert "No files matching" in result
 
@@ -121,10 +127,9 @@ async def test_glob_empty_returns_no_files_message(tmp_path, monkeypatch):
 # ── grep: output_mode ───────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_grep_content_mode_returns_matching_lines(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.py").write_text("def foo():\n    return 'bar'\n")
-    (tmp_path / "b.py").write_text("import os\n")
+async def test_grep_content_mode_returns_matching_lines(sandbox):
+    (sandbox / "a.py").write_text("def foo():\n    return 'bar'\n")
+    (sandbox / "b.py").write_text("import os\n")
 
     result = await _grep_search(
         "proj", "foo", ".", output_mode="content",
@@ -135,10 +140,9 @@ async def test_grep_content_mode_returns_matching_lines(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_grep_files_with_matches_mode_returns_paths_only(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.py").write_text("foo = 1\n")
-    (tmp_path / "b.py").write_text("bar = 1\n")
+async def test_grep_files_with_matches_mode_returns_paths_only(sandbox):
+    (sandbox / "a.py").write_text("foo = 1\n")
+    (sandbox / "b.py").write_text("bar = 1\n")
 
     result = await _grep_search(
         "proj", "foo", ".", output_mode="files_with_matches",
@@ -149,9 +153,15 @@ async def test_grep_files_with_matches_mode_returns_paths_only(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_grep_no_matches_message(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.py").write_text("hello\n")
+async def test_grep_no_matches_message(sandbox):
+    """A pattern with zero hits returns the explicit "No matches" message.
+
+    Environment sensitivity: the bounded rg run is wall-clock limited, so a
+    pathologically loaded machine can still surface a "search timed out"
+    error here; the module's autouse fixture widens the deadline to keep
+    this deterministic. Input is already minimal (one one-line file).
+    """
+    (sandbox / "a.py").write_text("hello\n")
 
     result = await _grep_search(
         "proj", "nomatch_xyz_zzz", ".",
@@ -163,10 +173,9 @@ async def test_grep_no_matches_message(tmp_path, monkeypatch):
 # ── grep: pattern starting with hyphen (must use -e) ────────────────
 
 @pytest.mark.asyncio
-async def test_grep_pattern_starting_with_hyphen(tmp_path, monkeypatch):
+async def test_grep_pattern_starting_with_hyphen(sandbox):
     """A pattern starting with '-' must be passed via -e, not as a flag."""
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("has -i flag-looking text\n")
+    (sandbox / "a.txt").write_text("has -i flag-looking text\n")
 
     result = await _grep_search(
         "proj", "-i", ".",
@@ -179,9 +188,8 @@ async def test_grep_pattern_starting_with_hyphen(tmp_path, monkeypatch):
 # ── grep: case insensitive flag ─────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_grep_case_insensitive_flag(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("Hello World\n")
+async def test_grep_case_insensitive_flag(sandbox):
+    (sandbox / "a.txt").write_text("Hello World\n")
 
     # Without -i, "hello" shouldn't match
     result_sensitive = await _grep_search(
@@ -201,10 +209,9 @@ async def test_grep_case_insensitive_flag(tmp_path, monkeypatch):
 # ── grep: glob filter ───────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_grep_glob_filter(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "match.py").write_text("target_token\n")
-    (tmp_path / "match.txt").write_text("target_token\n")
+async def test_grep_glob_filter(sandbox):
+    (sandbox / "match.py").write_text("target_token\n")
+    (sandbox / "match.txt").write_text("target_token\n")
 
     result = await _grep_search(
         "proj", "target_token", ".",
@@ -218,10 +225,9 @@ async def test_grep_glob_filter(tmp_path, monkeypatch):
 # ── grep: truncation marker ─────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_grep_truncation_marker(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
+async def test_grep_truncation_marker(sandbox):
     # Generate one file with many matching lines
-    (tmp_path / "big.txt").write_text("\n".join("match" for _ in range(300)))
+    (sandbox / "big.txt").write_text("\n".join("match" for _ in range(300)))
 
     result = await _grep_search(
         "proj", "match", ".",
@@ -233,9 +239,8 @@ async def test_grep_truncation_marker(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_grep_head_limit_zero_means_unlimited(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "big.txt").write_text("\n".join("match" for _ in range(50)))
+async def test_grep_head_limit_zero_means_unlimited(sandbox):
+    (sandbox / "big.txt").write_text("\n".join("match" for _ in range(50)))
 
     result = await _grep_search(
         "proj", "match", ".",
@@ -250,27 +255,25 @@ async def test_grep_head_limit_zero_means_unlimited(tmp_path, monkeypatch):
 # ── grep: project-relative output paths ─────────────────────────────
 
 @pytest.mark.asyncio
-async def test_grep_root_search_returns_project_relative_paths(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "a.py").write_text("target_token\n")
-    (tmp_path / "b.py").write_text("target_token\n")
+async def test_grep_root_search_returns_project_relative_paths(sandbox):
+    (sandbox / "src").mkdir()
+    (sandbox / "src" / "a.py").write_text("target_token\n")
+    (sandbox / "b.py").write_text("target_token\n")
 
     result = await _grep_search(
         "proj", "target_token", ".", output_mode="files_with_matches",
         flags={}, head_limit=10, offset=0,
     )
     assert set(result.split("\n")) == {"src/a.py", "b.py"}
-    assert str(tmp_path) not in result
+    assert str(sandbox) not in result
     assert "./" not in result
 
 
 @pytest.mark.asyncio
-async def test_grep_subdir_search_returns_project_relative_paths(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "a.py").write_text("target_token\n")
-    (tmp_path / "top.py").write_text("target_token\n")
+async def test_grep_subdir_search_returns_project_relative_paths(sandbox):
+    (sandbox / "src").mkdir()
+    (sandbox / "src" / "a.py").write_text("target_token\n")
+    (sandbox / "top.py").write_text("target_token\n")
 
     result = await _grep_search(
         "proj", "target_token", "src", output_mode="content",
@@ -281,26 +284,24 @@ async def test_grep_subdir_search_returns_project_relative_paths(tmp_path, monke
 
 
 @pytest.mark.asyncio
-async def test_grep_absolute_path_returns_absolute_paths(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.py").write_text("target_token\n")
+async def test_grep_absolute_path_returns_absolute_paths(sandbox):
+    (sandbox / "a.py").write_text("target_token\n")
 
     result = await _grep_search(
-        "proj", "target_token", str(tmp_path), output_mode="files_with_matches",
+        "proj", "target_token", str(sandbox), output_mode="files_with_matches",
         flags={}, head_limit=10, offset=0,
     )
-    assert result.strip() == str(tmp_path / "a.py")
+    assert result.strip() == str(sandbox / "a.py")
 
 
 @pytest.mark.asyncio
-async def test_grep_fallback_strips_dot_slash_prefix(tmp_path, monkeypatch):
+async def test_grep_fallback_strips_dot_slash_prefix(sandbox):
     """The grep fallback passes "." for the root search and must strip the
     "./" prefixes grep echoes (rg is not involved in this path)."""
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.py").write_text("target_token\n")
+    (sandbox / "a.py").write_text("target_token\n")
 
     result = await _grep_fallback(
-        "target_token", ".", str(tmp_path), "",
+        "target_token", ".", str(sandbox), "",
         output_mode="content", case_insensitive=False,
         context=0, after_context=0, before_context=0,
         multiline=False, type_filter="",

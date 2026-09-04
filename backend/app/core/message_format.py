@@ -48,7 +48,7 @@ def build_tool_results_index(messages: list) -> Dict[str, str]:
 _REPLACEMENT_COUNT_RE = re.compile(r"\((\d+) replacement\(s\)\)")
 
 
-def _is_failed_tool_result(result: str) -> bool:
+def is_failed_tool_result(result: str) -> bool:
     """True for the failure texts a tool result can carry: tool-layer
     ``Error:`` returns, the runner's exception wrapper ``Tool '<name>'
     error: …``, and mid-tool cancellation (``Tool cancelled by user.``)."""
@@ -73,12 +73,12 @@ def file_edit_stats(
     deletion side is claimed.
 
     Returns None for non-file tools, failed calls (``result`` carrying a
-    failure marker — see ``_is_failed_tool_result``), and calls without a
+    failure marker — see ``is_failed_tool_result``), and calls without a
     usable path.
     """
     if tool_name not in ("edit", "write") or not isinstance(params, dict):
         return None
-    if _is_failed_tool_result(result):
+    if is_failed_tool_result(result):
         return None
     path = params.get("file_path") or params.get("path")
     if not path or not isinstance(path, str):
@@ -150,12 +150,19 @@ def build_assistant_turn(
     truncate_params: int = 80,
     truncate_result: int = 200,
     truncate_hint: int = 500,
+    parked: bool = False,
 ) -> tuple[Dict[str, Any], int]:
     """Merge consecutive assistant/tool messages starting at *start_index*.
 
     Returns ``(turn_dict, next_index)`` where *next_index* is the index of
     the first message not consumed by this turn (a user message or end of
     list).
+
+    *parked* marks the turn as paused on an interaction checkpoint (the
+    session's latest task is ``awaiting_input``). An unpaired tool call in a
+    parked turn is the call the open dialog is blocked on — the turn is
+    alive and its result arrives after the user answers, so it serializes
+    as ``status: "awaiting_input"``, not ``"interrupted"``.
 
     The returned dict has the shape::
 
@@ -209,14 +216,32 @@ def build_assistant_turn(
             for tc in tcs:
                 fn = tc.get("function", {})
                 raw_args = fn.get("arguments", "") or ""
+                tc_id = tc.get("id", "")
+                has_result = bool(tc_id) and tc_id in tool_results
+                if has_result:
+                    status = "done"
+                elif parked:
+                    # The turn is parked on an interaction checkpoint and this
+                    # call is the one the open dialog is blocking — alive, not
+                    # dead; its result lands after the user answers.
+                    status = "awaiting_input"
+                else:
+                    # No result and the session is not parked: the turn was
+                    # cut off mid-flight (process restart mid-turn; startup
+                    # reconciliation marks such tasks failed). It must not
+                    # render as a completed step after a refresh.
+                    status = "interrupted"
                 step: Dict[str, Any] = {
                     "type": "tool",
                     "tool": fn.get("name", "unknown"),
                     "params": raw_args[:truncate_params],
-                    "status": "done",
+                    "status": status,
                 }
-                tc_id = tc.get("id", "")
-                if tc_id and tc_id in tool_results:
+                # Emitted on every step so a resumed live stream can re-attach
+                # to a history-reloaded step by id (tool_end flips it to done).
+                if tc_id:
+                    step["tool_call_id"] = tc_id
+                if has_result:
                     r = tool_results[tc_id]
                     step["result"] = r[:truncate_result] + (
                         "..." if len(r) > truncate_result else ""
@@ -244,6 +269,9 @@ def build_assistant_turn(
             if _assistant_turn_follows(messages, j):
                 # Mid-turn compaction boundary: surface it as a timeline
                 # step at its real position so the turn stays one entry.
+                # The boundary row carries the summarization call's own
+                # spend — part of this turn's totals.
+                _add_usage(nxt)
                 _, summary = split_boundary_content(getattr(nxt, "content", None) or "")
                 collected_process.append({"type": "compact", "content": summary})
             else:
@@ -338,6 +366,8 @@ def _boundary_card_entry(msg, summary: str) -> Dict[str, Any]:
 def shape_messages_for_ui(
     messages: list,
     boundary_seq: Optional[int],
+    *,
+    session_parked: bool = False,
 ) -> List[Dict[str, Any]]:
     """Group raw message rows into UI-ready chat-history entries.
 
@@ -355,10 +385,30 @@ def shape_messages_for_ui(
     *boundary_seq* is the seq of the last compaction boundary; user
     messages at or before it are marked ``can_edit=False`` because the
     prior context has been summarised away.
+
+    *session_parked* is the authoritative task-state fact that the
+    session's latest task is stopped on an interaction checkpoint. It
+    applies to the final assistant turn only — the park always lives
+    there. An unpaired call in an earlier turn is a genuinely interrupted
+    one.
     """
     tool_results = build_tool_results_index(messages)
     result: List[Dict[str, Any]] = []
     pending_compacts: List[tuple] = []
+
+    # Start index of the final assistant turn: the first assistant row
+    # after the last user row (the turn build consumes every assistant
+    # row from there on, so this is the only start that can be parked).
+    final_turn_start = -1
+    if session_parked:
+        last_user = -1
+        for idx, m in enumerate(messages):
+            if getattr(m, "role", None) == "user":
+                last_user = idx
+        for idx in range(last_user + 1, len(messages)):
+            if getattr(messages[idx], "role", None) == "assistant":
+                final_turn_start = idx
+                break
 
     def _flush_pending() -> None:
         result.extend(
@@ -437,6 +487,7 @@ def shape_messages_for_ui(
                 truncate_params=80,
                 truncate_result=200,
                 truncate_hint=500,
+                parked=i == final_turn_start,
             )
             finalized = finalize_assistant_turn(turn)
             entry["content"] = finalized.get("text", "")
@@ -450,7 +501,13 @@ def shape_messages_for_ui(
             if pending_compacts:
                 # Compaction fired while this turn was being prepared: lead
                 # its timeline with the summary step, matching where the
-                # live stream showed the compaction hint.
+                # live stream showed the compaction hint. The boundary rows'
+                # summarization spend belongs to this turn too — it happened
+                # after the user message, before the first assistant call.
+                for boundary_msg, _ in pending_compacts:
+                    entry["token_count"] += getattr(boundary_msg, "token_count", 0) or 0
+                    entry["cached_tokens"] += getattr(boundary_msg, "cached_tokens", 0) or 0
+                    entry["input_tokens"] += getattr(boundary_msg, "input_tokens", 0) or 0
                 entry["process"] = [
                     {"type": "compact", "content": summary}
                     for _, summary in pending_compacts

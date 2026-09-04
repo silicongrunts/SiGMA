@@ -525,7 +525,7 @@ class GitService:
                 "DATE:%ai"
             ]
             fmt = "\n".join(fmt_lines)
-            args = ["log", f"-n", str(limit), f"--pretty={fmt}"]
+            args = ["log", "-n", str(limit), f"--pretty={fmt}"]
             if before:
                 _validate_commit_hash(before)
                 args.extend(["--skip=1", before])

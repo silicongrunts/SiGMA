@@ -28,6 +28,7 @@ export default function SynthesisTab({
   handleExitNotebook,
   onFileReady,
   onSaveBeforeAnnotationChat,
+  onAnnotationChanged,
   onApplyDiffSave,
   onOpenPath,
 }) {
@@ -225,6 +226,7 @@ export default function SynthesisTab({
                 ref={editorRef}
                 onFileReady={onFileReady}
                 onSaveBeforeAnnotationChat={onSaveBeforeAnnotationChat}
+                onAnnotationChanged={onAnnotationChanged}
                 onApplyDiffSave={onApplyDiffSave}
                 onContentChange={(c) => {
                   setHasUnsavedChanges(true)

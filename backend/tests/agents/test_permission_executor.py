@@ -14,12 +14,24 @@ the task as ``awaiting_input``. Read-only tools and the exempt tool families
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
+from pathlib import Path
+import hashlib
+import json
 
 import pytest
 
+from app.agents.tools.file_tools import _edit_file, _write_file
+from app.agents.tools.notebook_tools import _notebook_run_cell
+from app.agents.tools.read_state import read_state_cache
+from app.core.config import settings
+from app.core.text_diff import CONTENT_SOFT_LIMIT
 from app.services import permission_executor
 from app.services.file_service import PathAccessLevel
-from app.services.permission_executor import PermissionRequestPause
+from app.services.permission_executor import (
+    PermissionRequestPause,
+    approved_notebook_drift_error,
+    restore_approved_read_state,
+)
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -92,8 +104,10 @@ async def test_readonly_tool_skips_permission():
 # ── bash ────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_bash_readonly_auto_approved():
-    """ls is read-only per the allowlist; no pause."""
+async def test_bash_check_approval_proceeds_without_pause():
+    """When the bash permission check approves (the read-only allowlist
+    path), the executor proceeds directly — no pause and no consultation of
+    the bash auto-approve flag, which only governs non-read-only commands."""
     tool_def = _make_tool_def(is_read_only=False)
     with patch.object(permission_executor, "check_bash_permission",
                       return_value=_BashResult(True)) as mock_check, \
@@ -141,9 +155,9 @@ async def test_bash_non_readonly_raises_permission_pause():
 
 
 @pytest.mark.asyncio
-async def test_bash_pause_carries_full_command_as_content():
-    """The approval dialog must show the whole command: what the user reviews
-    is what gets executed, so content is never truncated for display."""
+async def test_bash_pause_carries_full_command_within_soft_limit():
+    """The approval dialog shows the whole command (within the payload soft
+    limit): what the user reviews is what gets executed."""
     tool_def = _make_tool_def(is_read_only=False)
     long_command = "python script.py " + " ".join(f"--opt{i}" for i in range(200))
     with patch.object(permission_executor, "check_bash_permission",
@@ -154,6 +168,7 @@ async def test_bash_pause_carries_full_command_as_content():
                 "bash", {"command": long_command}, tool_def, project_id="p",
             )
     assert exc_info.value.content == long_command
+    assert exc_info.value.content_truncated is False
 
 
 @pytest.mark.asyncio
@@ -195,8 +210,9 @@ async def test_notebook_run_reads_cell_source_as_content():
 
 @pytest.mark.asyncio
 async def test_notebook_run_pause_carries_full_cell_source():
-    """Cell source shown for approval must be complete, not a preview cut —
-    the user approves exactly the code that will run."""
+    """Cell source shown for approval must be complete (within the payload
+    soft limit), not a preview cut — the user approves exactly the code
+    that will run."""
     tool_def = _make_tool_def(is_read_only=False)
     long_source = "x = 1\n" + "y = 2\n" * 500
     fake_notebook = {"cells": [{"id": "c1", "cell_type": "code",
@@ -214,6 +230,7 @@ async def test_notebook_run_pause_carries_full_cell_source():
                 tool_def, project_id="p",
             )
     assert exc_info.value.content == long_source
+    assert exc_info.value.content_truncated is False
 
 
 @pytest.mark.asyncio
@@ -284,9 +301,9 @@ async def test_write_outside_sandbox_raises_pause_with_external_category():
 
 
 @pytest.mark.asyncio
-async def test_write_pause_carries_full_content():
-    """Write content shown for approval must be complete: the user approves
-    exactly the bytes that will land on disk."""
+async def test_write_pause_carries_full_content_within_soft_limit():
+    """Write content shown for approval must be complete (within the payload
+    soft limit): the user approves exactly the bytes that will land on disk."""
     tool_def = _make_tool_def(is_read_only=False)
     long_content = "# report\n" + "data line\n" * 500
     with patch.object(permission_executor.file_service, "check_write_allowed",
@@ -298,6 +315,27 @@ async def test_write_pause_carries_full_content():
                 tool_def, project_id="p",
             )
     assert exc_info.value.content == long_content
+    assert exc_info.value.content_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_write_pause_truncates_oversized_content():
+    """Content beyond CONTENT_SOFT_LIMIT is truncated with the flag set: the
+    pause frame is buffered per subscriber and persisted in the interaction
+    checkpoint, so one huge write approval must not park a multi-megabyte
+    frame in all of them."""
+    tool_def = _make_tool_def(is_read_only=False)
+    huge_content = "x" * (CONTENT_SOFT_LIMIT + 1000)
+    with patch.object(permission_executor.file_service, "check_write_allowed",
+                      return_value=PathAccessLevel.EXTERNAL), \
+         _auto_approve_patch("p", {"file_external": False}):
+        with pytest.raises(PermissionRequestPause) as exc_info:
+            await permission_executor.execute_with_permission(
+                "write", {"file_path": "/home/x.txt", "content": huge_content},
+                tool_def, project_id="p",
+            )
+    assert exc_info.value.content == "x" * CONTENT_SOFT_LIMIT
+    assert exc_info.value.content_truncated is True
 
 
 @pytest.mark.asyncio
@@ -328,6 +366,51 @@ async def test_tmp_treated_as_internal_category():
                 project_id="p",
             )
     assert exc_info.value.tool == "file_internal"
+
+
+# ── resume-side target drift / unresolvable snapshot ────────────────
+
+def test_drift_error_when_target_moved_since_approval():
+    with patch.object(permission_executor.file_service, "resolve_write_target",
+                      return_value=Path("/elsewhere/target.md")):
+        err = permission_executor.approved_target_drift_error(
+            "p", "/original/target.md", {"file_path": "/original/target.md"},
+            category="file_internal",
+        )
+    assert "changed since approval" in err
+    assert "not executed" in err
+
+
+def test_drift_error_passes_when_target_unchanged():
+    with patch.object(permission_executor.file_service, "resolve_write_target",
+                      return_value=Path("/original/target.md")):
+        err = permission_executor.approved_target_drift_error(
+            "p", "/original/target.md", {"file_path": "/original/target.md"},
+            category="file_internal",
+        )
+    assert err == ""
+
+
+def test_drift_error_refuses_empty_snapshot_for_file_categories():
+    """A file-category approval whose snapshot is empty (the target could
+    not be resolved at approval time) must not execute blind: the resume
+    refuses and the operation is re-requested."""
+    for category in ("file_external", "file_internal"):
+        err = permission_executor.approved_target_drift_error(
+            "p", "", {"file_path": "/p/file.md"}, category=category,
+        )
+        assert "could not be re-resolved" in err
+        assert "not executed" in err
+
+
+def test_drift_error_allows_empty_snapshot_without_file_target():
+    """bash / notebook approvals carry no resolved-target snapshot; an empty
+    snapshot there is the normal case and passes the check."""
+    for category in ("bash", "notebook", ""):
+        err = permission_executor.approved_target_drift_error(
+            "p", "", {}, category=category,
+        )
+        assert err == ""
 
 
 # ── annotation / library / draw / task tools are exempt ─────────────
@@ -503,7 +586,9 @@ async def test_edit_preflight_rejects_identical_old_new(tmp_path):
     assert edit_def is not None and edit_def.preflight is not None
     err = await edit_def.preflight(
         project_id="p", session_id="s",
-        file_path=str(tmp_path / "new.md"),  # non-existent -> new-file exemption
+        # A non-existent file is exempt from must-read-first, but the
+        # identical old/new check must still reject it.
+        file_path=str(tmp_path / "new.md"),
         old_string="x", new_string="x",
     )
     assert err is not None
@@ -536,4 +621,218 @@ async def test_edit_preflight_rejects_unread_existing_file(tmp_path):
     )
     assert err is not None
     assert "has not been read" in err
+
+
+# ── notebook approval replay binding (sha256 of full cell source) ───
+
+@pytest.mark.asyncio
+async def test_notebook_pause_hashes_full_source_before_truncation():
+    """The replay digest is taken over the FULL cell source: the dialog
+    preview is truncated at CONTENT_SOFT_LIMIT, but the resume-side
+    comparison must bind the content the user actually reviewed."""
+    tool_def = _make_tool_def(is_read_only=False)
+    source = "x = 1\n" + "y = 2\n" * (CONTENT_SOFT_LIMIT // 6)
+    fake_notebook = {"cells": [{"id": "c1", "cell_type": "code", "source": [source]}]}
+    fake_location = MagicMock()
+    with patch("app.agents.tools.notebook_utils.read_notebook_json",
+               new=AsyncMock(return_value=(fake_notebook, fake_location))), \
+         patch("app.agents.tools.notebook_utils.find_cell_index",
+               return_value=0), \
+         _auto_approve_patch("p", {"notebook": False}):
+        with pytest.raises(PermissionRequestPause) as exc_info:
+            await permission_executor.execute_with_permission(
+                "notebook_run_cell",
+                {"notebook_path": "nb.ipynb", "cell_id": "c1"},
+                tool_def, project_id="p",
+            )
+    assert exc_info.value.content_truncated is True
+    assert exc_info.value.content_sha256 == (
+        hashlib.sha256(source.encode("utf-8")).hexdigest()
+    )
+
+
+@pytest.mark.asyncio
+async def test_approved_notebook_drift_error_on_changed_cell():
+    """A cell edited while the task was parked must not execute under the
+    old approval — the user reviewed different code than what would run."""
+    approved_source = "print('approved version')"
+    changed = {"cells": [{"id": "c1", "cell_type": "code",
+                          "source": "print('tampered')"}]}
+    digest = hashlib.sha256(approved_source.encode("utf-8")).hexdigest()
+    with patch("app.agents.tools.notebook_utils.read_notebook_json",
+               new=AsyncMock(return_value=(changed, MagicMock()))):
+        err = await approved_notebook_drift_error(
+            "p", {"notebook_path": "nb.ipynb", "cell_id": "c1"}, digest,
+        )
+    assert "changed since approval" in err
+    assert "not executed" in err
+
+
+@pytest.mark.asyncio
+async def test_approved_notebook_drift_error_passes_when_cell_unchanged():
+    source = "print('approved version')"
+    notebook = {"cells": [{"id": "c1", "cell_type": "code", "source": source}]}
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    with patch("app.agents.tools.notebook_utils.read_notebook_json",
+               new=AsyncMock(return_value=(notebook, MagicMock()))):
+        err = await approved_notebook_drift_error(
+            "p", {"notebook_path": "nb.ipynb", "cell_id": "c1"}, digest,
+        )
+    assert err == ""
+
+
+@pytest.mark.asyncio
+async def test_approved_notebook_drift_error_on_removed_cell():
+    """A cell deleted while parked cannot run either — the approved target
+    is gone."""
+    digest = hashlib.sha256(b"print('approved version')").hexdigest()
+    with patch("app.agents.tools.notebook_utils.read_notebook_json",
+               new=AsyncMock(return_value=({"cells": []}, MagicMock()))):
+        err = await approved_notebook_drift_error(
+            "p", {"notebook_path": "nb.ipynb", "cell_id": "c1"}, digest,
+        )
+    assert "removed since approval" in err
+    assert "not executed" in err
+
+
+@pytest.mark.asyncio
+async def test_approved_notebook_drift_error_ignores_legacy_checkpoints():
+    """Checkpoints persisted before the digest existed carry no
+    content_sha256; the resume must proceed exactly as before instead of
+    failing closed on an upgrade."""
+    err = await approved_notebook_drift_error(
+        "p", {"notebook_path": "nb.ipynb", "cell_id": "c1"}, "",
+    )
+    assert err == ""
+
+
+# ── unexpected notebook read failure must not ask for blind approval ──
+
+@pytest.mark.asyncio
+async def test_notebook_unexpected_read_error_returns_error_not_pause():
+    """A non-NotebookToolError read failure must surface as an error tool
+    result — never as a pause whose dialog shows no code for the user to
+    blindly approve."""
+    tool_def = _make_tool_def(is_read_only=False)
+    with patch("app.agents.tools.notebook_utils.read_notebook_json",
+               new=AsyncMock(side_effect=OSError("disk error"))), \
+         _auto_approve_patch("p", {"notebook": False}):
+        result = await permission_executor.execute_with_permission(
+            "notebook_run_cell",
+            {"notebook_path": "nb.ipynb", "cell_id": "c1"},
+            tool_def, project_id="p",
+        )
+    assert result.startswith("Error:")
+    assert "c1" in result
+
+
+# ── approved resume read-state restore (must-read after restart) ────
+
+@pytest.mark.asyncio
+async def test_write_approval_resume_after_restart_executes(project):
+    """Restart simulation: the in-memory read-state cache is empty, yet an
+    approved write to an existing file must execute — the pause implies the
+    must-read preflight had already passed when the user approved. Without
+    the restore, the tool's own gate consumes the approval with no effect."""
+    session = "restart-write-sess"
+    # Absolute paths keep the write tool fully functional in this harness
+    # (write_file_absolute never consults the project registry).
+    target = settings.get_project_path(project) / "report.md"
+    target.write_text("# report\n")
+    read_state_cache.clear(session)
+
+    rejected = await _write_file(
+        project_id=project, session_id=session,
+        file_path=str(target), content="new body",
+    )
+    assert "has not been read" in rejected
+    assert target.read_text() == "# report\n"
+
+    restore_approved_read_state(
+        "write", {"file_path": str(target)}, project, session,
+    )
+    result = await _write_file(
+        project_id=project, session_id=session,
+        file_path=str(target), content="new body",
+    )
+    assert result.startswith("File written")
+    assert target.read_text() == "new body"
+
+
+@pytest.mark.asyncio
+async def test_edit_approval_resume_after_restart_executes(project):
+    session = "restart-edit-sess"
+    target = settings.get_project_path(project) / "code.py"
+    target.write_text("value = 1\n")
+    read_state_cache.clear(session)
+
+    restore_approved_read_state(
+        "edit", {"file_path": str(target)}, project, session,
+    )
+    result = await _edit_file(
+        project_id=project, session_id=session, file_path=str(target),
+        old_string="value = 1", new_string="value = 2",
+    )
+    assert result.startswith("File edited")
+    assert target.read_text() == "value = 2\n"
+
+
+@pytest.mark.asyncio
+async def test_notebook_approval_resume_after_restart_passes_gate(project):
+    """A notebook_run_cell approval resumed after a restart must get past the
+    must-read gate; without a Jupyter server the call then stops at that next
+    real dependency — anything else means the approval was consumed by the
+    gate instead of the operation running."""
+    session = "restart-nb-sess"
+    notebook = {
+        "cells": [{
+            "cell_type": "code", "id": "c1", "metadata": {},
+            "source": "1 + 1", "outputs": [], "execution_count": None,
+        }],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+    }
+    (settings.get_project_path(project) / "analysis.ipynb").write_text(
+        json.dumps(notebook),
+    )
+    read_state_cache.clear(session)
+
+    rejected = await _notebook_run_cell(
+        notebook_path="analysis.ipynb", cell_id="c1",
+        project_id=project, session_id=session,
+    )
+    assert "has not been read" in rejected
+
+    restore_approved_read_state(
+        "notebook_run_cell",
+        {"notebook_path": "analysis.ipynb", "cell_id": "c1"},
+        project, session,
+    )
+    result = await _notebook_run_cell(
+        notebook_path="analysis.ipynb", cell_id="c1",
+        project_id=project, session_id=session,
+    )
+    assert "Jupyter server is not running" in result
+
+
+@pytest.mark.asyncio
+async def test_approved_restore_scopes_to_approved_target(project):
+    """Restoring one target must not un-gate the rest of the session: a new
+    write to a file the model never read is still rejected after the resume."""
+    session = "restore-scope-sess"
+    base = settings.get_project_path(project)
+    approved = base / "approved.md"
+    approved.write_text("a")
+    other = base / "other.md"
+    other.write_text("untouched\n")
+    read_state_cache.clear(session)
+
+    restore_approved_read_state(
+        "write", {"file_path": str(approved)}, project, session,
+    )
+    rejected = await _write_file(
+        project_id=project, session_id=session, file_path=str(other),
+        content="x",
+    )
+    assert "has not been read" in rejected
+    assert other.read_text() == "untouched\n"
 

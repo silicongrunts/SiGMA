@@ -4,6 +4,12 @@
  * Storage is intentionally split into one global object and one object per
  * project. Keep all browser storage reads and writes in this module so key
  * ownership, migration, quota handling, and cleanup stay reviewable.
+ *
+ * Project keys embed the backend project id (`sigma_project_<id>`), so they
+ * are deliberately NOT migrated when a project is imported into another
+ * instance: the import assigns a new id, cleanupProjects() drops the old
+ * keys, and machine-local state (budgets, editor cursor, layout) resets to
+ * defaults. This is accepted behavior, not a bug (issue #63 follow-up).
  */
 
 export const STORAGE_KEYS = {
@@ -509,6 +515,8 @@ export const storage = {
   },
 
   cleanupProjects(existingProjectIds) {
+    // Cross-instance imports give the project a new id; the keys of the old
+    // id no longer match any existing project and are dropped on purpose.
     const existing = new Set((existingProjectIds || []).filter(Boolean))
     for (const projectId of existing) migrateProject(projectId)
     removeKeysMatching((key) => {

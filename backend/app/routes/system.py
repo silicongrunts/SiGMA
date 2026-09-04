@@ -327,12 +327,10 @@ def _extract_context_length(info: dict[str, Any] | None) -> int | None:
 # Service restart
 # ---------------------------------------------------------------------------
 
-_SUPERVISORCTL = "/usr/bin/supervisorctl"
-
 
 @router.post("/restart")
 async def restart_services():
-    """Restart the web and worker supervisor programs.
+    """Restart the web supervisor program.
 
     Spawns a detached subprocess that sleeps briefly (so the HTTP response
     can flush out), then calls supervisorctl.  ``start_new_session=True``
@@ -341,7 +339,7 @@ async def restart_services():
     reparented to init, and completes the restart command.
     """
     subprocess.Popen(
-        ["/bin/sh", "-c", "sleep 2 && /usr/bin/supervisorctl restart web worker"],
+        ["/bin/sh", "-c", "sleep 2 && /usr/bin/supervisorctl restart web"],
         start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

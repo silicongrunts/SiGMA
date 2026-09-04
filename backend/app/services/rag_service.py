@@ -20,6 +20,7 @@ import json
 import os
 import math
 import re
+import shutil
 import threading
 from dataclasses import dataclass
 from collections import Counter, OrderedDict
@@ -32,7 +33,7 @@ from pydantic import PrivateAttr
 
 from app.core.atomic_file import atomic_write_text
 from app.core.config import settings
-from app.core.exceptions import RAGIndexModelMismatchError
+from app.core.exceptions import RAGIndexModelMismatchError, ServiceException
 from app.core.model_config import ModelEndpoint, get_model_endpoint
 
 from app.core.logging import get_logger
@@ -84,6 +85,9 @@ class SearchChunk:
     score: float
     chunk_text: str
     line_start: int = 0
+    revision: int | None = None
+    generation: int | None = None
+    generation: int | None = None
 
 
 class LiteLLMEmbeddingModel(BaseEmbedding):
@@ -214,9 +218,13 @@ class RAGService:
         self._initialized = False
         self._projects = {}           # project_id -> _ProjectState
         self._project_lru = OrderedDict()
-        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rag")
+        self._executor = ThreadPoolExecutor(
+            max_workers=settings.RAG_EXECUTOR_WORKERS, thread_name_prefix="rag",
+        )
         self._projects_lock = threading.Lock()
         self._init_lock = threading.Lock()
+        self._generation_lock = threading.Lock()
+        self._project_generations: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -332,67 +340,178 @@ class RAGService:
         )
 
     def _sync_reset_project(self, project_id: str):
-        import chromadb
         self._ensure_init()
-        chroma_dir = settings.get_sigma_path(project_id) / "chroma"
-        if not chroma_dir.exists():
+        with self._generation_lock:
+            generation = self._project_generations.get(project_id, 0) + 1
+            self._project_generations[project_id] = generation
+            # Keep the barrier held through the destructive operation. A new
+            # writer may otherwise observe the new barrier, release the lock,
+            # and add chunks immediately before the old collection is deleted.
+            chroma_dir = settings.get_sigma_path(project_id) / "chroma"
+            if not chroma_dir.exists():
+                self._write_index_metadata(project_id)
+                return
+            try:
+                client = self._open_chroma_store(project_id, chroma_dir)
+            except ServiceException:
+                # Reset is destructive by definition, so a damaged store is
+                # removed wholesale here — rebuilding recreates it fresh.
+                logger.warning(
+                    "RAG: index store for project %s is damaged; removing it so "
+                    "the rebuild recreates it fresh", project_id, exc_info=True,
+                )
+                shutil.rmtree(chroma_dir, ignore_errors=True)
+                self._drop_cached_chroma_system(chroma_dir)
+                self._write_index_metadata(project_id)
+                self._evict_project(project_id)
+                return
+            try:
+                client.delete_collection(name="library")
+                logger.info(f"RAG: deleted collection for project {project_id}")
+            except Exception:
+                logger.debug("RAG collection did not need deletion for project %s", project_id, exc_info=True)
             self._write_index_metadata(project_id)
-            return
-        client = chromadb.PersistentClient(path=str(chroma_dir))
+            # Evict from cache so next access creates fresh collection
+            self._evict_project(project_id)
+
+    @staticmethod
+    def _drop_cached_chroma_system(chroma_dir: Path) -> None:
+        """Drop chromadb's in-process cached system for this path.
+
+        chromadb caches one system per persist directory; a store that
+        failed to open leaves a broken entry there, which must go before
+        the recreated directory can be reopened in this process. The cache
+        key is the persist directory for persistent local clients; a no-op
+        pop keeps this safe across chroma versions.
+        """
         try:
-            client.delete_collection(name="library")
-            logger.info(f"RAG: deleted collection for project {project_id}")
+            from chromadb.api.shared_system_client import SharedSystemClient
+            SharedSystemClient._identifier_to_system.pop(str(chroma_dir), None)
+            SharedSystemClient._identifier_to_refcount.pop(str(chroma_dir), None)
         except Exception:
-            logger.debug("RAG collection did not need deletion for project %s", project_id, exc_info=True)
-        self._write_index_metadata(project_id)
-        # Evict from cache so next access creates fresh collection
-        self._evict_project(project_id)
+            logger.debug("Failed to drop cached chroma system", exc_info=True)
+
+    @staticmethod
+    def _open_chroma_store(project_id: str, chroma_dir: Path):
+        """Open the project's persistent Chroma store.
+
+        Raises a user-actionable ServiceException when the store cannot be
+        opened (e.g. a corrupt SQLite file) instead of an opaque driver
+        error; rebuilding the index removes and recreates the store.
+        """
+        import chromadb
+        try:
+            return chromadb.PersistentClient(path=str(chroma_dir))
+        except Exception as exc:
+            raise ServiceException(
+                "The RAG index store is damaged. Rebuild the index to "
+                "recreate it (this deletes the damaged store).",
+                code="RAG_INDEX_STORE_DAMAGED", status_code=500,
+            ) from exc
 
     # ------------------------------------------------------------------
     # Orphan cleanup
     # ------------------------------------------------------------------
 
-    async def cleanup_orphans(self, project_id: str, valid_doc_ids: set):
-        """Remove orphan chunks, or reset collection if library is empty."""
-        if not valid_doc_ids:
-            # Library is empty — delete collection via ChromaDB API (safe across processes).
-            # Cannot shutil.rmtree the chroma directory here: the Huey worker process
-            # may have an open SQLite handle, and removing the directory prevents
-            # WAL/journal file creation → "readonly database" errors.
-            await self.reset_project_index(project_id)
-        else:
-            await asyncio.get_event_loop().run_in_executor(
-                self._executor, self._sync_cleanup_orphans, project_id, valid_doc_ids
-            )
+    async def cleanup_orphans(self, project_id: str, valid_doc_ids_provider) -> set:
+        """Remove chunks whose document no longer exists.
 
-    def _sync_cleanup_orphans(self, project_id: str, valid_doc_ids: set):
-        """Scan all chunks and remove those whose doc_id is not in valid set."""
+        Runs in tight phases so the freshness window between seeing the
+        collection's chunks and deciding which are orphans is milliseconds:
+        the valid-id set is read from the database via
+        *valid_doc_ids_provider* only after the chunk scan returns. When
+        the library is empty the whole collection is reset instead.
+
+        Returns the doc_ids whose chunks were removed so the caller can
+        re-check them against the database and re-index any document that
+        was created concurrently and lost chunks to the cleanup.
+        """
+        chunk_doc_ids = await self.collection_doc_ids(project_id)
+        if not chunk_doc_ids:
+            return set()
+
+        valid_doc_ids = await valid_doc_ids_provider()
+
+        if not valid_doc_ids:
+            # Library is empty — delete collection via ChromaDB API.
+            # Cannot shutil.rmtree the chroma directory here: another handle
+            # may hold the SQLite file open, and removing the directory
+            # prevents WAL/journal file creation → "readonly database" errors.
+            await self.reset_project_index(project_id)
+            return chunk_doc_ids
+
+        orphan_doc_ids = chunk_doc_ids - valid_doc_ids
+        if not orphan_doc_ids:
+            return set()
+
+        await asyncio.get_event_loop().run_in_executor(
+            self._executor, self._sync_remove_orphan_chunks,
+            project_id, orphan_doc_ids, valid_doc_ids,
+        )
+        return orphan_doc_ids
+
+    def _sync_remove_orphan_chunks(self, project_id: str,
+                                   orphan_doc_ids: set, valid_doc_ids: set):
+        """Delete every chunk of *orphan_doc_ids* and drop stale BM25 nodes.
+
+        The orphan set was resolved against a fresh database read by the
+        caller; this phase only executes the deletion, so a document that
+        gained chunks between the two phases keeps them.
+        """
         self._ensure_init()
         state = self._get_project(project_id)
         collection = state.vector_store._collection
 
-        if collection.count() == 0:
-            return
+        if collection.count() > 0:
+            all_records = collection.get(include=["metadatas"])
+            orphan_ids = []
+            for rid, meta in zip(all_records["ids"], all_records["metadatas"]):
+                chunk_doc_id, _, _ = self._extract_chunk_identity(meta or {})
+                if chunk_doc_id and chunk_doc_id in orphan_doc_ids:
+                    orphan_ids.append(rid)
 
-        all_records = collection.get(include=["metadatas"])
-        orphan_ids = []
-        for rid, meta in zip(all_records["ids"], all_records["metadatas"]):
-            chunk_doc_id, _ = self._extract_chunk_identity(meta or {})
-            if chunk_doc_id and chunk_doc_id not in valid_doc_ids:
-                orphan_ids.append(rid)
+            if orphan_ids:
+                collection.delete(ids=orphan_ids)
+                logger.info(
+                    f"RAG cleanup: removed {len(orphan_ids)} orphan chunks in project {project_id}"
+                )
 
-        if orphan_ids:
-            collection.delete(ids=orphan_ids)
-            logger.info(
-                f"RAG cleanup: removed {len(orphan_ids)} orphan chunks in project {project_id}"
-            )
+        # Clean BM25 in-memory nodes with the same validity predicate
+        with state.all_nodes_lock:
+            state.all_nodes = [
+                n for n in state.all_nodes
+                if self._extract_chunk_identity(n.metadata)[0] in valid_doc_ids
+            ]
+            self._invalidate_bm25(state)
 
-        # Clean BM25 in-memory nodes
-        state.all_nodes = [
-            n for n in state.all_nodes
-            if self._extract_chunk_identity(n.metadata)[0] in valid_doc_ids
-        ]
-        self._invalidate_bm25(state)
+    async def collection_doc_ids(self, project_id: str) -> set:
+        """Distinct doc_ids present in the project's persisted collection.
+
+        Cheap on purpose (no LlamaIndex state, no model loading); a missing
+        collection yields an empty set.
+        """
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor, self._sync_collection_doc_ids, project_id,
+        )
+
+    def _sync_collection_doc_ids(self, project_id: str) -> set:
+        chroma_dir = settings.get_sigma_path(project_id) / "chroma"
+        if not chroma_dir.exists():
+            return set()
+        client = self._open_chroma_store(project_id, chroma_dir)
+        try:
+            collection = client.get_collection(name="library")
+        except Exception:
+            # Missing collection: no chunks. A damaged store raises through
+            # to the caller, which decides whether that is recoverable.
+            return set()
+        records = collection.get(include=["metadatas"])
+        doc_ids = set()
+        for meta in records["metadatas"]:
+            doc_id, _, _ = self._extract_chunk_identity(meta or {})
+            if doc_id:
+                doc_ids.add(doc_id)
+        return doc_ids
 
     def _ensure_init(self):
         if not self._initialized:
@@ -493,8 +612,9 @@ class RAGService:
             state = self._projects.pop(project_id, None)
             self._project_lru.pop(project_id, None)
         if state:
-            state.all_nodes = []
-            self._invalidate_bm25(state)
+            with state.all_nodes_lock:
+                state.all_nodes = []
+                self._invalidate_bm25(state)
         logger.info("RAG: evicted stale cache for project %s", project_id)
 
     def evict_project(self, project_id: str) -> None:
@@ -506,13 +626,19 @@ class RAGService:
     # ------------------------------------------------------------------
 
     class _ProjectState:
-        __slots__ = ("vector_store", "index", "all_nodes", "bm25_index")
+        __slots__ = ("vector_store", "index", "all_nodes", "bm25_index", "all_nodes_lock")
 
         def __init__(self, vector_store, index):
             self.vector_store = vector_store  # ChromaVectorStore
             self.index = index                # VectorStoreIndex
             self.all_nodes = []
             self.bm25_index = None
+            # Correctness lock (single process, multiple executor threads):
+            # every all_nodes mutation and BM25 rebuild holds it, so an
+            # indexing purge/extend cannot race a search rebuild into
+            # duplicated or dropped BM25 entries. The persisted ChromaDB
+            # index is untouched by this cache.
+            self.all_nodes_lock = threading.Lock()
 
     def _get_project(self, project_id: str) -> "_ProjectState":
         """Get or create project state via LlamaIndex abstractions. Thread-safe."""
@@ -524,13 +650,12 @@ class RAGService:
                 return self._projects[project_id]
 
         # --- Slow path: create state outside lock ---
-        import chromadb
         from llama_index.vector_stores.chroma import ChromaVectorStore
         from llama_index.core import VectorStoreIndex, StorageContext
 
         chroma_dir = settings.get_sigma_path(project_id) / "chroma"
         chroma_dir.mkdir(parents=True, exist_ok=True)
-        client = chromadb.PersistentClient(path=str(chroma_dir))
+        client = self._open_chroma_store(project_id, chroma_dir)
         collection = client.get_or_create_collection(
             name="library",
             metadata={
@@ -561,8 +686,9 @@ class RAGService:
                 oldest_id, _ = self._project_lru.popitem(last=False)
                 evicted = self._projects.pop(oldest_id, None)
                 if evicted:
-                    evicted.all_nodes = []
-                    self._invalidate_bm25(evicted)
+                    with evicted.all_nodes_lock:
+                        evicted.all_nodes = []
+                        self._invalidate_bm25(evicted)
                     logger.info("RAG: evicted project %s from cache", oldest_id)
             self._projects[project_id] = state
             self._project_lru[project_id] = True
@@ -574,13 +700,42 @@ class RAGService:
         """Get chunk count from the underlying ChromaDB collection."""
         return state.vector_store._collection.count()
 
+    async def collection_count(self, project_id: str) -> int:
+        """Return the number of chunks in the project's persisted collection.
+
+        Cheap on purpose (no LlamaIndex state, no model loading) so callers
+        such as the maintenance sweep can probe every project. A missing
+        collection counts as zero.
+        """
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor, self._sync_collection_count, project_id,
+        )
+
+    def _sync_collection_count(self, project_id: str) -> int:
+        chroma_dir = settings.get_sigma_path(project_id) / "chroma"
+        if not chroma_dir.exists():
+            return 0
+        client = self._open_chroma_store(project_id, chroma_dir)
+        # Local import keeps chromadb's startup cost out of module import.
+        from chromadb.errors import NotFoundError
+
+        try:
+            collection = client.get_collection(name="library")
+        except NotFoundError:
+            # Only a genuinely missing collection counts as zero. Normalizing
+            # a transient error (e.g. SQLite busy under concurrent access) to
+            # zero would trip the sweep's empty-collection self-heal and
+            # re-enqueue the whole library for re-embedding.
+            return 0
+        return collection.count()
+
     # ------------------------------------------------------------------
     # Internal: chunk metadata helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_chunk_identity(meta: dict) -> tuple[str | None, int | None]:
-        """Extract (doc_id, doc_revision) from a ChromaDB chunk metadata record.
+    def _extract_chunk_identity(meta: dict) -> tuple[str | None, int | None, int | None]:
+        """Extract (doc_id, doc_revision, index_generation) from metadata.
 
         LlamaIndex's ChromaVectorStore adapter (v0.5.x) serializes node
         metadata into the ``_node_content`` JSON column instead of top-level
@@ -592,6 +747,7 @@ class RAGService:
         """
         doc_id = meta.get("doc_id")
         revision = meta.get("doc_revision")
+        generation = meta.get("index_generation")
 
         if doc_id == "None":
             doc_id = None
@@ -601,35 +757,68 @@ class RAGService:
                 node = json.loads(meta.get("_node_content", "{}"))
                 node_meta = node.get("metadata", {})
                 doc_id = node_meta.get("doc_id")
-                if revision is None:
-                    revision = node_meta.get("doc_revision")
             except (json.JSONDecodeError, AttributeError):
-                pass
+                node_meta = {}
+        else:
+            try:
+                node_meta = json.loads(meta.get("_node_content", "{}")).get("metadata", {})
+            except (json.JSONDecodeError, AttributeError):
+                node_meta = {}
+        if revision is None:
+            revision = node_meta.get("doc_revision")
+        if generation is None:
+            generation = node_meta.get("index_generation")
 
         try:
             revision_int = int(revision) if revision is not None else None
         except (TypeError, ValueError):
             revision_int = None
-        return doc_id, revision_int
+        try:
+            generation_int = int(generation) if generation is not None else None
+        except (TypeError, ValueError):
+            generation_int = None
+        if doc_id and revision_int is not None and generation_int is None:
+            # Chunks written before publication generations were persisted are
+            # the generation-zero index. Keep them visible after migration and
+            # make exact cleanup able to address them.
+            generation_int = 0
+        return doc_id, revision_int, generation_int
 
     # ------------------------------------------------------------------
     # Internal: purge all ChromaDB chunks for a doc_id
     # ------------------------------------------------------------------
 
-    def _purge_doc_chunks(self, state, doc_id, max_revision: int | None = None):
-        """Remove chunks belonging to doc_id.
+    def _purge_doc_chunks(
+        self, state, doc_id: str, revision: int | None = None,
+        generation: int | None = None, *, raise_on_error: bool = False,
+    ) -> bool:
+        """Remove only one exact document index generation.
 
-        When ``max_revision`` is provided, only chunks whose revision is
-        missing or ``<= max_revision`` are removed. This prevents a stale
-        indexing task from deleting chunks produced by a newer task for
-        the same document.
+        The operation is intentionally exact. A caller that wants to remove
+        all generations must enumerate them and call this method per exact
+        identity; no range predicate may delete a newer task's chunks.
+        """
+        if revision is None or generation is None:
+            raise ValueError("exact revision and generation are required")
+        with self._generation_lock:
+            return self._purge_doc_chunks_locked(
+                state, doc_id, revision, generation,
+                raise_on_error=raise_on_error,
+            )
 
-        Failures are logged but do not raise: purge is best-effort, and the
-        subsequent indexing pass will write fresh chunks regardless. The
-        worst-case residue is a few orphan chunks, which the periodic
-        ``cleanup_orphans`` sweep will reclaim.
+    def _purge_doc_chunks_locked(
+        self, state, doc_id: str, revision: int, generation: int,
+        *, raise_on_error: bool = False,
+    ) -> bool:
+        """Exact purge; caller holds ``generation_lock``.
+
+        The lock order is global: ``generation_lock`` then
+        ``state.all_nodes_lock``. Chroma and BM25 are updated before this
+        method returns, so retry/cancel/publish cleanup cannot leave a stale
+        BM25 generation behind.
         """
         collection = state.vector_store._collection
+        removed = False
 
         try:
             # Single scan: top-level metadata, "None" sentinel, and embedded
@@ -637,45 +826,31 @@ class RAGService:
             all_records = collection.get(include=["metadatas"])
             to_delete = []
             for rid, meta in zip(all_records["ids"], all_records["metadatas"]):
-                chunk_doc_id, chunk_rev = self._extract_chunk_identity(meta or {})
-                if chunk_doc_id != doc_id:
-                    continue
-                if max_revision is not None and chunk_rev is not None and chunk_rev > max_revision:
+                chunk_doc_id, chunk_rev, chunk_generation = self._extract_chunk_identity(meta or {})
+                if (chunk_doc_id, chunk_rev, chunk_generation) != (doc_id, revision, generation):
                     continue
                 to_delete.append(rid)
 
             if to_delete:
                 collection.delete(ids=to_delete)
-                if max_revision is not None:
-                    logger.info(
-                        "RAG purge: removed %d chunks for doc %s up to revision %s",
-                        len(to_delete), doc_id, max_revision,
-                    )
-                else:
-                    logger.info(
-                        "RAG purge: removed %d chunks for doc %s",
-                        len(to_delete), doc_id,
-                    )
+                removed = True
+                logger.info("RAG purge: removed %d chunks for %s revision=%s generation=%s", len(to_delete), doc_id, revision, generation)
         except Exception as e:
             logger.warning(
                 "RAG purge: scan/delete failed for doc %s: %s",
                 doc_id, e, exc_info=True,
             )
+            if raise_on_error:
+                raise
 
         # Clean in-memory BM25 nodes with the same predicate
         def _node_matches(n) -> bool:
-            node_doc_id, node_revision = self._extract_chunk_identity(n.metadata)
-            if node_doc_id != doc_id:
-                return False
-            if max_revision is None:
-                return True
-            try:
-                return node_revision is None or node_revision <= max_revision
-            except (TypeError, ValueError):
-                return True
+            return self._extract_chunk_identity(n.metadata) == (doc_id, revision, generation)
 
-        state.all_nodes = [n for n in state.all_nodes if not _node_matches(n)]
-        self._invalidate_bm25(state)
+        with state.all_nodes_lock:
+            state.all_nodes = [n for n in state.all_nodes if not _node_matches(n)]
+            self._invalidate_bm25(state)
+        return removed
 
     # ------------------------------------------------------------------
     # Index
@@ -689,9 +864,9 @@ class RAGService:
 
     def _sync_index(self, project_id, doc_id, content, title, description,
                     progress_callback: Optional[Callable[[], None]] = None,
-                    cancel_event: Optional[asyncio.Event] = None,
                     should_continue: Optional[Callable[[], bool]] = None,
                     doc_revision: int | None = None,
+                    index_generation: int | None = None,
                     _stale_cache_retried: bool = False):
         """Index a document using manual split -> batch embed -> batch store pipeline.
 
@@ -701,12 +876,20 @@ class RAGService:
             progress_callback: Optional callable invoked between embedding batches.
                 Used to heartbeat the owning background task.
             should_continue: Optional callable checked before destructive writes.
+                May raise — a raised check failure aborts the pipeline as an
+                error so the caller can retry, never as a fake success.
             doc_revision: Document revision represented by the chunks being written.
             _stale_cache_retried: Internal flag to prevent double retry on stale cache.
         """
         from llama_index.core import Document
+        from app.core.project_registry import is_project_active
+
+        if not is_project_active(project_id):
+            raise RuntimeError(f"Project {project_id} is not accepting RAG writes")
 
         self._ensure_init()
+        if doc_revision is None or index_generation is None:
+            raise ValueError("doc_revision and index_generation are required for RAG writes")
 
         try:
             state = self._get_project(project_id)
@@ -721,12 +904,11 @@ class RAGService:
             return
 
         try:
+            with self._generation_lock:
+                write_generation = self._project_generations.get(project_id, 0)
             if should_continue and not should_continue():
                 logger.info("Indexing skipped for stale/cancelled document %s", doc_id)
                 return
-
-            # Purge old chunks for this document
-            self._purge_doc_chunks(state, doc_id, max_revision=doc_revision)
 
             # ── 1. Split (single pass, shared by vector store + BM25) ────
             doc_metadata = {"doc_id": doc_id}
@@ -744,15 +926,16 @@ class RAGService:
             for n in nodes:
                 n.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
                 n.metadata["doc_id"] = doc_id
-                if doc_revision is not None:
-                    n.metadata["doc_revision"] = doc_revision
+                n.metadata["doc_revision"] = doc_revision
+                n.metadata["index_generation"] = index_generation
                 n.metadata["line_start"] = _line_number_for_chunk(full_text, n.get_content())
+            for chunk_number, node in enumerate(nodes):
+                node.id_ = hashlib.sha256(
+                    f"{doc_id}:{doc_revision}:{index_generation}:{chunk_number}:{node.get_content()}".encode()
+                ).hexdigest()
 
             # ── 3. Batch embed + progress updates ───────────────────────
             for i in range(0, len(nodes), EMBED_BATCH_SIZE):
-                if cancel_event and cancel_event.is_set():
-                    logger.info("Indexing cancelled for %s, aborting mid-batch", doc_id)
-                    return
                 if should_continue and not should_continue():
                     logger.info("Indexing stopped for stale/cancelled document %s", doc_id)
                     return
@@ -773,14 +956,26 @@ class RAGService:
             if should_continue and not should_continue():
                 logger.info("Indexing skipped before storing stale document %s", doc_id)
                 return
-            state.vector_store.add(nodes)
-
-            # ── 5. Update BM25 in-memory nodes (reuse same split) ────────
-            state.all_nodes = [n for n in state.all_nodes if n.metadata.get("doc_id") != doc_id]
-            state.all_nodes.extend(nodes)
-            self._invalidate_bm25(state)
+            if not is_project_active(project_id):
+                raise RuntimeError(
+                    f"Project {project_id} became inactive before RAG storage",
+                )
+            with self._generation_lock:
+                if write_generation != self._project_generations.get(project_id, 0):
+                    logger.info("Index generation changed; dropping stale write for %s", doc_id)
+                    return
+                self._purge_doc_chunks_locked(
+                    state, doc_id, revision=doc_revision, generation=index_generation,
+                    raise_on_error=True,
+                )
+                state.vector_store._collection.delete(ids=[node.node_id for node in nodes])
+                state.vector_store.add(nodes)
+                with state.all_nodes_lock:
+                    state.all_nodes.extend(nodes)
+                    self._invalidate_bm25(state)
 
             logger.info("Indexed %s: %d chunks", doc_id, len(nodes))
+            return True
 
         except Exception as e:
             if self._is_stale_collection_error(e) and not _stale_cache_retried:
@@ -794,9 +989,9 @@ class RAGService:
                 self._sync_index(
                     project_id, doc_id, content, title, description,
                     progress_callback=progress_callback,
-                    cancel_event=cancel_event,
                     should_continue=should_continue,
                     doc_revision=doc_revision,
+                    index_generation=index_generation,
                     _stale_cache_retried=True,
                 )
                 return
@@ -805,29 +1000,107 @@ class RAGService:
 
     async def index_document(self, project_id, doc_id, content, title="", description="",
                              progress_callback: Optional[Callable[[], None]] = None,
-                             cancel_event: Optional[asyncio.Event] = None,
                              should_continue: Optional[Callable[[], bool]] = None,
-                             doc_revision: int | None = None):
+                             doc_revision: int | None = None,
+                             index_generation: int | None = None):
+        from app.core.project_registry import is_project_active
+
+        if not is_project_active(project_id):
+            raise RuntimeError(f"Project {project_id} is not accepting RAG writes")
         if not content.strip() and not title.strip():
             return
-        await asyncio.get_event_loop().run_in_executor(
+        return await asyncio.get_event_loop().run_in_executor(
             self._executor, self._sync_index,
             project_id, doc_id, content, title, description,
-            progress_callback, cancel_event, should_continue, doc_revision,
+            progress_callback, should_continue, doc_revision, index_generation,
         )
 
     # ------------------------------------------------------------------
     # Remove
     # ------------------------------------------------------------------
 
-    def _sync_remove(self, project_id, doc_id):
+    def _sync_remove(self, project_id, doc_id, doc_revision: int | None = None,
+                     index_generation: int | None = None):
         self._ensure_init()
         state = self._get_project(project_id)
-        self._purge_doc_chunks(state, doc_id)
+        with self._generation_lock:
+            self._project_generations[project_id] = self._project_generations.get(project_id, 0) + 1
+            if doc_revision is None or index_generation is None:
+                records = state.vector_store._collection.get(include=["metadatas"])
+                identities = {
+                    (revision, generation)
+                    for meta in records["metadatas"]
+                    for chunk_doc_id, revision, generation in [self._extract_chunk_identity(meta or {})]
+                    if chunk_doc_id == doc_id and revision is not None and generation is not None
+                }
+            else:
+                identities = {(doc_revision, index_generation)}
+            for revision, generation in identities:
+                self._purge_doc_chunks_locked(state, doc_id, revision, generation)
 
-    async def remove_document(self, project_id, doc_id):
+    async def remove_document(self, project_id, doc_id, doc_revision: int | None = None,
+                              index_generation: int | None = None):
         await asyncio.get_event_loop().run_in_executor(
-            self._executor, self._sync_remove, project_id, doc_id
+            self._executor, self._sync_remove, project_id, doc_id,
+            doc_revision, index_generation,
+        )
+
+    def _sync_cleanup_generation(self, project_id, doc_id, doc_revision, index_generation):
+        state = self._get_project(project_id)
+        self._purge_doc_chunks(state, doc_id, doc_revision, index_generation)
+
+    async def cleanup_generation(self, project_id, doc_id, doc_revision, index_generation):
+        await asyncio.get_event_loop().run_in_executor(
+            self._executor, self._sync_cleanup_generation, project_id, doc_id,
+            doc_revision, index_generation,
+        )
+
+    def _sync_cleanup_stale_generations(self, project_id, retained: dict[str, set[tuple[int, int]]]):
+        """Remove non-published exact generations without touching active writes.
+
+        ``retained`` is a database snapshot: it contains the published tuple
+        and, for active documents, the currently-running tuple. Every other
+        tuple is an orphan from a failed cleanup or interrupted attempt.
+        Missing metadata is intentionally removed; the caller re-enqueues the
+        surviving document so legacy chunks cannot remain falsely visible.
+        """
+        state = self._get_project(project_id)
+        removed_doc_ids = set()
+        with self._generation_lock:
+            records = state.vector_store._collection.get(include=["metadatas"])
+            ids_by_doc = {}
+            for record_id, meta in zip(records["ids"], records["metadatas"]):
+                doc_id, revision, generation = self._extract_chunk_identity(meta or {})
+                if not doc_id:
+                    continue
+                identity = (revision, generation)
+                if identity not in retained.get(doc_id, set()):
+                    ids_by_doc.setdefault(doc_id, []).append(record_id)
+            for doc_id, record_ids in ids_by_doc.items():
+                state.vector_store._collection.delete(ids=record_ids)
+                removed_doc_ids.add(doc_id)
+
+            if removed_doc_ids:
+                with state.all_nodes_lock:
+                    kept_nodes = []
+                    for node in state.all_nodes:
+                        node_doc_id, node_revision, node_generation = (
+                            self._extract_chunk_identity(node.metadata)
+                        )
+                        if (
+                            node_doc_id not in removed_doc_ids
+                            or (node_revision, node_generation) in retained.get(
+                                node_doc_id, set()
+                            )
+                        ):
+                            kept_nodes.append(node)
+                    state.all_nodes = kept_nodes
+                    self._invalidate_bm25(state)
+        return removed_doc_ids
+
+    async def cleanup_stale_generations(self, project_id, retained):
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor, self._sync_cleanup_stale_generations, project_id, retained,
         )
 
     # ------------------------------------------------------------------
@@ -880,46 +1153,57 @@ class RAGService:
 
     @staticmethod
     def _invalidate_bm25(state) -> None:
+        """Drop the cached BM25 index after an all_nodes change.
+
+        Caller must hold ``state.all_nodes_lock`` — the cache is only ever
+        read/rebuilt under the same lock.
+        """
         if hasattr(state, "bm25_index"):
             state.bm25_index = None
 
     def _ensure_bm25_index(self, state) -> dict:
-        if getattr(state, "bm25_index", None) is not None:
+        # The whole check/rebuild/publish runs under the lock so the entries
+        # are a consistent snapshot of all_nodes and a concurrent indexing
+        # write cannot publish a stale index over a newer invalidation.
+        with state.all_nodes_lock:
+            if getattr(state, "bm25_index", None) is not None:
+                return state.bm25_index
+
+            if not state.all_nodes:
+                from llama_index.core.schema import TextNode
+
+                collection = state.vector_store._collection
+                records = collection.get(include=["documents", "metadatas"])
+                nodes = []
+                for i, node_id in enumerate(records["ids"]):
+                    doc = (records["documents"] or [])[i] or ""
+                    meta = dict((records["metadatas"] or [])[i] or {})
+                    doc_id, revision, generation = self._extract_chunk_identity(meta)
+                    if doc_id:
+                        meta["doc_id"] = doc_id
+                    if revision is not None:
+                        meta["doc_revision"] = revision
+                    if generation is not None:
+                        meta["index_generation"] = generation
+                    nodes.append(TextNode(id_=node_id, text=doc, metadata=meta))
+                state.all_nodes = nodes
+
+            entries = []
+            for node in state.all_nodes:
+                doc_id, _, _ = self._extract_chunk_identity(node.metadata)
+                if not doc_id:
+                    continue
+                tokens = self._tokenize_for_bm25(node.get_content())
+                if tokens:
+                    entries.append({
+                        "node": node,
+                        "doc_id": doc_id,
+                        "tokens": tokens,
+                        "term_counts": Counter(tokens),
+                    })
+
+            state.bm25_index = {"entries": entries}
             return state.bm25_index
-
-        if not state.all_nodes:
-            from llama_index.core.schema import TextNode
-
-            collection = state.vector_store._collection
-            records = collection.get(include=["documents", "metadatas"])
-            nodes = []
-            for i, node_id in enumerate(records["ids"]):
-                doc = (records["documents"] or [])[i] or ""
-                meta = dict((records["metadatas"] or [])[i] or {})
-                doc_id, revision = self._extract_chunk_identity(meta)
-                if doc_id:
-                    meta["doc_id"] = doc_id
-                if revision is not None:
-                    meta["doc_revision"] = revision
-                nodes.append(TextNode(id_=node_id, text=doc, metadata=meta))
-            state.all_nodes = nodes
-
-        entries = []
-        for node in state.all_nodes:
-            doc_id, _ = self._extract_chunk_identity(node.metadata)
-            if not doc_id:
-                continue
-            tokens = self._tokenize_for_bm25(node.get_content())
-            if tokens:
-                entries.append({
-                    "node": node,
-                    "doc_id": doc_id,
-                    "tokens": tokens,
-                    "term_counts": Counter(tokens),
-                })
-
-        state.bm25_index = {"entries": entries}
-        return state.bm25_index
 
     def _bm25_search(self, state, query: str, fetch_k: int,
                      allowed_doc_ids=None) -> list[SearchChunk]:
@@ -963,6 +1247,8 @@ class RAGService:
                     score=float(score),
                     chunk_text=node.get_content(),
                     line_start=int(node.metadata.get("line_start") or 0),
+                    revision=self._extract_chunk_identity(node.metadata)[1],
+                    generation=self._extract_chunk_identity(node.metadata)[2],
                 ))
 
         scored.sort(key=lambda chunk: chunk.score, reverse=True)
@@ -988,6 +1274,8 @@ class RAGService:
                         score=0.0,
                         chunk_text=chunk.chunk_text,
                         line_start=chunk.line_start,
+                        revision=chunk.revision,
+                        generation=chunk.generation,
                     )
                     scores[key] = 0.0
                 scores[key] += 1.0 / (rank_constant + rank)
@@ -999,7 +1287,8 @@ class RAGService:
         ranked.sort(key=lambda chunk: chunk.score, reverse=True)
         return ranked[:fetch_k]
 
-    def _sync_search(self, project_id, query, top_k, allowed_doc_ids=None) -> List[SearchChunk]:
+    def _sync_search(self, project_id, query, top_k, allowed_doc_ids=None,
+                     visible_revisions=None) -> List[SearchChunk]:
         from llama_index.core import QueryBundle
 
         state = self._get_project(project_id)
@@ -1029,6 +1318,8 @@ class RAGService:
                     score=1.0 - distances[i],  # cosine distance → similarity
                     chunk_text=documents[i],
                     line_start=int(metadatas[i].get("line_start") or 0),
+                    revision=self._extract_chunk_identity(metadatas[i])[1],
+                    generation=self._extract_chunk_identity(metadatas[i])[2],
                 ))
         else:
             # Standard LlamaIndex retriever path
@@ -1045,6 +1336,8 @@ class RAGService:
                         score=float(n.score),
                         chunk_text=n.node.text,
                         line_start=int(n.node.metadata.get("line_start") or 0),
+                        revision=self._extract_chunk_identity(n.node.metadata)[1],
+                        generation=self._extract_chunk_identity(n.node.metadata)[2],
                     ))
 
         try:
@@ -1052,6 +1345,16 @@ class RAGService:
         except Exception as e:
             logger.warning("BM25 search failed, using vector results only: %s", e, exc_info=True)
             bm25_results = []
+
+        if visible_revisions is not None:
+            vector_results = [
+                chunk for chunk in vector_results
+                if visible_revisions.get(chunk.doc_id) == (chunk.revision, chunk.generation)
+            ]
+            bm25_results = [
+                chunk for chunk in bm25_results
+                if visible_revisions.get(chunk.doc_id) == (chunk.revision, chunk.generation)
+            ]
 
         results = self._rrf_merge(vector_results, bm25_results, fetch_k)
 
@@ -1085,8 +1388,19 @@ class RAGService:
 
     async def search(self, project_id, query, top_k=None, allowed_doc_ids=None) -> List[SearchChunk]:
         top_k = top_k or settings.RAG_TOP_K
+        from app.database.unit_of_work import UnitOfWork
+        async with UnitOfWork(project_id) as uow:
+            docs = await uow.library.get_all()
+        visible_revisions = {
+            doc.id: (doc.indexed_revision, doc.indexed_generation) for doc in docs
+            if not doc.is_folder
+            and doc.processing_status == "completed"
+            and doc.indexed_revision == doc.revision
+            and doc.indexed_generation is not None
+        }
         return await asyncio.get_event_loop().run_in_executor(
-            self._executor, self._sync_search, project_id, query, top_k, allowed_doc_ids
+            self._executor, self._sync_search, project_id, query, top_k,
+            allowed_doc_ids, visible_revisions,
         )
 
 

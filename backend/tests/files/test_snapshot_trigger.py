@@ -2,12 +2,14 @@
 
 Absolute-path writes that land inside the project sandbox must trigger
 auto-snapshot (mirroring relative-path writes). Writes outside the sandbox
-must not.
+must not. The project-lifecycle write gate is patched open by the shared
+conftest fixture — the snapshot decision, not lifecycle gating, is what
+these tests exercise.
 """
 
 import pytest
 
-from app.services.file_service import file_service, PathAccessLevel
+from app.services.file_service import file_service
 
 
 @pytest.mark.asyncio
@@ -20,10 +22,12 @@ async def test_write_absolute_inside_sandbox_triggers_snapshot(tmp_path, monkeyp
         triggered.append(project_id)
 
     monkeypatch.setattr(file_service, "_after_file_mutation", fake_notify)
-    monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    monkeypatch.setattr(file_service, "get_project_path", lambda pid: sandbox)
 
-    # classify_path will resolve to SANDBOX for any path under tmp_path
-    target = tmp_path / "subdir" / "written.txt"
+    # classify_path will resolve to SANDBOX for any path under the sandbox
+    target = sandbox / "subdir" / "written.txt"
     await file_service.write_file_absolute("proj", str(target), "content")
 
     assert triggered == ["proj"]
@@ -38,26 +42,20 @@ async def test_write_absolute_outside_sandbox_skips_snapshot(tmp_path, monkeypat
         triggered.append(project_id)
 
     monkeypatch.setattr(file_service, "_after_file_mutation", fake_notify)
-    monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    monkeypatch.setattr(file_service, "get_project_path", lambda pid: sandbox)
 
-    # Path outside the project sandbox
-    outside = tmp_path.parent / "outside_sigmma_test_file.txt"
-    try:
-        await file_service.write_file_absolute("proj", str(outside), "content")
-        assert triggered == []  # no snapshot triggered
-    finally:
-        if outside.exists():
-            outside.unlink()
+    # A sibling of the sandbox — outside the project root yet fully inside
+    # tmp_path, so the test writes nothing outside pytest-owned directories.
+    outside = tmp_path / "outside_sigmma_test_file.txt"
+    await file_service.write_file_absolute("proj", str(outside), "content")
 
-
-@pytest.mark.asyncio
-async def test_classify_path_returns_sandbox_for_inner_path(tmp_path, monkeypatch):
-    """Sanity check for the path classifier used in snapshot decision."""
-    monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
-    level = file_service.classify_path("proj", str(tmp_path / "deep" / "file.txt"))
-    assert level is PathAccessLevel.SANDBOX
+    assert triggered == []  # no snapshot triggered
+    assert outside.read_text() == "content"
 
 
-# Note: classify_path's EXTERNAL/TMP branches are exercised by other tests
-# in the suite (permission_executor tests); we only need to verify SANDBOX
-# detection here since that's the trigger condition.
+# Note: classify_path's branches are exercised by other tests in the suite
+# (permission_executor tests); the two tests above pin the snapshot trigger
+# condition (SANDBOX vs. non-SANDBOX writes) behaviorally, so no separate
+# classifier sanity check is needed here.

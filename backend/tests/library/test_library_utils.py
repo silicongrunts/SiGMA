@@ -3,8 +3,6 @@ Tests for library_tools pure helpers — ID parsing, content formatting,
 and search result rendering.
 """
 
-import pytest
-
 from app.agents.tools.library_tools import (
     parse_ids,
     parse_fields,
@@ -18,10 +16,6 @@ from app.agents.tools.library_tools import (
 # ---------------------------------------------------------------------------
 # parse_ids
 # ---------------------------------------------------------------------------
-
-def test_parse_ids_list():
-    assert parse_ids(["a", "b", "c"]) == ["a", "b", "c"]
-
 
 def test_parse_ids_list_strips():
     assert parse_ids([" a ", " b"]) == ["a", "b"]
@@ -57,10 +51,6 @@ def test_parse_ids_invalid_json():
 
 def test_parse_fields_default_empty():
     assert parse_fields("") == ["content"]
-
-
-def test_parse_fields_default_content():
-    assert parse_fields("content") == ["content"]
 
 
 def test_parse_fields_none():

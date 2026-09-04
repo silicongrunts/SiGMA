@@ -5,7 +5,9 @@ from app.services.ai_service import ai_service
 from app.services.chat_attachments import save_chat_image
 from app.services.project_service import project_service
 from app.models.requests import StreamChatRequest, UpdateSessionRequest, EditChatMessageRequest, SkillLoadRequest, ForkSessionRequest
+from app.core.chat_attachments import MAX_CHAT_IMAGE_BYTES
 from app.core.response import ok
+from app.core.uploads import read_upload_bounded
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -14,7 +16,6 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 async def stream_chat(project_id: str, data: StreamChatRequest):
     """Send a message and receive SSE streamed response."""
     context = {
-        "file": data.file,
         "user_state": data.user_state,
         "attachments": data.attachments,
         "token_budget": data.token_budget,
@@ -22,7 +23,10 @@ async def stream_chat(project_id: str, data: StreamChatRequest):
     result = await ai_service.submit_chat(
         project_id, data.message, context,
         session_id=data.session_id, resume=data.resume,
-        interaction_response=data.interaction_response,
+        interaction_response=(
+            data.interaction_response.model_dump(exclude_none=True)
+            if data.interaction_response else None
+        ),
     )
     return StreamingResponse(
         ai_service.sse_listen(result["task_id"], project_id=project_id),
@@ -31,10 +35,23 @@ async def stream_chat(project_id: str, data: StreamChatRequest):
 
 
 @router.get("/stream/{task_id}")
-async def resume_stream(task_id: str):
-    """Reconnect to the SSE stream of an existing background task."""
+async def resume_stream(
+    task_id: str,
+    cursor: int | None = Query(None),
+    project_id: str = Query(...),
+):
+    """Reconnect to the SSE stream of an existing background task.
+
+    ``cursor`` is the highest event id (the ``id:`` line of a chunk) the
+    client has already received: only buffered events after it are
+    replayed, so a reconnecting client neither re-applies delivered chunks
+    nor misses the ones pushed while it was offline. Omit it for
+    a fresh subscriber (page reload) that needs the full buffer. The task's
+    ``project_id`` scopes the finished-task lookup so a task id alone never
+    probes other projects.
+    """
     return StreamingResponse(
-        ai_service.sse_listen(task_id),
+        ai_service.sse_listen(task_id, cursor=cursor, project_id=project_id),
         media_type="text/event-stream",
     )
 
@@ -71,7 +88,7 @@ async def get_chat_history(
     limit: int = Query(10, ge=1, le=200),
     before_seq: int | None = Query(None, ge=0),
 ):
-    """Get chat history for a session. Falls back to default session for backward compat."""
+    """Get chat history for a session. Falls back to the most recent session when session_id is omitted."""
     data = await ai_service.get_history(
         project_id, session_id=session_id,
         limit=limit, before_seq=before_seq,
@@ -117,7 +134,14 @@ async def upload_chat_attachment(
     session_id: str = Query(...),
     file: UploadFile = File(...),
 ):
-    content = await file.read()
+    # Stream in bounded chunks so an oversized "image" is rejected with the
+    # same 413 save_chat_image raises, before it is buffered in memory.
+    content = await read_upload_bounded(
+        file,
+        MAX_CHAT_IMAGE_BYTES,
+        message="Image is too large",
+        code="INVALID_REQUEST",
+    )
     attachment = await save_chat_image(
         project_id=project_id,
         session_id=session_id,

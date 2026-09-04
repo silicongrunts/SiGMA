@@ -5,11 +5,12 @@ IDs to metadata entries.  Several lower layers need to consult a project's
 status without depending on ``services.project_service``:
 
 * ``database.manager`` gates per-project DB initialization on status.
-* ``workers.huey_tasks`` skips queued work whose project is no longer active.
+* cross-project sweeps (startup migration, task reconciliation, library
+  maintenance) enumerate eligible projects.
 
 Routing those reads through ``project_service`` would create a
-``database -> services`` (and ``workers -> services``) edge that violates
-the layer model.  Keeping the read here preserves a clean DAG.
+``database -> services`` edge that violates the layer model.  Keeping the
+read here preserves a clean DAG.
 
 Write access, status transitions, and corrupt-file recovery remain in
 ``services.project_service``; this module is intentionally read-only and
@@ -21,7 +22,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from app.core.atomic_file import ProjectFileLock, safe_read_json
 from app.core.config import settings
@@ -32,12 +33,12 @@ logger = get_logger(__name__)
 PROJECT_STATUS_ACTIVE = "active"
 
 # In-process cache for the project registry. ``_read_registry`` is on the hot
-# path of ``is_project_active`` / ``get_project_status`` (worker heartbeat,
-# DB init, library scan). ``ProjectFileLock`` uses a blocking
-# ``fcntl.flock(LOCK_EX)``; when the web and worker processes contend on it,
-# the synchronous syscall freezes the async event loop and stalls every HTTP
-# request. Caching keyed on the file's mtime lets the common case (registry
-# unchanged) return instantly without touching the lock. Writes go through
+# path of ``is_project_active`` / ``get_project_status`` (DB init, library
+# scan). ``ProjectFileLock`` uses a blocking
+# ``fcntl.flock(LOCK_EX)``; acquiring it on the event loop can stall every
+# HTTP request while the lock is held. Caching keyed on the file's mtime
+# lets the common case (registry unchanged) return instantly without
+# touching the lock. Writes go through
 # ``project_service._update_projects`` which uses ``os.replace`` — that always
 # bumps the mtime, so the cache invalidates automatically on the next read.
 #
@@ -58,7 +59,7 @@ def _read_registry() -> dict:
     """Best-effort read of the project registry.
 
     Returns an empty dict when the file is missing or unparsable.  Lower
-    layers (DB init, worker gating) treat an unreadable registry as
+    layers (DB init, library scan) treat an unreadable registry as
     "no projects eligible" rather than crashing; the service layer owns
     any backup-and-rebuild recovery policy.
     """
@@ -110,3 +111,24 @@ def is_project_active(project_id: str) -> bool:
     if get_project_status(project_id) != PROJECT_STATUS_ACTIVE:
         return False
     return (settings.USERDATA_DIR / project_id).is_dir()
+
+
+def iter_project_ids() -> Iterator[str]:
+    """Yield active project IDs that own a project database.
+
+    Scans ``USERDATA_DIR`` (skipping the metadata directory), keeps only
+    projects whose registry status is active, and requires an existing
+    ``.SiGMA/project_data.db``. Every cross-project sweep — startup
+    migration, task reconciliation, library maintenance — enumerates
+    through this function so the eligibility rules stay in one place.
+    """
+    if not settings.USERDATA_DIR.exists():
+        return
+    for project_dir in sorted(settings.USERDATA_DIR.iterdir()):
+        if not project_dir.is_dir() or project_dir.name == ".SiGMA":
+            continue
+        if not is_project_active(project_dir.name):
+            continue
+        if not (project_dir / ".SiGMA" / "project_data.db").exists():
+            continue
+        yield project_dir.name

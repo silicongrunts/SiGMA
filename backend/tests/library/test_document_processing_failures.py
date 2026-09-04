@@ -6,9 +6,8 @@ and index permanent error failure.
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 
-from app.core.document_status import STATUS_FAILED, STATUS_INDEXING
 from app.core.exceptions import (
     DocumentConversionError, AIExtractionError,
 )
@@ -76,21 +75,18 @@ def dps(mock_library_service):
         mock_bg.enqueue_rag_index = AsyncMock()
         mock_bg.enqueue_document_process = AsyncMock()
         from app.services.document_processing_service import DocumentProcessingService
-        svc = DocumentProcessingService()
-        svc._running = True
-        yield svc
-        svc._executor.shutdown(wait=False)
+        yield DocumentProcessingService()
 
 
 # ---------------------------------------------------------------------------
-# Docling conversion failure → propagates to durable task runner
+# Docling empty output → fatal, propagates to durable task runner
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_docling_conversion_failure_propagates_to_task_runner(dps, mock_library_service):
-    """Docling fatal errors bubble up so the task runner owns retries."""
+async def test_docling_empty_output_is_fatal(dps, mock_library_service):
+    """An empty Docling result is treated as a fatal conversion failure and
+    bubbles up so the task runner owns retries."""
     import tempfile, os
-    from pathlib import Path
 
     # Create a temp PDF file (non-text)
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
@@ -155,6 +151,28 @@ async def test_empty_document_graceful_handling(dps, mock_library_service):
 
 
 # ---------------------------------------------------------------------------
+# Lease loss → the conversion/processing path observes the stop signal
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_should_stop_when_task_loses_lease_ownership():
+    """A task whose heartbeat reports lost ownership must stop the handler
+    through the same signal as a user cancel (the duplicate run is
+    revision-guarded; stopping early just avoids wasted work)."""
+    from app.services.document_processing_service import DocumentProcessingService
+
+    class LostLeaseContext:
+        async def is_cancelling(self):
+            return False
+
+        async def heartbeat(self):
+            return False
+
+    svc = DocumentProcessingService()
+    assert await svc._should_stop("proj1", "doc1", task_context=LostLeaseContext()) is True
+
+
+# ---------------------------------------------------------------------------
 # Timeout → propagates to durable task runner
 # ---------------------------------------------------------------------------
 
@@ -186,3 +204,73 @@ async def test_unexpected_error_propagates_to_task_runner(dps, mock_library_serv
                 await dps._process_document_in_background("proj1", "doc1")
 
     mock_library_service.mark_document_failed.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Background AI extraction is bounded by the AI metadata timeout
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cancellable_llm_call_bounds_hung_call_with_metadata_timeout(
+    dps, monkeypatch,
+):
+    """The background path gets the same outer time bound the sync route
+    enforces: a hung LLM call surfaces as asyncio.TimeoutError once the AI
+    metadata budget expires, and the inner call is cancelled (it cannot
+    chain the LLM stack's internal retries into unbounded work)."""
+    import asyncio
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings.library, "ai_metadata_timeout_seconds", 0.05)
+
+    state = {"cancelled": False}
+
+    async def hung_call():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+        return {}
+
+    with pytest.raises(asyncio.TimeoutError):
+        await dps._cancellable_llm_call("proj1", "doc1", hung_call())
+
+    await asyncio.sleep(0)  # let the inner cancellation finish propagating
+    assert state["cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_cancellable_llm_call_cancels_task_when_stop_check_raises(
+    dps, monkeypatch,
+):
+    """A non-cancellation failure from a stop check must still cancel the
+    in-flight LLM task and propagate the exception so the durable task runner
+    owns the retry — the call result must not be lost on an orphaned task."""
+    import asyncio
+
+    import app.services.document_processing_service as dps_module
+
+    monkeypatch.setattr(dps_module, "_STOP_CHECK_INTERVAL_SECONDS", 0.0)
+
+    state = {"cancelled": False}
+
+    async def slow_call():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+        return {}
+
+    async def failing_should_stop(*args, **kwargs):
+        raise RuntimeError("stop check failed")
+
+    monkeypatch.setattr(dps, "_should_stop", failing_should_stop)
+
+    with pytest.raises(RuntimeError, match="stop check failed"):
+        await dps._cancellable_llm_call("proj1", "doc1", slow_call())
+
+    await asyncio.sleep(0)  # let the inner cancellation finish propagating
+    assert state["cancelled"]

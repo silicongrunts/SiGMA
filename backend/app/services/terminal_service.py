@@ -33,6 +33,7 @@ from enum import Enum, auto
 from typing import Any
 
 from app.core.config import settings
+from app.core.project_registry import is_project_active
 from app.core.logging import get_logger
 from app.core.utils import generate_id
 
@@ -286,6 +287,8 @@ class TerminalService:
         a mismatch means the session was taken over and the handler
         must not touch it.
         """
+        if not is_project_active(project_id):
+            raise FileNotFoundError(f"Project is inactive: {project_id}")
         async with self._lock:
             existing = self._find_by_slot(project_id, slot)
 
@@ -431,6 +434,17 @@ class TerminalService:
         """Terminate a PTY session and release all resources."""
         async with self._lock:
             await self._kill_session_unlocked(session_id)
+
+    async def kill_project_sessions(self, project_id: str) -> None:
+        """Terminate every PTY session belonging to a project."""
+        async with self._lock:
+            session_ids = [
+                session_id
+                for session_id, session in self._sessions.items()
+                if session.project_id == project_id
+            ]
+            for session_id in session_ids:
+                await self._kill_session_unlocked(session_id)
 
     async def _kill_session_unlocked(self, session_id: str) -> None:
         """Terminate a session without acquiring ``self._lock``.

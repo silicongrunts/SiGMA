@@ -40,7 +40,9 @@ def test_tex_service_uses_year_specific_repositories(tmp_path, monkeypatch):
 
 def test_install_year_repository_uses_historic_archive_for_past_years():
     service = TeXService()
-    past_year = str(tex_module.utcnow().year - 1)
+    # year - 1 is still "live" (rolling tlnet) until the freeze window, so use
+    # year - 2, which _is_live_year always maps to the historic archive.
+    past_year = str(tex_module.utcnow().year - 2)
 
     url = service._install_year_repository_url("official", year=past_year)
 
@@ -84,6 +86,11 @@ async def test_switch_year_installs_base_packages_for_new_year(tmp_path, monkeyp
     service = TeXService()
     commands = []
 
+    # Pin HOME so the expected TEXMFHOME interpolation is deterministic and
+    # independent of the machine running the tests (the profile heredoc is
+    # quoted, so the script must embed the expanded path, never "~").
+    monkeypatch.setenv("HOME", str(tmp_path))
+
     async def fake_run_process(args, success_data=None, exit_codes=None):
         commands.append(args)
         if exit_codes is not None:
@@ -97,7 +104,7 @@ async def test_switch_year_installs_base_packages_for_new_year(tmp_path, monkeyp
     script = commands[0][2]
     assert "tlmgr install" in script
     assert "TEXMFHOME ~/texmf" not in script
-    assert f"TEXMFHOME {Path.home()}/texmf" in script
+    assert f"TEXMFHOME {tmp_path}/texmf" in script
     for package in tex_module.TEX_BASE_PACKAGES:
         assert package in script
     assert any("TeX Live 2026 installed and activated" in event for event in events)

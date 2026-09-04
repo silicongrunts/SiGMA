@@ -1,5 +1,5 @@
-"""Line-diff shaping shared by the permission layer, file conflict checks,
-and chat-timeline file-edit cards.
+"""Line-diff shaping and permission-payload caps shared by the permission
+layer, file conflict checks, and chat-timeline file-edit cards.
 
 Pure difflib helpers with no service or DB dependencies, so services and
 ``core.message_format`` share one implementation and one soft limit.
@@ -12,6 +12,14 @@ import difflib
 # Soft cap for diff payloads surfaced in UI modals (permission dialogs,
 # file-edit timeline cards). Diffs beyond this are truncated, not refused.
 DIFF_LINE_SOFT_LIMIT = 5000
+
+# Soft cap (characters) for the flat preview content of a permission pause
+# (write bodies, commands, notebook cell source). The pause payload lands in
+# the stream buffer, every subscriber queue, and the persisted interaction
+# checkpoint, so one huge write approval must not park a multi-megabyte
+# frame in all of them. Content beyond this is truncated, not refused;
+# ``content_truncated`` on the pause marks the cap.
+CONTENT_SOFT_LIMIT = 20_000
 
 
 def compute_diff_lines(old_text: str, new_text: str) -> list:

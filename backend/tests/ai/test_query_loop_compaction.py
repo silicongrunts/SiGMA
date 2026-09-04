@@ -1,8 +1,11 @@
+"""Passive compaction inside QueryLoop emits the compact_done summary."""
+
 import pytest
 
 from app.services.compaction_service import CompactionResult
 from app.services.compaction_service import ContextStats
 from app.services.query_loop import QueryLoop
+from tests.ai.conftest import make_fake_uow
 
 
 @pytest.mark.asyncio
@@ -36,12 +39,11 @@ async def test_compaction_done_event_carries_summary(monkeypatch):
 
     monkeypatch.setattr(query_loop_module.compaction_service, "compact_messages", _fake_compact)
 
-    class _FakeUnitOfWork:
-        @staticmethod
-        async def execute_atomic(project_id, operation):
-            return None
-
-    monkeypatch.setattr(query_loop_module, "UnitOfWork", _FakeUnitOfWork)
+    # The boundary write must never run in this test: the atomic operation is
+    # skipped entirely (run_atomic_operation=False), like the real cancelled path.
+    monkeypatch.setattr(
+        query_loop_module, "UnitOfWork", make_fake_uow(run_atomic_operation=False),
+    )
 
     loop = QueryLoop(project_id="project-a", session_id="session-1")
     prepared, events = await loop._prepare_messages([

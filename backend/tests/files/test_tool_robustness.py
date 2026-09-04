@@ -1,70 +1,51 @@
 """Robustness contracts for the file/search tools.
 
-- Search error classification: bad regex/path/resource errors must surface as
+Organized by theme:
+
+- A. Search error classification — bad regex/path/resource errors surface as
   errors, never as a silent "No matches".
-- EAGAIN retry in single-threaded mode.
-- CR stripping and --max-columns in grep output.
-- Streaming range reads: files over the whole-read cap stay windowed-readable,
-  with a bounded scan and degraded totals.
-- Edit robustness: CRLF/UTF-16/BOM round-trips, read-window region gate,
+- B. Grep engine details — EAGAIN retry in single-threaded mode, CR
+  stripping, --max-columns long-line omission.
+- C. Streaming range reads — files over the whole-read cap stay windowed
+  readable, with a bounded scan and degraded totals.
+- D. Edit robustness — CRLF/UTF-16/BOM round-trips, read-window region gate,
   notebook guard.
-- Image downscaling when Pillow is available.
-- Task cancellation reaches in-flight tools and kills their subprocesses.
+
+(In-flight tool cancellation contracts live in tests/ai/
+test_execute_tool_cancellable.py and tests/agents/tools/
+test_bash_cancellation.py.)
+
+The whole-read cap (``file_tools.MAX_TOOL_READ_BYTES``) and the range-scan
+budget are monkeypatched down per test: the contracts are about behaviour at
+the size boundary, not about the 10 MiB constant, so tests stay cheap.
 """
 
-import asyncio
 import base64
 import io
-import time
 import os
-from types import SimpleNamespace
 
 import pytest
 
 from app.agents.tools import file_tools
 from app.agents.tools.file_tools import (
     _edit_file, _edit_preflight, _glob_search, _grep_search,
-    _read_file, _read_image, _run_bounded_search, _SearchRun,
+    _read_file, _read_image, _SearchRun,
 )
-from app.agents.tools.read_state import read_state_cache
 from app.services import file_service as file_service_module
-from app.services.file_service import MAX_TOOL_READ_BYTES, file_service
-
-
-@pytest.fixture(autouse=True)
-def _clear_read_state():
-    read_state_cache.clear("sess")
-    yield
-    read_state_cache.clear("sess")
-
-
-def _patch_file_service(monkeypatch, tmp_path):
-    monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
-
-
-def _big_text_file(tmp_path, lines=300_000, width=32):
-    """A real >10 MB text file (>MAX_TOOL_READ_BYTES) for range reads."""
-    path = tmp_path / "big.log"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(f"line-{i:07d} {'x' * width}" for i in range(lines)))
-    assert path.stat().st_size > MAX_TOOL_READ_BYTES
-    return path
 
 
 # ── A: search failures are errors, not false "no matches" ────────────
 
 @pytest.mark.asyncio
-async def test_glob_nonexistent_directory_is_an_error(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
+async def test_glob_nonexistent_directory_is_an_error(sandbox):
     result = await _glob_search("proj", "*.py", "no_such_dir")
     assert result.startswith("Error:")
     assert "does not exist" in result
 
 
 @pytest.mark.asyncio
-async def test_glob_invalid_pattern_is_an_error(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("a")
+async def test_glob_invalid_pattern_is_an_error(sandbox):
+    (sandbox / "a.txt").write_text("a")
     result = await _glob_search("proj", "[a", ".")
     assert result.startswith("Error:")
     assert "glob search failed" in result
@@ -72,17 +53,15 @@ async def test_glob_invalid_pattern_is_an_error(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_grep_nonexistent_path_is_an_error(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
+async def test_grep_nonexistent_path_is_an_error(sandbox):
     result = await _grep_search("proj", "hello", "missing_dir")
     assert result.startswith("Error:")
     assert "does not exist" in result
 
 
 @pytest.mark.asyncio
-async def test_grep_invalid_regex_is_an_error(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("hello")
+async def test_grep_invalid_regex_is_an_error(sandbox):
+    (sandbox / "a.txt").write_text("hello")
     result = await _grep_search("proj", "[", ".")
     assert result.startswith("grep error")
     assert "unclosed character class" in result
@@ -90,9 +69,8 @@ async def test_grep_invalid_regex_is_an_error(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_grep_invalid_regex_via_fallback_is_an_error(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("hello")
+async def test_grep_invalid_regex_via_fallback_is_an_error(sandbox, monkeypatch):
+    (sandbox / "a.txt").write_text("hello")
 
     async def _rg_missing(cmd, *, cwd, timeout):
         raise FileNotFoundError("rg")
@@ -105,19 +83,17 @@ async def test_grep_invalid_regex_via_fallback_is_an_error(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_grep_valid_no_match_still_says_no_matches(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("hello")
+async def test_grep_valid_no_match_still_says_no_matches(sandbox):
+    (sandbox / "a.txt").write_text("hello")
     result = await _grep_search("proj", "zzzz", ".")
     assert result == "No matches for 'zzzz'"
 
 
-# ── E: EAGAIN retry, env timeout, CR strip, --max-columns ────────────
+# ── B: grep engine details ───────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_grep_eagain_retries_single_threaded(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "a.txt").write_text("needle")
+async def test_grep_eagain_retries_single_threaded(sandbox, monkeypatch):
+    (sandbox / "a.txt").write_text("needle")
 
     calls = []
 
@@ -137,9 +113,8 @@ async def test_grep_eagain_retries_single_threaded(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_grep_strips_trailing_cr(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "crlf.txt").write_bytes(b"needle here\r\nplain\n")
+async def test_grep_strips_trailing_cr(sandbox):
+    (sandbox / "crlf.txt").write_bytes(b"needle here\r\nplain\n")
     result = await _grep_search(
         "proj", "needle", ".", output_mode="content")
     assert "\r" not in result
@@ -147,24 +122,35 @@ async def test_grep_strips_trailing_cr(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_grep_omits_long_lines(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "min.txt").write_text("short\n" + "y" * 2000 + "\n")
+async def test_grep_omits_long_lines(sandbox):
+    (sandbox / "min.txt").write_text("short\n" + "y" * 2000 + "\n")
     result = await _grep_search(
         "proj", "y", ".", glob_filter="min.txt", output_mode="content")
     assert "[Omitted long matching line]" in result
-    assert "short" not in result or "yy" not in result
+    # The long line's payload never leaks, and the non-matching short
+    # line is not echoed either — only the omission marker survives.
+    assert "short" not in result
+    assert "yyyy" not in result
 
 
-# ── B: streaming range reads of large files ──────────────────────────
+# ── C: streaming range reads of files over the whole-read cap ────────
+
+def _big_text_file(tmp_path, lines=1000, width=32):
+    """A text file sized past the (patched) whole-read cap for range reads."""
+    path = tmp_path / "big.log"
+    path.write_text(
+        "\n".join(f"line-{i:07d} {'x' * width}" for i in range(lines)))
+    return path
+
 
 @pytest.mark.asyncio
 async def test_read_big_file_degraded_footer_when_scan_budget_hit(
-        tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    big = _big_text_file(tmp_path)
+        sandbox, monkeypatch):
+    monkeypatch.setattr(file_tools, "MAX_TOOL_READ_BYTES", 16 * 1024)
     monkeypatch.setattr(file_service_module, "_RANGE_SCAN_MAX_BYTES",
-                        2 * 1024 * 1024)
+                        16 * 1024)
+    big = _big_text_file(sandbox)
+    assert big.stat().st_size > 16 * 1024
 
     result = await _read_file("proj", "sess", str(big))
     assert not result.startswith("Error")
@@ -174,24 +160,28 @@ async def test_read_big_file_degraded_footer_when_scan_budget_hit(
 
 @pytest.mark.asyncio
 async def test_read_big_file_offset_beyond_scan_budget_errors(
-        tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    big = _big_text_file(tmp_path)
-    monkeypatch.setattr(file_service_module, "_RANGE_SCAN_MAX_BYTES",
-                        1024 * 1024)
+        sandbox, monkeypatch):
+    monkeypatch.setattr(file_tools, "MAX_TOOL_READ_BYTES", 16 * 1024)
+    # Small chunks keep the scan incremental so the budget can run out
+    # before the requested window is reached.
+    monkeypatch.setattr(file_service_module, "_RANGE_CHUNK_BYTES", 4 * 1024)
+    monkeypatch.setattr(file_service_module, "_RANGE_SCAN_MAX_BYTES", 8 * 1024)
+    big = _big_text_file(sandbox)
+    assert big.stat().st_size > 8 * 1024
 
-    result = await _read_file("proj", "sess", str(big), offset=290_000)
+    result = await _read_file("proj", "sess", str(big), offset=900)
     assert result.startswith("Error:")
     assert "scan budget" in result
 
 
 @pytest.mark.asyncio
 async def test_read_big_file_tail_beyond_scan_budget_errors(
-        tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    big = _big_text_file(tmp_path)
-    monkeypatch.setattr(file_service_module, "_RANGE_SCAN_MAX_BYTES",
-                        1024 * 1024)
+        sandbox, monkeypatch):
+    monkeypatch.setattr(file_tools, "MAX_TOOL_READ_BYTES", 16 * 1024)
+    monkeypatch.setattr(file_service_module, "_RANGE_CHUNK_BYTES", 4 * 1024)
+    monkeypatch.setattr(file_service_module, "_RANGE_SCAN_MAX_BYTES", 8 * 1024)
+    big = _big_text_file(sandbox)
+    assert big.stat().st_size > 8 * 1024
 
     result = await _read_file("proj", "sess", str(big), limit=-5)
     assert result.startswith("Error:")
@@ -199,9 +189,8 @@ async def test_read_big_file_tail_beyond_scan_budget_errors(
 
 
 @pytest.mark.asyncio
-async def test_read_directory_returns_friendly_error(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "dir").mkdir()
+async def test_read_directory_returns_friendly_error(sandbox):
+    (sandbox / "dir").mkdir()
     result = await _read_file("proj", "sess", "dir")
     assert result.startswith("Error:")
     assert "Not a regular file" in result
@@ -210,10 +199,8 @@ async def test_read_directory_returns_friendly_error(tmp_path, monkeypatch):
 # ── D: edit line-ending/encoding round-trips + region gate ───────────
 
 @pytest.mark.asyncio
-async def test_edit_crlf_file_matches_and_preserves_endings(
-        tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "win.txt"
+async def test_edit_crlf_file_matches_and_preserves_endings(sandbox):
+    target = sandbox / "win.txt"
     target.write_bytes(b"alpha\r\nbeta\r\ngamma\r\n")
 
     await _read_file("proj", "sess", "win.txt")
@@ -224,9 +211,8 @@ async def test_edit_crlf_file_matches_and_preserves_endings(
 
 
 @pytest.mark.asyncio
-async def test_edit_utf16_file_round_trip(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "u16.txt"
+async def test_edit_utf16_file_round_trip(sandbox):
+    target = sandbox / "u16.txt"
     target.write_bytes("héllo wörld\n".encode("utf-16"))  # BOM + LE
 
     read_result = await _read_file("proj", "sess", "u16.txt")
@@ -240,12 +226,10 @@ async def test_edit_utf16_file_round_trip(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_edit_utf16be_file_round_trip_preserves_byte_order(
-        tmp_path, monkeypatch):
+async def test_edit_utf16be_file_round_trip_preserves_byte_order(sandbox):
     """A big-endian UTF-16 file must round-trip as big-endian; writing back
     with the native-order "utf-16" codec would flip the whole file."""
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "u16be.txt"
+    target = sandbox / "u16be.txt"
     target.write_bytes(b"\xfe\xff" + "héllo wörld\n".encode("utf-16-be"))
 
     await _read_file("proj", "sess", "u16be.txt")
@@ -258,13 +242,11 @@ async def test_edit_utf16be_file_round_trip_preserves_byte_order(
 
 
 @pytest.mark.asyncio
-async def test_edit_utf16_crlf_file_round_trip_preserves_endings(
-        tmp_path, monkeypatch):
+async def test_edit_utf16_crlf_file_round_trip_preserves_endings(sandbox):
     """The CRLF heuristic runs on decoded text, so BOM'd UTF-16 CRLF files
     keep their line endings through an edit (UTF-16's raw bytes never
     contain "\r\n" as a contiguous pair)."""
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "u16crlf.txt"
+    target = sandbox / "u16crlf.txt"
     target.write_bytes("alpha\r\nbeta\r\n".encode("utf-16"))  # BOM + LE
 
     await _read_file("proj", "sess", "u16crlf.txt")
@@ -275,9 +257,8 @@ async def test_edit_utf16_crlf_file_round_trip_preserves_endings(
 
 
 @pytest.mark.asyncio
-async def test_edit_utf8_bom_preserved(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "bom.txt"
+async def test_edit_utf8_bom_preserved(sandbox):
+    target = sandbox / "bom.txt"
     target.write_bytes(b"\xef\xbb\xbfhello\n")
 
     await _read_file("proj", "sess", "bom.txt")
@@ -287,9 +268,8 @@ async def test_edit_utf8_bom_preserved(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_edit_region_gate_blocks_unread_region(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "long.txt"
+async def test_edit_region_gate_blocks_unread_region(sandbox):
+    target = sandbox / "long.txt"
     target.write_text("\n".join(f"line {i}" for i in range(500)))
 
     await _read_file("proj", "sess", "long.txt", offset=0, limit=10)
@@ -301,9 +281,8 @@ async def test_edit_region_gate_blocks_unread_region(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_edit_region_gate_allows_window_edit(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "long.txt"
+async def test_edit_region_gate_allows_window_edit(sandbox):
+    target = sandbox / "long.txt"
     target.write_text(
         "\n".join(f"line {i} unique-{i:04d}" for i in range(500)))
 
@@ -314,9 +293,8 @@ async def test_edit_region_gate_allows_window_edit(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_edit_replace_all_requires_full_read(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "dup.txt"
+async def test_edit_replace_all_requires_full_read(sandbox):
+    target = sandbox / "dup.txt"
     target.write_text(
         "\n".join("token" if i in (10, 400) else f"line {i}"
                   for i in range(500)))
@@ -334,12 +312,10 @@ async def test_edit_replace_all_requires_full_read(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_edit_replace_all_full_read_with_trailing_newline(
-        tmp_path, monkeypatch):
+async def test_edit_replace_all_full_read_with_trailing_newline(sandbox):
     """The window totals drop the phantom trailing line, so a complete read
     of a trailing-newline file still satisfies the replace_all gate."""
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "dup.txt"
+    target = sandbox / "dup.txt"
     target.write_text("x token\ny token\n")
 
     await _read_file("proj", "sess", "dup.txt")
@@ -350,11 +326,10 @@ async def test_edit_replace_all_full_read_with_trailing_newline(
 
 
 @pytest.mark.asyncio
-async def test_edit_region_gate_accumulates_windows(tmp_path, monkeypatch):
+async def test_edit_region_gate_accumulates_windows(sandbox):
     """Coverage is the union of windows read: after several windowed reads,
     every read region is editable — not just the most recent window."""
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "long.txt"
+    target = sandbox / "long.txt"
     target.write_text("\n".join(f"line {i} unique-{i:04d}" for i in range(500)))
 
     await _read_file("proj", "sess", "long.txt", offset=0, limit=10)
@@ -375,12 +350,10 @@ async def test_edit_region_gate_accumulates_windows(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_edit_replace_all_allows_contiguous_full_coverage(
-        tmp_path, monkeypatch):
+async def test_edit_replace_all_allows_contiguous_full_coverage(sandbox):
     """Contiguous windowed reads that together span the whole file satisfy
     the replace_all whole-file requirement; a coverage gap does not."""
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "dup.txt"
+    target = sandbox / "dup.txt"
     target.write_text("\n".join(
         "token" if i in (10, 400) else f"line {i}" for i in range(500)))
 
@@ -400,12 +373,11 @@ async def test_edit_replace_all_allows_contiguous_full_coverage(
 
 
 @pytest.mark.asyncio
-async def test_edit_region_gate_resets_on_disk_change(tmp_path, monkeypatch):
+async def test_edit_region_gate_resets_on_disk_change(sandbox):
     """Coverage belongs to one file state: an external change discards old
     windows, so a fresh windowed read does not unlock earlier lines seen
     only before the change."""
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "long.txt"
+    target = sandbox / "long.txt"
     target.write_text("\n".join(f"line {i} unique-{i:04d}" for i in range(500)))
     await _read_file("proj", "sess", "long.txt", offset=0, limit=10)
 
@@ -430,9 +402,8 @@ async def test_edit_region_gate_resets_on_disk_change(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_edit_and_preflight_refuse_notebooks(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "nb.ipynb"
+async def test_edit_and_preflight_refuse_notebooks(sandbox):
+    target = sandbox / "nb.ipynb"
     target.write_text('{"cells": [], "metadata": {}}')
 
     result = await _edit_file("proj", "sess", "nb.ipynb", "a", "b")
@@ -445,12 +416,11 @@ async def test_edit_and_preflight_refuse_notebooks(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_edit_rejects_empty_old_string(tmp_path, monkeypatch):
+async def test_edit_rejects_empty_old_string(sandbox):
     """Empty old_string (e.g. to fill an empty file) is rejected with a
     pointer to the write tool — an empty read window can never cover an
     edit, so the region gate would otherwise emit a dead-end error."""
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "empty.txt"
+    target = sandbox / "empty.txt"
     target.write_text("")
 
     result = await _edit_file("proj", "sess", str(target), "", "hello")
@@ -462,7 +432,7 @@ async def test_edit_rejects_empty_old_string(tmp_path, monkeypatch):
     assert pre is not None and "non-empty" in pre
 
 
-# ── F: image downscaling ─────────────────────────────────────────────
+# ── E: image downscaling ─────────────────────────────────────────────
 
 def _png_bytes_pil(w, h):
     from PIL import Image
@@ -472,11 +442,10 @@ def _png_bytes_pil(w, h):
 
 
 @pytest.mark.asyncio
-async def test_read_image_downscales_oversize_dimensions(tmp_path, monkeypatch):
+async def test_read_image_downscales_oversize_dimensions(sandbox):
     pytest.importorskip("PIL")
     from PIL import Image
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "wide.png"
+    target = sandbox / "wide.png"
     target.write_bytes(_png_bytes_pil(4000, 3000))
 
     result = await _read_image("proj", "sess", str(target), ".png")
@@ -488,160 +457,12 @@ async def test_read_image_downscales_oversize_dimensions(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_read_image_without_pil_rejects_oversize(tmp_path, monkeypatch):
+async def test_read_image_without_pil_rejects_oversize(sandbox, monkeypatch):
     pytest.importorskip("PIL")  # build the image, then hide PIL
-    _patch_file_service(monkeypatch, tmp_path)
-    target = tmp_path / "wide.png"
+    target = sandbox / "wide.png"
     target.write_bytes(_png_bytes_pil(4000, 3000))
 
     monkeypatch.setattr(file_tools, "_PIL_AVAILABLE", False)
     result = await _read_image("proj", "sess", str(target), ".png")
     assert isinstance(result, str)
     assert "exceeds" in result
-
-
-# ── C: cancellation reaches in-flight tools ──────────────────────────
-
-class _RunnerHarness:
-    """LLMLoopRunner without running its __init__ (heavy dependencies)."""
-
-    @classmethod
-    def make(cls):
-        from app.services.llm_loop_runner import LLMLoopRunner
-        return LLMLoopRunner.__new__(LLMLoopRunner)
-
-
-@pytest.mark.asyncio
-async def test_execute_tool_cancellable_cancels_slow_tool():
-    runner = _RunnerHarness.make()
-    ctx = SimpleNamespace(cancel_event=asyncio.Event())
-
-    async def set_cancel_later():
-        await asyncio.sleep(0.1)
-        ctx.cancel_event.set()
-
-    setter = asyncio.create_task(set_cancel_later())
-    start = time.monotonic()
-    result = await runner._execute_tool_cancellable(
-        ctx, asyncio.sleep(30))
-    elapsed = time.monotonic() - start
-    assert result == "Tool cancelled by user."
-    assert elapsed < 5.0
-    assert setter.done()
-
-
-@pytest.mark.asyncio
-async def test_execute_tool_cancellable_propagates_exceptions():
-    runner = _RunnerHarness.make()
-    ctx = SimpleNamespace(cancel_event=asyncio.Event())
-
-    async def boom():
-        raise RuntimeError("boom")
-
-    with pytest.raises(RuntimeError, match="boom"):
-        await runner._execute_tool_cancellable(ctx, boom())
-
-
-@pytest.mark.asyncio
-async def test_execute_tool_cancellable_outer_cancel_cleans_up_tool():
-    """Cancelling the runner task itself (worker shutdown) must not orphan
-    the in-flight tool — its CancelledError handler is what kills the
-    tool's subprocesses."""
-    runner = _RunnerHarness.make()
-    ctx = SimpleNamespace(cancel_event=asyncio.Event())
-    tool_cancelled = asyncio.Event()
-    tool_started = asyncio.Event()
-
-    async def slow_tool():
-        tool_started.set()
-        try:
-            await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            tool_cancelled.set()
-            raise
-
-    task = asyncio.create_task(
-        runner._execute_tool_cancellable(ctx, slow_tool()))
-    await tool_started.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert tool_cancelled.is_set()
-
-
-@pytest.mark.asyncio
-async def test_execute_tool_cancellable_without_event_awaits_normally():
-    runner = _RunnerHarness.make()
-    ctx = SimpleNamespace(cancel_event=None)
-    result = await runner._execute_tool_cancellable(ctx, _return("ok"))
-    assert result == "ok"
-
-
-async def _return(value):
-    await asyncio.sleep(0)
-    return value
-
-
-def _procs_containing(marker: str) -> list:
-    """PIDs whose cmdline contains *marker* (avoids pgrep's self-match)."""
-    hits = []
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit():
-            continue
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                cmdline = f.read().replace(b"\0", b" ").decode(
-                    "utf-8", errors="replace")
-        except OSError:
-            continue
-        if marker in cmdline:
-            hits.append((pid, cmdline))
-    return hits
-
-
-def _pgid_of(pid: str) -> int:
-    """Process group id from /proc/<pid>/stat (field 5)."""
-    with open(f"/proc/{pid}/stat") as f:
-        # comm may contain spaces/parens — parse after the last ')'.
-        return int(f.read().rsplit(")", 1)[1].split()[2])
-
-
-def _pids_in_pgid(pgid: int) -> list:
-    hits = []
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit():
-            continue
-        try:
-            if _pgid_of(pid) == pgid:
-                hits.append(pid)
-        except (OSError, ValueError, IndexError):
-            continue
-    return hits
-
-
-@pytest.mark.asyncio
-async def test_bash_cancellation_kills_subprocess(tmp_path, monkeypatch):
-    from app.agents.tools import bash as bash_module
-    from app.agents.tools.bash import _run_bash
-    monkeypatch.setattr(
-        bash_module, "settings",
-        SimpleNamespace(get_project_path=lambda pid: tmp_path))
-
-    marker = "sigma_cancel_probe_9d41"
-    task = asyncio.create_task(
-        _run_bash("proj", f"sleep 300; echo {marker}", timeout=600))
-    await asyncio.sleep(0.5)
-    # The shell (and its sleep child) must be running before cancellation.
-    shells = _procs_containing(marker)
-    assert shells, "command did not start"
-    pgid = _pgid_of(shells[0][0])
-    assert len(_pids_in_pgid(pgid)) >= 2, "child process not in group"
-
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    # The whole process group must be dead — killing only the coroutine (or
-    # only the shell) would orphan the sleep child.
-    await asyncio.sleep(0.3)
-    assert not _pids_in_pgid(pgid), \
-        "bash process group survived task cancellation"

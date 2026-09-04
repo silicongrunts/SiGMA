@@ -6,9 +6,9 @@
  * - Approve / Revise (with feedback) / Cancel buttons
  * - Submits response via streamInteractionRequest
  */
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { X } from 'lucide-react'
+import { AlertTriangle, X } from 'lucide-react'
 import { MarkdownContent } from './ChatShared'
 import { useStore } from '../store/useStore'
 
@@ -17,66 +17,79 @@ export default function PlanApprovalDialog() {
   const clearPendingInteraction = useStore(s => s.clearPendingInteraction)
   const interactionDismissed = useStore(s => s.interactionDismissed)
   const setInteractionDismissed = useStore(s => s.setInteractionDismissed)
+  const currentProject = useStore(s => s.currentProject)
 
   if (!pendingInteraction || pendingInteraction.type !== 'submit_plan_for_approval' || interactionDismissed) return null
+  if (pendingInteraction.projectId && pendingInteraction.projectId !== currentProject?.id) return null
 
   const { data, sessionId } = pendingInteraction
+  const projectId = pendingInteraction.projectId || currentProject?.id
   const taskId = data?.task_id
+  const interactionId = data?.interaction_id
+  const interactionType = data?.interaction_type
   const planContent = data?.plan_content || ''
 
   return (
+    // task_id is unique per parked interaction — the stable identity that
+    // forces a remount (fresh respond guard) when a new plan arrives.
     <PlanDialog
+      key={`${taskId}:${interactionId}`}
       planContent={planContent}
       sessionId={sessionId}
+      projectId={projectId}
       taskId={taskId}
+      interactionId={interactionId}
+      interactionType={interactionType}
       onClose={() => setInteractionDismissed(true)}
       onResolved={clearPendingInteraction}
     />
   )
 }
 
-function PlanDialog({ planContent, sessionId, taskId, onClose, onResolved }) {
+function PlanDialog({ planContent, sessionId, projectId, taskId, interactionId, interactionType, onClose, onResolved }) {
   const { t } = useTranslation()
   const [feedback, setFeedback] = useState('')
   const [showFeedback, setShowFeedback] = useState(false)
-  const [submitting, setSubmitting] = useState(false)
+  // Same guard as the permission dialog: a missing session is an error the
+  // user can fix (the dialog stays open), not a consumed response.
+  const [submitError, setSubmitError] = useState('')
+  // The handoff is fire-and-forget and the dialog unmounts as soon as the
+  // store consumes the request — a second click in the same frame must not
+  // enqueue a second response.
+  const respondedRef = useRef(false)
 
-  const handleApprove = async () => {
-    setSubmitting(true)
-    try {
-      useStore.getState().setStreamInteractionRequest({
-        message: '',
-        resume: true,
-        session_id: sessionId,
-        task_id: taskId,
-        interaction_response: { approved: true },
-      })
-      onResolved()
-    } catch (e) {
-      console.error('Failed to approve:', e)
-      setSubmitting(false)
+  const respond = approved => {
+    if (respondedRef.current) return
+    setSubmitError('')
+    if (!sessionId) {
+      setSubmitError(t('permission.respondFailed'))
+      return
     }
+    respondedRef.current = true
+    useStore.getState().setStreamInteractionRequest({
+      message: '',
+      resume: true,
+      projectId,
+      session_id: sessionId,
+      task_id: taskId,
+      interaction_response: {
+        task_id: taskId,
+        interaction_id: interactionId,
+        interaction_type: interactionType || 'submit_plan_for_approval',
+        ...(approved ? { approved: true } : { approved: false, feedback }),
+      },
+    })
+    onResolved()
   }
 
-  const handleRevise = async () => {
+  const handleApprove = () => respond(true)
+
+  const handleRevise = () => {
     if (!showFeedback) {
       setShowFeedback(true)
       return
     }
-    setSubmitting(true)
-    try {
-      useStore.getState().setStreamInteractionRequest({
-        message: '',
-        resume: true,
-        session_id: sessionId,
-        task_id: taskId,
-        interaction_response: { approved: false, feedback },
-      })
-      onResolved()
-    } catch (e) {
-      console.error('Failed to reject:', e)
-      setSubmitting(false)
-    }
+    respond(false)
   }
 
   return (
@@ -112,6 +125,14 @@ function PlanDialog({ planContent, sessionId, taskId, onClose, onResolved }) {
           </div>
         )}
 
+        {/* Submit error */}
+        {submitError && (
+          <div className="mb-6 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/50 text-red-600 dark:text-red-300 text-xs flex items-center gap-2">
+            <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+            <span className="break-words min-w-0">{submitError}</span>
+          </div>
+        )}
+
         {/* Footer */}
         <div className="flex justify-end gap-3 pt-6 border-t border-gray-100 dark:border-gray-800">
           <button
@@ -122,17 +143,15 @@ function PlanDialog({ planContent, sessionId, taskId, onClose, onResolved }) {
           </button>
           <button
             onClick={handleRevise}
-            disabled={submitting}
-            className="px-5 py-2 text-sm font-semibold text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 rounded-xl hover:bg-amber-100 dark:hover:bg-amber-900/30 disabled:opacity-40 transition-all"
+            className="px-5 py-2 text-sm font-semibold text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 rounded-xl hover:bg-amber-100 dark:hover:bg-amber-900/30 transition-all"
           >
             {showFeedback ? t('plan.reviseSubmit') : t('plan.revise')}
           </button>
           <button
             onClick={handleApprove}
-            disabled={submitting}
-            className="px-6 py-2 bg-sigma-600 text-white text-sm font-semibold rounded-xl hover:bg-sigma-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+            className="px-6 py-2 bg-sigma-600 text-white text-sm font-semibold rounded-xl hover:bg-sigma-700 transition-all"
           >
-            {submitting ? t('plan.approving') : t('plan.approve')}
+            {t('plan.approve')}
           </button>
         </div>
       </div>

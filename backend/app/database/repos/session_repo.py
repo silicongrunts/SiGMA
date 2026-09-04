@@ -19,13 +19,9 @@ class SessionRepository:
     def __init__(self, session: AsyncSession):
         self._session = session
 
-    async def create(self, project_id: str, title: str = "",
+    async def create(self, title: str = "",
                      session_kind: str = "chat") -> Session:
-        """Create a new session. Auto-generates 'Untitled-n' title if none provided.
-
-        ``project_id`` is written to the row to satisfy the NOT NULL column;
-        it is not used for filtering since this DB is already project-scoped.
-        """
+        """Create a new session. Auto-generates 'Untitled-n' title if none provided."""
         if not title:
             result = await self._session.execute(
                 select(func.count()).select_from(Session)
@@ -33,8 +29,7 @@ class SessionRepository:
             )
             count = result.scalar_one()
             title = f"Untitled-{count + 1}"
-        db_session = Session(project_id=project_id, title=title,
-                             session_kind=session_kind)
+        db_session = Session(title=title, session_kind=session_kind)
         self._session.add(db_session)
         await self._session.commit()
         await self._session.refresh(db_session)
@@ -42,7 +37,6 @@ class SessionRepository:
 
     async def stage_create(
         self,
-        project_id: str,
         *,
         session_id: str = "",
         title: str = "",
@@ -60,7 +54,6 @@ class SessionRepository:
         """
         db_session = Session(
             id=session_id or generate_id(),
-            project_id=project_id,
             title=title,
             session_kind=session_kind,
             agent_type=agent_type,
@@ -168,7 +161,6 @@ class SessionRepository:
 
     async def create_agent_session(
         self,
-        project_id: str,
         agent_type: str,
         parent_session_id: str = "",
         parent_tool_call_id: str = "",
@@ -176,7 +168,6 @@ class SessionRepository:
         """Create a hidden agent session. Not visible in session list UI."""
         title = f"Agent: {agent_type}"
         db_session = Session(
-            project_id=project_id,
             title=title,
             session_kind="agent",
             agent_type=agent_type,

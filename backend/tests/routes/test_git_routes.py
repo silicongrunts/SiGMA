@@ -8,7 +8,10 @@ from app.routes import git
 
 @pytest.mark.route
 @pytest.mark.asyncio
-async def test_get_log_enforces_route_defaults_to_service(monkeypatch):
+async def test_get_log_applies_route_defaults_over_http(client, no_password, monkeypatch):
+    """GET /git/{id}/log without query params must reach the service with the
+    route's declared defaults (limit=50, offset=0, before=None). Driving the
+    real HTTP layer is the only way to exercise FastAPI's Query defaults."""
     calls = {}
 
     def get_log(project_id, limit, offset, before):
@@ -17,9 +20,10 @@ async def test_get_log_enforces_route_defaults_to_service(monkeypatch):
 
     monkeypatch.setattr(git, "git_service", SimpleNamespace(get_log=get_log))
 
-    result = await git.get_log("project-1", limit=50, offset=0, before=None)
+    r = await client.get("/api/v1/git/project-1/log")
 
-    assert result["data"] == {"commits": [{"hash": "abc"}]}
+    assert r.status_code == 200
+    assert r.json()["data"] == {"commits": [{"hash": "abc"}]}
     assert calls["log"] == ("project-1", 50, 0, None)
 
 
@@ -85,36 +89,27 @@ async def test_tag_routes_delegate_to_service(monkeypatch):
 
 @pytest.mark.route
 @pytest.mark.asyncio
-async def test_manual_commit_delegates_to_service(monkeypatch):
+async def test_commit_and_health_delegate_to_snapshot_service(monkeypatch):
     calls = {}
 
     async def commit_now(project_id):
         calls["commit"] = project_id
         return {"success": False, "reason": "no changes"}
 
-    monkeypatch.setattr(git, "snapshot_service", SimpleNamespace(
-        commit_now=commit_now,
-    ))
-
-    result = await git.manual_commit("project-1")
-
-    assert result["data"] == {"success": False, "reason": "no changes"}
-    assert calls["commit"] == "project-1"
-
-
-@pytest.mark.route
-@pytest.mark.asyncio
-async def test_snapshot_health_returns_persisted_state(monkeypatch):
     async def get_health(project_id):
+        calls["health"] = project_id
         return {"status": "error", "consecutive_failures": 2}
 
     monkeypatch.setattr(git, "snapshot_service", SimpleNamespace(
-        get_health=get_health,
+        commit_now=commit_now, get_health=get_health,
     ))
 
-    result = await git.snapshot_health("project-1")
+    committed = await git.manual_commit("project-1")
+    health = await git.snapshot_health("project-1")
 
-    assert result["data"] == {"status": "error", "consecutive_failures": 2}
+    assert committed["data"] == {"success": False, "reason": "no changes"}
+    assert health["data"] == {"status": "error", "consecutive_failures": 2}
+    assert calls == {"commit": "project-1", "health": "project-1"}
 
 
 @pytest.mark.route

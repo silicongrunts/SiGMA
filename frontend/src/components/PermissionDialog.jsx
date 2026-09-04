@@ -5,11 +5,11 @@
  *
  * Shows the category, target path, and content preview. The user's response is
  * sent via the chat resume path (POST /chat/stream with resume=true), which
- * spawns a new worker task carrying the approval/denial. Auto-approve is
+ * resumes the in-process chat task with the approval/denial. Auto-approve is
  * configured separately in the ChatPanel settings menu (persisted to the
  * backend), so this dialog only handles single-shot approval.
  */
-import { useState, useCallback } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { ShieldAlert, FileText, Check, X, Loader2, AlertTriangle } from 'lucide-react'
 import { useStore } from '../store/useStore'
@@ -24,19 +24,27 @@ export default function PermissionDialog() {
   const autoApproveSettings = useStore(s => s.autoApproveSettings)
   const setAutoApproveType = useStore(s => s.setAutoApproveType)
 
-  if (!pendingPermission) return null
+  if (!pendingPermission || (pendingPermission.project_id && pendingPermission.project_id !== currentProject?.id)) return null
 
-  const { session_id, tool, tool_name, path, operation, content, description, diff_lines, diff_truncated } = pendingPermission
+  const { session_id, task_id, interaction_id, interaction_type, tool, tool_name, path, operation, content, description, diff_lines, diff_truncated, resolved_path } = pendingPermission
   const isAutoApproved = autoApproveSettings[tool] === true
 
   return (
+    // task_id is unique per parked interaction, so it is the only stable
+    // identity: two consecutive approvals for the same path/tool must remount
+    // the prompt (resetting its responded guard), and one for a different
+    // path must not reuse a key stitched from mutable payload fields.
     <PermissionPrompt
-      key={session_id + (path || '') + (operation || '') + (tool_name || '') + (diff_lines?.length ?? 0)}
+      key={`${task_id}:${interaction_id}`}
       projectId={currentProject?.id}
       sessionId={session_id}
+      taskId={task_id}
+      interactionId={interaction_id}
+      interactionType={interaction_type}
       tool={tool}
       toolName={tool_name || tool}
       path={path}
+      resolvedPath={resolved_path}
       operation={operation}
       content={content || ''}
       description={description || ''}
@@ -50,16 +58,19 @@ export default function PermissionDialog() {
 }
 
 function PermissionPrompt({
-  projectId, sessionId, tool, toolName, path, operation, content, description,
+  projectId, sessionId, taskId, interactionId, interactionType, tool, toolName, path, resolvedPath, operation, content, description,
   diffLines, diffTruncated,
   onResolved, isAutoApproved, onToggleAutoApprove,
 }) {
   const { t } = useTranslation()
-  const [responding, setResponding] = useState(false)
   const [submitError, setSubmitError] = useState('')
   const [showDenyInput, setShowDenyInput] = useState(false)
   const [denyReason, setDenyReason] = useState('')
   const [autoApproveSaving, setAutoApproveSaving] = useState(false)
+  // The handoff is fire-and-forget and the dialog unmounts as soon as the
+  // store consumes the request — a second click in the same frame must not
+  // enqueue a second response.
+  const respondedRef = useRef(false)
 
   const hasDiff = Array.isArray(diffLines) && diffLines.length > 0
   const modalMaxW = hasDiff ? 'max-w-4xl' : 'max-w-xl'
@@ -79,24 +90,28 @@ function PermissionPrompt({
     }
   }
 
-  const handleRespond = useCallback(async (approved, reason = '') => {
-    setResponding(true)
+  // Submit via the chat resume path — the in-process chat task is resumed
+  // with the approval/denial, unpausing its loop. Handoff is fire-and-forget:
+  // if the resume fails, ChatPanel restores this dialog from the server's
+  // /active checkpoint so the parked task stays answerable.
+  const handleRespond = (approved, reason = '') => {
+    if (respondedRef.current) return
     setSubmitError('')
     if (!sessionId) {
       setSubmitError(t('permission.respondFailed'))
-      setResponding(false)
       return
     }
-    // Submit via the chat resume path — spawns a new worker task carrying
-    // the approval/denial, which resumes the paused loop.
+    respondedRef.current = true
     useStore.getState().setStreamInteractionRequest({
       message: '',
       resume: true,
+      projectId,
       session_id: sessionId,
-      interaction_response: { approved, reason },
+      task_id: taskId,
+      interaction_response: { task_id: taskId, interaction_id: interactionId, interaction_type: interactionType || 'permission', approved, reason },
     })
     onResolved()
-  }, [sessionId, onResolved, t])
+  }
 
   const handleDenyClick = () => {
     if (!showDenyInput) {
@@ -177,6 +192,16 @@ function PermissionPrompt({
                 <FileText className="w-4 h-4 text-gray-400 dark:text-gray-500 mt-0.5 flex-shrink-0" />
                 <code className="text-xs text-gray-700 dark:text-gray-300 break-all font-mono leading-relaxed">{path}</code>
               </div>
+              {/* The displayed path may be a symlink; the approval binds the
+                  resolved target, so show it when they differ. */}
+              {resolvedPath && resolvedPath !== path && (
+                <div className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                  <AlertTriangle className="w-3 h-3 flex-shrink-0" />
+                  <span className="break-all">
+                    {t('permission.resolvedTarget')}: <code className="font-mono">{resolvedPath}</code>
+                  </span>
+                </div>
+              )}
             </div>
           )}
 
@@ -256,19 +281,18 @@ function PermissionPrompt({
         <div className="flex border-t border-gray-100 dark:border-gray-800 divide-x divide-gray-100 dark:divide-gray-800 flex-shrink-0">
           <button
             onClick={handleDenyClick}
-            disabled={responding}
             className="flex-1 flex items-center justify-center gap-2 py-3.5 text-sm font-semibold text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-200 transition-all disabled:opacity-40"
           >
-            {responding ? <Loader2 className="w-4 h-4 animate-spin" /> : <X className="w-4 h-4" />}
-            {showDenyInput ? (responding ? t('common.sending') : t('permission.confirmDeny')) : t('permission.deny')}
+            <X className="w-4 h-4" />
+            {showDenyInput ? t('permission.confirmDeny') : t('permission.deny')}
           </button>
           <button
             onClick={() => handleRespond(true)}
-            disabled={responding || hasDenyReason}
+            disabled={hasDenyReason}
             className="flex-1 flex items-center justify-center gap-2 py-3.5 text-sm font-semibold text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 hover:text-amber-700 dark:hover:text-amber-300 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            {responding ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
-            {responding ? t('common.sending') : t('permission.allow')}
+            <Check className="w-4 h-4" />
+            {t('permission.allow')}
           </button>
         </div>
       </div>

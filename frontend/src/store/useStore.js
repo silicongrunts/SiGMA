@@ -52,6 +52,7 @@ const initialState = {
   interactionDismissed: false,        // user closed the interaction modal without resolving (input stays gated)
   pendingPermission: null,            // {session_id, tool, tool_name, path, operation, content, description, diff_lines, diff_truncated}
   autoApproveSettings: {},            // { [toolType]: boolean } per-project, loaded on project switch
+  autoApproveByProject: {},           // durable UI cache keyed by project id
   autoApproveLoadFailed: false,       // last fetch failed — UI must not present stale/all-off as real state
   taskList: [],                       // [{id, subject, status}]
   expandedTasks: false,               // auto-expand when tools modify tasks
@@ -76,6 +77,8 @@ const initialState = {
 
   // File hash baseline — MD5 of disk content at load/save time, for conflict detection
   fileHash: null,
+  annotationRevision: 0,
+  annotationFileHash: null,
 
   // Terminal panel visibility
   showTerminal: false,
@@ -89,7 +92,11 @@ const actions = (set, get) => ({
   setCurrentProject: (project) => set((state) => {
     if (state.currentProject?.id === project?.id) return { currentProject: project }
     // auto-approve settings are loaded from the backend by loadAutoApproveSettings()
-    return { currentProject: project, autoApproveSettings: {}, autoApproveLoadFailed: false }
+    return {
+      currentProject: project,
+      autoApproveSettings: project?.id ? (state.autoApproveByProject[project.id] || {}) : {},
+      autoApproveLoadFailed: false,
+    }
   }),
   addProject: (p) => set((s) => ({ projects: [...s.projects, p] })),
   removeProject: (id) => set((s) => {
@@ -98,7 +105,7 @@ const actions = (set, get) => ({
   }),
   setCurrentFile: (file) => set((state) => {
     if (state.currentFile === file) return {}
-    return { currentFile: file, annotations: [], isAnnotationsLoaded: false, activeAnnotationId: null, fileHash: null }
+    return { currentFile: file, annotations: [], isAnnotationsLoaded: false, activeAnnotationId: null, fileHash: null, annotationRevision: 0, annotationFileHash: null }
   }),
   clearCurrentFile: () => set({
     currentFile: null,
@@ -109,6 +116,8 @@ const actions = (set, get) => ({
     isAnnotationsLoaded: false,
     activeAnnotationId: null,
     fileHash: null,
+    annotationRevision: 0,
+    annotationFileHash: null,
   }),
   setIsTexFile: (isTex) => set({ isTexFile: isTex }),
   setActiveTab: (tab) => set((state) => {
@@ -198,7 +207,13 @@ const actions = (set, get) => ({
     // Local state update only. Callers must persist to the backend first and
     // call this only after the PUT succeeds (see ChatPanel's approvingCategory).
     const settings = { ...s.autoApproveSettings, [toolType]: enabled }
-    return { autoApproveSettings: settings }
+    const projectId = s.currentProject?.id
+    return {
+      autoApproveSettings: settings,
+      autoApproveByProject: projectId
+        ? { ...s.autoApproveByProject, [projectId]: settings }
+        : s.autoApproveByProject,
+    }
   }),
   loadAutoApproveSettings: async (projectId) => {
     // Fetch the four-category flags from the backend. Called after project
@@ -208,9 +223,17 @@ const actions = (set, get) => ({
     // auto-approving writes.
     try {
       const data = await permissionsAPI.getAutoApprove(projectId)
-      set({ autoApproveSettings: data || {}, autoApproveLoadFailed: false })
+      const settings = data || {}
+      if (useStore.getState().currentProject?.id !== projectId) return
+      set(s => ({
+        autoApproveSettings: settings,
+        autoApproveByProject: { ...s.autoApproveByProject, [projectId]: settings },
+        autoApproveLoadFailed: false,
+      }))
     } catch (e) {
-      set({ autoApproveSettings: {}, autoApproveLoadFailed: true })
+      if (useStore.getState().currentProject?.id === projectId) {
+        set({ autoApproveSettings: {}, autoApproveLoadFailed: true })
+      }
     }
   },
   setTaskList: (tasks) => set({ taskList: tasks }),
@@ -224,6 +247,7 @@ const actions = (set, get) => ({
   toggleMdSyncScroll: () => set(s => ({ mdSyncScroll: !s.mdSyncScroll })),
   setIsLoadingFile: (val) => set({ isLoadingFile: val }),
   setFileHash: (hash) => set({ fileHash: hash }),
+  setAnnotationCAS: (revision, fileHash) => set({ annotationRevision: revision ?? 0, annotationFileHash: fileHash ?? null }),
   toggleTerminal: () => set(s => ({ showTerminal: !s.showTerminal })),
   setShowTerminal: (val) => set({ showTerminal: val }),
   setTerminalState: (projectId, state) => set(s => ({

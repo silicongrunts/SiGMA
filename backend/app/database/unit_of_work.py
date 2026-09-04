@@ -23,16 +23,17 @@ Methods that self-commit (**every mutation except those listed below**):
 * ``SessionRepository``: ``create``, ``update``, ``delete``
 * ``MessageRepository``: ``create``,
   ``delete_by_session``, ``create_for_annotation``
-* ``AnnotationRepository``: ``create``, ``delete``, ``delete_by_id``,
-  ``save_all``
+* ``AnnotationRepository``: ``apply_mutation_cas``,
+  ``create_transaction``, ``delete_transaction``
 * ``LibraryRepository``: ``create``, ``update``, ``delete``, ``move_items``,
   ``update_processing_status``, ``update_processing_log``, ``update_content``,
   ``update_fields``, ``mark_failed``, ``reset_processing``
 * ``TaskRepository``: ``create``, ``replace_all``, ``delete_by_session``
-* ``TaskStateRepository``: ``set_queued``, ``heartbeat``, ``mark_completed``,
+* ``TaskStateRepository``: ``set_queued``, ``mark_running``, ``mark_completed``,
   ``mark_failed``, ``mark_cancelled``, ``request_cancel``,
-  ``mark_awaiting_input``, ``clear_interaction_by_session``,
-  ``delete_by_session``
+  ``mark_awaiting_input``, ``claim_interaction``,
+  ``prune_terminal_by_session``, ``prune_terminal_by_owner``,
+  ``delete_by_owner``, ``fail_all_runnable``
 * ``ProjectConfigRepository``: ``set``
 * ``BackgroundTaskRepository``: all mutation methods
 
@@ -62,6 +63,7 @@ Preferred atomic pattern::
 
 import asyncio
 
+from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.core.logging import get_logger
@@ -93,8 +95,8 @@ class UnitOfWork:
     self-commit (see module docstring for the full catalogue).
 
     **Self-commit exception:** Most repository mutation methods commit
-    internally (e.g. ``TaskRepository.create()``, ``MessageRepository.create()``,
-    ``AnnotationRepository.delete_by_id()``).  Seq-allocating methods use
+    internally (e.g. ``TaskRepository.create()``, ``MessageRepository.create()``).
+    Seq-allocating methods use
     self-commit to make uniqueness conflicts visible across concurrent
     connections; other self-commit methods preserve the repository API's
     transaction boundary. Do NOT wrap them in a transaction that expects a
@@ -106,9 +108,11 @@ class UnitOfWork:
     single commit.
     """
 
-    def __init__(self, project_id: str, *, allow_inactive: bool = False):
+    def __init__(self, project_id: str, *, allow_inactive: bool = False,
+                 immediate: bool = False):
         self.project_id = project_id
         self.allow_inactive = allow_inactive
+        self._immediate = immediate
         # Repos (initialized on enter)
         self.sessions: SessionRepository = None  # type: ignore
         self.messages: MessageRepository = None  # type: ignore
@@ -142,6 +146,15 @@ class UnitOfWork:
         self.tasks = TaskRepository(self._session)
         self.config = ProjectConfigRepository(self._session)
         self.background_tasks = BackgroundTaskRepository(self._session)
+
+        if self._immediate:
+            # Begin the transaction as a writer immediately: every statement
+            # below — including guard reads — runs inside one write
+            # transaction, so a concurrent writer either committed before
+            # this read (and is visible to the guard) or serializes after
+            # this commit. A deferred transaction would instead read without
+            # a snapshot and let the later write proceed on fresh data.
+            await self._session.execute(sa_text("BEGIN IMMEDIATE"))
         return self
 
     async def __aexit__(self, exc_type, _exc_val, _exc_tb):
@@ -167,6 +180,7 @@ class UnitOfWork:
         project_id: str,
         operation,
         *,
+        immediate: bool = False,
         max_retries: int = MAX_RETRIES,
     ):
         """Run staged repository operations in one commit with seq-conflict retry.
@@ -174,10 +188,12 @@ class UnitOfWork:
         ``operation`` receives a UnitOfWork and must use non-self-commit methods.
         If a concurrent writer wins the same unique seq value, the whole
         operation is retried from a fresh session so all related writes remain
-        atomic.
+        atomic. With ``immediate=True`` the transaction is begun as a writer
+        (BEGIN IMMEDIATE) before the operation runs, so a guard read inside
+        ``operation`` is serialized against concurrent claims.
         """
         for attempt in range(max_retries):
-            async with cls(project_id) as uow:
+            async with cls(project_id, immediate=immediate) as uow:
                 try:
                     result = await operation(uow)
                     await uow.commit()

@@ -1,6 +1,7 @@
-"""Shared core utilities — identifiers, time, path safety, image parsing.
+"""Shared core utilities — identifiers, time, path safety, image parsing,
+library content blankness.
 
-This module groups four small, dependency-light helper families that are
+This module groups small, dependency-light helper families that are
 imported across every backend layer.  Keeping them in one place keeps the
 ``core`` surface easy to scan while preserving each helper's original
 contract.
@@ -11,6 +12,7 @@ Sections
 * Time — ``utcnow``, ``parse_iso``, ``to_iso``
 * Path safety — ``is_within``, ``sanitize_filename``
 * Image parsing — ``detect_image_media_type``, ``image_dimensions``
+* Library content blankness — ``CONTENT_BLANK_CHARS``, ``is_blank_content``
 """
 
 from __future__ import annotations
@@ -139,6 +141,37 @@ def sanitize_filename(filename: str) -> str:
     if filename in (".", ".."):
         raise FileSystemError(f"Invalid filename: {filename}", code="INVALID_REQUEST")
     return filename
+
+
+# ---------------------------------------------------------------------------
+# Library content blankness
+# ---------------------------------------------------------------------------
+
+# The set of characters treated as blank in library document content. Both
+# judgments of "blank content" must use exactly this set:
+#
+# * SQL: ``trim(content, CONTENT_BLANK_CHARS) == ''`` in
+#   ``LibraryRepository.list_ids_with_content``
+# * Python: ``is_blank_content(content)`` (strip of the same characters)
+#
+# Equivalence: both predicates are true iff content is empty or consists
+# solely of characters from this set — SQL ``trim(x, chars)`` and Python
+# ``str.strip(chars)`` remove leading/trailing occurrences of the same
+# characters, and any character outside the set stops both. Using Python's
+# argument-less ``strip()`` here would strip a wider Unicode set and break
+# that equivalence, leaving the sweep's empty-collection self-heal looping
+# on contents that SQL counts as non-blank.
+CONTENT_BLANK_CHARS = " \t\r\n\x0b\x0c"
+
+
+def is_blank_content(content: Optional[str]) -> bool:
+    """True when library document *content* is empty or only blank characters.
+
+    The blankness rule shared with the SQL filter in
+    ``LibraryRepository.list_ids_with_content`` — see
+    ``CONTENT_BLANK_CHARS`` for the equivalence contract.
+    """
+    return not (content or "").strip(CONTENT_BLANK_CHARS)
 
 
 # ---------------------------------------------------------------------------

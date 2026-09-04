@@ -11,7 +11,7 @@ to prevent typos and centralize the allowed set.
 STATUS_PENDING = "pending"
 STATUS_PROCESSING = "processing"   # docling conversion + AI field extraction
 STATUS_INDEXING = "indexing"       # RAG vector indexing
-STATUS_CANCELLING = "cancelling"   # document deleted, processing should stop
+STATUS_CANCELLING = "cancelling"   # tasks stopping; awaiting a converging status
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 

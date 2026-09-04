@@ -1,7 +1,5 @@
 """Chat search: matching over user-visible UI entries and snippet building."""
 
-import pytest
-
 from app.core.chat_search import (
     SNIPPET_CONTEXT,
     build_snippet,

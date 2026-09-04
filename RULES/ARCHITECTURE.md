@@ -1,9 +1,7 @@
 # Architecture Rules
 
-Keep SiGMA layered, understandable, and easy to change. Prefer explicit
-ownership over generic abstractions. Core workflow: AI conversation ->
-Explore / Library / Synthesis workspace -> project files, knowledge base,
-snapshots, notebooks, long-running tasks.
+Keep SiGMA layered and easy to change. Prefer explicit ownership over generic
+abstractions.
 
 ## Backend Dependency Direction
 
@@ -12,15 +10,13 @@ or documented in this file is forbidden:
 
 ```text
 routes -> services -> database/repos
-routes -> services -> workers
-workers -> services
 agents/tools -> services
 services -> services only through public APIs
 ```
 
-- Routes do not access repositories, SQLAlchemy models, `UnitOfWork`, or
-  worker internals unless explicitly a worker/stream control endpoint.
-- Services own business workflows and coordinate repositories, workers,
+- Routes do not access repositories, SQLAlchemy models, or `UnitOfWork`
+  directly.
+- Services own business workflows and coordinate repositories,
   LLM calls, filesystem services, and permission services.
 - Repositories own SQLAlchemy queries and never leak outside the database
   boundary.
@@ -31,19 +27,20 @@ services -> services only through public APIs
 - Never import or mutate private methods or internal state across module
   boundaries without a documented exception.
 
-## Backend Module Responsibilities
+## Backend Ownership
 
-- `core/`: config, logging, middleware, lifecycle, response helpers, path
-  helpers, shared exceptions.
-- `routes/`: HTTP/WebSocket adapters.
-- `services/`: domain logic and orchestration.
-- `database/`: models, repositories, database manager, migrations
-  boundary, unit of work.
-- `agents/`: agent registry, prompts, tool declarations.
-- `workers/`: Huey tasks, worker-only orchestration, stream relay.
-- `models/`: Pydantic request/response schemas.
+- `core/`: configuration, logging, lifecycle, middleware, shared exceptions,
+  response helpers, and reusable infrastructure.
+- `routes/`: HTTP and WebSocket adapters.
+- `services/`: domain behavior and workflow orchestration.
+- `database/`: ORM models, repositories, database management, migrations, and
+  units of work.
+- `agents/`: prompts, agent registration, tool declarations, and execution
+  boundaries.
+- `models/`: request and response schemas.
 
-If a file starts owning two unrelated reasons to change, split it.
+Split a file when it owns unrelated reasons to change, not merely because it is
+long.
 
 ## Frontend Dependency Direction
 
@@ -66,51 +63,41 @@ hooks -> api/store/utils
   helpers, context, or store state with clear ownership — never hidden
   callbacks or module-specific globals.
 
-## Route Rules
+## Routes And Services
 
-Routes may accept parameters, rely on Pydantic validation, delegate to one
-domain service (multiple calls only for validation, response assembly, or
-framework adaptation), wrap output in the HTTP response format, and return
-framework streaming/file responses. Routes may not build prompts, open
-files directly, execute database queries, allocate sequence numbers, make
-permission decisions, or contain long workflows.
+Routes validate input, call domain services, translate errors, and format
+framework responses. They do not build prompts, open project files, query the
+database, allocate ordering values, decide permissions, or own workflows.
 
-## Service Rules
+Service methods represent domain operations and expose stable public APIs.
+Business failures raise typed exceptions; structured error objects are allowed
+only where the API contract explicitly models them.
 
-Service methods match domain operations: `create_project`,
-`compile_project`, `start_ai_reply_stream` — not `do_stuff`, `handle`,
-`process_data`. Business failures raise typed exceptions; returning
-`{"error": ...}` is acceptable only for worker result payloads or APIs
-that explicitly model error objects.
+## Database Boundary
 
-## Database Rules
+- Schema changes go through Alembic. Existing databases migrate; newly created
+  databases are stamped to the current head.
+- ORM objects remain inside `database/`.
+- Unique or monotonic ordering is enforced by the database or a documented
+  transactional mechanism.
+- SQLite table rebuilds use Alembic batch operations. Structural changes to
+  `library_documents` must preserve or recreate its FTS5 triggers.
 
-- Schema changes go through Alembic; existing databases migrate through
-  Alembic; new project databases may initialize from models and stamp to
-  the current Alembic head.
-- Application code does not depend on ORM objects outside `database/`.
-- Sequence/order values that must be unique or monotonic under concurrency
-  are enforced by the database or a documented transactional mechanism.
+## Long-Running Tasks
 
-## Worker Rules
+- Chat, annotation, and library work runs as asyncio tasks in one web process.
+- Database rows are the durable task truth; in-memory events and stream buffers
+  are coordination only.
+- Cancellation, retry, disconnect, and process restart must leave tasks
+  recoverable or visibly terminal.
+- Persistent checkpoints and permission decisions never depend solely on
+  process memory.
+- Multi-worker or multi-replica deployment is forbidden until task ownership
+  and stream coordination are redesigned for it.
 
-- Huey task functions are worker entry points, not business services; they
-  call services for domain logic.
-- Stream relay stays isolated from HTTP route logic except through
-  explicit stream APIs.
-- Persistent data, task checkpoints, and permission decisions never depend
-  solely on worker process memory (auto-approve flags, for example, are
-  persisted in `project_config` and read live per call).
+## Browser Automation
 
-## Browser Automation Rules
-
-- Browser automation uses the shared BrowserManager/CDP architecture;
-  tools do not launch independent browsers.
-- CDP URLs use `127.0.0.1`, not `localhost` (IPv6 ambiguity).
-- VNC and readiness polling is allowed when bounded, cancellable, and
-  documented in the component or service.
-
-Line count is a review signal, not an architecture rule: at 400+ lines
-check responsibility, at 700+ look for real submodules, at 1000+ record a
-rationale or decomposition plan. Split by domain responsibility; see
-`RULES/CONTRIBUTING.md` for decomposition and extraction rules.
+- Browser tools use the shared BrowserManager/CDP architecture and do not
+  launch independent browsers.
+- Polling is bounded, cancellable, cleaned up, and tied to an observable
+  success or failure condition.

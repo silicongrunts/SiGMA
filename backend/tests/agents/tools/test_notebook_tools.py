@@ -2,11 +2,11 @@
 
 import json
 import os
-from types import SimpleNamespace
 
 import pytest
 
 from app.agents.tools.notebook_tools import (
+    _format_run_result,
     _notebook_edit,
     _notebook_read,
     _notebook_run_cell,
@@ -21,15 +21,11 @@ def _clear_read_state():
     read_state_cache.clear("sess")
 
 
-def _patch_project(monkeypatch, tmp_path):
+def _no_jupyter(monkeypatch):
+    """No Jupyter server: read/edit paths never touch a kernel."""
     from app.agents.tools import notebook_tools
     from app.agents.tools import notebook_utils
 
-    monkeypatch.setattr(
-        notebook_utils,
-        "settings",
-        SimpleNamespace(get_project_path=lambda pid: tmp_path),
-    )
     monkeypatch.setattr(notebook_utils, "get_jupyter", lambda: None)
     monkeypatch.setattr(notebook_tools, "get_jupyter", lambda: None)
 
@@ -60,9 +56,9 @@ def _cell(cell_id, source, outputs=None, cell_type="code"):
 
 
 @pytest.mark.asyncio
-async def test_notebook_read_pages_cells_and_includes_index(tmp_path, monkeypatch):
-    _patch_project(monkeypatch, tmp_path)
-    nb = tmp_path / "nb.ipynb"
+async def test_notebook_read_pages_cells_and_includes_index(project_root, monkeypatch):
+    _no_jupyter(monkeypatch)
+    nb = project_root / "nb.ipynb"
     _write_notebook(nb, [_cell(f"c{i}", f"print({i})") for i in range(8)])
 
     result = await _notebook_read("nb.ipynb", "proj", "sess", offset=2, limit=3)
@@ -75,9 +71,9 @@ async def test_notebook_read_pages_cells_and_includes_index(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_notebook_read_cell_id_pages_outputs(tmp_path, monkeypatch):
-    _patch_project(monkeypatch, tmp_path)
-    nb = tmp_path / "nb.ipynb"
+async def test_notebook_read_cell_id_pages_outputs(project_root, monkeypatch):
+    _no_jupyter(monkeypatch)
+    nb = project_root / "nb.ipynb"
     text = "\n".join(f"line {i}" for i in range(20))
     _write_notebook(nb, [_cell("c1", "print('x')", [{
         "output_type": "stream",
@@ -98,9 +94,22 @@ async def test_notebook_read_cell_id_pages_outputs(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_notebook_read_truncates_outputs_in_cell_list(tmp_path, monkeypatch):
-    _patch_project(monkeypatch, tmp_path)
-    nb = tmp_path / "nb.ipynb"
+async def test_notebook_read_unknown_cell_id_returns_cell_not_found(
+    project_root, monkeypatch,
+):
+    _no_jupyter(monkeypatch)
+    nb = project_root / "nb.ipynb"
+    _write_notebook(nb, [_cell("c1", "print('x')")])
+
+    result = await _notebook_read("nb.ipynb", "proj", "sess", cell_id="missing")
+
+    assert result == "Error: Cell not found: missing"
+
+
+@pytest.mark.asyncio
+async def test_notebook_read_truncates_outputs_in_cell_list(project_root, monkeypatch):
+    _no_jupyter(monkeypatch)
+    nb = project_root / "nb.ipynb"
     text = "\n".join(f"line {i}" for i in range(120))
     _write_notebook(nb, [_cell("c1", "print('x')", [{
         "output_type": "stream",
@@ -115,9 +124,9 @@ async def test_notebook_read_truncates_outputs_in_cell_list(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_notebook_edit_requires_prior_read(tmp_path, monkeypatch):
-    _patch_project(monkeypatch, tmp_path)
-    nb = tmp_path / "nb.ipynb"
+async def test_notebook_edit_requires_prior_read(project_root, monkeypatch):
+    _no_jupyter(monkeypatch)
+    nb = project_root / "nb.ipynb"
     _write_notebook(nb, [_cell("c1", "old")])
 
     result = await _notebook_edit(
@@ -129,9 +138,25 @@ async def test_notebook_edit_requires_prior_read(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_notebook_edit_succeeds_after_read_and_refreshes_cache(tmp_path, monkeypatch):
-    _patch_project(monkeypatch, tmp_path)
-    nb = tmp_path / "nb.ipynb"
+async def test_notebook_edit_unknown_cell_id_returns_cell_not_found(
+    project_root, monkeypatch,
+):
+    _no_jupyter(monkeypatch)
+    nb = project_root / "nb.ipynb"
+    _write_notebook(nb, [_cell("c1", "old")])
+    await _notebook_read("nb.ipynb", "proj", "sess")
+
+    result = await _notebook_edit(
+        "nb.ipynb", "new", "proj", "sess", cell_id="missing",
+    )
+
+    assert result == "Error: Cell not found: missing"
+
+
+@pytest.mark.asyncio
+async def test_notebook_edit_succeeds_after_read_and_refreshes_cache(project_root, monkeypatch):
+    _no_jupyter(monkeypatch)
+    nb = project_root / "nb.ipynb"
     _write_notebook(nb, [_cell("c1", "old"), _cell("c2", "second")])
 
     await _notebook_read("nb.ipynb", "proj", "sess")
@@ -150,9 +175,9 @@ async def test_notebook_edit_succeeds_after_read_and_refreshes_cache(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_notebook_edit_fails_after_external_change(tmp_path, monkeypatch):
-    _patch_project(monkeypatch, tmp_path)
-    nb = tmp_path / "nb.ipynb"
+async def test_notebook_edit_fails_after_external_change(project_root, monkeypatch):
+    _no_jupyter(monkeypatch)
+    nb = project_root / "nb.ipynb"
     _write_notebook(nb, [_cell("c1", "old")])
 
     await _notebook_read("nb.ipynb", "proj", "sess")
@@ -197,12 +222,12 @@ class _FakeJupyter:
 
 
 @pytest.mark.asyncio
-async def test_notebook_run_cell_requires_prior_read(tmp_path, monkeypatch):
-    _patch_project(monkeypatch, tmp_path)
+async def test_notebook_run_cell_requires_prior_read(project_root, monkeypatch):
+    _no_jupyter(monkeypatch)
     from app.agents.tools import notebook_tools
 
     monkeypatch.setattr(notebook_tools, "get_jupyter", lambda: _FakeJupyter())
-    nb = tmp_path / "nb.ipynb"
+    nb = project_root / "nb.ipynb"
     _write_notebook(nb, [_cell("c1", "print('x')")])
 
     result = await _notebook_run_cell(
@@ -214,12 +239,12 @@ async def test_notebook_run_cell_requires_prior_read(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_notebook_run_cell_succeeds_after_read_and_refreshes_cache(tmp_path, monkeypatch):
-    _patch_project(monkeypatch, tmp_path)
+async def test_notebook_run_cell_succeeds_after_read_and_refreshes_cache(project_root, monkeypatch):
+    _no_jupyter(monkeypatch)
     from app.agents.tools import notebook_tools
 
     monkeypatch.setattr(notebook_tools, "get_jupyter", lambda: _FakeJupyter())
-    nb = tmp_path / "nb.ipynb"
+    nb = project_root / "nb.ipynb"
     _write_notebook(nb, [_cell("c1", "print('x')")])
 
     await _notebook_read("nb.ipynb", "proj", "sess")
@@ -232,3 +257,43 @@ async def test_notebook_run_cell_succeeds_after_read_and_refreshes_cache(tmp_pat
 
     assert "[ok] Execution count: 1" in result
     assert edit_result.startswith("Updated cell")
+
+
+# ── _format_run_result — execution result formatting ────────────────
+
+def test_format_run_result_error_branch_reports_error_and_traceback():
+    result = _format_run_result({
+        "status": "error",
+        "execution_count": 3,
+        "error_name": "ValueError",
+        "error_value": "boom",
+        "traceback": [
+            "\x1b[0;31mTraceback (most recent call last):\x1b[0m",
+            '  File "nb.py", line 1, in <module>',
+            "ValueError: boom",
+        ],
+    })
+
+    assert "[error] Execution count: 3" in result
+    assert "ValueError: boom" in result
+    assert "\x1b[" not in result  # ANSI codes stripped from the traceback
+    assert "(no output)" not in result  # error branch is not a no-output ok
+
+
+def test_format_run_result_error_defaults_error_name():
+    """A kernel error payload without error_name falls back to a generic
+    'Error' label instead of rendering 'None'."""
+    result = _format_run_result({
+        "status": "error",
+        "error_value": "silent failure",
+    })
+
+    assert result.splitlines()[0] == "[error]"
+    assert "Error: silent failure" in result
+
+
+def test_format_run_result_timeout_branch():
+    result = _format_run_result({"status": "timeout"})
+
+    assert "[timeout]" in result
+    assert "Execution timed out and the kernel was interrupted." in result

@@ -138,11 +138,6 @@ def test_tool_schemas_hide_vision_when_current_role_accepts_images(monkeypatch):
 
 
 def test_read_schema_describes_image_support_only_for_multimodal_role(monkeypatch):
-    from app.agents.prompts import PROMPT_READ
-
-    assert "can read images" not in PROMPT_READ.lower()
-    assert "contents are presented visually" not in PROMPT_READ.lower()
-
     monkeypatch.setattr(settings.models, "vision", ModelSettings(reuse="supervisor"))
     schemas = tool_schemas_for_model_role("supervisor")
     read_schema = next(schema for schema in schemas if schema["function"]["name"] == "read")

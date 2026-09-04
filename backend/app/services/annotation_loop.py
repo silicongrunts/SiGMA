@@ -5,9 +5,10 @@ Delegates the LLM ↔ tool loop to LLMLoopRunner and handles:
 - Message building with annotation context
 - Diff validation on final response
 - Restricted tool set (whitelist enforced)
-- Agent(explore-only) restriction
+- No subagent or interactive tool path
 """
 
+import asyncio
 from functools import partial
 from typing import AsyncIterator
 
@@ -16,15 +17,12 @@ from app.agents.prompt_service import prompt_service
 from app.agents.tool_schema_service import tool_schemas_for_model_role
 from app.agents.tools.annotation_tools import validate_diffs
 from app.agents.tools.read_state import read_state_cache
-from app.agents.toolsets import ANNOTATION_TOOLS, ALLOWED_AGENT_TYPES
+from app.agents.toolsets import ANNOTATION_TOOLS
 from app.services.file_service import file_service
 from app.database.unit_of_work import UnitOfWork
 from app.services.annotation_service import serialize_annotation
-from app.services.llm_loop_runner import (
-    LLMLoopRunner, LoopContext,
-    SSE_ERROR,
-    SSE_CONTEXT_STATS, SSE_COMPACT_START, SSE_COMPACT_DONE,
-)
+from app.core.chat_events import SSE_CONTEXT_STATS, SSE_COMPACT_START, SSE_COMPACT_DONE
+from app.services.llm_loop_runner import LLMLoopRunner, LoopContext, SSE_ERROR
 from app.services.compaction_service import compaction_service
 from app.services.token_budget import TokenBudgetTracker
 from app.services.message_persist import stage_new_messages
@@ -57,7 +55,7 @@ class AnnotationLoop:
         project_id: str,
         file_path: str,
         annotation_id: str,
-        cancel_event: "asyncio.Event | None" = None,
+        cancel_event: asyncio.Event | None = None,
     ):
         self.project_id = project_id
         self.file_path = file_path
@@ -114,7 +112,7 @@ class AnnotationLoop:
             tool_schemas=self._tool_schemas,
             allowed_tools=ANNOTATION_TOOLS,
             cancel_event=self._cancel_event,
-            execute_tool=self._execute_tool_with_agent_check,
+            execute_tool=LLMLoopRunner.execute_tool_default,
             persist_messages=self._save_messages,
             prepare_messages=self._prepare_messages,
             validate_final_response=self._validate_diff_response,
@@ -141,6 +139,9 @@ class AnnotationLoop:
             "message": "Session Compacting...",
             **stats.to_dict(),
         }))
+        # A turn the user already cancelled must not start a new compaction.
+        if self._cancel_event and self._cancel_event.is_set():
+            raise asyncio.CancelledError()
         try:
             result = await compaction_service.compact_messages(
                 messages,
@@ -149,6 +150,7 @@ class AnnotationLoop:
                 tools=self._tool_schemas,
                 token_budget_tracker=self._token_budget_tracker,
                 session_id=f"annotation:{self.annotation_id}",
+                cancel_event=self._cancel_event,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -178,28 +180,8 @@ class AnnotationLoop:
         return result.messages, events
 
     # ------------------------------------------------------------------
-    # Tool execution with Agent(explore-only) enforcement
+    # Annotation toolset is non-interactive by construction.
     # ------------------------------------------------------------------
-
-    async def _execute_tool_with_agent_check(
-        self, tool_name: str, tool_args: dict
-    ) -> str:
-        """Execute tool with Agent restriction for annotation context."""
-        if tool_name == "agent":
-            agent_type = tool_args.get("agent_type", "")
-            resume_id = tool_args.get("resume_id", "")
-            allowed = ALLOWED_AGENT_TYPES.get("annotation", frozenset())
-
-            if resume_id:
-                return "Error: Resume is not available in annotation context."
-            if agent_type not in allowed:
-                names = ", ".join(sorted(allowed))
-                return (
-                    f"Error: Only '{names}' agent(s) are available in "
-                    f"annotation context. Got '{agent_type}'."
-                )
-
-        return await LLMLoopRunner.execute_tool_default(tool_name, tool_args)
 
     # ------------------------------------------------------------------
     # Message building

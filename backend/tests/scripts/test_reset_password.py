@@ -30,10 +30,21 @@ SCRIPT = BACKEND_DIR / "scripts" / "reset_password.py"
 PY = sys.executable
 
 
-def _run(tmp_path: Path, stdin: str, extra_args=None) -> subprocess.CompletedProcess:
-    """Run the script against an isolated userdata dir, returning its result."""
+def _run(
+    tmp_path: Path,
+    stdin: str,
+    extra_args=None,
+    path_override: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Run the script against an isolated userdata dir, returning its result.
+
+    ``path_override`` replaces the subprocess ``PATH`` (used to hide host
+    binaries such as ``supervisorctl`` behind a controlled, empty bin dir).
+    """
     env = dict(os.environ)
     env["SIGMA_USERDATA_DIR"] = str(tmp_path)
+    if path_override is not None:
+        env["PATH"] = path_override
     return subprocess.run(
         [PY, str(SCRIPT), *(extra_args or [])],
         input=stdin,
@@ -171,11 +182,15 @@ def test_clear_flag_requires_confirmation(tmp_path):
 @pytest.mark.security
 @pytest.mark.regression
 def test_restart_falls_back_when_no_supervisor(tmp_path):
-    """Outside supervisord the script tells the caller to restart manually
-    rather than guessing/killing a host process."""
-    result = _run(tmp_path, "any-pw-123\n" * 2)
+    """Without a reachable supervisorctl the script tells the caller to
+    restart manually rather than guessing/killing a host process."""
+    # Control the detection point: an empty bin dir as PATH guarantees
+    # shutil.which("supervisorctl") misses, so the fallback path fires
+    # deterministically even on a host that has supervisord installed.
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    result = _run(tmp_path, "any-pw-123\n" * 2, path_override=str(empty_bin))
     assert result.returncode == 0
-    # The dev/test env has no supervisorctl socket, so the fallback message fires.
     assert "manually" in result.stdout
 
 

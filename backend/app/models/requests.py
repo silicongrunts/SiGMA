@@ -5,21 +5,71 @@ Every POST/PUT/PATCH endpoint MUST use a schema from this file.
 Never use Dict = Body(...) — always use a typed request model.
 """
 
-from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional, List, Dict, Any, Literal
+from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
+from typing import Annotated, Optional, List, Dict, Any, Literal, Union
 
 
 # ---------------------------------------------------------------------------
 # Chat
 # ---------------------------------------------------------------------------
 
+class InteractionResponseBase(BaseModel):
+    model_config = {"extra": "forbid"}
+    task_id: str = Field(..., min_length=1)
+    interaction_id: str = Field(..., min_length=1)
+    interaction_type: Literal[
+        "permission", "ask_user_question", "submit_plan_for_approval",
+    ]
+
+
+class PermissionInteractionResponse(InteractionResponseBase):
+    interaction_type: Literal["permission"]
+    approved: StrictBool
+    reason: str = Field(default="", max_length=10000)
+
+
+class QuestionAnswer(BaseModel):
+    model_config = {"extra": "forbid"}
+    question: str = Field(..., min_length=1, max_length=10000)
+    answer: Union[str, List[str]]
+
+    @model_validator(mode="after")
+    def validate_answer(self):
+        if isinstance(self.answer, list):
+            if not self.answer or any(not isinstance(item, str) or not item.strip() for item in self.answer):
+                raise ValueError("Question answers must contain non-empty strings")
+        elif not self.answer.strip():
+            raise ValueError("Question answers must not be empty")
+        return self
+
+
+class QuestionInteractionResponse(InteractionResponseBase):
+    interaction_type: Literal["ask_user_question"]
+    answers: List[QuestionAnswer] = Field(..., min_length=1, max_length=4)
+
+
+class PlanInteractionResponse(InteractionResponseBase):
+    interaction_type: Literal["submit_plan_for_approval"]
+    approved: StrictBool
+    feedback: str = Field(default="", max_length=10000)
+
+
+InteractionResponse = Annotated[
+    Union[
+        PermissionInteractionResponse,
+        QuestionInteractionResponse,
+        PlanInteractionResponse,
+    ],
+    Field(discriminator="interaction_type"),
+]
+
+
 class StreamChatRequest(BaseModel):
     """Request body for /chat/stream/{project_id}."""
     message: str = Field(default="", max_length=100000)
     session_id: Optional[str] = None
-    file: Optional[str] = None
     resume: bool = False  # set true to continue a crashed task from checkpoint
-    interaction_response: Optional[Dict[str, Any]] = None  # user response to interactive tool
+    interaction_response: Optional[InteractionResponse] = None
     user_state: Optional[Dict[str, Any]] = None  # frontend context (active tab, cursor, citation, etc.)
     attachments: List[Dict[str, Any]] = Field(default_factory=list)
     token_budget: Optional[int] = Field(None, ge=1)
@@ -119,8 +169,18 @@ class SaveAnnotationsRequest(BaseModel):
     """Request body for POST /annotations/{project_id}."""
     file_path: Optional[str] = Field(None, alias="filePath")
     annotations: List[Dict[str, Any]]
+    expected_revision: Optional[int] = Field(None, alias="expectedRevision", ge=0)
+    expected_file_hash: Optional[str] = Field(None, alias="expectedFileHash", min_length=1)
+    delete_ids: List[str] = Field(default_factory=list, alias="deleteIds")
 
     model_config = {"populate_by_name": True}
+
+
+class SaveDocumentRequest(SaveAnnotationsRequest):
+    """Atomically coordinated editor content and annotation anchor update."""
+    content: str
+    expected_file_hash: str = Field(..., alias="expectedFileHash", min_length=1)
+    expected_revision: int = Field(..., alias="expectedRevision", ge=0)
 
 
 class AnnotationStreamRequest(BaseModel):

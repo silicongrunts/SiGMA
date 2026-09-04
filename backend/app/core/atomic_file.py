@@ -6,6 +6,7 @@ Provides:
 * Atomic text / binary write (temp file → fsync → rename)
 * Optional compare-and-swap (hash check under lock)
 * Optional create-only mode (refuse to overwrite existing files, under lock)
+* Streaming-write claim primitive (hard-link an existing temp onto a free name)
 * Safe JSON read with corruption handling
 
 Usage::
@@ -103,6 +104,12 @@ class ProjectFileLock:
     With ``timeout`` set, acquisition polls non-blockingly up to the deadline
     and raises ``TimeoutError`` instead of blocking a thread forever — a
     stuck previous holder must not wedge every later caller.
+
+    Because the lock file is unlinked on release, a waiter that opened the
+    file before its deletion can end up flocking a dead inode while another
+    waiter already created a fresh one — two holders, no exclusion. Every
+    acquisition therefore re-validates that the locked fd still refers to
+    the live lock path and retries on a stale file.
     """
 
     _POLL_INTERVAL_SEC = 0.1
@@ -117,8 +124,20 @@ class ProjectFileLock:
         self._fd = None
 
     def __enter__(self):
-        self._fd = open(self._lock_path, "w")
         deadline = None if self._timeout is None else time.monotonic() + self._timeout
+        while True:
+            self._fd = open(self._lock_path, "w")
+            self._flock(deadline)
+            if self._fd_is_current():
+                return self
+            # Stale lock file: the previous holder unlinked this path and
+            # another waiter already created a fresh one, so the flock we
+            # just acquired guards a dead inode. Release and retry on the
+            # current file.
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            self._fd.close()
+
+    def _flock(self, deadline: float | None) -> None:
         while True:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -134,17 +153,51 @@ class ProjectFileLock:
                         f"File lock busy after {self._timeout}s: {self._data_file}"
                     )
                 time.sleep(self._POLL_INTERVAL_SEC)
-        return self
+
+    def _fd_is_current(self) -> bool:
+        try:
+            return (
+                os.stat(self._lock_path).st_ino
+                == os.fstat(self._fd.fileno()).st_ino
+            )
+        except FileNotFoundError:
+            return False
 
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         if self._fd:
+            # Unlink while still holding the flock: once the lock is
+            # released, a waiter may acquire this very inode and re-validate
+            # against the path, so the file must already be gone from the
+            # namespace by then. Unlinking after unlock would delete the
+            # lock file out from under the next validated holder.
+            try:
+                os.unlink(self._lock_path)
+            except OSError:
+                pass
             fcntl.flock(self._fd, fcntl.LOCK_UN)
             self._fd.close()
-        try:
-            os.unlink(self._lock_path)
-        except OSError:
-            pass
         return False
+
+
+# ---------------------------------------------------------------------------
+# Low-level claim primitive
+# ---------------------------------------------------------------------------
+
+def claim_path(tmp_path: Path, dest_path: Path) -> None:
+    """Atomically claim ``dest_path`` with an already-written temp file.
+
+    The claim is a single ``os.link``: ``dest_path`` is created as a hard
+    link to ``tmp_path`` — the caller must have written the temp file into
+    the destination directory, so both live on one filesystem — or
+    ``FileExistsError`` is raised with the destination untouched. Existence
+    check and creation are one kernel operation, so exactly one concurrent
+    claimant can win; the temp link is removed after a successful claim.
+    """
+    os.link(tmp_path, dest_path)
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -269,40 +322,6 @@ def atomic_write_bytes(
                     disk_hash=disk_hash,
                 )
         atomic_replace_bytes(path, data)
-
-
-# ---------------------------------------------------------------------------
-# Atomic write with unique-name fallback
-# ---------------------------------------------------------------------------
-
-def atomic_write_unique_file(
-    path: Path,
-    data: bytes,
-    *,
-    hash_func: Callable[[bytes], str] | None = None,
-) -> Path:
-    """Write binary *data* to *path*, auto-appending ``_1``, ``_2``, etc.
-    if the target file already exists.
-
-    Uses ``atomic_write_bytes(fail_if_exists=True)`` under a lock, so the
-    existence check is race-safe.  Returns the ``Path`` that was actually
-    written (may differ from *path* when a suffix was appended).
-
-    The caller does **not** need to loop — this function retries internally
-    with incrementing suffixes until a free name is found.
-    """
-    path = path.resolve()
-    stem = path.stem
-    suffix = path.suffix
-    attempt = 1
-    target = path
-    while True:
-        try:
-            atomic_write_bytes(target, data, fail_if_exists=True, hash_func=hash_func)
-            return target
-        except AtomicFileExistsError:
-            target = path.parent / f"{stem}_{attempt}{suffix}"
-            attempt += 1
 
 
 # ---------------------------------------------------------------------------

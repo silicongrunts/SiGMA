@@ -143,8 +143,7 @@ class DatabaseManager:
         """Ensure the database exists and is at the latest schema revision.
 
         Both new and existing databases are brought to head via
-        ``alembic upgrade head`` — there is no longer a separate
-        ``Base.metadata.create_all`` path.
+        ``alembic upgrade head``.
         """
         db_path = self._get_db_path(project_id)
 
@@ -187,14 +186,14 @@ class DatabaseManager:
 
     @classmethod
     def _run_migration_locked(cls, cfg, db_path: Path) -> None:
-        """Validate and run ``alembic upgrade head`` under a cross-process lock.
+        """Validate and run ``alembic upgrade head`` under a file lock.
 
-        The lock prevents the web process and the huey worker process from
-        migrating the same project DB simultaneously (supervisord starts both
-        in parallel).  ``fcntl.flock`` is per-machine, which matches SiGMA's
-        single-container deployment.  The second caller blocks until the first
-        finishes, then ``upgrade head`` is a no-op because the DB is already
-        at head.
+        Migrations run on an executor thread while the event loop keeps
+        serving requests, so a concurrent caller may enter for the same
+        database. ``fcntl.flock`` is per-machine, which matches SiGMA's
+        single-container deployment. The second caller blocks until the
+        first finishes, then ``upgrade head`` is a no-op because the DB is
+        already at head.
         """
         lock_path = cls._lock_path_for(db_path)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,27 +346,16 @@ class DatabaseManager:
     async def migrate_all_projects(self):
         """Migrate all existing project databases at startup.
 
-        Scans USERDATA_DIR for project directories and runs pending
-        Alembic migrations on each.  A failure for one project is logged,
-        quarantined for the rest of this process lifetime, and does not
-        prevent other projects from being migrated.
+        Enumerates active projects via ``project_registry.iter_project_ids``
+        and runs pending Alembic migrations on each.  A failure for one
+        project is logged, quarantined for the rest of this process
+        lifetime, and does not prevent other projects from being migrated.
         """
-        if not settings.USERDATA_DIR.exists():
-            return
-
-        from app.core.project_registry import is_project_active
+        from app.core.project_registry import iter_project_ids
 
         migrated = 0
-        for project_dir in sorted(settings.USERDATA_DIR.iterdir()):
-            if not project_dir.is_dir() or project_dir.name == ".SiGMA":
-                continue
-            pid = project_dir.name
-            if pid in self._quarantine:
-                continue
-            if pid in self._deleted or not is_project_active(pid):
-                continue
-            db_path = project_dir / ".SiGMA" / "project_data.db"
-            if not db_path.exists():
+        for pid in iter_project_ids():
+            if pid in self._quarantine or pid in self._deleted:
                 continue
             async with self._init_lock:
                 if pid in self._initialized:

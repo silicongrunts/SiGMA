@@ -22,7 +22,8 @@ enqueue) and ``background_task_service`` → ``library_task_protocol``
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from app.database.unit_of_work import UnitOfWork
@@ -47,24 +48,38 @@ class RunningTaskContext:
     """Runtime context for a single in-flight background task.
 
     Exposes the two operations every handler needs: refreshing the lease
-    so the dispatcher does not reclaim the task, and detecting a user-
-    initiated cancel.
+    so the dispatcher does not reclaim the task, and detecting a cancel
+    (user-initiated via the task row, or lease loss signalled in-process
+    through ``cancel_event``).
     """
 
     project_id: str
     task_id: str
     owner: str
     lease_seconds: int
+    # Set in-process when the task's lease was lost to another claim; the
+    # durable row cannot carry that signal because the new claimant owns it.
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def heartbeat(self) -> bool:
-        async with UnitOfWork(self.project_id) as uow:
-            return await uow.background_tasks.heartbeat(
-                self.task_id, self.owner, self.lease_seconds
-            )
+        if self.cancel_event.is_set():
+            return False
+        try:
+            async with UnitOfWork(self.project_id) as uow:
+                return await uow.background_tasks.heartbeat(
+                    self.task_id, self.owner, self.lease_seconds
+                )
+        except Exception:
+            return False
 
     async def is_cancelling(self) -> bool:
-        async with UnitOfWork(self.project_id) as uow:
-            return await uow.background_tasks.is_cancelling(self.task_id)
+        if self.cancel_event.is_set():
+            return True
+        try:
+            async with UnitOfWork(self.project_id) as uow:
+                return await uow.background_tasks.is_cancelling(self.task_id)
+        except Exception:
+            return True
 
 
 # A handler takes the runtime context and the task's parsed payload.

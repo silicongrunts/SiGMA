@@ -326,7 +326,6 @@ def test_commit_files_covers_non_adjacent_commit_range(tmp_path):
 
     (project_path / "notes.md").write_text("notes v1\n", encoding="utf-8")
     service.create_snapshot_commit(project_id)
-    c2 = service.get_log(project_id, 1)[0]["hash"]
 
     (project_path / "main.md").write_text("# Title (edited)\n", encoding="utf-8")
     service.create_snapshot_commit(project_id)

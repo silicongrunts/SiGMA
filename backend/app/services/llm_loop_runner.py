@@ -14,10 +14,19 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable, Awaitable, Any
 
 from app.core.chat_attachments import render_image_refs_tag, strip_image_refs_tag
+from app.core.chat_events import (
+    SSE_DELTA, SSE_TOOL_START, SSE_TOOL_END, SSE_THOUGHT,
+    SSE_FILE_CHANGED, SSE_ANNOTATION_CHANGED, SSE_TASK_LIST,
+    SSE_AWAITING_INPUT, SSE_AGENT_EVENT,
+    SSE_TURN_USAGE,
+    SSE_STREAM_STATUS, make_event,
+)
 from app.core.logging import get_logger
-from app.core.message_format import file_edit_stats
+from app.core.message_format import file_edit_stats, is_failed_tool_result
 from app.core.task_status import SSE_CANCELLED, SSE_DONE, SSE_ERROR
 from app.agents.tools.registry import tool_registry
+from app.services.pauses import InteractiveToolPause, is_permission_pause
+from app.services.message_persist import CHECKPOINT_FLAG, clear_checkpoint_markers
 from app.services.token_budget import TokenBudgetTracker, TokenBudgetExceeded, extract_llm_usage
 
 logger = get_logger(__name__)
@@ -25,54 +34,18 @@ logger = get_logger(__name__)
 MAX_TOOL_OUTPUT_CHARS = 50_000
 MAX_CONSECUTIVE_TOOL_ERRORS = 3
 AGENT_TOOL_ERROR_PREFIX = "Agent error:"
-# SSE event types (shared by all loop consumers). The terminal event names
-# (SSE_CANCELLED/SSE_DONE/SSE_ERROR) are imported at the top of this module
-# from app.core.task_status — they are the wire contract with the frontend and
-# must not drift from the stream relay's emission/matching.
-SSE_DELTA = "delta"
-SSE_TOOL_START = "tool_start"
-SSE_TOOL_END = "tool_end"
-SSE_THOUGHT = "thought"
-SSE_FILE_CHANGED = "file_changed"
-SSE_ANNOTATION_CHANGED = "annotation_changed"
-SSE_TASK_LIST = "task_list"
-SSE_AWAITING_INPUT = "awaiting_input"
-SSE_AGENT_EVENT = "agent_event"
-SSE_CONTEXT_STATS = "context_stats"
-SSE_COMPACT_START = "compact_start"
-SSE_COMPACT_DONE = "compact_done"
-
-
-class InteractiveToolPause(Exception):
-    """Raised when a subagent encounters an interactive tool and cannot pause.
-
-    Propagates to the parent loop, which saves its own checkpoint and
-    pauses on behalf of the subagent.  Carries all state needed for resume.
-    """
-
-    def __init__(
-        self,
-        *,
-        tool_name: str,
-        tool_args: dict,
-        tool_call_id: str,
-        interaction_data: dict,
-        agent_session_id: str = "",
-        agent_type: str = "",
-        parent_tool_call_id: str = "",
-        agent_usage_baseline: dict | None = None,
-    ):
-        self.tool_name = tool_name
-        self.tool_args = tool_args
-        self.tool_call_id = tool_call_id
-        self.interaction_data = interaction_data
-        self.agent_session_id = agent_session_id
-        self.agent_type = agent_type
-        self.parent_tool_call_id = parent_tool_call_id
-        self.agent_usage_baseline = agent_usage_baseline
-        super().__init__(
-            f"Interactive tool '{tool_name}' requires user input in subagent"
-        )
+# Partial-assistant checkpoint cadence: a streamed turn longer than this gets
+# its row inserted once and refreshed in place, so a crash loses at most one
+# interval of text instead of the whole assistant turn. The round-boundary
+# save stays authoritative; checkpoint writes are best-effort.
+PARTIAL_CHECKPOINT_INTERVAL_SECONDS = 2.0
+PARTIAL_CHECKPOINT_MIN_CHARS = 200
+# SSE event types (shared by all loop consumers) live in app.core.chat_events
+# together with the payload contract; the names are re-exported here because
+# query_loop / agent_service / annotation_loop import them from this module.
+# The terminal event names (SSE_CANCELLED/SSE_DONE/SSE_ERROR) come from
+# app.core.task_status — they are the wire contract with the frontend and must
+# not drift from the stream session's emission/matching.
 
 
 @dataclass
@@ -98,9 +71,8 @@ class LoopContext:
     # by comparing ``allowed_tools`` against specific toolset constants.
     context_kind: str = "main"
 
-    # Task ID for checkpoint persistence (interactive tools).
-    # Empty string means no checkpoint will be saved — the runner will
-    # raise InteractiveToolPause instead.
+    # Task ID of the owning chat task, used for log context only. Checkpoint
+    # persistence for pauses goes through the ``on_pause`` hook.
     task_id: str = ""
 
     # ── Hooks (optional callbacks) ──
@@ -112,6 +84,13 @@ class LoopContext:
     # persist_messages: save new messages. Signature: async (messages) -> None
     persist_messages: Callable[..., Awaitable[None]] | None = None
 
+    # Persist the growing assistant text while it streams (partial-assistant
+    # checkpoint). Requires persist_messages. Loops whose persister does not
+    # implement the checkpoint protocol (see message_persist) must leave this
+    # off — enabling it with a plain tail-insert persister would duplicate the
+    # in-flight message on every flush.
+    persist_partial_assistant: bool = False
+
     # prepare_messages: called before each LLM call and may replace the
     # in-memory context, for example after compaction.  It returns
     # (messages, events_to_emit).
@@ -121,18 +100,16 @@ class LoopContext:
     #   Returns an error string to feed back, or None if OK.
     validate_final_response: Callable[[str], Awaitable[str | None]] | None = None
 
-    # on_interactive_pause: called when an interactive tool is about to pause.
-    #   The hook is responsible for saving the interaction checkpoint
-    #   (typically via uow.task_state.mark_awaiting_input).  If not provided,
-    #   the runner raises InteractiveToolPause (used by subagents).
+    # on_pause: called when an interactive tool pauses for user input OR a
+    #   write/bash/notebook tool needs approval — both park the task as
+    #   ``awaiting_input`` with the same checkpoint payload, so one hook
+    #   covers both sites. The hook is responsible for saving the interaction
+    #   checkpoint (typically via uow.task_state.mark_awaiting_input). If not
+    #   provided, the runner propagates the pause to the parent loop
+    #   (InteractiveToolPause / the PermissionRequestPause itself; used by
+    #   subagents).
     #   Signature: async (tool_name, tool_args, tool_call_id, interaction_data) -> None
-    on_interactive_pause: Callable[..., Awaitable[None]] | None = None
-
-    # on_permission_pause: called when a write/bash/notebook tool needs user
-    #   approval. Same checkpoint semantics as on_interactive_pause. If not
-    #   provided, the runner raises PermissionRequestPause (used by subagents).
-    #   Signature: async (tool_name, tool_args, tool_call_id, interaction_data) -> None
-    on_permission_pause: Callable[..., Awaitable[None]] | None = None
+    on_pause: Callable[..., Awaitable[None]] | None = None
 
     # Callbacks for fetching data after tool execution
     get_active_tasks: Callable[[str], Awaitable[list]] | None = None
@@ -147,6 +124,25 @@ class LoopContext:
     last_real_count_at_index: int = 0
 
 
+@dataclass
+class ToolRoundState:
+    """Cross-round execution state of ``_execute_tool_round``.
+
+    ``consecutive_tool_errors`` / ``tool_error_stop_message`` carry across
+    rounds of one run so the consecutive-error guard counts a streak that
+    may span several LLM rounds. ``paused`` marks a pending interaction or
+    permission checkpoint (the run must stop without a terminal frame);
+    ``exit_error`` / ``aborted`` carry a hard failure for the caller's
+    finalization.
+    """
+
+    paused: bool = False
+    aborted: bool = False
+    exit_error: Exception | None = None
+    consecutive_tool_errors: int = 0
+    tool_error_stop_message: str = ""
+
+
 class LLMLoopRunner:
     """Shared LLM loop kernel.  One instance can be reused for multiple runs."""
 
@@ -156,6 +152,12 @@ class LLMLoopRunner:
         Modifies `messages` in place (appends assistant + tool messages).
         On completion, the last assistant message's content is available as
         LoopResult.final_text.
+
+        Entry also completes a partially executed tool round left at the
+        conversation tail by a pause/resume (see ``_complete_pending_round``):
+        every tool call of the tail assistant message is executed before the
+        first LLM call, so a paused round's sibling calls are never silently
+        dropped and the provider's tool_call/result pairing contract holds.
         """
         accumulated_input = 0
         accumulated_output = 0
@@ -163,8 +165,7 @@ class LLMLoopRunner:
         aborted = False
         exit_error = None
         error_message_persisted = False
-        consecutive_tool_errors = 0
-        tool_error_stop_message = ""
+        round_state = ToolRoundState()
 
         async def _emit_cancelled() -> AsyncIterator[dict]:
             turn_usage = self._build_turn_usage(
@@ -177,7 +178,109 @@ class LLMLoopRunner:
                 cancel_data["usage"] = self._public_usage(turn_usage)
             yield self.sse(SSE_CANCELLED, cancel_data)
 
+        loop_time = asyncio.get_running_loop().time
+        # Per-round partial-checkpoint state (rebound at the top of each round).
+        live_text: list[str] = []
+        live_reasoning: list[str] = []
+        live_chars = 0
+        # The in-flight assistant dict, created at the first checkpoint flush
+        # and reused as the round's final assistant message so its checkpoint
+        # row id travels with it (see message_persist's checkpoint protocol).
+        pending_assistant: dict | None = None
+        last_checkpoint_at = 0.0
+
+        def _checkpoint_due() -> bool:
+            return (
+                live_chars >= PARTIAL_CHECKPOINT_MIN_CHARS
+                and loop_time() - last_checkpoint_at
+                >= PARTIAL_CHECKPOINT_INTERVAL_SECONDS
+            )
+
+        async def _flush_partial_checkpoint() -> None:
+            """Best-effort durable checkpoint of the in-flight assistant text.
+
+            The partial message is persisted through the normal round
+            persister, which inserts its row once and refreshes it in place on
+            later flushes. Failures are logged and ignored: streaming must
+            never break on a checkpoint error, and the round-boundary save
+            remains authoritative for final content.
+            """
+            nonlocal pending_assistant, last_checkpoint_at
+            last_checkpoint_at = loop_time()
+            if pending_assistant is None:
+                pending_assistant = self.msg(
+                    "assistant",
+                    "".join(live_text),
+                    reasoning_content="".join(live_reasoning),
+                    **{CHECKPOINT_FLAG: True},
+                )
+            else:
+                # A retry restarts the stream from scratch; never blank a row
+                # that already holds a longer partial text from a prior attempt.
+                text = "".join(live_text)
+                if text or not pending_assistant.get("content"):
+                    pending_assistant["content"] = text
+                reasoning = "".join(live_reasoning)
+                if reasoning:
+                    pending_assistant["reasoning_content"] = reasoning
+            try:
+                await ctx.persist_messages(messages + [pending_assistant])
+            except Exception:
+                logger.warning(
+                    "Partial assistant checkpoint failed; continuing stream",
+                    exc_info=True,
+                )
+
+        def _append_partial_for_terminal() -> None:
+            """Attach the in-flight partial assistant (if any) to ``messages``.
+
+            Called on cancel/error exits from streaming so the terminal
+            persist keeps the text streamed so far instead of dropping it,
+            even when no checkpoint flush ran yet.
+            """
+            nonlocal pending_assistant
+            text = "".join(live_text)
+            reasoning = "".join(live_reasoning)
+            if pending_assistant is None:
+                if not text and not reasoning:
+                    return
+                pending_assistant = self.msg(
+                    "assistant", text,
+                    reasoning_content=reasoning,
+                    **{CHECKPOINT_FLAG: True},
+                )
+            else:
+                # A retry restarts the stream from scratch; never blank a
+                # partial text already held from a prior attempt.
+                if text:
+                    pending_assistant["content"] = text
+                if reasoning:
+                    pending_assistant["reasoning_content"] = reasoning
+            messages.append(pending_assistant)
+            pending_assistant = None
+
+        # Complete the paused round a resume re-entered with. Only a round at
+        # the conversation tail qualifies — a stale unpaired round buried
+        # under later messages stays history (rendered "interrupted"), never
+        # auto-executed on a fresh turn. Each pause consumes at least the
+        # checkpointed call, so successive resumes always make progress.
+        async for evt in self._complete_pending_round(ctx, messages, round_state):
+            yield evt
+        if round_state.paused:
+            # The gated sibling parked the loop again; its checkpoint is
+            # saved and the awaiting_input frame already emitted.
+            return
+        if round_state.exit_error:
+            exit_error = round_state.exit_error
+            aborted = True
+
         while not aborted:
+            # The previous round's messages were finalized by its boundary
+            # persist; dropping their checkpoint markers lets later saves skip
+            # those rows via the history-count slice instead of re-updating
+            # them on every flush.
+            clear_checkpoint_markers(messages)
+
             # Check cancellation — distinguish budget exceeded from user cancel.
             if ctx.cancel_event and ctx.cancel_event.is_set():
                 if ctx.token_budget_tracker and ctx.token_budget_tracker.exceeded:
@@ -211,47 +314,89 @@ class LLMLoopRunner:
                     logger.exception("LLM stream task failed")
                     await delta_queue.put(("__error__", exc))
 
+            # Per-round reset of the streaming accumulators and the partial
+            # assistant state (the previous round's message was finalized).
+            live_text = []
+            live_reasoning = []
+            live_chars = 0
+            pending_assistant = None
+            last_checkpoint_at = loop_time()
+
             llm_task = asyncio.create_task(_stream_to_queue())
 
-            text_content = ""
-            reasoning_content = ""
-            tool_calls = []
-            llm_usage = None
+            try:
+                text_content = ""
+                reasoning_content = ""
+                tool_calls = []
+                llm_usage = None
 
-            while True:
-                if ctx.cancel_event and ctx.cancel_event.is_set():
-                    llm_task.cancel()
-                    with suppress(asyncio.CancelledError):
+                while True:
+                    if ctx.cancel_event and ctx.cancel_event.is_set():
+                        llm_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await llm_task
+                        _append_partial_for_terminal()
+                        async for evt in _emit_cancelled():
+                            yield evt
+                        return
+
+                    try:
+                        item_type, item_data = await asyncio.wait_for(
+                            delta_queue.get(), timeout=0.5
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+
+                    if item_type == "__result__":
+                        text_content, reasoning_content, tool_calls, llm_usage = item_data
+                        break
+                    elif item_type == "__error__":
                         await llm_task
-                    async for evt in _emit_cancelled():
+                        _append_partial_for_terminal()
+                        exit_error = item_data
+                        break
+                    elif item_type == "delta":
+                        live_text.append(item_data)
+                        live_chars += len(item_data)
+                        evt = self.sse(SSE_DELTA, {"content": item_data})
                         yield evt
-                    return
+                    elif item_type == "reasoning_delta":
+                        live_reasoning.append(item_data)
+                        live_chars += len(item_data)
+                        evt = self.sse(SSE_THOUGHT, {"content": item_data})
+                        yield evt
+                    elif item_type == "stream_status":
+                        if item_data.get("status") == "retrying":
+                            # A retried attempt replays the response from the
+                            # start; restart accumulation so the checkpoint tracks
+                            # the text actually being streamed now.
+                            live_text.clear()
+                            live_reasoning.clear()
+                            live_chars = 0
+                        evt = self.sse(SSE_STREAM_STATUS, item_data)
+                        yield evt
 
-                try:
-                    item_type, item_data = await asyncio.wait_for(
-                        delta_queue.get(), timeout=0.5
-                    )
-                except asyncio.TimeoutError:
-                    continue
+                    if (
+                        ctx.persist_partial_assistant
+                        and ctx.persist_messages
+                        and _checkpoint_due()
+                    ):
+                        await _flush_partial_checkpoint()
 
-                if item_type == "__result__":
-                    text_content, reasoning_content, tool_calls, llm_usage = item_data
-                    break
-                elif item_type == "__error__":
-                    await llm_task
-                    exit_error = item_data
-                    break
-                elif item_type == "delta":
-                    evt = self.sse(SSE_DELTA, {"content": item_data})
-                    yield evt
-                elif item_type == "reasoning_delta":
-                    evt = self.sse(SSE_THOUGHT, {"content": item_data})
-                    yield evt
-                elif item_type == "stream_status":
-                    evt = self.sse("stream_status", item_data)
-                    yield evt
-
-            await llm_task
+                await llm_task
+            finally:
+                # A hard cancellation of this runner (CancelledError injected
+                # at any await above) must not orphan the in-flight stream —
+                # its provider request would keep running to natural
+                # completion with nobody retrieving the result.
+                if not llm_task.done():
+                    llm_task.cancel()
+                    try:
+                        await llm_task
+                    except asyncio.CancelledError:
+                        pass  # cleanup: stream task cancellation
+                    except Exception:
+                        logger.debug("LLM stream task cleanup raised non-cancelled error", exc_info=True)
 
             # LLM error during streaming — break outer loop for finalization.
             if exit_error:
@@ -279,7 +424,7 @@ class LLMLoopRunner:
                 for_realtime=True,
             )
             if progressive_usage:
-                yield self.sse("turn_usage", {"usage": self._public_usage(progressive_usage)})
+                yield self.sse(SSE_TURN_USAGE, {"usage": self._public_usage(progressive_usage)})
 
             budget_exceeded = False
             if ctx.token_budget_tracker:
@@ -294,17 +439,19 @@ class LLMLoopRunner:
                     yield self.sse(SSE_DELTA, {"content": text_content})
 
             # Append assistant message
-            if text_content or tool_calls or reasoning_content:
+            if text_content or tool_calls or reasoning_content or pending_assistant:
                 extra = {}
                 if llm_usage:
                     tu = extract_llm_usage(llm_usage)
                     extra["_input_tokens"] = tu.input
                     extra["_completion_tokens"] = tu.output
                     extra["_cached_tokens"] = tu.cached
-                messages.append(self.msg(
-                    "assistant", text_content or "", tool_calls,
-                    reasoning_content=reasoning_content, **extra,
-                ))
+                assistant_msg = self._fill_assistant_message(
+                    pending_assistant, text_content or "", reasoning_content,
+                    tool_calls, extra,
+                )
+                messages.append(assistant_msg)
+            pending_assistant = None
 
             if budget_exceeded:
                 break
@@ -338,331 +485,32 @@ class LLMLoopRunner:
                         continue  # let LLM retry
                 break
 
-            # Execute tool calls
-            pending_image_messages: list[dict] = []
-            for tc in tool_calls:
-                tool_name = tc.get("name", "")
-                tool_args = tc.get("params", {})
-                tool_call_id = tc.get("id", "")
-
-                tool_def = tool_registry.get(tool_name)
-
-                # Inject project_id / session_id for tools that need them
-                if tool_def:
-                    if tool_def.requires_project_id:
-                        tool_args["project_id"] = ctx.project_id
-                    if tool_def.requires_session_id and ctx.session_id:
-                        tool_args["session_id"] = ctx.session_id
-                    if tool_def.requires_model_role:
-                        tool_args["model_role"] = ctx.model_role
-
-                # Runtime whitelist enforcement
-                if ctx.allowed_tools is not None and tool_name not in ctx.allowed_tools:
-                    tool_result = (
-                        f"Error: Tool '{tool_name}' is not available in this context"
-                    )
-                    evt = self.sse(SSE_TOOL_END, {
-                        "tool": tool_name,
-                        "result_summary": tool_result[:200],
-                        "tool_call_id": tool_call_id,
-                    })
-                    yield evt
-                    messages.append(self.msg("tool", tool_result, tool_call_id=tool_call_id))
-                    continue
-
-                # Runtime forbidden list enforcement
-                if tool_name in ctx.forbidden_tools:
-                    tool_result = self._forbidden_tool_result(tool_name, ctx)
-                    evt = self.sse(SSE_TOOL_END, {
-                        "tool": tool_name,
-                        "result_summary": tool_result[:200],
-                        "tool_call_id": tool_call_id,
-                    })
-                    yield evt
-                    messages.append(self.msg("tool", tool_result, tool_call_id=tool_call_id))
-                    continue
-
-                # Emit tool_start with tool_call_id
-                evt_start = self.sse(SSE_TOOL_START, {
-                    "tool": tool_name,
-                    "params": self._safe_params(tool_args),
-                    "tool_call_id": tool_call_id,
-                })
-                yield evt_start
-
-                # Interactive tool — build interaction data. On success it
-                # pauses for user input; on a validation/call error the error
-                # is fed back to the LLM as a tool result (like normal tools)
-                # so the LLM can retry — invalid input never reaches the user
-                # as a broken modal.
-                if tool_def and tool_def.requires_user_interaction:
-                    tool_error = None
-                    try:
-                        interaction_data = await self.call_tool(tool_def, tool_args)
-                    except Exception as exc:
-                        tool_error = f"Tool '{tool_name}' error: {exc}"
-                        interaction_data = None
-
-                    # A valid pause request is a dict carrying interaction_type.
-                    # Anything else (error string, call exception, or a dict
-                    # without interaction_type) is a tool error → feed it back
-                    # to the LLM as a tool result, do not pause.
-                    if tool_error or not (
-                        isinstance(interaction_data, dict)
-                        and interaction_data.get("interaction_type")
-                    ):
-                        if tool_error is None:
-                            if isinstance(interaction_data, dict):
-                                tool_error = (
-                                    "Error: interactive tool returned no "
-                                    f"interaction_type. Payload: "
-                                    f"{str(interaction_data)[:200]}"
-                                )
-                            else:
-                                tool_error = (
-                                    str(interaction_data).strip()
-                                    or "Error: empty tool result"
-                                )
-                        yield self.sse(SSE_TOOL_END, {
-                            "tool": tool_name,
-                            "result_summary": tool_error[:200],
-                            "tool_call_id": tool_call_id,
-                        })
-                        messages.append(self.msg(
-                            "tool", tool_error, tool_call_id=tool_call_id,
-                        ))
-                        continue  # round-persist + next LLM turn handle the rest
-                    turn_usage = self._build_turn_usage(
-                        ctx, accumulated_input, accumulated_output, accumulated_cached,
-                    )
-                    # If cancel landed while the interactive tool was preparing
-                    # its prompt, honor it: record a cancelled tool result (this
-                    # keeps tool_call/result pairing intact) and let the outer
-                    # loop emit the cancelled event instead of parking for input.
-                    if ctx.cancel_event and ctx.cancel_event.is_set():
-                        messages.append(self.msg(
-                            "tool", "Tool cancelled by user.",
-                            tool_call_id=tool_call_id,
-                        ))
-                        break
-                    if ctx.persist_messages:
-                        await ctx.persist_messages(messages)
-
-                    # Persist interaction checkpoint or raise to parent.
-                    # Messages already carry per-message token accounting, so
-                    # the checkpoint callback needs no usage payload.
-                    if ctx.on_interactive_pause:
-                        await ctx.on_interactive_pause(
-                            tool_name=tool_name,
-                            tool_args=tool_args,
-                            tool_call_id=tool_call_id,
-                            interaction_data=interaction_data,
-                        )
-                    elif not ctx.task_id:
-                        # Subagent without on_interactive_pause — propagate up
-                        raise InteractiveToolPause(
-                            tool_name=tool_name,
-                            tool_args=tool_args,
-                            tool_call_id=tool_call_id,
-                            interaction_data=interaction_data,
-                        )
-                    else:
-                        # Fallback: persist checkpoint directly via UnitOfWork
-                        from app.database.unit_of_work import UnitOfWork
-                        async with UnitOfWork(ctx.project_id) as uow:
-                            await uow.task_state.mark_awaiting_input(
-                                ctx.task_id, {
-                                    "tool_name": tool_name,
-                                    "tool_args": tool_args,
-                                    "tool_call_id": tool_call_id,
-                                    "interaction_data": interaction_data,
-                                }
-                            )
-
-                    evt_input = self.sse(SSE_AWAITING_INPUT, interaction_data)
-                    yield evt_input
-                    done_data = {}
-                    if turn_usage:
-                        done_data["usage"] = self._public_usage(turn_usage)
-                    yield self.sse(SSE_DONE, done_data)
-                    return  # loop pauses
-
-                # agent tool — run via queue-based event forwarding
-                if tool_def and getattr(tool_def, 'is_agent_tool', False):
-                    try:
-                        async for evt in self._run_agent_tool(
-                            ctx, tool_name, tool_args, tool_call_id, messages
-                        ):
-                            yield evt
-                    except InteractiveToolPause:
-                        raise
-                    except Exception as exc:
-                        # PermissionRequestPause propagates up so the parent
-                        # loop (or QueryLoop) can checkpoint on behalf of the
-                        # subagent. All other exceptions take the error path.
-                        if (
-                            type(exc).__name__ == "PermissionRequestPause"
-                            and hasattr(exc, "tool")
-                        ):
-                            raise
-                        exit_error = exc
-                        aborted = True
-                        break
-                    agent_tool_message = self._last_tool_message(
-                        messages, tool_call_id,
-                    )
-                    if agent_tool_message.startswith(AGENT_TOOL_ERROR_PREFIX):
-                        consecutive_tool_errors += 1
-                        if consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS:
-                            tool_error_stop_message = (
-                                "Model produced invalid tool calls "
-                                f"{consecutive_tool_errors} consecutive times. "
-                                f"Last tool error: {agent_tool_message}"
-                            )
-                    else:
-                        consecutive_tool_errors = 0
-                        tool_error_stop_message = ""
-                    continue
-
-                # Execute the tool (via hook or default)
-                try:
-                    tool_coro = (
-                        ctx.execute_tool(tool_name, tool_args)
-                        if ctx.execute_tool
-                        else self.execute_tool_default(tool_name, tool_args)
-                    )
-                    tool_result = await self._execute_tool_cancellable(
-                        ctx, tool_coro)
-                except Exception as exc:
-                    # PermissionRequestPause is raised by execute_with_permission
-                    # when a write/bash/notebook tool needs user approval. Handle
-                    # it like an interactive pause: persist a checkpoint, emit
-                    # awaiting_input, and end this run. The user's response arrives
-                    # via the resume path.
-                    _is_perm_pause = (
-                        type(exc).__name__ == "PermissionRequestPause"
-                        and hasattr(exc, "tool")
-                    )
-                    if _is_perm_pause:
-                        pause = exc  # PermissionRequestPause instance
-                        # Stamp the full tool args / call id so the checkpoint
-                        # can re-execute the tool on resume.
-                        pause.tool_args = tool_args
-                        pause.inner_tool_call_id = tool_call_id
-                        turn_usage = self._build_turn_usage(
-                            ctx, accumulated_input, accumulated_output,
-                            accumulated_cached,
-                        )
-                        # If cancel landed before we could pause, record a
-                        # cancelled tool result and let the outer loop emit the
-                        # cancelled event instead of parking.
-                        if ctx.cancel_event and ctx.cancel_event.is_set():
-                            messages.append(self.msg(
-                                "tool", "Tool cancelled by user.",
-                                tool_call_id=tool_call_id,
-                            ))
-                            break
-                        if ctx.persist_messages:
-                            await ctx.persist_messages(messages)
-
-                        interaction_data = {
-                            "interaction_type": "permission",
-                            "tool": pause.tool,
-                            "tool_name": pause.tool_name,
-                            "path": pause.path,
-                            "operation": pause.operation,
-                            "content": pause.content,
-                            "description": pause.description,
-                            "diff_lines": pause.diff_lines,
-                            "diff_truncated": pause.diff_truncated,
-                        }
-                        if ctx.on_permission_pause:
-                            await ctx.on_permission_pause(
-                                tool_name=tool_name,
-                                tool_args=tool_args,
-                                tool_call_id=tool_call_id,
-                                interaction_data=interaction_data,
-                            )
-                        elif not ctx.task_id:
-                            # Subagent without on_permission_pause — propagate up
-                            # to the parent loop, which will checkpoint on behalf.
-                            raise
-                        else:
-                            # Fallback: persist checkpoint directly
-                            from app.database.unit_of_work import UnitOfWork
-                            async with UnitOfWork(ctx.project_id) as uow:
-                                await uow.task_state.mark_awaiting_input(
-                                    ctx.task_id, {
-                                        "tool_name": tool_name,
-                                        "tool_args": tool_args,
-                                        "tool_call_id": tool_call_id,
-                                        "interaction_data": interaction_data,
-                                    }
-                                )
-
-                        yield self.sse(SSE_AWAITING_INPUT, interaction_data)
-                        done_data = {}
-                        if turn_usage:
-                            done_data["usage"] = self._public_usage(turn_usage)
-                        yield self.sse(SSE_DONE, done_data)
-                        return  # loop pauses
-
-                    tool_result = f"Tool '{tool_name}' error: {exc}"
-                    yield self.sse(SSE_TOOL_END, self.tool_end_payload(
-                        tool_name, tool_args, tool_result, tool_call_id,
-                    ))
-                    messages.append(self.msg(
-                        "tool", tool_result, tool_call_id=tool_call_id,
-                    ))
-                    consecutive_tool_errors += 1
-                    if consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS:
-                        tool_error_stop_message = (
-                            "Model produced invalid tool calls "
-                            f"{consecutive_tool_errors} consecutive times. "
-                            f"Last tool error: {tool_result}"
-                        )
-                    continue
-
-                consecutive_tool_errors = 0
-                tool_error_stop_message = ""
-
-                tool_result, image_messages = self._normalize_tool_result(tool_result)
-
-                # Truncate very long outputs
-                if len(tool_result) > MAX_TOOL_OUTPUT_CHARS:
-                    tool_result = tool_result[:MAX_TOOL_OUTPUT_CHARS] + "\n... [truncated]"
-
-                # Emit tool_end with tool_call_id
-                yield self.sse(SSE_TOOL_END, self.tool_end_payload(
-                    tool_name, tool_args, tool_result, tool_call_id,
-                ))
-
-                # Side-effect events (file_changed, annotation_changed, task_list)
-                fc_evt = self._emit_file_changed(tool_name, tool_args, tool_result)
-                if fc_evt:
-                    yield fc_evt
-
-                ac_evt = self._emit_annotation_changed(tool_name, tool_args)
-                if ac_evt:
-                    yield ac_evt
-
-                if tool_name in {"task_create", "task_update", "task_list", "task_get", "task_write"}:
-                    tl_evt = await self._fetch_task_list(ctx)
-                    if tl_evt:
-                        yield tl_evt
-
-                # Append tool result to messages
-                messages.append(self.msg("tool", tool_result, tool_call_id=tool_call_id))
-                pending_image_messages.extend(image_messages)
-
-            messages.extend(pending_image_messages)
+            # Execute tool calls. The same executor serves a fresh LLM
+            # round and a resumed turn's pending tail round, so sibling
+            # calls of a paused round cannot be silently dropped.
+            async for evt in self._execute_tool_round(
+                ctx, messages, tool_calls, round_state,
+            ):
+                yield evt
+            if round_state.paused:
+                # The pause site persisted messages and emitted the
+                # awaiting_input frame; nothing else to finalize.
+                return
+            if round_state.exit_error:
+                exit_error = round_state.exit_error
+                aborted = True
 
             # Persist every completed tool round
             if ctx.persist_messages:
                 await ctx.persist_messages(messages)
 
-            if tool_error_stop_message:
-                exit_error = RuntimeError(tool_error_stop_message)
+            if round_state.tool_error_stop_message:
+                logger.error(
+                    "Loop aborted after consecutive tool errors (task=%s): %s",
+                    ctx.task_id or ctx.session_id,
+                    round_state.tool_error_stop_message,
+                )
+                exit_error = RuntimeError(round_state.tool_error_stop_message)
                 aborted = True
 
             if aborted:
@@ -699,6 +547,365 @@ class LLMLoopRunner:
         yield self.sse(SSE_DONE, done_data)
 
     @staticmethod
+    def _pending_tail_tool_calls(messages: list[dict]) -> list[dict]:
+        """Tool calls of a partially executed round at the conversation tail.
+
+        Walks backwards over trailing tool results (and in-memory ephemeral
+        image messages); if the assistant message they answer carries
+        tool_calls without results, those calls are returned in original
+        order, parsed to the runner's ``{id, name, params}`` shape. Any other
+        tail (user message, plain assistant text) means no round is pending.
+
+        Only tail rounds are returned on purpose: an unpaired round buried
+        under later messages is a dead turn (crash or cancel), and silently
+        auto-executing its stale calls on a fresh turn would surprise the
+        user. Those stay history — rendered as interrupted.
+        """
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if msg.get("_ephemeral") or msg.get("role") == "tool":
+                continue
+            tool_calls = msg.get("tool_calls") or []
+            if msg.get("role") != "assistant" or not tool_calls:
+                return []
+            answered = {
+                m.get("tool_call_id")
+                for m in messages[idx + 1:]
+                if m.get("role") == "tool"
+            }
+            pending = []
+            for tc in tool_calls:
+                if tc.get("id") and tc.get("id") in answered:
+                    continue
+                fn = tc.get("function", {})
+                try:
+                    params = json.loads(fn.get("arguments", "") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    params = {}
+                pending.append({
+                    "id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "params": params if isinstance(params, dict) else {},
+                })
+            return pending
+        return []
+
+    async def _complete_pending_round(
+        self, ctx: LoopContext, messages: list[dict], state: ToolRoundState,
+    ) -> AsyncIterator[dict]:
+        """Execute the paused round's not-yet-run sibling calls, if any.
+
+        Resume paths re-enter ``run()`` with the checkpointed call already
+        answered; its siblings of the same assistant message used to dangle
+        forever — never executed, no result row, an invalid provider history
+        and a misleading "interrupted" timeline after refresh. They run here
+        through the same executor as a live round, gates included.
+        """
+        pending = self._pending_tail_tool_calls(messages)
+        if not pending:
+            return
+        async for evt in self._execute_tool_round(ctx, messages, pending, state):
+            yield evt
+        if not state.paused and ctx.persist_messages:
+            await ctx.persist_messages(messages)
+
+    async def _execute_tool_round(
+        self, ctx: LoopContext, messages: list[dict],
+        tool_calls: list[dict], state: ToolRoundState,
+    ) -> AsyncIterator[dict]:
+        """Execute one round's tool calls in order, appending each result.
+
+        Shared by the live loop (a fresh LLM round) and the resume entry
+        (a paused round's pending sibling calls — see
+        ``_complete_pending_round``), so the two paths cannot drift.
+        Pauses set ``state.paused`` and end iteration right after the
+        awaiting_input frame; hard failures land in ``state.exit_error``
+        or ``state.tool_error_stop_message`` for the caller to finalize.
+        """
+        pending_image_messages: list[dict] = []
+        for tc in tool_calls:
+            tool_name = tc.get("name", "")
+            tool_args = tc.get("params", {})
+            tool_call_id = tc.get("id", "")
+
+            tool_def = tool_registry.get(tool_name)
+
+            # Inject project_id / session_id for tools that need them
+            if tool_def:
+                if tool_def.requires_project_id:
+                    tool_args["project_id"] = ctx.project_id
+                if tool_def.requires_session_id and ctx.session_id:
+                    tool_args["session_id"] = ctx.session_id
+                if tool_def.requires_model_role:
+                    tool_args["model_role"] = ctx.model_role
+
+            # Runtime whitelist enforcement
+            if ctx.allowed_tools is not None and tool_name not in ctx.allowed_tools:
+                tool_result = (
+                    f"Error: Tool '{tool_name}' is not available in this context"
+                )
+                evt = self.sse(SSE_TOOL_END, {
+                    "tool": tool_name,
+                    "result_summary": tool_result[:200],
+                    "tool_call_id": tool_call_id,
+                })
+                yield evt
+                messages.append(self.msg("tool", tool_result, tool_call_id=tool_call_id))
+                continue
+
+            # Runtime forbidden list enforcement
+            if tool_name in ctx.forbidden_tools:
+                tool_result = self._forbidden_tool_result(tool_name, ctx)
+                evt = self.sse(SSE_TOOL_END, {
+                    "tool": tool_name,
+                    "result_summary": tool_result[:200],
+                    "tool_call_id": tool_call_id,
+                })
+                yield evt
+                messages.append(self.msg("tool", tool_result, tool_call_id=tool_call_id))
+                continue
+
+            # Emit tool_start with tool_call_id
+            evt_start = self.sse(SSE_TOOL_START, {
+                "tool": tool_name,
+                "params": self._safe_params(tool_args),
+                "tool_call_id": tool_call_id,
+            })
+            yield evt_start
+
+            # Interactive tool — build interaction data. On success it
+            # pauses for user input; on a validation/call error the error
+            # is fed back to the LLM as a tool result (like normal tools)
+            # so the LLM can retry — invalid input never reaches the user
+            # as a broken modal.
+            if tool_def and tool_def.requires_user_interaction:
+                tool_error = None
+                try:
+                    interaction_data = await self.call_tool(tool_def, tool_args)
+                except Exception as exc:
+                    tool_error = f"Tool '{tool_name}' error: {exc}"
+                    interaction_data = None
+
+                # A valid pause request is a dict carrying interaction_type.
+                # Anything else (error string, call exception, or a dict
+                # without interaction_type) is a tool error → feed it back
+                # to the LLM as a tool result, do not pause.
+                if tool_error or not (
+                    isinstance(interaction_data, dict)
+                    and interaction_data.get("interaction_type")
+                ):
+                    if tool_error is None:
+                        if isinstance(interaction_data, dict):
+                            tool_error = (
+                                "Error: interactive tool returned no "
+                                f"interaction_type. Payload: "
+                                f"{str(interaction_data)[:200]}"
+                            )
+                        else:
+                            tool_error = (
+                                str(interaction_data).strip()
+                                or "Error: empty tool result"
+                            )
+                    yield self.sse(SSE_TOOL_END, {
+                        "tool": tool_name,
+                        "result_summary": tool_error[:200],
+                        "tool_call_id": tool_call_id,
+                    })
+                    messages.append(self.msg(
+                        "tool", tool_error, tool_call_id=tool_call_id,
+                    ))
+                    continue  # round-persist + next LLM turn handle the rest
+                # If cancel landed while the interactive tool was preparing
+                # its prompt, honor it: record a cancelled tool result (this
+                # keeps tool_call/result pairing intact) and let the outer
+                # loop emit the cancelled event instead of parking for input.
+                if ctx.cancel_event and ctx.cancel_event.is_set():
+                    messages.append(self.msg(
+                        "tool", "Tool cancelled by user.",
+                        tool_call_id=tool_call_id,
+                    ))
+                    break
+                if ctx.persist_messages:
+                    await ctx.persist_messages(messages)
+
+                # Persist interaction checkpoint or propagate the pause to
+                # the parent loop. Messages already carry per-message token
+                # accounting, so the checkpoint callback needs no usage
+                # payload.
+                if ctx.on_pause:
+                    await ctx.on_pause(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        tool_call_id=tool_call_id,
+                        interaction_data=interaction_data,
+                    )
+                else:
+                    # Subagent without an on_pause hook — propagate up.
+                    raise InteractiveToolPause(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        tool_call_id=tool_call_id,
+                        interaction_data=interaction_data,
+                    )
+
+                # The task runner synthesizes the done frame when it sees
+                # the parked awaiting_input status — the loop must not emit
+                # a second terminal frame for the same pause.
+                yield self.sse(SSE_AWAITING_INPUT, interaction_data)
+                state.paused = True
+                return  # loop pauses
+
+            # agent tool — run via queue-based event forwarding
+            if tool_def and getattr(tool_def, 'is_agent_tool', False):
+                try:
+                    async for evt in self._run_agent_tool(
+                        ctx, tool_name, tool_args, tool_call_id, messages
+                    ):
+                        yield evt
+                except InteractiveToolPause:
+                    raise
+                except Exception as exc:
+                    # PermissionRequestPause propagates up so the parent
+                    # loop (or QueryLoop) can checkpoint on behalf of the
+                    # subagent. All other exceptions take the error path.
+                    if is_permission_pause(exc):
+                        raise
+                    state.exit_error = exc
+                    state.aborted = True
+                    break
+                agent_tool_message = self._last_tool_message(
+                    messages, tool_call_id,
+                )
+                if agent_tool_message.startswith(AGENT_TOOL_ERROR_PREFIX):
+                    state.consecutive_tool_errors += 1
+                    if state.consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS:
+                        state.tool_error_stop_message = (
+                            "Model produced invalid tool calls "
+                            f"{state.consecutive_tool_errors} consecutive times. "
+                            f"Last tool error: {agent_tool_message}"
+                        )
+                else:
+                    state.consecutive_tool_errors = 0
+                    state.tool_error_stop_message = ""
+                continue
+
+            # Execute the tool (via hook or default)
+            try:
+                tool_coro = (
+                    ctx.execute_tool(tool_name, tool_args)
+                    if ctx.execute_tool
+                    else self.execute_tool_default(tool_name, tool_args)
+                )
+                tool_result = await self.execute_tool_cancellable(
+                    ctx.cancel_event, tool_coro)
+            except Exception as exc:
+                # A permission pause is handled like an interactive pause:
+                # persist a checkpoint, emit awaiting_input, and end this
+                # run. The user's response arrives via the resume path.
+                if is_permission_pause(exc):
+                    pause = exc
+                    # Stamp the full tool args / call id so the checkpoint
+                    # can re-execute the tool on resume.
+                    pause.tool_args = tool_args
+                    pause.inner_tool_call_id = tool_call_id
+                    # If cancel landed before we could pause, record a
+                    # cancelled tool result and let the outer loop emit the
+                    # cancelled event instead of parking.
+                    if ctx.cancel_event and ctx.cancel_event.is_set():
+                        messages.append(self.msg(
+                            "tool", "Tool cancelled by user.",
+                            tool_call_id=tool_call_id,
+                        ))
+                        break
+                    if ctx.persist_messages:
+                        await ctx.persist_messages(messages)
+
+                    interaction_data = {
+                        "interaction_type": "permission",
+                        "task_id": ctx.task_id,
+                        "tool": pause.tool,
+                        "tool_name": pause.tool_name,
+                        "path": pause.path,
+                        "resolved_path": pause.resolved_path,
+                        "operation": pause.operation,
+                        "content": pause.content,
+                        "content_truncated": pause.content_truncated,
+                        "content_sha256": pause.content_sha256,
+                        "description": pause.description,
+                        "diff_lines": pause.diff_lines,
+                        "diff_truncated": pause.diff_truncated,
+                    }
+                    if ctx.on_pause:
+                        await ctx.on_pause(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            tool_call_id=tool_call_id,
+                            interaction_data=interaction_data,
+                        )
+                    else:
+                        # Subagent without an on_pause hook — propagate up
+                        # to the parent loop, which will checkpoint on
+                        # behalf of the subagent.
+                        raise
+
+                    # The task runner synthesizes the done frame when it
+                    # sees the parked awaiting_input status — the loop must
+                    # not emit a second terminal frame for the same pause.
+                    yield self.sse(SSE_AWAITING_INPUT, interaction_data)
+                    state.paused = True
+                    return  # loop pauses
+
+                tool_result = f"Tool '{tool_name}' error: {exc}"
+                yield self.sse(SSE_TOOL_END, self.tool_end_payload(
+                    tool_name, tool_args, tool_result, tool_call_id,
+                ))
+                messages.append(self.msg(
+                    "tool", tool_result, tool_call_id=tool_call_id,
+                ))
+                state.consecutive_tool_errors += 1
+                if state.consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS:
+                    state.tool_error_stop_message = (
+                        "Model produced invalid tool calls "
+                        f"{state.consecutive_tool_errors} consecutive times. "
+                        f"Last tool error: {tool_result}"
+                    )
+                continue
+
+            state.consecutive_tool_errors = 0
+            state.tool_error_stop_message = ""
+
+            tool_result, image_messages = self._normalize_tool_result(tool_result)
+
+            # Truncate very long outputs
+            if len(tool_result) > MAX_TOOL_OUTPUT_CHARS:
+                tool_result = tool_result[:MAX_TOOL_OUTPUT_CHARS] + "\n... [truncated]"
+
+            # Emit tool_end with tool_call_id
+            yield self.sse(SSE_TOOL_END, self.tool_end_payload(
+                tool_name, tool_args, tool_result, tool_call_id,
+            ))
+
+            # Side-effect events (file_changed, annotation_changed, task_list)
+            fc_evt = self._emit_file_changed(tool_name, tool_args, tool_result)
+            if fc_evt:
+                yield fc_evt
+
+            ac_evt = self._emit_annotation_changed(tool_name, tool_args)
+            if ac_evt:
+                yield ac_evt
+
+            if tool_name in {"task_create", "task_update", "task_list", "task_get", "task_write"}:
+                tl_evt = await self._fetch_task_list(ctx)
+                if tl_evt:
+                    yield tl_evt
+
+            # Append tool result to messages
+            messages.append(self.msg("tool", tool_result, tool_call_id=tool_call_id))
+            pending_image_messages.extend(image_messages)
+
+        messages.extend(pending_image_messages)
+
+    @staticmethod
     def _build_turn_usage(
         ctx: LoopContext,
         accumulated_input: int,
@@ -707,7 +914,10 @@ class LLMLoopRunner:
         for_realtime: bool = False,
     ) -> dict | None:
         if ctx.token_budget_tracker and (for_realtime or not ctx.is_agent_tool):
-            tracked = ctx.token_budget_tracker.usage
+            # Whole-turn totals (baseline + carry + this task's accrual),
+            # not the per-task accrual alone: a turn split by pause/resume
+            # cycles must keep one monotonic stat line.
+            tracked = ctx.token_budget_tracker.total_usage
             usage = {
                 "input": tracked.input,
                 "output": tracked.output,
@@ -737,6 +947,34 @@ class LLMLoopRunner:
             return {"input": 0, "output": 0, "cached": 0}
         usage = ctx.token_budget_tracker.usage
         return {"input": usage.input, "output": usage.output, "cached": usage.cached}
+
+    @staticmethod
+    def budget_tracker_usage(tracker) -> dict[str, int]:
+        """Snapshot a tracker's own accrual directly — for resume paths that
+        hold the tracker but no LoopContext (subagent interaction resume)."""
+        if not tracker:
+            return {"input": 0, "output": 0, "cached": 0}
+        usage = tracker.usage
+        return {"input": usage.input, "output": usage.output, "cached": usage.cached}
+
+    @staticmethod
+    def _pending_agent_usage_carry(
+        ctx: LoopContext, usage_before: dict[str, int],
+    ) -> dict[str, int]:
+        """Subagent spend accrued since the enclosing agent call started.
+
+        Stamped onto a propagating pause and persisted in the interaction
+        checkpoint: while the agent call is parked, its spend lives only in
+        the tracker and the subagent's own rows — invisible to the parent
+        turn until the completion delta row lands. The resume seeds this
+        value back into the tracker's carry bucket so the turn stats never
+        drop across the pause/resume split.
+        """
+        now = LLMLoopRunner.tracker_usage_snapshot(ctx)
+        return {
+            key: max(0, now[key] - int(usage_before.get(key) or 0))
+            for key in ("input", "output", "cached")
+        }
 
     @staticmethod
     def _tracker_usage_delta(ctx: LoopContext, before: dict[str, int]) -> dict[str, int]:
@@ -811,7 +1049,7 @@ class LLMLoopRunner:
             except InteractiveToolPause as e:
                 await event_queue.put({"__interactive_pause__": e})
             except Exception as e:
-                if type(e).__name__ == "PermissionRequestPause" and hasattr(e, "tool"):
+                if is_permission_pause(e):
                     await event_queue.put({"__interactive_pause__": e})
                 else:
                     logger.exception("agent tool execution failed for %s", tool_name)
@@ -880,6 +1118,9 @@ class LLMLoopRunner:
                     # parent loop can checkpoint on behalf of the subagent.
                     e = item["__interactive_pause__"]
                     e.parent_tool_call_id = tool_call_id
+                    e.agent_usage_carry = self._pending_agent_usage_carry(
+                        ctx, usage_before,
+                    )
                     await agent_task
                     raise e
 
@@ -917,7 +1158,7 @@ class LLMLoopRunner:
                     elif inner_type == SSE_DONE:
                         # Don't forward subagent's done event — it's internal
                         pass
-                    elif inner_type == "turn_usage":
+                    elif inner_type == SSE_TURN_USAGE:
                         # Forward progressive usage as top-level event so the
                         # frontend's existing handler updates the message in
                         # real time during subagent execution.
@@ -927,7 +1168,7 @@ class LLMLoopRunner:
                             "inner_type": inner_type,
                             "inner_data": inner_data,
                         })
-                        yield self.sse("turn_usage", inner_data)
+                        yield self.sse(SSE_TURN_USAGE, inner_data)
                     else:
                         yield self.sse(SSE_AGENT_EVENT, {
                             "parent_tool_call_id": tool_call_id,
@@ -997,7 +1238,10 @@ class LLMLoopRunner:
     @staticmethod
     def _emit_file_changed(tool_name: str, tool_args: dict, tool_result: str = "") -> dict | None:
         """Return file_changed SSE event if applicable."""
-        if tool_result.startswith("Error:"):
+        # Failed tool results — including the "Tool cancelled by user." marker
+        # a cancelled call leaves in place of a result — mean no file operation
+        # actually happened, so there is nothing for the frontend to refresh.
+        if is_failed_tool_result(tool_result):
             return None
         if tool_name == "notebook_run_cell" and tool_args.get("interrupt"):
             return None
@@ -1057,21 +1301,25 @@ class LLMLoopRunner:
     # Default tool execution
     # ------------------------------------------------------------------
 
-    async def _execute_tool_cancellable(self, ctx, tool_coro):
+    @staticmethod
+    async def execute_tool_cancellable(cancel_event, tool_coro):
         """Run a tool call, cancelling it the moment the user cancels.
 
-        Cancelling the tool's asyncio task is how a user stop reaches
-        in-flight work — subprocess-based tools (bash, glob, grep) kill
-        their children in CancelledError cleanup. Without this, a cancelled
-        task keeps waiting on the tool until its own timeout. Exceptions
-        from the tool (including PermissionRequestPause) propagate
-        unchanged; on cancellation a "Tool cancelled by user." result keeps
-        the tool_call/tool_result pairing intact.
+        The one cancellation wrapper for every tool execution site: the main
+        loop's per-call execution and the resume paths' approved-tool
+        execution (direct, fork, and subagent) all go through it, so a user
+        stop reaches in-flight work no matter which path launched the tool —
+        subprocess-based tools (bash, glob, grep) kill their children in
+        CancelledError cleanup. Without this, a cancelled task keeps waiting
+        on the tool until its own timeout. Exceptions from the tool
+        (including PermissionRequestPause) propagate unchanged; on
+        cancellation a "Tool cancelled by user." result keeps the
+        tool_call/tool_result pairing intact.
         """
-        if ctx.cancel_event is None:
+        if cancel_event is None:
             return await tool_coro
         tool_task = asyncio.ensure_future(tool_coro)
-        cancel_task = asyncio.create_task(ctx.cancel_event.wait())
+        cancel_task = asyncio.create_task(cancel_event.wait())
         try:
             done, _ = await asyncio.wait(
                 {tool_task, cancel_task},
@@ -1086,7 +1334,14 @@ class LLMLoopRunner:
                 # Expected: the tool_task we just cancelled. But if our own
                 # task has a pending outer cancellation, that delivery must
                 # not be swallowed — the finally below still cleans up.
-                if asyncio.current_task().cancelling():
+                # cancelling() is 3.11+; on 3.10 the fallback is whether the
+                # awaited task itself ended up cancelled (an outer cancel
+                # raises at this await without touching tool_task).
+                current = asyncio.current_task()
+                if current and getattr(current, "cancelling", None):
+                    if current.cancelling():
+                        raise
+                elif not tool_task.cancelled():
                     raise
             except Exception:
                 logger.debug(
@@ -1094,9 +1349,9 @@ class LLMLoopRunner:
             return "Tool cancelled by user."
         finally:
             cancel_task.cancel()
-            # An outer cancellation (worker shutdown, task revoke) must not
-            # orphan the in-flight tool — its CancelledError handler is what
-            # kills the tool's subprocesses.
+            # An outer cancellation (process shutdown, task cancellation) must
+            # not orphan the in-flight tool — its CancelledError handler is
+            # what kills the tool's subprocesses.
             if not tool_task.done():
                 tool_task.cancel()
 
@@ -1161,27 +1416,112 @@ class LLMLoopRunner:
         }
         return await tool_def.call(**clean)
 
+    @staticmethod
+    async def call_interactive_tool(
+        tool_def, tool_args: dict, interaction_response: dict | None,
+        session_id: str | None = None,
+    ) -> str:
+        """Execute an interactive tool on resume with the user's response.
+
+        THE merge contract for every interactive resume path (direct and
+        subagent). The checkpointed ``tool_args`` come from the LLM and are
+        authoritative: they are filtered to the tool's declared schema
+        properties plus the context-injection set, exactly as ``call_tool``
+        does. The ``interaction_response`` comes from the frontend modal, not
+        from the LLM: it may only introduce keys the schema does not declare
+        (``answers``, ``approved``, ...) — a response key colliding with a
+        declared property is dropped and the checkpoint value wins, so the
+        modal cannot swap an LLM-produced argument at answer time. The
+        runner-stamped context params (``project_id``/``session_id``/
+        ``model_role``, captured in the checkpointed args) are re-applied
+        last so a client response can never override them; *session_id*
+        re-stamps the session for tools that require one (the subagent
+        resume passes the agent session, or the main session for the
+        plan-approval tool, whose plan belongs to the parent session).
+
+        On failure the rendered error string is returned and becomes the
+        persisted tool result: a failed call's side-effect state is unknown,
+        so the loop never re-executes the tool — no retry happens.
+        """
+        schema_props = set(tool_def.input_schema.get("properties", {}).keys())
+        context_params = {"project_id", "session_id", "model_role"}
+        clean = {
+            k: v for k, v in tool_args.items()
+            if k in schema_props or k in context_params
+        }
+        overlay = {
+            k: v for k, v in (interaction_response or {}).items()
+            if k not in schema_props
+        }
+        context = {k: clean[k] for k in context_params if k in clean}
+        if session_id is not None and tool_def.requires_session_id:
+            context["session_id"] = session_id
+        try:
+            return str(await tool_def.call(**{**clean, **overlay, **context}))
+        except Exception as exc:
+            logger.exception(
+                "Interactive tool response failed for %s", tool_def.name,
+            )
+            return f"Tool '{tool_def.name}' error: {exc}"
+
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def tool_calls_payload(tool_calls: list[dict]) -> list[dict]:
+        """Render parsed tool calls into the wire-format list stored on
+        assistant messages (and persisted as the tool_calls JSON)."""
+        return [
+            {"id": tc.get("id", ""), "type": "function",
+             "function": {"name": tc["name"],
+                          "arguments": json.dumps(tc.get("params", {}), ensure_ascii=False)}}
+            for tc in tool_calls
+        ]
 
     @staticmethod
     def msg(role: str, content: str, tool_calls: list[dict] | None = None,
              tool_call_id: str = "", reasoning_content: str = "", **extra) -> dict:
         msg: dict = {"role": role, "content": content}
         if tool_calls:
-            msg["tool_calls"] = [
-                {"id": tc.get("id", ""), "type": "function",
-                 "function": {"name": tc["name"],
-                              "arguments": json.dumps(tc.get("params", {}), ensure_ascii=False)}}
-                for tc in tool_calls
-            ]
+            msg["tool_calls"] = LLMLoopRunner.tool_calls_payload(tool_calls)
         if tool_call_id:
             msg["tool_call_id"] = tool_call_id
         if reasoning_content:
             msg["reasoning_content"] = reasoning_content
         msg.update(extra)
         return msg
+
+    @staticmethod
+    def _fill_assistant_message(
+        target: dict | None,
+        content: str,
+        reasoning_content: str,
+        tool_calls: list[dict],
+        extra: dict,
+    ) -> dict:
+        """Fill the checkpointed partial assistant dict in place with the
+        round's final result, or build a fresh assistant message when nothing
+        was checkpointed. Filling in place keeps the checkpoint row id (and
+        flag) on the message that enters ``messages``, so the round-boundary
+        save refreshes the existing row instead of inserting a duplicate."""
+        if target is None:
+            return LLMLoopRunner.msg(
+                "assistant", content, tool_calls,
+                reasoning_content=reasoning_content, **extra,
+            )
+        target["content"] = content
+        if reasoning_content:
+            target["reasoning_content"] = reasoning_content
+        else:
+            target.pop("reasoning_content", None)
+        if tool_calls:
+            target["tool_calls"] = LLMLoopRunner.tool_calls_payload(tool_calls)
+        else:
+            target.pop("tool_calls", None)
+        if extra:
+            target.update(extra)
+        return target
 
     @staticmethod
     def entry_from_history(msg, content) -> dict:
@@ -1240,7 +1580,8 @@ class LLMLoopRunner:
 
     @staticmethod
     def sse(event_type: str, data: dict) -> dict:
-        return {"type": event_type, "data": data}
+        """Build one SSE event dict via the shared chat event contract."""
+        return make_event(event_type, data)
 
     @staticmethod
     def tool_end_payload(tool_name: str, tool_args, tool_result: str,

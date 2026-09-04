@@ -50,12 +50,7 @@ sqlalchemy==2.0.36
 aiosqlite==0.20.0
 alembic==1.18.4
 
-# Task queue
-huey==3.0.0
-
 # Utilities
-pylatexenc==2.10
-zipstream-new==1.1.8
 tiktoken==0.8.0
 playwright==1.58.0
 html2text==2025.4.15

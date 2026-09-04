@@ -1,8 +1,6 @@
 /**
- * DiffView — shared side-by-side diff rendering component.
- *
- * Extracted from HistoryPanel so both HistoryPanel and FileConflictModal
- * can reuse the same diff rendering logic.
+ * DiffView — shared side-by-side diff rendering component used by
+ * HistoryPanel and FileConflictModal.
  *
  * Accepts typed diff lines with `type` in ('context', 'remove', 'add').
  * Produces paired left/right columns for side-by-side display.

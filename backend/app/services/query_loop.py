@@ -22,6 +22,7 @@ from app.core.chat_attachments import (
     strip_internal_image_tags,
 )
 from app.core.model_config import get_model_endpoint, model_role_accepts_images
+from app.core.utils import generate_id
 from app.database.unit_of_work import UnitOfWork
 from app.agents.prompt_service import prompt_service
 from app.agents.tool_schema_service import tool_schemas_for_model_role
@@ -31,14 +32,23 @@ from app.services.compaction_service import compaction_service
 from app.services.chat_attachments import read_attachment_base64, read_image_path_base64
 from app.services.session_temp_service import session_temp_service
 from app.services.task_service import task_to_dict
+from app.core.chat_events import (
+    SSE_AWAITING_INPUT, SSE_CONTEXT_STATS, SSE_COMPACT_START, SSE_COMPACT_DONE,
+)
 from app.services.llm_loop_runner import (
-    LLMLoopRunner, LoopContext, InteractiveToolPause,
+    LLMLoopRunner, LoopContext,
     SSE_ERROR, SSE_DONE, SSE_TOOL_END, SSE_AGENT_EVENT,
-    SSE_CONTEXT_STATS, SSE_COMPACT_START, SSE_COMPACT_DONE,
     MAX_TOOL_OUTPUT_CHARS,
 )
+from app.services.pauses import InteractiveToolPause, is_permission_pause
+from app.services.permission_executor import (
+    approved_notebook_drift_error,
+    approved_target_drift_error,
+    restore_approved_read_state,
+)
 from app.services.token_budget import extract_llm_usage
-from app.services.message_persist import stage_new_messages
+from app.services.message_persist import stage_new_messages, CHECKPOINT_ROW_ID
+from app.core.text_diff import CONTENT_SOFT_LIMIT
 
 logger = get_logger(__name__)
 
@@ -68,9 +78,44 @@ class QueryLoop:
         self._persisted_real_count_at_index = 0
         self._context_warning_level = 0
 
+    def _checkpoint(self, interaction_data: dict) -> dict:
+        """Attach the immutable identity shared by UI, DB, and resume."""
+        interaction_id = interaction_data.get("interaction_id") or generate_id()
+        interaction_type = interaction_data.get("interaction_type")
+        if not interaction_type:
+            raise ValueError("Interactive checkpoint is missing interaction_type")
+        interaction_data.update({
+            "task_id": self._task_id,
+            "interaction_id": interaction_id,
+        })
+        return {
+            "interaction_id": interaction_id,
+            "interaction_type": interaction_type,
+        }
+
+    async def _finish_checkpoint(self, success: bool, error: str = "") -> None:
+        response = self._interaction_response or {}
+        async with UnitOfWork(self.project_id) as uow:
+            if success:
+                await uow.task_state.complete_interaction(response.get("task_id", ""))
+            else:
+                await uow.task_state.fail_interaction(response.get("task_id", ""), error)
+
     @staticmethod
     def _resolve_model(role: str) -> str:
         return get_model_endpoint(role).litellm_model
+
+    def _require_not_cancelled(self) -> None:
+        """Raise CancelledError when the user has stopped this turn.
+
+        Boundary check for phases that have no per-chunk cancel signal of
+        their own (message building, the compaction call); the compaction LLM
+        call itself is raced against the cancel event inside
+        ``compaction_service.compact_messages``. The raised CancelledError
+        propagates to the task runner, which finalizes the row as cancelled.
+        """
+        if self._cancel_event and self._cancel_event.is_set():
+            raise asyncio.CancelledError()
 
     # ------------------------------------------------------------------
     # Public API
@@ -81,7 +126,7 @@ class QueryLoop:
         messages = []
         try:
             # ── Resume from interaction checkpoint ──
-            if self._interaction_response:
+            if self._interaction_response is not None:
                 async for event in self._resume_from_interaction():
                     yield event
                 return
@@ -89,43 +134,63 @@ class QueryLoop:
             # Build messages
             messages = await self._build_messages()
             if not messages:
-                yield LLMLoopRunner.sse(SSE_ERROR, {"error": "Failed to build messages"})
+                yield await self._error_event("Failed to build messages")
                 return
 
             # Build loop context
             ctx = self._build_loop_context()
-            async for event in LLMLoopRunner().run(ctx, messages):
+            async for event in self._run_loop_guarded(ctx, messages):
                 yield event
 
+        except Exception as e:
+            logger.error("QueryLoop error: %s", e, exc_info=True)
+            yield await self._error_event(e)
+
+    async def _run_loop_guarded(
+        self, ctx, messages: list[dict],
+    ) -> AsyncIterator[dict]:
+        """THE single pause boundary for every main-loop entry path.
+
+        ``LLMLoopRunner.run()`` deliberately re-raises subagent pauses so the
+        QueryLoop layer can checkpoint them. Every entry that re-runs the main
+        loop (new message, permission resume, interaction resume, subagent
+        interaction resume) must iterate through this method: a pause
+        escaping the loop is converted into the matching checkpoint +
+        awaiting_input / done events HERE, so it can never leak into the
+        task runner and kill it.
+
+        ``_save_messages`` persists only the not-yet-persisted tail, so
+        catching a pause after a partially persisted round is safe.
+        """
+        try:
+            async for event in LLMLoopRunner().run(ctx, messages):
+                yield event
         except InteractiveToolPause as e:
             # Subagent hit an interactive tool — persist main messages first
             # (includes the assistant→agent tool_call), then save checkpoint.
             await self._save_messages(messages)
             async for event in self._emit_subagent_pause(e):
                 yield event
-
         except Exception as e:
-            # Subagent hit a permission gate — same checkpoint pattern as
-            # InteractiveToolPause, but the interaction_data is a permission
-            # payload (interaction_type="permission"). The checkpoint is saved
-            # as a direct (non-subagent) interaction keyed on the agent tool,
-            # so resume routes to _resume_from_permission.
-            if type(e).__name__ == "PermissionRequestPause" and hasattr(e, "tool"):
+            # Subagent hit a permission gate — same checkpoint pattern, but
+            # the interaction_data is a permission payload so resume routes
+            # to _resume_from_permission (or _resume_subagent_interaction
+            # when the paused subagent has a persistent session).
+            if is_permission_pause(e):
                 await self._save_messages(messages)
                 async for event in self._emit_subagent_permission_pause(e):
                     yield event
             else:
                 logger.error("QueryLoop error: %s", e, exc_info=True)
-                content = await self._persist_error_message(e)
-                yield LLMLoopRunner.sse(SSE_ERROR, {"error": str(e), "content": content})
+                yield await self._error_event(e)
 
     async def compact_active(self) -> AsyncIterator[dict]:
         """Run an explicit user-requested session compaction and stop."""
+        self._require_not_cancelled()
         try:
             messages = await self._build_messages()
             if not messages:
-                yield LLMLoopRunner.sse(SSE_ERROR, {"error": "Failed to build messages"})
-                yield LLMLoopRunner.sse(SSE_DONE, {})
+                yield await self._error_event("Failed to build messages")
                 return
 
             tools = tool_schemas_for_model_role(self.model_role)
@@ -137,6 +202,7 @@ class QueryLoop:
                 "message": "Session Compacting...",
                 **stats.to_dict(),
             })
+            self._require_not_cancelled()
             result = await compaction_service.compact_messages(
                 messages,
                 model_role=self.model_role,
@@ -144,10 +210,12 @@ class QueryLoop:
                 tools=tools,
                 token_budget_tracker=self._token_budget_tracker,
                 session_id=self.session_id,
+                cancel_event=self._cancel_event,
             )
             async def _operation(uow):
                 await compaction_service.stage_session_boundary(
                     uow, self.session_id, result.boundary_content,
+                    usage=extract_llm_usage(result.usage).to_dict(),
                 )
                 await uow.sessions.stage_touch(self.session_id)
 
@@ -168,13 +236,10 @@ class QueryLoop:
             yield LLMLoopRunner.sse(SSE_DONE, done_data)
         except Exception as e:
             logger.error("Active compact failed: %s", e, exc_info=True)
-            yield LLMLoopRunner.sse(SSE_ERROR, {
-                "error": (
-                    f"Unable to compact this session: {e}. "
-                    "Please create a new session and continue from there."
-                )
-            })
-            yield LLMLoopRunner.sse(SSE_DONE, {})
+            yield await self._error_event(
+                f"Unable to compact this session: {e}. "
+                "Please create a new session and continue from there."
+            )
 
     async def context_stats(self) -> dict:
         """Return current estimated LLM context stats for this session."""
@@ -206,23 +271,38 @@ class QueryLoop:
             task_id=self._task_id,
             execute_tool=self._execute_tool_with_permissions,
             persist_messages=self._save_messages,
+            # The main loop's persister implements the partial-assistant
+            # checkpoint protocol, so long streamed turns are durably
+            # persisted while they stream.
+            persist_partial_assistant=True,
             prepare_messages=self._prepare_messages,
             get_active_tasks=self._get_active_tasks,
-            on_interactive_pause=self._on_interactive_pause,
-            on_permission_pause=self._on_permission_pause,
+            on_pause=self._on_pause,
             token_budget_tracker=self._token_budget_tracker,
         )
         self._loop_ctx = ctx
         return ctx
 
     # ------------------------------------------------------------------
-    # Interactive tool pause hook (direct tools like ask_user_question)
+    # Pause checkpoint hook (interactive tools AND permission gates)
     # ------------------------------------------------------------------
 
-    async def _on_interactive_pause(
+    async def _on_pause(
         self, *, tool_name, tool_args, tool_call_id, interaction_data,
     ) -> None:
-        """Save interaction checkpoint for a direct interactive tool."""
+        """Save the awaiting_input checkpoint for a paused tool.
+
+        An interactive tool asking for input and a gated tool waiting for
+        approval park the task identically — same checkpoint payload, same
+        resume dispatch (``_resume_from_interaction`` routes on the payload's
+        ``interaction_type``) — so one hook serves both pause sites.
+
+        The task id is stamped into the payload so the awaiting_input SSE
+        frame and the persisted checkpoint both carry the unique interaction
+        id the frontend needs for dialog remount keys (and so a restore from
+        the DB yields the same shape).
+        """
+        checkpoint = self._checkpoint(interaction_data)
         async with UnitOfWork(self.project_id) as uow:
             await uow.task_state.mark_awaiting_input(
                 self._task_id, {
@@ -230,35 +310,67 @@ class QueryLoop:
                     "tool_args": tool_args,
                     "tool_call_id": tool_call_id,
                     "interaction_data": interaction_data,
+                    "checkpoint": checkpoint,
                 }
             )
 
-    async def _on_permission_pause(
-        self, *, tool_name, tool_args, tool_call_id, interaction_data,
-    ) -> None:
-        """Save interaction checkpoint for a permission approval request."""
-        async with UnitOfWork(self.project_id) as uow:
-            await uow.task_state.mark_awaiting_input(
-                self._task_id, {
-                    "tool_name": tool_name,
-                    "tool_args": tool_args,
-                    "tool_call_id": tool_call_id,
-                    "interaction_data": interaction_data,
-                }
-            )
+    @staticmethod
+    def _checkpoint_carry(pause) -> dict[str, int]:
+        """Subagent spend to persist with a pause checkpoint.
+
+        Seeded back into the next task's tracker (see
+        ``chat_executor._load_turn_usage_baseline``) so the turn token
+        stats keep counting the parked subagent's spend across the
+        pause/resume split. Zero when the pause carries no stamp
+        (direct tool pauses, and checkpoints saved before the field
+        existed).
+        """
+        carry = getattr(pause, "agent_usage_carry", None) or {}
+        return {
+            "input": int(carry.get("input") or 0),
+            "output": int(carry.get("output") or 0),
+            "cached": int(carry.get("cached") or 0),
+        }
 
     # ------------------------------------------------------------------
-    # Subagent checkpoint (when plan agent's interactive tool pauses)
+    # Subagent checkpoint (interactive tool paused inside a subagent)
     # ------------------------------------------------------------------
 
     async def _save_subagent_checkpoint(self, pause: InteractiveToolPause) -> None:
-        """Save a rich checkpoint for subagent interaction resume."""
-        # Mirror interaction_type/interaction_data to the top level so the
-        # frontend restore path (getActive → active.interaction.interaction_type)
-        # works uniformly for subagent checkpoints. The resume dispatch in
-        # _resume_from_interaction checks is_subagent_interaction first, so the
-        # redundant top-level interaction_data never causes a wrong branch.
+        """Save the checkpoint for a subagent interaction pause.
+
+        Subagents with a persistent session (general/resume/plan) checkpoint
+        as a rich subagent interaction: the resume dispatch routes on the
+        ``is_subagent_interaction`` sentinel and continues the subagent
+        mid-loop. Top-level interaction_type/interaction_data are mirrored
+        for the frontend restore path (getActive →
+        active.interaction.interaction_type); the dispatch checks the
+        sentinel first, so the redundant fields never cause a wrong branch.
+
+        Fork subagents have no persistent session to resume — they take the
+        same fallback as the permission pause: a direct-style checkpoint
+        carrying the outer agent tool call plus the inner interactive tool's
+        identity, so resume executes the inner tool with the user's answers
+        and injects the result as the agent tool's result.
+        """
         interaction = pause.interaction_data or {}
+        checkpoint = self._checkpoint(interaction)
+        carry = self._checkpoint_carry(pause)
+        if not pause.agent_session_id:
+            async with UnitOfWork(self.project_id) as uow:
+                await uow.task_state.mark_awaiting_input(
+                    self._task_id, {
+                        "tool_name": "agent",
+                        "tool_args": {},
+                        "tool_call_id": pause.parent_tool_call_id,
+                        "interaction_data": interaction,
+                        "checkpoint": checkpoint,
+                        "inner_tool_name": pause.tool_name,
+                        "inner_tool_args": pause.tool_args,
+                        "agent_usage_carry": carry,
+                    }
+                )
+            return
         async with UnitOfWork(self.project_id) as uow:
             await uow.task_state.mark_awaiting_input(
                 self._task_id, {
@@ -267,6 +379,7 @@ class QueryLoop:
                     # Top-level interaction fields (for frontend restore only)
                     "interaction_type": interaction.get("interaction_type"),
                     "interaction_data": interaction,
+                    "checkpoint": checkpoint,
                     # Outer agent tool context
                     "parent_tool_call_id": pause.parent_tool_call_id,
                     # Subagent session
@@ -280,11 +393,24 @@ class QueryLoop:
                     "inner_tool_args": pause.tool_args,
                     "inner_tool_call_id": pause.tool_call_id,
                     "inner_interaction_data": pause.interaction_data,
+                    # Subagent spend parked with the pause (turn stats)
+                    "agent_usage_carry": carry,
                 }
             )
 
     async def _emit_subagent_pause(self, pause: InteractiveToolPause) -> AsyncIterator[dict]:
-        """Persist a subagent pause and emit the matching UI events."""
+        """Persist a subagent pause and emit the matching UI events.
+
+        No done frame here: parking is not a loop-computed terminal event —
+        the task runner synthesizes done when it sees the awaiting_input
+        status.
+        """
+        # Stamp the owning task id so the emitted dialog payload and the
+        # persisted checkpoint carry the frontend's interaction id.
+        pause.interaction_data = {
+            **(pause.interaction_data or {}),
+            "task_id": self._task_id,
+        }
         await self._save_subagent_checkpoint(pause)
         yield LLMLoopRunner.sse(SSE_AGENT_EVENT, {
             "parent_tool_call_id": pause.parent_tool_call_id,
@@ -292,12 +418,7 @@ class QueryLoop:
             "inner_type": "awaiting_input",
             "inner_data": pause.interaction_data,
         })
-        yield LLMLoopRunner.sse("awaiting_input", pause.interaction_data)
-        done_data = {}
-        usage = self._current_turn_usage()
-        if usage:
-            done_data["usage"] = usage
-        yield LLMLoopRunner.sse(SSE_DONE, done_data)
+        yield LLMLoopRunner.sse(SSE_AWAITING_INPUT, pause.interaction_data)
 
     async def _emit_subagent_permission_pause(self, pause) -> AsyncIterator[dict]:
         """Persist a subagent permission pause and emit matching UI events.
@@ -315,15 +436,21 @@ class QueryLoop:
         """
         interaction_data = {
             "interaction_type": "permission",
+            "task_id": self._task_id,
             "tool": pause.tool,
             "tool_name": pause.tool_name,
             "path": pause.path,
+            "resolved_path": pause.resolved_path,
             "operation": pause.operation,
             "content": pause.content,
+            "content_truncated": pause.content_truncated,
+            "content_sha256": pause.content_sha256,
             "description": pause.description,
             "diff_lines": pause.diff_lines,
             "diff_truncated": pause.diff_truncated,
         }
+        checkpoint = self._checkpoint(interaction_data)
+        carry = self._checkpoint_carry(pause)
 
         has_session = bool(getattr(pause, "agent_session_id", ""))
 
@@ -341,6 +468,7 @@ class QueryLoop:
                         # Top-level interaction fields (for frontend restore only)
                         "interaction_type": interaction_data.get("interaction_type"),
                         "interaction_data": interaction_data,
+                        "checkpoint": checkpoint,
                         "parent_tool_call_id": pause.parent_tool_call_id,
                         "agent_session_id": pause.agent_session_id,
                         "agent_type": pause.agent_type,
@@ -351,6 +479,8 @@ class QueryLoop:
                         "inner_tool_args": getattr(pause, "tool_args", {}),
                         "inner_tool_call_id": getattr(pause, "inner_tool_call_id", ""),
                         "inner_interaction_data": interaction_data,
+                        # Subagent spend parked with the pause (turn stats)
+                        "agent_usage_carry": carry,
                     }
                 )
         else:
@@ -364,8 +494,10 @@ class QueryLoop:
                         "tool_args": {},
                         "tool_call_id": pause.parent_tool_call_id,
                         "interaction_data": interaction_data,
+                        "checkpoint": checkpoint,
                         "inner_tool_name": pause.tool_name,
                         "inner_tool_args": getattr(pause, "tool_args", {}),
+                        "agent_usage_carry": carry,
                     }
                 )
 
@@ -375,22 +507,7 @@ class QueryLoop:
             "inner_type": "awaiting_input",
             "inner_data": interaction_data,
         })
-        yield LLMLoopRunner.sse("awaiting_input", interaction_data)
-        done_data = {}
-        usage = self._current_turn_usage()
-        if usage:
-            done_data["usage"] = usage
-        yield LLMLoopRunner.sse(SSE_DONE, done_data)
-
-    def _current_turn_usage(self) -> dict | None:
-        if not self._token_budget_tracker:
-            return None
-        usage = self._token_budget_tracker.usage
-        return {
-            "input": usage.input,
-            "output": usage.output,
-            "cached": usage.cached,
-        }
+        yield LLMLoopRunner.sse(SSE_AWAITING_INPUT, interaction_data)
 
     async def _prepare_messages(self, messages: list[dict]) -> tuple[list[dict], list[dict]]:
         loop_ctx = getattr(self, "_loop_ctx", None)
@@ -423,6 +540,9 @@ class QueryLoop:
             "message": "Session Compacting...",
             **stats.to_dict(),
         }))
+        # Boundary check: a turn the user already cancelled must not start a
+        # new compaction.
+        self._require_not_cancelled()
         try:
             result = await compaction_service.compact_messages(
                 messages,
@@ -431,6 +551,7 @@ class QueryLoop:
                 tools=tool_schemas_for_model_role(self.model_role),
                 token_budget_tracker=self._token_budget_tracker,
                 session_id=self.session_id,
+                cancel_event=self._cancel_event,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -440,6 +561,7 @@ class QueryLoop:
         async def _operation(uow):
             await compaction_service.stage_session_boundary(
                 uow, self.session_id, result.boundary_content,
+                usage=extract_llm_usage(result.usage).to_dict(),
             )
             await uow.sessions.stage_touch(self.session_id)
 
@@ -512,15 +634,24 @@ class QueryLoop:
 
         try:
             async with UnitOfWork(self.project_id) as uow:
-                state = await uow.task_state.get_pending_interaction_by_session(
-                    self.session_id
+                response = self._interaction_response or {}
+                state = await uow.task_state.get_pending_interaction(
+                    response.get("task_id", ""),
+                    response.get("interaction_id", ""),
+                    response.get("interaction_type", ""),
                 )
             if not state:
-                yield LLMLoopRunner.sse(SSE_ERROR, {"error": "No pending interaction found"})
+                # Client-side race or stale checkpoint (e.g. the approval was
+                # already consumed by another resume): not a task failure, so
+                # end the stream cleanly instead of persisting a phantom
+                # error bubble.
+                logger.warning(
+                    "No pending interaction found for session %s", self.session_id,
+                )
                 yield LLMLoopRunner.sse(SSE_DONE, {})
                 return
 
-            # ── Subagent interaction: resume the plan agent ──
+            # ── Subagent interaction: resume the subagent mid-loop ──
             if state.get("is_subagent_interaction"):
                 async for event in self._resume_subagent_interaction(state):
                     yield event
@@ -533,50 +664,97 @@ class QueryLoop:
                     yield event
                 return
 
+            # ── Fork-agent interactive resume ──
+            # A fork subagent has no persistent session, so its interactive
+            # pause is checkpointed as the outer agent tool call (tool_name
+            # "agent" + the inner tool's identity) instead of a subagent
+            # interaction. Matched before the direct branch: "agent" is not
+            # an interactive tool and would be discarded as stale there.
+            if state.get("tool_name") == "agent" and state.get("inner_tool_name"):
+                async for event in self._resume_from_fork_interaction(state):
+                    yield event
+                return
+
             # ── Normal (direct) interaction resume ──
             tool_name = state.get("tool_name", "")
             tool_args = state.get("tool_args", {})
             tool_def = tool_registry.get(tool_name)
 
             if not tool_def or not tool_def.requires_user_interaction:
-                yield LLMLoopRunner.sse(SSE_ERROR, {
-                    "error": f"Tool '{tool_name}' does not support interaction"
-                })
-                yield LLMLoopRunner.sse(SSE_DONE, {})
+                # Keep the checkpoint identity durable even when the tool can
+                # no longer be resolved. This makes the failure visible and
+                # gives the UI a stable retry/recovery handle.
+                async with UnitOfWork(self.project_id) as uow:
+                    claimed = await uow.task_state.claim_interaction(
+                        response.get("task_id", ""), response.get("interaction_id", ""),
+                        response.get("interaction_type", ""),
+                    )
+                    if claimed is not None:
+                        await uow.task_state.fail_interaction(
+                            response.get("task_id", ""),
+                            f"Interactive tool '{tool_name}' is no longer available",
+                        )
+                logger.warning(
+                    "Interaction checkpoint for session %s references tool "
+                    "'%s' which does not support interaction",
+                    self.session_id, tool_name,
+                )
+                yield await self._error_event(
+                    f"Interactive tool '{tool_name}' is no longer available"
+                )
                 return
 
             messages = await self._build_messages()
             if not messages:
-                yield LLMLoopRunner.sse(SSE_ERROR, {"error": "Failed to load checkpoint"})
-                yield LLMLoopRunner.sse(SSE_DONE, {})
+                # Claim and retain the checkpoint as failed. The approval is
+                # still recoverable after the transient load failure.
+                async with UnitOfWork(self.project_id) as uow:
+                    claimed = await uow.task_state.claim_interaction(
+                        response.get("task_id", ""), response.get("interaction_id", ""),
+                        response.get("interaction_type", ""),
+                    )
+                    if claimed is not None:
+                        await uow.task_state.fail_interaction(
+                            response.get("task_id", ""), "Failed to load checkpoint",
+                        )
+                yield await self._error_event("Failed to load checkpoint")
                 return
 
             tool_call_id = state.get("tool_call_id", "")
-            existing = None
-            if tool_call_id:
-                for m in reversed(messages):
-                    if m.get("role") == "tool" and m.get("tool_call_id") == tool_call_id:
-                        existing = m
-                        break
 
-            if existing:
-                tool_result = existing.get("content", "")
-            else:
-                merged_args = {**tool_args, **self._interaction_response}
-                try:
-                    result = await tool_def.call(**merged_args)
-                    tool_result = str(result)
-                except Exception as e:
-                    logger.exception("Interactive tool response failed for %s", tool_name)
-                    tool_result = f"Tool '{tool_name}' error processing response: {e}"
-
-                if tool_call_id:
-                    messages.append(LLMLoopRunner.msg(
-                        "tool", tool_result, tool_call_id=tool_call_id
-                    ))
-
+            # Claim the checkpoint BEFORE any tool executes: the guarded
+            # UPDATE's rowcount ensures only one of several concurrent resumes
+            # can consume it, so a resume racing a cancel of the parked task
+            # cannot execute the interactive tool on a checkpoint that was
+            # already taken (same fail-safe contract as _resume_from_permission
+            # — losing the response is safer than a duplicated side effect).
             async with UnitOfWork(self.project_id) as uow:
-                await uow.task_state.clear_interaction_by_session(self.session_id)
+                claimed = await uow.task_state.claim_interaction(
+                    response.get("task_id", ""), response.get("interaction_id", ""),
+                    response.get("interaction_type", ""),
+                )
+            if claimed is None:
+                logger.warning(
+                    "Interaction checkpoint for session %s was already "
+                    "consumed by another resume", self.session_id,
+                )
+                yield LLMLoopRunner.sse(SSE_DONE, {})
+                return
+
+            tool_result = await LLMLoopRunner.call_interactive_tool(
+                tool_def, tool_args, self._interaction_response,
+            )
+
+            if tool_call_id:
+                messages.append(LLMLoopRunner.msg(
+                    "tool", tool_result, tool_call_id=tool_call_id
+                ))
+                # Persist the executed result before the LLM continues:
+                # the tool's side effect already happened, so its outcome
+                # must survive a crash or a restart mid-loop.
+                await self._save_messages(messages)
+
+            await self._finish_checkpoint(True)
 
             yield LLMLoopRunner.sse(SSE_TOOL_END, {
                 "tool": tool_name, "result_summary": strip_image_refs_tag(tool_result)[:200],
@@ -584,12 +762,50 @@ class QueryLoop:
             })
 
             ctx = self._build_loop_context()
-            async for event in LLMLoopRunner().run(ctx, messages):
+            async for event in self._run_loop_guarded(ctx, messages):
                 yield event
 
         except Exception as e:
             logger.error("Resume from interaction error: %s", e, exc_info=True)
-            yield LLMLoopRunner.sse(SSE_ERROR, {"error": str(e)})
+            await self._finish_checkpoint(False, str(e))
+            yield await self._error_event(e)
+
+    async def _execute_approved_tool(
+        self, tool_name: str, tool_args: dict, session_id: str = "",
+    ) -> str:
+        """Execute a tool the user just approved, for every approval resume.
+
+        Direct, fork, and subagent approval resumes run the approved tool
+        through one helper: context params are injected the same way the
+        runner does before its calls, the execution shares the main loop's
+        cancellation wrapper (a stop during a slow approved bash cancels the
+        tool instead of outliving the turn), and a failure becomes the
+        error-string tool result — an approved operation is never re-executed.
+        """
+        tool_def = tool_registry.get(tool_name)
+        if not (tool_def and tool_def.call):
+            return f"Error: Tool '{tool_name}' is not available"
+        call_args = dict(tool_args)
+        if tool_def.requires_project_id:
+            call_args.setdefault("project_id", self.project_id)
+        if tool_def.requires_session_id and (session_id or self.session_id):
+            call_args.setdefault("session_id", session_id or self.session_id)
+        if tool_def.requires_model_role:
+            call_args.setdefault("model_role", self.model_role)
+        # The must-read-first cache is in-memory and empty after the restart
+        # that made this resume necessary, while the paused call's preflight
+        # had already proven the target was read. Re-recording it keeps the
+        # approved execution from being consumed by the tool's own gate.
+        restore_approved_read_state(
+            tool_name, call_args, self.project_id, session_id or self.session_id,
+        )
+        try:
+            return str(await LLMLoopRunner.execute_tool_cancellable(
+                self._cancel_event, LLMLoopRunner.call_tool(tool_def, call_args),
+            ))
+        except Exception as exc:
+            logger.exception("Approved tool '%s' failed", tool_name)
+            return f"Tool '{tool_name}' error: {exc}"
 
     async def _resume_from_permission(self, state: dict) -> AsyncIterator[dict]:
         """Resume the query loop from a permission approval checkpoint.
@@ -605,19 +821,63 @@ class QueryLoop:
         loop re-runs with the operation already done. If denied, a rejection
         string is injected instead.
 
+        When the checkpoint carries an approval-time resolved-target snapshot
+        (``resolved_path``, file write pauses), the approved operation runs
+        only if the target still resolves to the snapshot: a target that
+        drifted while the task was parked (e.g. a flipped symlink) is not
+        executed and gets an error tool result instead.
+
+        The checkpoint is atomically claimed BEFORE any tool executes: the
+        guarded UPDATE's rowcount ensures only one of several concurrent
+        resumes can run the approved operation; the rest end silently. The
+        trade-off is fail-safe — a crash between the claim and the execution
+        loses one approval (the user re-approves) rather than risking a
+        duplicated side effect.
+
         Subagent pauses from persistent agents (general/resume) never reach
         here — they are saved as ``is_subagent_interaction`` checkpoints and
         resumed via ``_resume_subagent_interaction``.
         """
         try:
+            response = self._interaction_response or {}
             interaction_data = state.get("interaction_data", {})
             tool_name = state.get("tool_name", "")
             tool_args = state.get("tool_args", {})
             tool_call_id = state.get("tool_call_id", "")
+            # Fork-agent checkpoints store the gated tool's identity in the
+            # inner fields; the outer "agent" args carry no target.
+            inner_tool_name = state.get("inner_tool_name", "")
+            inner_tool_args = state.get("inner_tool_args", {})
 
             messages = await self._build_messages()
             if not messages:
-                yield LLMLoopRunner.sse(SSE_ERROR, {"error": "Failed to load checkpoint"})
+                # Retain the approval as a failed, durable checkpoint so a
+                # refresh can retry it with the same identity.
+                async with UnitOfWork(self.project_id) as uow:
+                    claimed = await uow.task_state.claim_interaction(
+                        response.get("task_id", ""), response.get("interaction_id", ""),
+                        response.get("interaction_type", ""),
+                    )
+                    if claimed is not None:
+                        await uow.task_state.fail_interaction(
+                            response.get("task_id", ""), "Failed to load checkpoint",
+                        )
+                yield await self._error_event("Failed to load checkpoint")
+                return
+
+            # Claim only after every read-only step succeeded: a failure in
+            # message building must not consume the checkpoint the approval
+            # still depends on.
+            async with UnitOfWork(self.project_id) as uow:
+                claimed = await uow.task_state.claim_interaction(
+                    response.get("task_id", ""), response.get("interaction_id", ""),
+                    response.get("interaction_type", ""),
+                )
+            if claimed is None:
+                logger.warning(
+                    "Permission checkpoint for session %s was already "
+                    "consumed by another resume", self.session_id,
+                )
                 yield LLMLoopRunner.sse(SSE_DONE, {})
                 return
 
@@ -627,90 +887,100 @@ class QueryLoop:
 
             is_subagent = tool_name == "agent"
 
+            # Approval binds the approved operation's snapshot: when the
+            # checkpoint carries a resolved-target snapshot (file write
+            # pauses), the target must still resolve to it; when it carries a
+            # cell-source digest (notebook pauses), the cell must still hash
+            # to it. A target that drifted while the task was parked (e.g. a
+            # flipped symlink) or a cell edited under an old approval is not
+            # executed and gets an error tool result instead. A denial
+            # executes nothing, so its message is unaffected.
+            drift_error = ""
             if approved:
+                drift_error = approved_target_drift_error(
+                    self.project_id,
+                    interaction_data.get("resolved_path", ""),
+                    # The fork checkpoint stores the gated tool's args in
+                    # inner_tool_args; the outer "agent" args carry no target.
+                    inner_tool_args if is_subagent else tool_args,
+                    interaction_data.get("tool", ""),
+                )
+                if not drift_error:
+                    drift_error = await approved_notebook_drift_error(
+                        self.project_id,
+                        inner_tool_args if is_subagent else tool_args,
+                        interaction_data.get("content_sha256", ""),
+                    )
+            executed = approved and not drift_error
+
+            if drift_error:
+                logger.warning(
+                    "Approved target for session %s changed since approval; "
+                    "the tool was not executed", self.session_id,
+                )
+                tool_result = drift_error
+            elif approved:
                 if is_subagent:
                     # Fork agent — execute the approved inner tool directly
                     # and inject the result as the agent tool's result.
-                    inner_tool_name = state.get("inner_tool_name", "")
-                    inner_tool_args = state.get("inner_tool_args", {})
-                    inner_tool_def = tool_registry.get(inner_tool_name)
-                    if inner_tool_def and inner_tool_def.call:
-                        call_args = dict(inner_tool_args)
-                        if inner_tool_def.requires_project_id:
-                            call_args.setdefault("project_id", self.project_id)
-                        if inner_tool_def.requires_session_id and self.session_id:
-                            call_args.setdefault("session_id", self.session_id)
-                        if inner_tool_def.requires_model_role:
-                            call_args.setdefault("model_role", self.model_role)
-                        try:
-                            tool_result = str(await LLMLoopRunner.call_tool(
-                                inner_tool_def, call_args,
-                            ))
-                        except Exception as exc:
-                            logger.exception(
-                                "Permission-approved fork tool '%s' failed",
-                                inner_tool_name,
-                            )
-                            tool_result = f"Tool '{inner_tool_name}' error: {exc}"
-                    else:
-                        tool_result = (
-                            f"Error: Tool '{inner_tool_name}' is not available"
-                        )
+                    tool_result = await self._execute_approved_tool(
+                        inner_tool_name, inner_tool_args,
+                    )
                 else:
                     # Execute the tool directly, bypassing the permission gate
                     # — the user just explicitly approved this exact operation.
                     # Re-checking auto-approve via execute_with_permission would
                     # risk pausing again.
-                    tool_def = tool_registry.get(tool_name)
-                    if tool_def and tool_def.call:
-                        # Inject context params the same way the main loop does
-                        # (llm_loop_runner injects them before call_tool).
-                        call_args = dict(tool_args)
-                        if tool_def.requires_project_id:
-                            call_args.setdefault("project_id", self.project_id)
-                        if tool_def.requires_session_id and self.session_id:
-                            call_args.setdefault("session_id", self.session_id)
-                        if tool_def.requires_model_role:
-                            call_args.setdefault("model_role", self.model_role)
-                        try:
-                            tool_result = await LLMLoopRunner.call_tool(
-                                tool_def, call_args,
-                            )
-                        except Exception as exc:
-                            logger.exception(
-                                "Permission-approved tool '%s' failed",
-                                tool_name,
-                            )
-                            tool_result = f"Tool '{tool_name}' error: {exc}"
-                    else:
-                        tool_result = f"Error: Tool '{tool_name}' is not available"
+                    tool_result = await self._execute_approved_tool(
+                        tool_name, tool_args,
+                    )
             else:
                 tool_result = self._permission_denial_message(
                     interaction_data, reason,
                 )
 
             if tool_call_id:
+                # A fork-agent pause carries the subagent spend accrued
+                # before the pause (agent_usage_carry): the injected result
+                # completes the outer agent call, so its row must hold the
+                # fork's whole usage, not just nothing. Direct pauses have
+                # no carry field and keep zero token fields.
                 messages.append(LLMLoopRunner.msg(
                     "tool", tool_result, tool_call_id=tool_call_id,
+                    **LLMLoopRunner.usage_extra(state.get("agent_usage_carry")),
                 ))
+                # Persist the executed tool's result immediately: a process
+                # restart mid-loop marks the task failed at startup, and the
+                # persisted result keeps an already-executed operation's
+                # outcome visible in history.
+                await self._save_messages(messages)
 
-            # Clear the checkpoint before re-running the loop.
-            async with UnitOfWork(self.project_id) as uow:
-                await uow.task_state.clear_interaction_by_session(self.session_id)
+            await self._finish_checkpoint(True)
 
-            # A denial executed nothing, so it must carry no file-edit
-            # metadata — pass None for the args. (Fork-agent rows are tool
-            # "agent", which never carries metadata either.)
-            yield LLMLoopRunner.sse(SSE_TOOL_END, LLMLoopRunner.tool_end_payload(
-                tool_name, tool_args if approved else None,
+            # Only an actually executed operation carries file-edit metadata
+            # and the file_changed side-effect event — denials and
+            # target-drift refusals inject synthetic strings, not file ops,
+            # so they pass None for the args.
+            end_payload = LLMLoopRunner.tool_end_payload(
+                tool_name, tool_args if executed else None,
                 tool_result, tool_call_id,
-            ))
+            )
+            if is_subagent and executed:
+                # Fork agent: forward the inner tool's file-edit metadata on
+                # the outer agent step, mirroring the persistent-subagent
+                # path's inner tool_end (same checkpointed inner args, same
+                # result string — nothing is synthesized).
+                inner_end = LLMLoopRunner.tool_end_payload(
+                    inner_tool_name, inner_tool_args, tool_result, tool_call_id,
+                )
+                if "file_edit" in inner_end:
+                    end_payload["file_edit"] = inner_end["file_edit"]
+            yield LLMLoopRunner.sse(SSE_TOOL_END, end_payload)
 
             # A file-mutating tool was just executed on approval — emit
             # file_changed so the frontend refreshes the file tree, matching the
             # main loop's side-effect (llm_loop_runner emits it after call_tool).
-            # Denials inject synthetic strings, not file ops, so skip those.
-            if approved:
+            if executed:
                 if is_subagent:
                     fc_evt = LLMLoopRunner._emit_file_changed(
                         inner_tool_name, inner_tool_args, tool_result,
@@ -723,24 +993,23 @@ class QueryLoop:
                     yield fc_evt
 
             ctx = self._build_loop_context()
-            async for event in LLMLoopRunner().run(ctx, messages):
+            async for event in self._run_loop_guarded(ctx, messages):
                 yield event
 
         except Exception as e:
-            # A fork-agent sub-task hit another permission gate during the
-            # re-run. Re-checkpoint it (don't lose the pause) instead of
-            # treating it as an unrecoverable error.
-            if type(e).__name__ == "PermissionRequestPause" and hasattr(e, "tool"):
-                await self._save_messages(messages)
-                async for event in self._emit_subagent_permission_pause(e):
-                    yield event
-            else:
-                logger.error("Resume from permission error: %s", e, exc_info=True)
-                yield LLMLoopRunner.sse(SSE_ERROR, {"error": str(e)})
+            logger.error("Resume from permission error: %s", e, exc_info=True)
+            await self._finish_checkpoint(False, str(e))
+            yield await self._error_event(e)
 
     @staticmethod
     def _permission_denial_message(interaction_data: dict, reason: str) -> str:
-        """Build a category-appropriate denial string for the LLM."""
+        """Build a category-appropriate denial string for the LLM.
+
+        The reason is user free text that lands in the persisted message
+        history, so it is capped at the same soft limit the permission layer
+        applies to every other persisted approval payload. A truncated reason
+        still tells the model why the user refused.
+        """
         category = interaction_data.get("tool", "")
         operation = interaction_data.get("operation", "")
         path = interaction_data.get("path", "")
@@ -752,8 +1021,105 @@ class QueryLoop:
         else:
             denial = f"User denied permission to {operation or 'modify'} file: {path}"
         if reason:
+            if len(reason) > CONTENT_SOFT_LIMIT:
+                reason = reason[:CONTENT_SOFT_LIMIT] + " ... [truncated]"
             denial += f". User says: {reason}"
         return denial
+
+    async def _resume_from_fork_interaction(self, state: dict) -> AsyncIterator[dict]:
+        """Resume the query loop from a fork subagent's interactive pause.
+
+        A fork subagent has no persistent session, so it cannot be resumed
+        mid-loop. Same fallback as the fork branch of _resume_from_permission:
+        the inner interactive tool (ask_user_question, plan approval) executes
+        with the user's response and its result is injected as the outer
+        ``agent`` tool's result — the main loop re-runs with the answer
+        already delivered. The session re-stamp targets the main session: the
+        fork carries no agent session, and the plan-approval tool's plan
+        belongs to the session that owns the turn anyway.
+
+        The claim-before-execute contract matches _resume_from_permission: a
+        crash between the claim and the execution loses one answer rather
+        than risking a duplicated side effect.
+        """
+        try:
+            response = self._interaction_response or {}
+            tool_call_id = state.get("tool_call_id", "")
+            inner_tool_name = state.get("inner_tool_name", "")
+            inner_tool_args = state.get("inner_tool_args", {})
+
+            messages = await self._build_messages()
+            if not messages:
+                # Retain the answer as a failed, durable checkpoint so a
+                # refresh can retry it with the same identity.
+                async with UnitOfWork(self.project_id) as uow:
+                    claimed = await uow.task_state.claim_interaction(
+                        response.get("task_id", ""), response.get("interaction_id", ""),
+                        response.get("interaction_type", ""),
+                    )
+                    if claimed is not None:
+                        await uow.task_state.fail_interaction(
+                            response.get("task_id", ""), "Failed to load checkpoint",
+                        )
+                yield await self._error_event("Failed to load checkpoint")
+                return
+
+            # Claim only after every read-only step succeeded: a failure in
+            # message building must not consume the checkpoint the answer
+            # still depends on.
+            async with UnitOfWork(self.project_id) as uow:
+                claimed = await uow.task_state.claim_interaction(
+                    response.get("task_id", ""), response.get("interaction_id", ""),
+                    response.get("interaction_type", ""),
+                )
+            if claimed is None:
+                logger.warning(
+                    "Fork interaction checkpoint for session %s was already "
+                    "consumed by another resume", self.session_id,
+                )
+                yield LLMLoopRunner.sse(SSE_DONE, {})
+                return
+
+            inner_tool_def = tool_registry.get(inner_tool_name)
+            if inner_tool_def and inner_tool_def.requires_user_interaction:
+                # Same interactive-tool merge contract as the direct resume
+                # path (schema filter → response overlay → context re-stamp,
+                # see LLMLoopRunner.call_interactive_tool).
+                inner_result = await LLMLoopRunner.call_interactive_tool(
+                    inner_tool_def, inner_tool_args or {},
+                    self._interaction_response, session_id=self.session_id,
+                )
+            else:
+                # A checkpoint whose inner tool no longer resolves to an
+                # interactive tool is stale; the raw response is still
+                # delivered so the model sees the user's answer attempt.
+                inner_result = str(self._interaction_response or "")
+
+            if tool_call_id:
+                # Carry the fork's pre-pause spend onto the completing agent
+                # tool row (see _resume_from_permission's fork branch).
+                messages.append(LLMLoopRunner.msg(
+                    "tool", inner_result, tool_call_id=tool_call_id,
+                    **LLMLoopRunner.usage_extra(state.get("agent_usage_carry")),
+                ))
+                # Persist the injected result before the LLM continues: the
+                # user's answer must survive a crash or restart mid-loop.
+                await self._save_messages(messages)
+
+            await self._finish_checkpoint(True)
+
+            yield LLMLoopRunner.sse(SSE_TOOL_END, LLMLoopRunner.tool_end_payload(
+                "agent", {}, inner_result, tool_call_id,
+            ))
+
+            ctx = self._build_loop_context()
+            async for event in self._run_loop_guarded(ctx, messages):
+                yield event
+
+        except Exception as e:
+            logger.error("Resume from fork interaction error: %s", e, exc_info=True)
+            await self._finish_checkpoint(False, str(e))
+            yield await self._error_event(e)
 
     # ------------------------------------------------------------------
     # Subagent interaction resume
@@ -761,6 +1127,7 @@ class QueryLoop:
 
     async def _resume_subagent_interaction(self, state: dict) -> AsyncIterator[dict]:
         """Resume a subagent that paused for user interaction (e.g. plan approval)."""
+        response = self._interaction_response or {}
         parent_tool_call_id = state.get("parent_tool_call_id", "")
         agent_session_id = state.get("agent_session_id", "")
         agent_type = state.get("agent_type", "")
@@ -770,11 +1137,44 @@ class QueryLoop:
         inner_tool_name = state.get("inner_tool_name", "")
         inner_tool_args = state.get("inner_tool_args", {})
         inner_tool_call_id = state.get("inner_tool_call_id", "")
+        # Snapshot at resume start: the tracker's accrual from here until a
+        # re-pause is exactly the post-resume subagent spend (the main loop
+        # makes no LLM call until the agent call completes), so the carried
+        # pre-pause spend can be chained with it below.
+        resume_start_usage = LLMLoopRunner.budget_tracker_usage(
+            self._token_budget_tracker,
+        )
 
         if not agent_session_id or not parent_tool_call_id:
-            yield LLMLoopRunner.sse(SSE_ERROR, {
-                "error": "Invalid subagent checkpoint"
-            })
+            # The checkpoint cannot be resumed, but its identity remains
+            # durable so the UI can offer recovery instead of losing it.
+            async with UnitOfWork(self.project_id) as uow:
+                claimed = await uow.task_state.claim_interaction(
+                    response.get("task_id", ""), response.get("interaction_id", ""),
+                    response.get("interaction_type", ""),
+                )
+            if claimed is not None:
+                await self._finish_checkpoint(False, "Invalid subagent checkpoint")
+            yield await self._error_event("Invalid subagent checkpoint")
+            return
+
+        # Claim the checkpoint BEFORE the inner tool executes — the same
+        # contract as _resume_from_permission: the guarded UPDATE's rowcount
+        # ensures only one of several concurrent resumes can run the
+        # operation, and a cancel that consumed the checkpoint (or a user
+        # answering from a second tab) prevents the side effect. A crash
+        # between the claim and the execution loses one approval rather
+        # than risking a duplicated side effect.
+        async with UnitOfWork(self.project_id) as uow:
+            claimed = await uow.task_state.claim_interaction(
+                response.get("task_id", ""), response.get("interaction_id", ""),
+                response.get("interaction_type", ""),
+            )
+        if claimed is None:
+            logger.warning(
+                "Subagent interaction checkpoint for session %s was already "
+                "consumed by another resume", self.session_id,
+            )
             yield LLMLoopRunner.sse(SSE_DONE, {})
             return
 
@@ -785,71 +1185,85 @@ class QueryLoop:
         )
         inner_tool_def = tool_registry.get(inner_tool_name)
         inner_result = ""
+        # Only a permission-approved execution runs a real side effect;
+        # every branch below that injects a synthetic string leaves False.
+        inner_executed = False
 
         if is_permission:
             # Permission approval/denial for a subagent's write/bash/notebook
             # tool. If approved, execute the tool directly (the user just
             # approved this exact operation — re-checking the permission gate
-            # would pause again). If denied, inject a rejection string.
+            # would pause again), unless the resolved write target drifted
+            # while the task was parked (same snapshot contract as
+            # _resume_from_permission). If denied, inject a rejection string.
             response = self._interaction_response or {}
             approved = response.get("approved", False)
             reason = response.get("reason", "")
+            # Same snapshot contract as _resume_from_permission: the resolved
+            # write target must still resolve to the approval-time snapshot,
+            # and the approved notebook cell must still hash to its snapshot.
+            drift_error = ""
             if approved:
-                if inner_tool_def and inner_tool_def.call:
-                    call_args = dict(inner_tool_args or {})
-                    if inner_tool_def.requires_project_id:
-                        call_args.setdefault("project_id", self.project_id)
-                    if inner_tool_def.requires_session_id:
-                        call_args.setdefault("session_id", agent_session_id)
-                    if inner_tool_def.requires_model_role:
-                        call_args.setdefault("model_role", "supervisor")
-                    try:
-                        inner_result = str(
-                            await LLMLoopRunner.call_tool(inner_tool_def, call_args)
-                        )
-                    except Exception as exc:
-                        logger.exception(
-                            "Permission-approved subagent tool '%s' failed",
-                            inner_tool_name,
-                        )
-                        inner_result = f"Tool '{inner_tool_name}' error: {exc}"
-                else:
-                    inner_result = (
-                        f"Error: Tool '{inner_tool_name}' is not available"
+                drift_error = approved_target_drift_error(
+                    self.project_id,
+                    inner_interaction_data.get("resolved_path", ""),
+                    inner_tool_args or {},
+                    inner_interaction_data.get("tool", ""),
+                )
+                if not drift_error:
+                    drift_error = await approved_notebook_drift_error(
+                        self.project_id,
+                        inner_tool_args or {},
+                        inner_interaction_data.get("content_sha256", ""),
                     )
+            inner_executed = bool(approved and not drift_error)
+            if drift_error:
+                logger.warning(
+                    "Approved subagent target for session %s changed since "
+                    "approval; the tool was not executed", self.session_id,
+                )
+                inner_result = drift_error
+            elif approved:
+                # The agent session re-stamp targets the subagent's session —
+                # the same session the paused call ran against.
+                inner_result = await self._execute_approved_tool(
+                    inner_tool_name, inner_tool_args or {},
+                    session_id=agent_session_id,
+                )
             else:
                 inner_result = self._permission_denial_message(
                     inner_interaction_data, reason,
                 )
         elif inner_tool_def and inner_tool_def.requires_user_interaction:
-            merged = {**inner_tool_args, **(self._interaction_response or {})}
-            if inner_tool_def.requires_project_id:
-                merged["project_id"] = self.project_id
-            if inner_tool_def.requires_session_id:
-                merged["session_id"] = (
-                    self.session_id
-                    if inner_tool_name == "submit_plan_for_approval"
-                    else agent_session_id
-                )
-            try:
-                result = await inner_tool_def.call(**merged)
-                inner_result = str(result)
-            except Exception as e:
-                logger.exception("Subagent interactive tool response failed for %s", inner_tool_name)
-                inner_result = f"Error processing response: {e}"
+            # Same interactive-tool merge contract as the direct resume path
+            # (schema filter → response overlay → context re-stamp, see
+            # LLMLoopRunner.call_interactive_tool). The session re-stamp
+            # targets the agent session — except the plan-approval tool,
+            # whose plan belongs to the main session that owns the turn.
+            session_for_tool = (
+                self.session_id
+                if inner_tool_name == "submit_plan_for_approval"
+                else agent_session_id
+            )
+            inner_result = await LLMLoopRunner.call_interactive_tool(
+                inner_tool_def, inner_tool_args or {},
+                self._interaction_response, session_id=session_for_tool,
+            )
         else:
             inner_result = str(self._interaction_response or "")
 
-        # Emit tool_end for the inner tool. Denials and plain interaction
-        # responses executed no edit/write, so they pass None for the args
-        # and carry no file-edit metadata.
+        await self._finish_checkpoint(True)
+
+        # Emit tool_end for the inner tool. Denials, plain interaction
+        # responses, and target-drift refusals executed no edit/write, so they
+        # pass None for the args and carry no file-edit metadata.
         yield LLMLoopRunner.sse(SSE_AGENT_EVENT, {
             "parent_tool_call_id": parent_tool_call_id,
             "agent_type": agent_type,
             "inner_type": SSE_TOOL_END,
             "inner_data": LLMLoopRunner.tool_end_payload(
                 inner_tool_name,
-                inner_tool_args if is_permission and approved else None,
+                inner_tool_args if inner_executed else None,
                 inner_result,
                 inner_tool_call_id,
             ),
@@ -857,18 +1271,14 @@ class QueryLoop:
 
         # A permission-approved file-mutating tool was just executed directly —
         # emit file_changed so the frontend refreshes the file tree, matching the
-        # main loop's side-effect. Denials inject synthetic strings, not file ops.
-        if is_permission and approved:
+        # main loop's side-effect. Denials and drift refusals inject synthetic
+        # strings, not file ops.
+        if inner_executed:
             fc_evt = LLMLoopRunner._emit_file_changed(
                 inner_tool_name, inner_tool_args, inner_result,
             )
             if fc_evt:
                 yield fc_evt
-
-        # The user's response has been consumed. Clear the old awaiting_input
-        # checkpoint before continuing; a rejected plan may create a new one.
-        async with UnitOfWork(self.project_id) as uow:
-            await uow.task_state.clear_interaction_by_session(self.session_id)
 
         # ── Short-circuit: if plan approved, skip agent resume entirely ──
         approved = (self._interaction_response or {}).get("approved", False)
@@ -916,10 +1326,10 @@ class QueryLoop:
                 except InteractiveToolPause as e:
                     await event_queue.put({"__interactive_pause__": e})
                 except Exception as e:
-                    if type(e).__name__ == "PermissionRequestPause" and hasattr(e, "tool"):
+                    if is_permission_pause(e):
                         await event_queue.put({"__interactive_pause__": e})
                     else:
-                        logger.error("Plan agent resume failed: %s", e, exc_info=True)
+                        logger.error("Subagent resume failed: %s", e, exc_info=True)
                         await event_queue.put({"__error__": str(e)})
 
             resume_task = asyncio.create_task(_run_plan_resume())
@@ -948,10 +1358,20 @@ class QueryLoop:
                         break
                     elif "__interactive_pause__" in item:
                         pause = item["__interactive_pause__"]
-                        if (
-                            type(pause).__name__ == "PermissionRequestPause"
-                            and hasattr(pause, "tool")
-                        ):
+                        # Chain the carried spend: what was parked before this
+                        # resume plus what the resumed subagent spent since.
+                        # The main loop makes no LLM call while the agent call
+                        # is pending, so the diff since resume start is the
+                        # subagent's own post-resume spend.
+                        now_usage = LLMLoopRunner.budget_tracker_usage(
+                            self._token_budget_tracker,
+                        )
+                        pause.agent_usage_carry = {
+                            key: int((state.get("agent_usage_carry") or {}).get(key) or 0)
+                            + max(0, now_usage[key] - resume_start_usage[key])
+                            for key in ("input", "output", "cached")
+                        }
+                        if is_permission_pause(pause):
                             # Subagent's tool hit another permission gate during
                             # resume. Re-checkpoint as a subagent interaction so
                             # the subagent resumes mid-loop again on next approval.
@@ -1006,8 +1426,7 @@ class QueryLoop:
         # ── Append agent tool result to main messages and continue main loop ──
         messages = await self._build_messages()
         if not messages:
-            yield LLMLoopRunner.sse(SSE_ERROR, {"error": "Failed to load messages"})
-            yield LLMLoopRunner.sse(SSE_DONE, {})
+            yield await self._error_event("Failed to load messages")
             return
 
         # Check if agent tool result was already persisted
@@ -1038,7 +1457,7 @@ class QueryLoop:
             return
 
         ctx = self._build_loop_context()
-        async for event in LLMLoopRunner().run(ctx, messages):
+        async for event in self._run_loop_guarded(ctx, messages):
             yield event
 
     # ------------------------------------------------------------------
@@ -1070,10 +1489,6 @@ class QueryLoop:
             tips=tips,
             skills_summary=skills_summary,
         )
-
-        # agents_desc = self._describe_agents()
-        # if agents_desc:
-        #     sys_prompt += f"\n\n# Available Agents\n{agents_desc}"
 
         messages.append(LLMLoopRunner.msg("system", sys_prompt))
 
@@ -1235,11 +1650,20 @@ class QueryLoop:
                 msg for msg in messages[1:]
                 if not msg.get("_ephemeral") and msg.get("role") != "system"
             ]
-            new_messages = candidates[history_count:]
+            # Candidates already holding a checkpoint row id sit below the
+            # slice (their rows are in history_count) but must be included so
+            # the partial-assistant checkpoint refreshes them in place instead
+            # of leaving stale content or inserting a duplicate.
+            new_messages = [
+                msg for idx, msg in enumerate(candidates)
+                if idx >= history_count
+                or msg.get(CHECKPOINT_ROW_ID) is not None
+            ]
 
             await stage_new_messages(
                 new_messages,
                 partial(uow.messages.stage_create, session_id=self.session_id),
+                update=uow.messages.stage_update_content,
             )
 
             await uow.sessions.stage_touch(self.session_id)
@@ -1265,13 +1689,16 @@ class QueryLoop:
             logger.debug("Failed to persist QueryLoop error message", exc_info=True)
         return content
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    async def _error_event(self, error: Exception | str) -> dict:
+        """Persist a visible assistant error, then return its SSE_ERROR event.
 
-    def _describe_agents(self) -> str:
-        from app.agents.registry import agent_registry
-        lines = []
-        for a in agent_registry.list_all():
-            lines.append(f"- **{a.name}**: {a.when_to_use} (Model: {a.model})")
-        return "\n".join(lines)
+        Every terminal error must be persisted BEFORE it is streamed: the
+        frontend writes error text into the live bubble only, so an
+        unpersisted error vanishes on refresh and the failure leaves no
+        trace behind.
+        """
+        text = str(error)
+        content = await self._persist_error_message(
+            error if isinstance(error, Exception) else RuntimeError(text),
+        )
+        return LLMLoopRunner.sse(SSE_ERROR, {"error": text, "content": content})

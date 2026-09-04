@@ -33,7 +33,6 @@ import hashlib
 import hmac
 import os
 import secrets as _secrets
-from pathlib import Path
 from typing import Optional
 
 from fastapi import Request, Response
@@ -101,8 +100,8 @@ def get_auth_secret() -> bytes:
     """Return the HMAC signing secret, provisioning it on first use.
 
     The secret is 32 cryptographically-random bytes persisted to
-    ``auth_secret.key`` with mode 0600. It is cached in-process for the lifetime
-    of the worker. Rotating it (deleting the file or calling
+    ``auth_secret.key`` with mode 0600. It is cached in-process for the
+    lifetime of the process. Rotating it (deleting the file or calling
     :func:`rotate_auth_secret`) invalidates all outstanding session cookies.
     """
     global _auth_secret_cache

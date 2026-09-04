@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 from sqlalchemy import (
     String, Integer, Text, ForeignKey, DateTime, Boolean, UniqueConstraint,
-    CheckConstraint, MetaData,
+    CheckConstraint, MetaData, Index, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.ext.asyncio import AsyncAttrs
@@ -61,11 +61,6 @@ class Session(Base):
     __tablename__ = "sessions"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_id)
-    # Retained for NOT NULL only. This DB file is already project-scoped
-    # (one file per project under ``userdata/<id>/.SiGMA/``), so the column
-    # is not used for filtering or identity. Writers still populate it with
-    # the current project id to satisfy the constraint.
-    project_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
     title: Mapped[str] = mapped_column(String(500), default="", nullable=False)
 
     # Session kind: "chat" for user sessions, "agent" for hidden agent sessions
@@ -198,6 +193,32 @@ class Annotation(Base):
         }
 
 
+class AnnotationFileState(Base):
+    """CAS state for one file's annotation collection."""
+
+    __tablename__ = "annotation_file_states"
+
+    file_path: Mapped[str] = mapped_column(String(500), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    file_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class AnnotationFileTransaction(Base):
+    """Durable intent for a file and its annotation mutation."""
+
+    __tablename__ = "annotation_file_transactions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    file_path: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
+    expected_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    new_file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    old_content: Mapped[str] = mapped_column(Text, nullable=False)
+    mutations: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
 class LibraryDocument(Base):
     """Documents in the Library tab for a project."""
     __tablename__ = "library_documents"
@@ -211,9 +232,15 @@ class LibraryDocument(Base):
     doc_type: Mapped[str] = mapped_column(String(50), default="text")
     keywords: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    embedding_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-
     revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    # The last document revision whose RAG write completed successfully.
+    # ``NULL`` deliberately makes a newly edited document invisible to RAG
+    # until its replacement index is committed.
+    indexed_revision: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    indexed_generation: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    index_generation: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False,
+    )
     processing_status: Mapped[str] = mapped_column(String(20), default="completed", nullable=False)
     processing_log: Mapped[Optional[str]] = mapped_column(Text, default="", nullable=False)
     processing_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -238,6 +265,9 @@ class LibraryDocument(Base):
             "doc_type": self.doc_type,
             "keywords": parse_keywords(self.keywords),
             "revision": self.revision,
+            "indexed_revision": self.indexed_revision,
+            "indexed_generation": self.indexed_generation,
+            "index_generation": self.index_generation,
             "processing_status": self.processing_status,
             "processing_started_at": to_iso(self.processing_started_at),
             "processing_completed_at": to_iso(self.processing_completed_at),
@@ -258,6 +288,9 @@ class LibraryDocument(Base):
             "doc_type": self.doc_type,
             "keywords": parse_keywords(self.keywords),
             "revision": self.revision,
+            "indexed_revision": self.indexed_revision,
+            "indexed_generation": self.indexed_generation,
+            "index_generation": self.index_generation,
             "processing_status": self.processing_status,
             "processing_log": self.processing_log,
             "processing_started_at": to_iso(self.processing_started_at),
@@ -292,8 +325,32 @@ class Task(Base):
 
 
 class TaskState(Base):
-    """Task heartbeat and status tracking per project."""
+    """Task status tracking per project."""
     __tablename__ = "task_state"
+    __table_args__ = (
+        # One runnable task per logical owner, enforced by the database:
+        # concurrent submissions of the same session/annotation cannot both
+        # hold a queued/running/cancelling row. Interaction rows
+        # are excluded so a resume can insert its new queued row while the
+        # old checkpoint row still exists.
+        Index(
+            "uq_task_state_owner_runnable",
+            "owner_type", "owner_id",
+            unique=True,
+            sqlite_where=text("status IN ('queued', 'running', 'cancelling')"),
+        ),
+        # At most one interaction checkpoint per owner across its full
+        # lifecycle — consuming/failed rows retain checkpoint ownership.
+        Index(
+            "uq_task_state_owner_parked",
+            "owner_type", "owner_id",
+            unique=True,
+            sqlite_where=text(
+                "status IN ('awaiting_input', 'interaction_consuming', "
+                "'interaction_failed')"
+            ),
+        ),
+    )
 
     task_id: Mapped[str] = mapped_column(String, primary_key=True)
     session_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
@@ -302,7 +359,6 @@ class TaskState(Base):
     status: Mapped[str] = mapped_column(String, default="queued")
     task_type: Mapped[str] = mapped_column(String, default="llm")
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    heartbeat_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     interaction_state: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON for pending user interaction
     created_at: Mapped[str] = mapped_column(String, default="")
     updated_at: Mapped[str] = mapped_column(String, default="")
@@ -311,16 +367,12 @@ class TaskState(Base):
 class BackgroundTask(Base):
     """Durable background task queue entry scoped to a project.
 
-    Huey is used only to wake worker loops.  This table is the source of truth
-    for library/background task state, retry, leasing, and crash recovery.
+    This table is the source of truth for library/background task state,
+    retry, leasing, and crash recovery.
     """
     __tablename__ = "background_tasks"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    # Retained for NOT NULL only. See Session.project_id for the rationale:
-    # this DB is already project-scoped, and the worker passes the project_id
-    # explicitly through its claim/run pipeline rather than reading this column.
-    project_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
     kind: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
     queue: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
     status: Mapped[str] = mapped_column(String(20), index=True, nullable=False, default="queued")
@@ -333,6 +385,9 @@ class BackgroundTask(Base):
     lease_owner: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Earliest instant a queued task may be claimed after a failed attempt
+    # (exponential retry backoff). NULL means eligible immediately.
+    not_before: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

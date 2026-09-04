@@ -8,7 +8,7 @@ import { computeDiffState } from '../utils/diffState'
 import { formatTimestamp } from '../utils/formatTimestamp'
 import { useStore } from '../store/useStore'
 import { createSSEStreamParser } from '../utils/sse'
-import { ThinkingProcess } from './ChatShared'
+import { STREAM_RECOVERY_MAX_ATTEMPTS, STREAM_RECOVERY_DELAY_MS, ThinkingProcess, streamStatusText, withTransientHint } from './ChatShared'
 import { toastError } from './Toast'
 
 const MIN_WIDTH = 320
@@ -23,16 +23,6 @@ const MIN_THREAD_HEIGHT = 100
  *  React-derived maxHeight and the DOM-direct resize path so they stay in sync. */
 const threadMaxHeightFor = (cardHeight) =>
   Math.max(MIN_THREAD_HEIGHT, cardHeight - CARD_CHROME_HEIGHT)
-
-function streamStatusText(data, t) {
-  if (data?.status === 'retrying') {
-    return t('chat.llmRetrying', {
-      attempt: data.attempt || 1,
-      maxAttempts: data.max_attempts || data.maxAttempts || 1,
-    })
-  }
-  return data?.message || ''
-}
 
 /**
  * AnnotationPopup — draggable + resizable popup for annotation threads.
@@ -50,14 +40,34 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   const [size, setSize] = useState({ width: MIN_WIDTH, height: 380 })
   const [expandedDiff, setExpandedDiff] = useState(null)
   const [isStreaming, setIsStreaming] = useState(false)
+  const [isDeleting, setIsDeleting] = useState(false)
   const abortRef = useRef(null)
   const taskIdRef = useRef(null)
+  // Highest applied SSE event id for the current annotation stream; passed
+  // back as the resume cursor so a reconnect replays only what was missed.
+  const lastSeqRef = useRef(0)
   const stopAbortTimerRef = useRef(null)
   const stopRequestedRef = useRef(false)
   const scrollRef = useRef(null)
   // True once the thread has been auto-scrolled to the bottom on first mount.
   const hasAutoScrolledRef = useRef(false)
   const replyInputRef = useRef(null)
+
+  const handleDelete = useCallback(async () => {
+    if (isDeleting) return
+    setIsDeleting(true)
+    // Detach this popup's stream before asking the backend to drain the task;
+    // buffered late events must not update an entity that is being deleted.
+    abortRef.current?.abort()
+    abortRef.current = null
+    taskIdRef.current = null
+    try {
+      await onDelete(annotation.id)
+    } catch (error) {
+      setIsDeleting(false)
+      throw error
+    }
+  }, [annotation.id, isDeleting, onDelete])
   const wrapperRef = useRef(null)
   const isDraggingRef = useRef(false)
   // True only while the resize grip is held. Guards card/thread inline styles
@@ -72,10 +82,11 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   // The annotation card element; resize writes its width/height directly during
   // the gesture for responsiveness, then commits to `size` state on release.
   const cardRef = useRef(null)
-  const annoIdRef = useRef(annotation.id)
-
-  // Keep ref in sync
-  annoIdRef.current = annotation.id
+  // The annotation id the live stream belongs to, captured when the stream
+  // starts. The stream's store updates target this captured id — never the
+  // currently selected annotation — so switching the popup to another
+  // annotation mid-stream can never write one thread's content into another.
+  const streamAnnoIdRef = useRef(null)
 
   // Auto-focus reply input for newly created (pending) annotations
   useEffect(() => {
@@ -88,8 +99,8 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   // The popup instance survives switching to another annotation, but the diff
   // panel, reply draft, and first-open auto-scroll belong to one thread —
   // reset them whenever the annotation id changes. The pending→persisted id
-  // swap (annoIdRef handoff below) passes through here before any of that
-  // state can hold content, so it resets nothing.
+  // swap passes through here before any of that state can hold content, so
+  // it resets nothing.
   useEffect(() => {
     setExpandedDiff(null)
     setReply('')
@@ -112,6 +123,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       }
       stopRequestedRef.current = false
       taskIdRef.current = null
+      streamAnnoIdRef.current = null
       if (activeDragRef.current) {
         document.removeEventListener('mousemove', activeDragRef.current.move)
         document.removeEventListener('mouseup', activeDragRef.current.up)
@@ -311,9 +323,9 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
 
   // ── Functional store updates (avoid stale closures) ──
 
-  /** Update the last thread entry via store — always reads latest state. */
-  const updateLastThreadEntry = useCallback((updater) => {
-    const id = annoIdRef.current
+  /** Update the last thread entry of annotation `id` via store — always reads
+   *  latest state. The id is captured by the caller at stream start. */
+  const updateLastThreadEntry = useCallback((id, updater) => {
     useStore.setState(s => ({
       annotations: s.annotations.map(a => {
         if (a.id !== id) return a
@@ -325,9 +337,9 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     }))
   }, [])
 
-  /** Append entries to the thread via store — always reads latest state. */
-  const appendToThread = useCallback((...entries) => {
-    const id = annoIdRef.current
+  /** Append entries to the thread of annotation `id` via store — always reads
+   *  latest state. The id is captured by the caller at send time. */
+  const appendToThread = useCallback((id, ...entries) => {
     useStore.setState(s => ({
       annotations: s.annotations.map(a => {
         if (a.id !== id) return a
@@ -343,14 +355,18 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     }
   }, [])
 
-  const ensureStreamingEntry = useCallback(() => {
-    const id = annoIdRef.current
+  const ensureStreamingEntry = useCallback((id) => {
     useStore.setState(s => ({
       annotations: s.annotations.map(a => {
         if (a.id !== id) return a
         const thread = [...(a.thread || [])]
         const last = thread[thread.length - 1]
-        if (last?.isStreaming) return a
+        // A trailing streaming entry here is a stale partial from an aborted
+        // earlier stream (the popup detached or remounted mid-reply) —
+        // transient UI state, never persisted. Drop it so the fresh stream
+        // rebuilds the reply from the full replay instead of appending after
+        // the leftover text.
+        if (last?.isStreaming) thread.pop()
         return {
           ...a,
           thread: [
@@ -362,131 +378,251 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     }))
   }, [])
 
-  const consumeAnnotationStream = useCallback(async (stream, controller) => {
-    const reader = stream.getReader()
-    const decoder = new TextDecoder()
+  /** Remove the trailing streaming entry of annotation `id` — the in-flight
+   *  partial reply this component created for a live stream. Only entries
+   *  marked isStreaming are touched, so persisted history is never removed. */
+  const removeTrailingStreamingEntry = useCallback((id) => {
+    useStore.setState(s => ({
+      annotations: s.annotations.map(a => {
+        if (a.id !== id) return a
+        const thread = [...(a.thread || [])]
+        const last = thread[thread.length - 1]
+        if (!last?.isStreaming) return a
+        thread.pop()
+        return { ...a, thread }
+      }),
+    }))
+  }, [])
+
+  const consumeAnnotationStream = useCallback(async (annoId, stream, controller) => {
     let reachedTerminal = false
+    // True between a gap frame and the thread reload it triggers: the
+    // reconnecting cursor predates the oldest buffered event, so mid-events
+    // were evicted and the live view has a hole replay cannot fill.
+    // replayUntil is the gap frame's highest replayed seq: replayed frames up
+    // to it are already covered by the reloaded thread, so the seq gate —
+    // not reload completion — decides when appending resumes. A missing value
+    // falls back to dropping until the reload completes.
+    let reloadingAfterGap = false
+    let replayUntil = null
 
-    const parser = createSSEStreamParser({
-      onEvent: (type, data) => {
-        if (type === 'task_id') {
-          taskIdRef.current = data.task_id
-        } else if (type === 'delta') {
-          updateLastThreadEntry(entry => {
-            const process = [...(entry.process || [])]
-            const streamIdx = process.findLastIndex(s => s.type === 'streaming_text')
-            if (streamIdx >= 0) {
-              process[streamIdx] = { ...process[streamIdx], content: (process[streamIdx].content || '') + (data.content || '') }
-            } else {
-              process.push({ type: 'streaming_text', content: data.content || '' })
-            }
-            return { ...entry, process, isStreaming: true }
-          })
-        } else if (type === 'thought') {
-          updateLastThreadEntry(entry => {
-            const process = [...(entry.process || [])]
-            if (data.message) {
-              process.push({ type: 'hint', content: data.message, transient: true })
-            }
-            return { ...entry, process, isStreaming: true }
-          })
-        } else if (type === 'stream_status') {
-          updateLastThreadEntry(entry => {
-            const process = [...(entry.process || [])]
-            const statusMessage = streamStatusText(data, t)
-            if (statusMessage) {
-              process.push({ type: 'hint', content: statusMessage, transient: true })
-            }
-            return { ...entry, process, isStreaming: true }
-          })
-        } else if (type === 'tool_start') {
-          updateLastThreadEntry(entry => {
-            let process = (entry.process || []).map(s =>
-              s.type === 'streaming_text' ? { ...s, type: 'hint' } : s
-            )
-            process.push({ type: 'tool', tool: data.tool, params: data.params, status: 'running' })
-            return { ...entry, process, isStreaming: true }
-          })
-        } else if (type === 'tool_end') {
-          updateLastThreadEntry(entry => {
-            const process = (entry.process || []).map(s =>
-              s.type === 'tool' && s.status === 'running' && s.tool === data.tool
-                ? { ...s, status: 'done', result: data.result_summary }
-                : s
-            )
-            return { ...entry, process, isStreaming: true }
-          })
-        } else if (type === 'annotation_changed') {
-          onAnnotationChanged?.(data.file_name || data.file_path)
-        } else if (type === 'done' || type === 'cancelled') {
-          reachedTerminal = true
-          clearStopAbortTimer()
-          stopRequestedRef.current = false
-          setIsStreaming(false)
-          setSiGMADOProcessingAnnotationId(null)
-          updateLastThreadEntry(entry => {
-            const process = [...(entry.process || [])]
-            const streamIdx = process.findLastIndex(s => s.type === 'streaming_text')
-            let content = entry.content || ''
-            if (streamIdx >= 0) {
-              content = process[streamIdx].content || ''
-              process.splice(streamIdx, 1)
-            }
-            const cleanProcess = process.filter(s => !s.transient)
-            return { ...entry, content, process: cleanProcess.length ? cleanProcess : undefined, isStreaming: false }
-          })
-        } else if (type === 'error') {
-          reachedTerminal = true
-          clearStopAbortTimer()
-          stopRequestedRef.current = false
-          setIsStreaming(false)
-          setSiGMADOProcessingAnnotationId(null)
-          updateLastThreadEntry(entry => {
-            const process = [...(entry.process || [])]
-            const content = data.content || data.error || data.message || t('chat.toast.unknownError')
-            return {
-              ...entry,
-              content,
-              process: process.filter(s => !s.transient && s.type !== 'streaming_text'),
-              isStreaming: false,
-            }
-          })
+    const handleEvent = (type, data, id) => {
+      if (Number.isInteger(id)) {
+        // While a gap reload is in flight — and for every replayed frame up
+        // to the gap's replay_until, even after the reload lands — the
+        // reloaded thread already covers the event: drop it but keep the
+        // cursor advancing so frames arriving after the replay batch pass
+        // the gate. Frames beyond replay_until are genuinely live and append
+        // even mid-reload. The small hole at the seam is corrected by the
+        // terminal reload below.
+        if (reloadingAfterGap || (replayUntil !== null && id <= replayUntil)) {
+          lastSeqRef.current = id
+          return
         }
-      },
-      onError: (err) => {
-        console.error('Annotation SSE stream error:', err)
-      },
-    })
-
-    await parser.start(reader, decoder, controller.signal)
-    if (reachedTerminal && !controller.signal.aborted) {
-      await onReloadAnnotation?.(annoIdRef.current)
+        // Overlapping replay: skip anything already applied.
+        if (id <= lastSeqRef.current) return
+        lastSeqRef.current = id
+      } else {
+        // Control frames are never entered into the server's replay buffer,
+        // so the seq gate above cannot apply to them. Known control types
+        // fall through to the dispatch below; anything else is dropped
+        // loudly instead of guessed at.
+        if (type === 'error' && data?.reason === 'idle_timeout') {
+          // Stream-health signal, not a failure: the server merely stopped
+          // seeing traffic. Neither render the error nor end the turn — the
+          // reconnect loop below reattaches with the cursor.
+          return
+        }
+        if (type === 'gap') {
+          // Rebuild the thread from the persisted annotation (the checkpoint
+          // covers the evicted range), then resume appending once the stale
+          // replay batch has passed. replay_until bounds that batch;
+          // recompute per gap so a later reconnect's gap always governs its
+          // own batch.
+          replayUntil = Number.isInteger(data?.replay_until) ? data.replay_until : null
+          if (!reloadingAfterGap) {
+            reloadingAfterGap = true
+            Promise.resolve(onReloadAnnotation?.(annoId))
+              .catch(e => console.warn('Failed to reload annotation:', e))
+              .finally(() => { reloadingAfterGap = false })
+          }
+          return
+        }
+        if (type !== 'task_id' && type !== 'done' && type !== 'error' && type !== 'cancelled') {
+          console.warn('[Annotations] Dropping SSE frame without a seq id:', type)
+          return
+        }
+      }
+      if (type === 'task_id') {
+        taskIdRef.current = data.task_id
+      } else if (type === 'delta') {
+        updateLastThreadEntry(annoId, entry => {
+          const process = [...(entry.process || [])]
+          const streamIdx = process.findLastIndex(s => s.type === 'streaming_text')
+          if (streamIdx >= 0) {
+            process[streamIdx] = { ...process[streamIdx], content: (process[streamIdx].content || '') + (data.content || '') }
+          } else {
+            process.push({ type: 'streaming_text', content: data.content || '' })
+          }
+          return { ...entry, process, isStreaming: true }
+        })
+      } else if (type === 'thought') {
+        // Reasoning arrives as per-token deltas: aggregate into the single
+        // trailing transient hint instead of appending one entry per event.
+        updateLastThreadEntry(annoId, entry => ({
+          ...entry,
+          process: withTransientHint(entry.process || [], data.content || ''),
+          isStreaming: true,
+        }))
+      } else if (type === 'stream_status') {
+        const statusMessage = streamStatusText(data, t)
+        if (statusMessage) {
+          updateLastThreadEntry(annoId, entry => ({
+            ...entry,
+            process: withTransientHint(entry.process || [], statusMessage),
+            isStreaming: true,
+          }))
+        }
+      } else if (type === 'tool_start') {
+        updateLastThreadEntry(annoId, entry => {
+          let process = (entry.process || []).map(s =>
+            s.type === 'streaming_text' ? { ...s, type: 'hint' } : s
+          )
+          process.push({ type: 'tool', tool: data.tool, params: data.params, status: 'running' })
+          return { ...entry, process, isStreaming: true }
+        })
+      } else if (type === 'tool_end') {
+        updateLastThreadEntry(annoId, entry => {
+          const process = (entry.process || []).map(s =>
+            s.type === 'tool' && s.status === 'running' && s.tool === data.tool
+              ? { ...s, status: 'done', result: data.result_summary }
+              : s
+          )
+          return { ...entry, process, isStreaming: true }
+        })
+      } else if (type === 'annotation_changed') {
+        onAnnotationChanged?.(data.file_path)
+      } else if (type === 'done' || type === 'cancelled') {
+        reachedTerminal = true
+        clearStopAbortTimer()
+        stopRequestedRef.current = false
+        setIsStreaming(false)
+        setSiGMADOProcessingAnnotationId(null)
+        updateLastThreadEntry(annoId, entry => {
+          const process = [...(entry.process || [])]
+          const streamIdx = process.findLastIndex(s => s.type === 'streaming_text')
+          let content = entry.content || ''
+          if (streamIdx >= 0) {
+            content = process[streamIdx].content || ''
+            process.splice(streamIdx, 1)
+          }
+          const cleanProcess = process.filter(s => !s.transient)
+          return { ...entry, content, process: cleanProcess.length ? cleanProcess : undefined, isStreaming: false }
+        })
+      } else if (type === 'error') {
+        reachedTerminal = true
+        clearStopAbortTimer()
+        stopRequestedRef.current = false
+        setIsStreaming(false)
+        setSiGMADOProcessingAnnotationId(null)
+        updateLastThreadEntry(annoId, entry => {
+          const process = [...(entry.process || [])]
+          const content = data.content || data.error || data.message || t('chat.toast.unknownError')
+          return {
+            ...entry,
+            content,
+            process: process.filter(s => !s.transient && s.type !== 'streaming_text'),
+            isStreaming: false,
+          }
+        })
+      }
     }
-  }, [clearStopAbortTimer, onAnnotationChanged, onReloadAnnotation, setSiGMADOProcessingAnnotationId, updateLastThreadEntry])
+
+    let current = stream
+    let reconnects = 0
+    while (true) {
+      reachedTerminal = false
+      const appliedBefore = lastSeqRef.current
+      const parser = createSSEStreamParser({
+        onEvent: handleEvent,
+        onError: (err) => console.error('Annotation SSE stream error:', err),
+      })
+      await parser.start(current.getReader(), new TextDecoder(), controller.signal)
+      if (controller.signal.aborted) return
+      if (reachedTerminal) break
+      // The stream ended with no terminal event (connection drop, or the
+      // server closed it after its send buffer overflowed). Reconnect with
+      // the cursor while the task is still running; give up after a few
+      // consecutive unproductive tries. A connection that replayed at least
+      // one fresh (not already applied) event made real progress, so it does
+      // not count toward the bound.
+      if (lastSeqRef.current > appliedBefore) reconnects = 0
+      reconnects += 1
+      if (reconnects > STREAM_RECOVERY_MAX_ATTEMPTS || !taskIdRef.current) break
+      // Pace reconnects like the chat consumer instead of retrying in a
+      // tight loop against a backend that may still be down.
+      await new Promise(resolve => setTimeout(resolve, STREAM_RECOVERY_DELAY_MS))
+      // Cursor-based resume replays only the events after the last applied seq.
+      try {
+        current = await filesAPI.resumeAnnotationReplyStream(projectId, taskIdRef.current, controller.signal, lastSeqRef.current)
+      } catch (err) {
+        if (err.name === 'AbortError') return
+        console.error('Failed to resume annotation stream:', err)
+        break
+      }
+    }
+
+    if (!reachedTerminal) {
+      // No terminal event even after the reconnect attempt: stop the spinner
+      // and surface the loss instead of leaving a half-rendered turn spinning.
+      if (abortRef.current === controller) {
+        setIsStreaming(false)
+        setSiGMADOProcessingAnnotationId(null)
+        abortRef.current = null
+        taskIdRef.current = null
+        streamAnnoIdRef.current = null
+        stopRequestedRef.current = false
+        clearStopAbortTimer()
+      }
+      updateLastThreadEntry(annoId, entry => ({ ...entry, isStreaming: false }))
+      toastError(t('chat.toast.resumeFailed'))
+      return
+    }
+    await onReloadAnnotation?.(annoId)
+  }, [clearStopAbortTimer, onAnnotationChanged, onReloadAnnotation, projectId, setSiGMADOProcessingAnnotationId, t, updateLastThreadEntry])
 
   // ── SiGMADO: SSE streaming ──
-  const startSiGMADOStream = useCallback(async () => {
+  const startSiGMADOStream = useCallback(async (annoId) => {
     // Read from store to avoid stale closure guard
-    if (useStore.getState().siGMADOProcessingAnnotationId) return
-    // Read annotation ID from ref (always up-to-date, even after persist changes ID)
-    const currentAnnoId = annoIdRef.current
-    setSiGMADOProcessingAnnotationId(currentAnnoId)
+    if (useStore.getState().siGMADOProcessingAnnotationId) {
+      // handleSend already persisted and rendered the user reply — say why
+      // no AI response starts instead of letting it read as a failed send.
+      toastError(t('annotations.replyBusy'))
+      return
+    }
+    lastSeqRef.current = 0
+    streamAnnoIdRef.current = annoId
+    setSiGMADOProcessingAnnotationId(annoId)
     setIsStreaming(true)
 
-    ensureStreamingEntry()
+    ensureStreamingEntry(annoId)
 
     const controller = new AbortController()
     abortRef.current = controller
 
     try {
       const stream = await filesAPI.streamAnnotationReply(
-        projectId, filePath, currentAnnoId, controller.signal,
+        projectId, filePath, annoId, controller.signal,
       )
 
-      await consumeAnnotationStream(stream, controller)
+      await consumeAnnotationStream(annoId, stream, controller)
     } catch (err) {
       if (err.name !== 'AbortError') {
         console.error('SiGMADO stream failed:', err)
+        // The stream never started (e.g. 409): drop the entry
+        // ensureStreamingEntry created so no empty bubble stays behind.
+        removeTrailingStreamingEntry(annoId)
+        toastError(t('annotations.replyStartFailed', { message: err.message || t('chat.toast.unknownError') }))
       }
     } finally {
       // Only clear state if this is still the active controller.
@@ -496,11 +632,12 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
         setSiGMADOProcessingAnnotationId(null)
         abortRef.current = null
         taskIdRef.current = null
+        streamAnnoIdRef.current = null
         stopRequestedRef.current = false
         clearStopAbortTimer()
       }
     }
-  }, [filePath, projectId, setSiGMADOProcessingAnnotationId, ensureStreamingEntry, consumeAnnotationStream, clearStopAbortTimer])
+  }, [filePath, projectId, t, setSiGMADOProcessingAnnotationId, ensureStreamingEntry, consumeAnnotationStream, clearStopAbortTimer, removeTrailingStreamingEntry])
 
   const saveBeforeAnnotationChat = useCallback(async () => {
     if (!onSaveBeforeAnnotationChat) return true
@@ -511,6 +648,29 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       return false
     }
   }, [onSaveBeforeAnnotationChat])
+
+  // Detach a stream that belongs to a different annotation: switching the
+  // popup to another thread aborts the in-flight fetch and clears the global
+  // processing state, so the new thread can stream on its own. The server
+  // task keeps running; the reconcile effect below re-attaches to it when
+  // this annotation is opened again. The in-flight partial reply is transient
+  // UI state — remove it so the reattach's full replay rebuilds the entry
+  // fresh instead of appending after the stale text. The pending→persisted id
+  // swap keeps the same logical thread (the stream already targets the
+  // persisted id) and is not treated as a switch.
+  useEffect(() => {
+    if (!abortRef.current || streamAnnoIdRef.current === annotation.id) return
+    const streamAnnoId = streamAnnoIdRef.current
+    abortRef.current.abort()
+    abortRef.current = null
+    taskIdRef.current = null
+    stopRequestedRef.current = false
+    clearStopAbortTimer()
+    removeTrailingStreamingEntry(streamAnnoId)
+    streamAnnoIdRef.current = null
+    setIsStreaming(false)
+    setSiGMADOProcessingAnnotationId(null)
+  }, [annotation.id, clearStopAbortTimer, removeTrailingStreamingEntry, setSiGMADOProcessingAnnotationId])
 
   useEffect(() => {
     if (annotation.isPending || !projectId || !annotation.id) return
@@ -528,16 +688,21 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
 
         setSiGMADOProcessingAnnotationId(annotation.id)
         setIsStreaming(true)
-        ensureStreamingEntry()
+        streamAnnoIdRef.current = annotation.id
+        ensureStreamingEntry(annotation.id)
         abortRef.current = controller
         taskIdRef.current = active.task_id
+        lastSeqRef.current = 0
 
-        const stream = await filesAPI.resumeAnnotationReplyStream(active.task_id, controller.signal)
+        const stream = await filesAPI.resumeAnnotationReplyStream(projectId, active.task_id, controller.signal, lastSeqRef.current)
         if (cancelled) return
-        await consumeAnnotationStream(stream, controller)
+        await consumeAnnotationStream(annotation.id, stream, controller)
       } catch (err) {
         if (err.name !== 'AbortError') {
           console.error('Failed to restore annotation stream:', err)
+          // The resume never produced a stream: release the entry
+          // ensureStreamingEntry created so the spinner does not hang.
+          updateLastThreadEntry(annotation.id, entry => ({ ...entry, isStreaming: false }))
         }
       } finally {
         if (abortRef.current === controller) {
@@ -545,6 +710,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
           setSiGMADOProcessingAnnotationId(null)
           abortRef.current = null
           taskIdRef.current = null
+          streamAnnoIdRef.current = null
           stopRequestedRef.current = false
           clearStopAbortTimer()
         }
@@ -559,29 +725,32 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       if (abortRef.current === controller) {
         abortRef.current = null
         taskIdRef.current = null
+        streamAnnoIdRef.current = null
         stopRequestedRef.current = false
         clearStopAbortTimer()
         setIsStreaming(false)
         setSiGMADOProcessingAnnotationId(null)
       }
     }
-  }, [annotation.id, annotation.isPending, projectId, ensureStreamingEntry, consumeAnnotationStream, onReloadAnnotation, setSiGMADOProcessingAnnotationId, clearStopAbortTimer])
+  }, [annotation.id, annotation.isPending, projectId, ensureStreamingEntry, consumeAnnotationStream, onReloadAnnotation, setSiGMADOProcessingAnnotationId, clearStopAbortTimer, updateLastThreadEntry])
 
   const handleStop = async () => {
     if (stopRequestedRef.current) return
 
     const taskId = taskIdRef.current
     const controller = abortRef.current
+    // The stream being stopped belongs to the annotation it started on.
+    const streamAnnoId = streamAnnoIdRef.current || annotation.id
     if (!taskId || !projectId || !controller) {
       if (controller) controller.abort()
       abortRef.current = null
       taskIdRef.current = null
       stopRequestedRef.current = false
       clearStopAbortTimer()
-      updateLastThreadEntry(entry => ({ ...entry, isStreaming: false }))
+      updateLastThreadEntry(streamAnnoId, entry => ({ ...entry, isStreaming: false }))
       setIsStreaming(false)
       setSiGMADOProcessingAnnotationId(null)
-      onReloadAnnotation?.(annotation.id).catch(e => console.warn('Failed to reload annotation:', e))
+      onReloadAnnotation?.(streamAnnoId)?.catch(e => console.warn('Failed to reload annotation:', e))
       return
     }
 
@@ -596,10 +765,10 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       taskIdRef.current = null
       stopAbortTimerRef.current = null
       stopRequestedRef.current = false
-      updateLastThreadEntry(entry => ({ ...entry, isStreaming: false }))
+      updateLastThreadEntry(streamAnnoId, entry => ({ ...entry, isStreaming: false }))
       setIsStreaming(false)
       setSiGMADOProcessingAnnotationId(null)
-      try { await onReloadAnnotation?.(annotation.id) } catch { /* best-effort */ }
+      try { await onReloadAnnotation?.(streamAnnoId) } catch { /* best-effort */ }
     }, 10000)
   }
 
@@ -625,10 +794,8 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       }
       if (!persistedId) return
       setReply('')
-      // Update ref to new ID so startSiGMADOStream uses the correct one
-      annoIdRef.current = persistedId
-      // Auto-trigger AI reply
-      startSiGMADOStream()
+      // Auto-trigger AI reply, bound to the persisted annotation id
+      startSiGMADOStream(persistedId)
       return
     }
 
@@ -644,17 +811,20 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     try {
       // Persist only the user reply — does NOT wipe existing intermediate messages
       await filesAPI.replyAnnotation(projectId, annotation.id, replyText)
+      onAnnotationChanged?.(filePath)
     } catch (e) {
       toastError(e.message || t('common.saveFailed'))
       return
     }
 
-    // Append user message via store (functional update — no stale closure)
-    appendToThread(newMsg)
+    // Append user message via store (functional update, targeted at the
+    // annotation the reply was sent to — captured, not read from the ref,
+    // so a mid-flight annotation switch cannot misplace it)
+    appendToThread(annotation.id, newMsg)
     setReply('')
 
-    // Trigger streaming AI reply
-    startSiGMADOStream()
+    // Trigger streaming AI reply for this annotation
+    startSiGMADOStream(annotation.id)
   }
 
   // Positioning + z-index for the outer wrapper. Opacity is NOT applied here:
@@ -769,7 +939,9 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
                 {t('common.stop')}
               </button>
             )}
-            <button onClick={() => onDelete(annotation.id)} className="p-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 text-red-400 hover:text-red-600 rounded-lg transition-colors" title={t('annotations.deleteTitle')}><Trash2 className="w-3.5 h-3.5" /></button>
+            <button onClick={handleDelete} disabled={isDeleting} className="p-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 text-red-400 hover:text-red-600 rounded-lg transition-colors disabled:opacity-50" title={t('annotations.deleteTitle')}>
+              {isDeleting ? <span className="text-[10px]">{t('common.waiting', 'Waiting…')}</span> : <Trash2 className="w-3.5 h-3.5" />}
+            </button>
             <button onClick={onClose} className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-400 dark:text-gray-500 rounded-lg"><X className="w-4 h-4" /></button>
           </div>
         </div>

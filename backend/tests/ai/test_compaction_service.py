@@ -1,11 +1,88 @@
+"""Unit tests for compaction_service: cancel-safe summarization, compaction
+budgets and boundary views, token estimation (images, incremental stats,
+special tokens), and the boundary row's summarization-spend persistence."""
+
+import asyncio
 import base64
 import struct
 
 import pytest
 
 from app.core.config import ModelSettings, settings
-from app.core.utils import image_dimensions
 from app.services.compaction_service import compaction_service
+from tests.ai.conftest import RecordingMessagesRepo, make_fake_uow
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner", ["cancel", "provider", "both"])
+async def test_summarize_with_cancel_drains_racing_tasks(monkeypatch, winner):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    created_tasks = []
+
+    async def fake_call_chat_text(**kwargs):
+        created_tasks.append(asyncio.current_task())
+        started.set()
+        if winner == "provider":
+            return "summary", None
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            raise
+        return "summary", None
+
+    monkeypatch.setattr(
+        "app.services.compaction_service.llm_service.call_chat_text",
+        fake_call_chat_text,
+    )
+    cancel_event = asyncio.Event()
+    task = asyncio.create_task(compaction_service._summarize_with_cancel(
+        [{"role": "user", "content": "content"}],
+        model_role="supervisor",
+        tools=None,
+        session_id=None,
+        cancel_event=cancel_event,
+    ))
+    await started.wait()
+    if winner in {"cancel", "both"}:
+        cancel_event.set()
+    if winner in {"provider", "both"}:
+        release.set()
+
+    if winner in {"cancel", "both"}:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        assert await task == ("summary", None)
+    assert created_tasks and all(created_task.done() for created_task in created_tasks)
+
+
+@pytest.mark.asyncio
+async def test_summarize_with_cancel_drains_tasks_on_outer_cancellation(monkeypatch):
+    started = asyncio.Event()
+    created_tasks = []
+
+    async def fake_call_chat_text(**kwargs):
+        created_tasks.append(asyncio.current_task())
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "app.services.compaction_service.llm_service.call_chat_text",
+        fake_call_chat_text,
+    )
+    task = asyncio.create_task(compaction_service._summarize_with_cancel(
+        [{"role": "user", "content": "content"}],
+        model_role="supervisor",
+        tools=None,
+        session_id=None,
+        cancel_event=asyncio.Event(),
+    ))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert created_tasks and all(created_task.done() for created_task in created_tasks)
 
 
 def test_compaction_budget_defaults_and_formula(monkeypatch):
@@ -182,14 +259,15 @@ def test_strip_user_reminder_handles_multipart_content():
 
 # ---------------------------------------------------------------------------
 # Image token estimation
+# (minimal PNG/JPEG builders; parsing itself is pinned by
+# tests/core/test_image_dimensions.py)
 # ---------------------------------------------------------------------------
 
 def _png_header(width: int, height: int) -> bytes:
     """Build a minimal PNG header (signature + IHDR chunk) for testing."""
     sig = b"\x89PNG\r\n\x1a\n"
     ihdr_data = struct.pack(">II", width, height)
-    ihdr = ihdr_data
-    return sig + b"\x00\x00\x00\r" + b"IHDR" + ihdr
+    return sig + b"\x00\x00\x00\r" + b"IHDR" + ihdr_data
 
 
 def _jpeg_header(width: int, height: int) -> bytes:
@@ -215,30 +293,9 @@ def _jpeg_with_app_segment(width: int, height: int, app_payload_size: int) -> by
     )
 
 
-def _gif_header(width: int, height: int) -> bytes:
-    return b"GIF89a" + struct.pack("<HH", width, height)
-
-
-def test_image_dimensions_png():
-    assert image_dimensions(_png_header(1920, 1080)) == (1920, 1080)
-    assert image_dimensions(_png_header(800, 600)) == (800, 600)
-
-
-def test_image_dimensions_jpeg():
-    assert image_dimensions(_jpeg_header(1280, 720)) == (1280, 720)
-
-
-def test_image_dimensions_jpeg_skips_app_segments():
-    assert image_dimensions(_jpeg_with_app_segment(1280, 720, 512)) == (1280, 720)
-
-
-def test_image_dimensions_gif():
-    assert image_dimensions(_gif_header(400, 300)) == (400, 300)
-
-
-def test_image_dimensions_unrecognised():
-    assert image_dimensions(b"\x00\x01\x02\x03") is None
-    assert image_dimensions(b"") is None
+# PNG/JPEG header parsing (including GIF, pinned over there) is pinned by
+# tests/core/test_image_dimensions.py; the builders stay here because the
+# image-token estimation tests below still need synthetic image payloads.
 
 
 def test_estimate_image_url_tokens_megapixel_formula():
@@ -476,3 +533,36 @@ def test_estimate_messages_tokens_survives_special_tokens():
         {"role": "assistant", "content": "summary <|endofprompt|> done"},
     ]
     assert compaction_service.estimate_messages_tokens(messages) > 0
+
+
+@pytest.mark.asyncio
+async def test_stage_session_boundary_persists_summarization_spend():
+    """The boundary row carries the summarization call's own spend so a
+    post-compaction resume seeds it into the turn stats instead of the
+    display dropping after the split."""
+    messages_repo = RecordingMessagesRepo()
+    uow = make_fake_uow(messages=messages_repo)()
+
+    await compaction_service.stage_session_boundary(
+        uow, "session-1", "boundary body",
+        usage={"input": 1234, "output": 56, "cached": 1200},
+    )
+
+    staged = messages_repo.created[0]
+    assert staged["session_id"] == "session-1"
+    assert staged["role"] == "system"
+    assert staged["is_boundary"] is True
+    assert staged["token_count"] == 56
+    assert staged["input_tokens"] == 1234
+    assert staged["cached_tokens"] == 1200
+
+
+@pytest.mark.asyncio
+async def test_stage_session_boundary_without_usage_stays_zero():
+    messages_repo = RecordingMessagesRepo()
+    uow = make_fake_uow(messages=messages_repo)()
+
+    await compaction_service.stage_session_boundary(uow, "session-1", "boundary body")
+
+    staged = messages_repo.created[0]
+    assert (staged["token_count"], staged["input_tokens"], staged["cached_tokens"]) == (0, 0, 0)

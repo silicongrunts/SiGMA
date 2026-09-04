@@ -294,7 +294,6 @@ class LaTeXService:
                 m = re.search(r'on input line (\d+)', raw)
                 if m:
                     # Extract the warning message (before "on input line")
-                    warn_msg = raw.split('Warning')[0] + 'Warning'
                     warn_detail = re.sub(r'^.*?Warning[:\s]*', '', raw, count=1)
                     if warn_detail:
                         full_msg = warn_detail.split('on input line')[0].strip()

@@ -66,7 +66,6 @@ async def _run_agent_validated(**kwargs) -> str:
     """Validate parameters before dispatching to agent_service."""
     agent_type = kwargs.get("agent_type", "")
     prompt = kwargs.get("prompt", "")
-    resume_id = kwargs.get("resume_id", "")
 
     if not prompt or not prompt.strip():
         return "Error: prompt is required for the agent tool."

@@ -72,11 +72,37 @@ class TokenBudgetExceeded(Exception):
 
 
 class TokenBudgetTracker:
-    """Shared token budget for one user turn, including nested agent loops."""
+    """Shared token budget for one user turn, including nested agent loops.
 
-    def __init__(self, budget: int | None = None):
+    Display vs budget accounting: a chat task can be split across several
+    pause/resume cycles, and each launch creates a fresh tracker. ``usage``
+    accrues only within one task (it drives the budget), while ``base``
+    (token spend persisted by earlier tasks of the same turn) and ``carry``
+    (subagent spend from before a pause, not yet in any parent row) are
+    display-only buckets folded into ``total_usage`` so the reported turn
+    stats stay monotonic across resumes.
+    """
+
+    def __init__(
+        self,
+        budget: int | None = None,
+        base: TokenUsage | None = None,
+        carry: TokenUsage | None = None,
+    ):
         self.budget = int(budget) if budget is not None else None
+        self.base = base or TokenUsage()
+        self.carry = carry or TokenUsage()
         self.usage = TokenUsage()
+
+    @property
+    def total_usage(self) -> TokenUsage:
+        """Whole-turn totals for display: earlier tasks' persisted spend,
+        carried subagent spend, and this task's accrual combined."""
+        return TokenUsage(
+            input=self.base.input + self.carry.input + self.usage.input,
+            output=self.base.output + self.carry.output + self.usage.output,
+            cached=self.base.cached + self.carry.cached + self.usage.cached,
+        )
 
     @property
     def exceeded(self) -> bool:

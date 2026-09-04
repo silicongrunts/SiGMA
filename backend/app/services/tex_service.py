@@ -296,7 +296,7 @@ class TeXService:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-        except FileNotFoundError as exc:
+        except FileNotFoundError:
             yield self._event("error", {"message": f"Command not found: {args[0]}"})
             logger.warning("TeX command not found: %s", args[0], exc_info=True)
             return

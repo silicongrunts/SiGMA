@@ -2,16 +2,22 @@
 
 import pytest
 
-from app.agents.tools import sleep as sleep_module
 from app.agents.tools.sleep import _sleep, _MAX_DURATION
 
 
 @pytest.fixture(autouse=True)
 def _no_real_sleep(monkeypatch):
-    """Patch asyncio.sleep so duration-based tests don't actually wait."""
+    """Replace ``asyncio.sleep`` with an instant no-op for every test here.
+
+    Deliberately global: the tool body calls ``asyncio.sleep`` directly (not
+    an injectable seam), so the module-global patch is the only way to keep
+    duration-based tests instant. monkeypatch restores the real sleep after
+    each test; nothing else in these tests' event loops depends on real
+    time.
+    """
     async def _instant(_):
         return None
-    monkeypatch.setattr(sleep_module.asyncio, "sleep", _instant)
+    monkeypatch.setattr("asyncio.sleep", _instant)
 
 
 @pytest.mark.asyncio

@@ -4,9 +4,9 @@ Message Repository — CRUD operations for Message model.
 Only this file (and other files in database/) may import Message directly.
 """
 
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Tuple
 
-from sqlalchemy import select, delete as sql_delete, func
+from sqlalchemy import select, delete as sql_delete, update as sql_update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -59,7 +59,11 @@ class MessageRepository:
         return await allocate(
             self._session, Message, group_col, group_value,
             lambda seq: Message(
+                # The id is generated up front instead of relying on the
+                # column default: staged rows are not flushed yet, and the
+                # partial-assistant checkpoint needs the real id at once.
                 **{group_field: group_value},
+                id=generate_id(),
                 role=_normalize_role(role), content=content, tool_calls=tool_calls,
                 tool_call_id=tool_call_id, reasoning_content=reasoning_content,
                 token_count=token_count, cached_tokens=cached_tokens,
@@ -119,6 +123,38 @@ class MessageRepository:
             input_tokens=input_tokens, is_boundary=is_boundary,
         )
 
+    async def stage_update_content(
+        self,
+        message_id: str,
+        *,
+        content: str,
+        tool_calls: str | None = None,
+        reasoning_content: str | None = None,
+        token_count: int = 0,
+        input_tokens: int = 0,
+        cached_tokens: int = 0,
+    ) -> bool:
+        """Refresh the content of an existing message row without committing.
+
+        Used by the partial-assistant checkpoint: the row is inserted once at
+        its final seq position and its content is refreshed in place as the
+        LLM streams. Returns False when the row no longer exists so the caller
+        can fall back to a normal insert.
+        """
+        result = await self._session.execute(
+            sql_update(Message)
+            .where(Message.id == message_id)
+            .values(
+                content=content,
+                tool_calls=tool_calls,
+                reasoning_content=reasoning_content,
+                token_count=token_count,
+                input_tokens=input_tokens,
+                cached_tokens=cached_tokens,
+            )
+        )
+        return result.rowcount > 0
+
     async def stage_copy_messages(
         self,
         messages: List[Message],
@@ -177,6 +213,32 @@ class MessageRepository:
         )
         result = await self._session.execute(query)
         return list(result.scalars().all())
+
+    async def sum_usage_after_last_user(self, session_id: str) -> dict[str, int]:
+        """Sum persisted token usage of the rows after the last user row.
+
+        The current turn's spend as far as persistence is concerned: the
+        window the chat turn-stat baseline is seeded from. Rows before the
+        last user row belong to earlier turns; when the session has no user
+        row there is no turn window and the sums are zero.
+        """
+        last_user_seq = (
+            select(func.max(Message.seq)).where(
+                Message.session_id == session_id,
+                Message.role == "user",
+            )
+        ).scalar_subquery()
+        query = select(
+            func.coalesce(func.sum(Message.token_count), 0),
+            func.coalesce(func.sum(Message.input_tokens), 0),
+            func.coalesce(func.sum(Message.cached_tokens), 0),
+        ).where(
+            Message.session_id == session_id,
+            Message.seq > last_user_seq,
+        )
+        result = await self._session.execute(query)
+        output, input_, cached = result.one()
+        return {"output": int(output), "input": int(input_), "cached": int(cached)}
 
     async def get_by_id(self, message_id: str) -> Optional[Message]:
         result = await self._session.execute(

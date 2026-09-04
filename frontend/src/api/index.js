@@ -1,11 +1,12 @@
 /**
- * SiGMA API Client - Unified Response Format
+ * SiGMA API client.
  *
- * All backend non-streaming endpoints now return:
+ * Non-streaming endpoints return the unified envelope
  *   { request_id: str, success: bool, error: str|null, data: any }
- *
- * The request() function auto-unwraps the `data` field so component
- * code continues to work without changes.
+ * and request() unwraps `data` (or throws `error`), so callers receive plain
+ * payloads. Streaming endpoints return the raw fetch ReadableStream body and
+ * are consumed with createSSEStreamParser (see utils/sse.js for the event
+ * boundary, id/seq, and cursor-replay contract).
  */
 
 import { createSSEStreamParser } from '../utils/sse'
@@ -75,7 +76,11 @@ async function request(endpoint, options = {}, isText = false) {
       if (!errorMsg) {
         errorMsg = i18n.t('api.requestFailedStatus', { status: response.status })
       }
-      throw new Error(errorMsg)
+      const error = new Error(errorMsg)
+      // HTTP status for callers that branch on it (e.g. the 503
+      // TASK_STATE_UNAVAILABLE recoverable-error path).
+      error.status = response.status
+      throw error
     }
 
     // 204 No Content
@@ -101,6 +106,97 @@ async function request(endpoint, options = {}, isText = false) {
   }
 }
 
+/** Error for a failed streaming fetch, which returns the raw body instead of
+ *  going through request(). The body is parsed defensively — a proxy 502 HTML
+ *  page or an empty body is not JSON — and the message is shaped the same way
+ *  request() shapes it, falling back to the HTTP status. */
+async function streamResponseError(response, fallback) {
+  // Same session-cookie recovery as request(): a 401 on a streaming or blob
+  // endpoint means the session expired — bounce to the login screen.
+  if (response.status === 401) {
+    if (window.location.pathname !== '/login') {
+      window.location.href = '/login'
+    }
+    throw new Error(i18n.t('auth.loginRequired'))
+  }
+  let data = {}
+  try {
+    data = await response.json()
+  } catch {
+    // Not JSON — surface the status below instead of a SyntaxError.
+  }
+  let errorMsg
+  // Unified format error: { success: false, error: "message" }
+  if (data.success === false && data.error) {
+    errorMsg = typeof data.error === 'string' ? data.error : data.error.message || JSON.stringify(data.error)
+  } else if (Array.isArray(data.detail)) {
+    errorMsg = data.detail.map(d => d.msg || d).join('; ')
+  } else if (typeof data.detail === 'string') {
+    errorMsg = data.detail
+  } else if (data.detail?.error?.message) {
+    errorMsg = data.detail.error.message
+  } else if (data.detail?.message) {
+    errorMsg = data.detail.message
+  } else if (data.error) {
+    errorMsg = typeof data.error === 'string' ? data.error : JSON.stringify(data.error)
+  } else if (data.message) {
+    errorMsg = data.message
+  }
+  throw new Error(errorMsg || `${fallback} (${i18n.t('api.requestFailedStatus', { status: response.status })})`)
+}
+
+// Grace period for a streaming request to produce its response headers. A
+// server that accepts the request but never answers would otherwise hang the
+// turn while the stream-health probes (normal endpoints) still pass, so
+// nothing would ever abort it. 5s matches the magnitude of the probes the
+// consumers already run: slow enough for a busy local backend, fast enough
+// not to strand a turn. Only the establishment is bounded — once headers
+// arrive the timer is cleared and the body stream is governed solely by the
+// caller's signal, so long replays and turns are never cut.
+const STREAM_HEADERS_TIMEOUT_MS = 5000
+
+/** fetch() for SSE endpoints: resolves with the response body once headers
+ *  have arrived, applying the headers timeout above. The caller's signal is
+ *  forwarded into a dedicated internal controller — aborting either source
+ *  rejects the fetch — so cancellation keeps working after the timer is
+ *  cleared. A headers timeout surfaces as a normal Error (never an
+ *  AbortError) so consumers treat it as a connect failure, not a user abort.
+ *  HTTP 408 is the canonical "server did not respond in time" status and is
+ *  reused here only as the message template's status placeholder. */
+async function fetchEventStream(url, options, failureFallback) {
+  const callerSignal = options?.signal
+  if (callerSignal?.aborted) throw callerSignal.reason ?? new DOMException('Aborted', 'AbortError')
+  const controller = new AbortController()
+  const onCallerAbort = () => controller.abort(callerSignal.reason)
+  callerSignal?.addEventListener('abort', onCallerAbort, { once: true })
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort(new Error(i18n.t('api.requestFailedStatus', { status: 408 })))
+  }, STREAM_HEADERS_TIMEOUT_MS)
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal })
+    if (!response.ok) return streamResponseError(response, failureFallback)
+    // The listener intentionally outlives this call: callers abort the
+    // shared signal to cancel in-flight reads (the SSE loop only checks
+    // the flag between chunks, so the forwarded abort is what unblocks a
+    // hung read), and it removes itself once fired.
+    return response.body
+  } catch (err) {
+    // The request settled without handing out a body — stop forwarding
+    // aborts to a fetch that no longer exists.
+    callerSignal?.removeEventListener('abort', onCallerAbort)
+    // A concurrent caller abort must keep its AbortError so the consumer's
+    // abort handling stays in charge of the turn.
+    if (timedOut && !callerSignal?.aborted) {
+      throw new Error(i18n.t('api.requestFailedStatus', { status: 408 }))
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Project API
 // ---------------------------------------------------------------------------
@@ -118,7 +214,7 @@ export const projectsAPI = {
   getConfig: (id) => request(`/projects/${id}/config`),
   updateConfig: (id, data) => request(`/projects/${id}/config`, { method: 'PATCH', body: JSON.stringify(data) }),
   export: (id) => fetch(`${API_BASE_URL}/projects/${id}/export`).then(r => {
-      if (!r.ok) return r.json().then(d => { throw new Error(d.error || d.detail || i18n.t('api.exportFailed')) })
+      if (!r.ok) return streamResponseError(r, i18n.t('api.exportFailed'))
       return r.blob()
   }),
 }
@@ -139,25 +235,19 @@ export const systemAPI = {
     return request(`/system/litellm/context?${qs.toString()}`)
   },
   /** Check settings config and model connectivity — returns ReadableStream for SSE */
-  checkSettings: (payload, signal) => fetch(`${API_BASE_URL}/system/settings/check`, {
+  checkSettings: (payload, signal) => fetchEventStream(`${API_BASE_URL}/system/settings/check`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     signal,
-  }).then(r => {
-    if (!r.ok) return r.json().then(d => { throw new Error(d.detail || i18n.t('api.checkFailed')) })
-    return r.body
-  }),
+  }, i18n.t('api.checkFailed')),
   getTeXStatus: () => request('/system/tex/status'),
-  runTeXOperation: (payload, signal) => fetch(`${API_BASE_URL}/system/tex/run`, {
+  runTeXOperation: (payload, signal) => fetchEventStream(`${API_BASE_URL}/system/tex/run`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     signal,
-  }).then(r => {
-    if (!r.ok) return r.json().then(d => { throw new Error(d.detail || i18n.t('api.requestFailed')) })
-    return r.body
-  }),
+  }, i18n.t('api.requestFailed')),
   restart: () => request('/system/restart', { method: 'POST' }),
 }
 
@@ -206,7 +296,7 @@ export const filesAPI = {
   move: (projectId, source, destination) => request(`/files/${projectId}/move`, { method: 'POST', body: JSON.stringify({ source, destination }) }),
   rename: (projectId, path, newName) => request(`/files/${projectId}/rename`, { method: 'POST', body: JSON.stringify({ path, new_name: newName }) }),
   download: (projectId, path) => fetch(`${API_BASE_URL}/files/${projectId}/download?path=${encodeURIComponent(path)}`).then(r => {
-      if (!r.ok) return r.json().then(d => { throw new Error(d.error || d.detail || i18n.t('api.downloadFailed')) })
+      if (!r.ok) return streamResponseError(r, i18n.t('api.downloadFailed'))
       return r.blob()
   }),
   upload: (projectId, formData) => fetch(`${API_BASE_URL}/files/${projectId}/upload`, { method: 'POST', body: formData }).then(async r => {
@@ -222,31 +312,36 @@ export const filesAPI = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths }),
     }).then(r => {
-      if (!r.ok) return r.json().then(d => { throw new Error(d.error || d.detail || i18n.t('api.downloadFailed')) })
+      if (!r.ok) return streamResponseError(r, i18n.t('api.downloadFailed'))
       return r.blob()
     }),
   // Annotation Sync
-  loadAnnotations: (projectId, path) => request(`/annotations/${projectId}?path=${encodeURIComponent(path)}`),
+  loadAnnotations: async (projectId, path) => {
+    const result = await request(`/annotations/${projectId}?path=${encodeURIComponent(path)}`)
+    return Array.isArray(result) ? { annotations: result, revision: 0, fileHash: null } : result
+  },
   createAnnotation: (projectId, path, data) => request(`/annotations/${projectId}/create?path=${encodeURIComponent(path)}`, { method: 'POST', body: JSON.stringify(data) }),
-  saveAnnotations: (projectId, path, annotations) => request(`/annotations/${projectId}?path=${encodeURIComponent(path)}`, { method: 'POST', body: JSON.stringify({ annotations }) }),
+  saveAnnotations: (projectId, path, annotations, cas = {}) => request(`/annotations/${projectId}?path=${encodeURIComponent(path)}`, { method: 'POST', body: JSON.stringify({ annotations, deleteIds: cas.deleteIds || [], expectedRevision: cas.revision, expectedFileHash: cas.fileHash }) }),
+  saveDocument: (projectId, path, content, annotations, cas = {}) => request(`/annotations/${projectId}/save-document?path=${encodeURIComponent(path)}`, { method: 'POST', body: JSON.stringify({ content, annotations, deleteIds: cas.deleteIds || [], expectedRevision: cas.revision, expectedFileHash: cas.fileHash }) }),
+  deleteAnnotation: (projectId, annotationId, cas = {}) => {
+    const params = new URLSearchParams()
+    if (cas.revision != null) params.set('expected_revision', cas.revision)
+    if (cas.fileHash) params.set('expectedFileHash', cas.fileHash)
+    const query = params.toString() ? `?${params}` : ''
+    return request(`/annotations/${projectId}/${encodeURIComponent(annotationId)}${query}`, { method: 'DELETE' })
+  },
   /** Append a user reply to an annotation (preserves existing messages) */
   replyAnnotation: (projectId, annotationId, content) => request(`/annotations/${projectId}/reply`, { method: 'POST', body: JSON.stringify({ annotationId, content }) }),
   /** Stream an AI reply for an annotation — returns ReadableStream for SSE parsing */
-  streamAnnotationReply: (projectId, filePath, annotationId, signal) => fetch(`${API_BASE_URL}/annotations/stream/${projectId}`, {
+  streamAnnotationReply: (projectId, filePath, annotationId, signal) => fetchEventStream(`${API_BASE_URL}/annotations/stream/${projectId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ filePath, annotationId }),
     signal,
-  }).then(r => {
-    if (!r.ok) return r.json().then(d => { throw new Error(d.error || i18n.t('api.annotationReplyFailed')) })
-    return r.body
-  }),
+  }, i18n.t('api.annotationReplyFailed')),
   getActiveAnnotationReply: (projectId, annotationId) =>
     request(`/annotations/active/${projectId}?annotation_id=${encodeURIComponent(annotationId)}`),
-  resumeAnnotationReplyStream: (taskId, signal) => fetch(`${API_BASE_URL}/annotations/stream/${encodeURIComponent(taskId)}`, { signal }).then(r => {
-    if (!r.ok) return r.json().then(d => { throw new Error(d.error || i18n.t('api.resumeFailed')) })
-    return r.body
-  }),
+  resumeAnnotationReplyStream: (projectId, taskId, signal, cursor = null) => fetchEventStream(`${API_BASE_URL}/annotations/stream/${encodeURIComponent(taskId)}?project_id=${encodeURIComponent(projectId)}${Number.isInteger(cursor) ? `&cursor=${cursor}` : ''}`, { signal }, i18n.t('api.resumeFailed')),
   cancelAnnotationReply: (projectId, taskId) =>
     request(`/annotations/cancel/${projectId}/${encodeURIComponent(taskId)}`, { method: 'POST' }),
 }
@@ -285,29 +380,25 @@ export const chatAPI = {
   },
 
   /** Send a message and get an SSE stream back */
-  stream: (projectId, data, signal) => fetch(`${API_BASE_URL}/chat/stream/${projectId}`, {
+  stream: (projectId, data, signal) => fetchEventStream(`${API_BASE_URL}/chat/stream/${projectId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
     signal,
-  }).then(r => {
-    if (!r.ok) return r.json().then(d => { throw new Error(d.detail?.message || d.error || i18n.t('api.chatFailed')) })
-    return r.body  // readable stream for SSE
-  }),
+  }, i18n.t('api.chatFailed')),
 
   /** Check for an active (running / stale) background task for a specific session */
-  getActive: (projectId, sessionId) =>
-    request(`/chat/active/${projectId}?session_id=${encodeURIComponent(sessionId || '')}`),
+  getActive: (projectId, sessionId, options = {}) =>
+    request(`/chat/active/${projectId}?session_id=${encodeURIComponent(sessionId || '')}`, options),
 
   /** Current estimated LLM context stats for a session */
   contextStats: (projectId, sessionId) =>
     request(`/chat/context-stats/${projectId}?session_id=${encodeURIComponent(sessionId || '')}`),
 
-  /** Reconnect to an existing task's SSE stream */
-  resumeStream: (taskId, signal) => fetch(`${API_BASE_URL}/chat/stream/${taskId}`, { signal }).then(r => {
-    if (!r.ok) return r.json().then(d => { throw new Error(d.error || i18n.t('api.resumeFailed')) })
-    return r.body  // readable stream for SSE
-  }),
+  /** Reconnect to an existing task's SSE stream. cursor=N replays only events
+   *  with id > N; omitting it replays the full buffer. project_id scopes the
+   *  finished-task lookup to the session's project. */
+  resumeStream: (projectId, taskId, signal, cursor = null) => fetchEventStream(`${API_BASE_URL}/chat/stream/${taskId}?project_id=${encodeURIComponent(projectId)}${Number.isInteger(cursor) ? `&cursor=${cursor}` : ''}`, { signal }, i18n.t('api.resumeFailed')),
 
   /** Load chat history for a session */
   history: (projectId, sessionId, params = {}) => {
@@ -319,16 +410,15 @@ export const chatAPI = {
     return request(`/chat/history/${projectId}${qs ? '?' + qs : ''}`)
   },
 
-  /** Edit a user message and stream the replacement reply */
-  editMessage: (projectId, sessionId, data, signal) => fetch(`${API_BASE_URL}/chat/edit/${projectId}/${sessionId}`, {
+  /** Edit a user message and stream the replacement reply — same SSE
+   *  establishment contract as every other stream endpoint (headers
+   *  timeout, abort forwarding). */
+  editMessage: (projectId, sessionId, data, signal) => fetchEventStream(`${API_BASE_URL}/chat/edit/${projectId}/${encodeURIComponent(sessionId)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
     signal,
-  }).then(r => {
-    if (!r.ok) return r.json().then(d => { throw new Error(d.detail?.message || d.error || i18n.t('api.editFailed')) })
-    return r.body
-  }),
+  }, i18n.t('api.editFailed')),
 
   /** Clear chat history for a session */
   clearHistory: (projectId, sessionId) => {
@@ -575,5 +665,3 @@ export function fetchBlob(url) {
     return r.blob()
   })
 }
-
-export default { projects: projectsAPI, files: filesAPI, compile: compileAPI, git: gitsAPI, notebooks: notebooksAPI, library: libraryAPI, browser: browserAPI, chat: chatAPI, terminal: terminalAPI, skills: skillsAPI, permissions: permissionsAPI }

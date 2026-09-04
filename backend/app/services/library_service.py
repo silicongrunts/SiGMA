@@ -4,7 +4,8 @@ Library Service - CRUD operations for library documents and folders.
 All database access goes through UnitOfWork + LibraryRepository.
 No direct SQLAlchemy or ORM model imports in this file.
 """
-import re
+import asyncio
+import time
 from typing import List, Dict, Optional
 
 from app.core.document_status import (
@@ -12,14 +13,29 @@ from app.core.document_status import (
     STATUS_CANCELLING, STATUS_COMPLETED, STATUS_FAILED,
     ACTIVE_STATUSES,
 )
-from app.core.utils import utcnow
+from app.core.utils import is_within, utcnow
 from app.database.unit_of_work import UnitOfWork
 
 from app.core.config import settings
-from app.core.exceptions import RAGIndexModelMismatchError, DuplicateTitleError, ValidationError
+from app.core.exceptions import (
+    FileSystemError, RAGIndexModelMismatchError, DuplicateTitleError,
+    ValidationError, ServiceException,
+)
 from app.core.logging import get_logger
 from app.services.project_service import project_service
 logger = get_logger(__name__)
+
+# Files younger than this are never treated as orphans: a just-landed file
+# is unreferenced until its DB row commits, and only the mtime bounds that
+# window (in-flight upload temps live in the .uploading subdirectory, which
+# cleanup never scans for deletions).
+ORPHAN_FILE_GRACE_SECONDS = 3600
+
+# Bounded wait for in-flight library task handlers to wind down before the
+# destructive index reset; a handler past its last cancellation checkpoint
+# may still write chunks into the collection being reset.
+_REBUILD_DRAIN_TIMEOUT_SECONDS = 60.0
+_REBUILD_DRAIN_POLL_SECONDS = 1.0
 
 
 class LibraryService:
@@ -142,20 +158,25 @@ class LibraryService:
 
     async def create_document(self, project_id: str, data: Dict) -> Dict:
         """Create a new library document."""
+        content = data.get("content") or ""
+        has_content = bool(content.strip())
+        # The row is born in the status the pipeline actually starts from:
+        # content documents go straight to "indexing" (the status the
+        # maintenance sweep re-enqueues), so a crash after the create can
+        # never strand a "completed" document whose chunks were never
+        # written. A document without content has nothing to index.
         async with UnitOfWork(project_id) as uow:
             doc = await uow.library.create(
                 title=data.get("title", "Untitled"),
                 description=data.get("description", ""),
-                content=data.get("content", ""),
+                content=content,
                 source=data.get("source", ""),
                 doc_type=data.get("doc_type", "text"),
                 keywords=data.get("keywords"),
+                processing_status=STATUS_INDEXING if has_content else STATUS_COMPLETED,
             )
 
-        # Queue for RAG indexing via durable background task queue.
-        if doc.content and doc.content.strip():
-            async with UnitOfWork(project_id) as uow:
-                await uow.library.update_processing_status(doc.id, status=STATUS_INDEXING)
+        if has_content:
             from app.services.background_task_service import background_task_service
             await background_task_service.enqueue_rag_index(project_id, doc.id)
 
@@ -242,20 +263,59 @@ class LibraryService:
             doc = await uow.library.update(doc_id, data)
 
         # Side effects (outside transaction). Folders never need RAG indexing.
+        status_changed = False
         if is_folder:
             pass
         elif needs_reprocess:
-            # Non-completed doc modified → full re-process from scratch
+            # Non-completed doc modified → full re-process from scratch. The
+            # in-flight tasks were cancelled above, so put the document back
+            # into the queue with the new revision: the reprocess task sees
+            # status "pending" and the old task aborts on revision mismatch.
             from app.services.background_task_service import background_task_service
-            await background_task_service.enqueue_document_process(
-                project_id, doc_id, action="reprocess",
-            )
-        elif any(f in data and data[f] is not None for f in ("title", "description", "content")):
-            # Completed doc content change → re-index only (no re-extraction)
             async with UnitOfWork(project_id) as uow:
-                await uow.library.update_processing_status(doc_id, status=STATUS_INDEXING)
+                current = await uow.library.get_by_id(doc_id)
+                if current:
+                    await uow.library.update_processing_status(
+                        doc_id, status=STATUS_PENDING,
+                        started_at=utcnow(),
+                        expected_revision=current.revision,
+                    )
+            await background_task_service.enqueue_document_process(project_id, doc_id)
+            status_changed = True
+        elif any(f in data and data[f] is not None for f in ("title", "description", "content")):
             from app.services.background_task_service import background_task_service
-            await background_task_service.enqueue_rag_index(project_id, doc_id)
+            if doc.processing_status == STATUS_FAILED and not (doc.content or "").strip():
+                # A failed conversion produced no content, so there is nothing
+                # to re-index: the edit sends the document back through full
+                # processing instead of silently completing an empty index.
+                async with UnitOfWork(project_id) as uow:
+                    current = await uow.library.get_by_id(doc_id)
+                    if current:
+                        await uow.library.update_processing_status(
+                            doc_id, status=STATUS_PENDING,
+                            started_at=utcnow(),
+                            expected_revision=current.revision,
+                        )
+                await background_task_service.enqueue_document_process(project_id, doc_id)
+            else:
+                # Completed doc content change → re-index only (no re-extraction)
+                async with UnitOfWork(project_id) as uow:
+                    current = await uow.library.get_by_id(doc_id)
+                    if current:
+                        await uow.library.update_processing_status(
+                            doc_id, status=STATUS_INDEXING,
+                            expected_revision=current.revision,
+                        )
+                await background_task_service.enqueue_rag_index(project_id, doc_id)
+            status_changed = True
+
+        if status_changed:
+            # The side-effect branches run in their own sessions; re-read so
+            # the response reflects the post-transition status.
+            async with UnitOfWork(project_id) as uow:
+                refreshed = await uow.library.get_by_id(doc_id)
+            if refreshed:
+                doc = refreshed
 
         project_service.touch_project(project_id)
         return doc.to_dict()
@@ -291,52 +351,75 @@ class LibraryService:
         """Signal running library background tasks to stop for a document.
 
         Two signals: DB status "cancelling" on the document + durable task
-        cancellation in the background task table. Running workers observe both
+        cancellation in the background task table. Running tasks observe both
         through periodic cancellation checks.
         """
         async with UnitOfWork(project_id) as uow:
             doc = await uow.library.get_by_id(doc_id)
-            if not doc or doc.processing_status not in ACTIVE_STATUSES:
+            if not doc:
                 return
-            await uow.library.update_processing_status(
-                doc_id, status=STATUS_CANCELLING,
-                log_append="Cancelling processing...",
-            )
+            if doc.processing_status in ACTIVE_STATUSES:
+                await uow.library.update_processing_status(
+                    doc_id, status=STATUS_CANCELLING,
+                    log_append="Cancelling processing...",
+                    expected_revision=doc.revision,
+                )
         try:
             from app.services.background_task_service import background_task_service
             await background_task_service.cancel_document_tasks(project_id, doc_id)
+            if not await background_task_service.wait_for_document(project_id, doc_id):
+                raise FileSystemError(
+                    f"Document {doc_id} still has running processing work; retry later.",
+                    code="DOCUMENT_DRAIN_TIMEOUT",
+                )
         except Exception as exc:
             logger.warning("Failed to cancel background tasks for %s: %s", doc_id, exc, exc_info=True)
+            raise
 
     async def delete_single(self, project_id: str, doc_id: str):
         """Delete a single document (cancel tasks + RAG + file + DB)."""
         async with UnitOfWork(project_id) as uow:
             doc = await uow.library.get_by_id(doc_id)
-            if not doc:
-                return
+        if not doc:
+            return
 
-            # Signal running processing tasks to stop
-            if not doc.is_folder and doc.processing_status in ACTIVE_STATUSES:
-                await self._cancel_processing(project_id, doc_id)
+        if not doc.is_folder:
+            await self._cancel_processing(project_id, doc_id)
 
-            # Remove from RAG index
-            if not doc.is_folder:
+        if not doc.is_folder:
+            try:
+                from app.services.rag_service import rag_service
+                await rag_service.remove_document(project_id, doc_id)
+            except Exception as exc:
+                raise ServiceException(
+                    f"Could not remove document {doc_id} from the search index; retry later.",
+                    code="LIBRARY_DELETE_FAILED", status_code=500,
+                ) from exc
+
+        if doc.file_path:
+            from pathlib import Path
+            library_dir = settings.get_sigma_path(project_id).joinpath("library").resolve()
+            file_path = Path(doc.file_path).resolve()
+            if not is_within(file_path, library_dir):
+                raise FileSystemError(
+                    f"Document file is outside the managed library directory: {doc.file_path}",
+                    code="INVALID_LIBRARY_PATH",
+                )
+            if file_path.exists():
+                if not file_path.is_file():
+                    raise FileSystemError(
+                        f"Document file is not a regular file: {doc.file_path}",
+                        code="LIBRARY_DELETE_FAILED",
+                    )
                 try:
-                    from app.services.rag_service import rag_service
-                    await rag_service.remove_document(project_id, doc_id)
-                except Exception as e:
-                    logger.warning("Failed to remove document from RAG: %s", e, exc_info=True)
+                    file_path.unlink()
+                except OSError as exc:
+                    raise FileSystemError(
+                        f"Could not delete document file {doc_id}; retry later.",
+                        code="LIBRARY_DELETE_FAILED",
+                    ) from exc
 
-            # Delete source file from disk
-            if doc.file_path:
-                try:
-                    from pathlib import Path
-                    p = Path(doc.file_path)
-                    if p.exists():
-                        p.unlink()
-                except Exception as e:
-                    logger.warning("Failed to delete file %s: %s", doc.file_path, e, exc_info=True)
-
+        async with UnitOfWork(project_id) as uow:
             await uow.library.delete(doc_id)
 
         project_service.touch_project(project_id)
@@ -345,32 +428,68 @@ class LibraryService:
         """Clean up orphan files and ChromaDB chunks after deletion."""
         async with UnitOfWork(project_id) as uow:
             all_docs = await uow.library.get_all()
-        valid_doc_ids = {doc.id for doc in all_docs}
         valid_file_paths = {doc.file_path for doc in all_docs if doc.file_path}
 
         await self._cleanup_orphan_files(project_id, valid_file_paths)
 
         try:
             from app.services.rag_service import rag_service
+
+            async def valid_doc_ids() -> set:
+                async with UnitOfWork(project_id) as uow:
+                    docs = await uow.library.get_all()
+                return {doc.id for doc in docs}
+
             await rag_service.cleanup_orphans(project_id, valid_doc_ids)
         except Exception as e:
             logger.warning("Post-delete chunk cleanup failed: %s", e, exc_info=True)
 
+    async def cleanup_orphan_files(self, project_id: str) -> None:
+        """Remove library files on disk that no document row points at.
+
+        Public entry for the delete flow and the daily upkeep pass; the
+        grace period and ``.uploading`` handling live in
+        :meth:`_cleanup_orphan_files`.
+        """
+        async with UnitOfWork(project_id) as uow:
+            all_docs = await uow.library.get_all()
+        valid_file_paths = {doc.file_path for doc in all_docs if doc.file_path}
+        await self._cleanup_orphan_files(project_id, valid_file_paths)
+
     async def _cleanup_orphan_files(self, project_id: str, valid_file_paths: set):
-        """Remove files in library directory not referenced by any DB record."""
-        from pathlib import Path
+        """Remove files in library directory not referenced by any DB record.
+
+        Unreferenced files younger than the grace period are kept (the DB row
+        may not have committed yet); temp files of in-flight uploads live in
+        the ``.uploading`` subdirectory and are only removed there once stale,
+        so a crashed upload's temp cannot accumulate forever either.
+        """
+        from app.services.document_processing_service import document_processing_service
+
         library_dir = settings.get_sigma_path(project_id) / "library"
         if not library_dir.exists():
             return
 
+        now = time.time()
+        candidates = [
+            f for f in library_dir.iterdir()
+            if f.is_file() and str(f) not in valid_file_paths
+        ]
+        uploading_dir = library_dir / document_processing_service.UPLOADING_DIRNAME
+        if uploading_dir.is_dir():
+            candidates.extend(uploading_dir.iterdir())
+
         removed = 0
-        for f in library_dir.iterdir():
-            if f.is_file() and str(f) not in valid_file_paths:
-                try:
-                    f.unlink()
-                    removed += 1
-                except Exception as e:
-                    logger.warning("Failed to delete orphan file %s: %s", f, e, exc_info=True)
+        for f in candidates:
+            if not f.is_file():
+                continue
+            try:
+                if now - f.stat().st_mtime < ORPHAN_FILE_GRACE_SECONDS:
+                    continue
+                f.unlink()
+                removed += 1
+            except Exception as e:
+                logger.warning("Failed to delete orphan file %s: %s", f, e, exc_info=True)
         if removed:
             logger.info(f"Cleaned {removed} orphan file(s) from library directory")
 
@@ -522,9 +641,10 @@ class LibraryService:
         """Keyword search with real pagination.
 
         Returns ``{"results": [...], "total": int}`` where ``total`` is the
-        real match count (independent of limit/offset) so callers can show
-        accurate pagination metadata. ``results`` follows the same enrichment
-        shape as ``search_documents``.
+        SQL candidate count (independent of limit/offset), an upper bound of
+        the post-filtered matches, so callers can show pagination metadata
+        without a content scan per page. ``results`` follows the same
+        enrichment shape as ``search_documents``.
         """
         allowed_ids = None
         if parent_id:
@@ -596,6 +716,13 @@ class LibraryService:
             return enriched
         except RAGIndexModelMismatchError:
             raise
+        except ServiceException as e:
+            if e.code == "RAG_INDEX_STORE_DAMAGED":
+                # The user-actionable damaged-store error must reach the
+                # client instead of degrading silently to keyword results.
+                raise
+            logger.warning("RAG search failed, falling back to keyword: %s", e, exc_info=True)
+            return await self.search_documents(project_id, query, parent_id=parent_id)
         except Exception as e:
             logger.warning("RAG search failed, falling back to keyword: %s", e, exc_info=True)
             return await self.search_documents(project_id, query, parent_id=parent_id)
@@ -603,17 +730,18 @@ class LibraryService:
     async def rebuild_index(self, project_id: str) -> Dict:
         """Rebuild RAG index for all documents in a project. Non-blocking.
 
-        All documents with content are marked as "indexing" and enqueued
-        as durable background tasks. The caller gets an immediate response
-        without waiting for the actual indexing to complete.
+        Documents with content are marked as "indexing" and enqueued as
+        durable background tasks; active documents without content go back
+        to full processing. The caller gets an immediate response without
+        waiting for the actual indexing to complete.
         """
-        # 1. Delete old ChromaDB collection so it will be recreated with current model
         from app.services.rag_service import rag_service
-        await rag_service.reset_project_index(project_id)
 
-        # 2. Get all docs with content + docs with active processing tasks
+        # 1. Snapshot docs that need re-indexing plus docs with active
+        #    processing tasks.
         doc_ids_to_reindex: List[str] = []
         active_doc_ids: List[str] = []
+        active_without_content: List[str] = []
         async with UnitOfWork(project_id) as uow:
             docs = await uow.library.get_all()
             for doc in docs:
@@ -621,52 +749,105 @@ class LibraryService:
                     doc_ids_to_reindex.append(doc.id)
                 if doc.processing_status in ACTIVE_STATUSES:
                     active_doc_ids.append(doc.id)
+                    if not doc.content:
+                        active_without_content.append(doc.id)
 
-        # 3. Cancel all active processing/indexing tasks to prevent concurrent writes
+        # 2. Cancel all active processing/indexing tasks BEFORE destroying
+        #    the ChromaDB collection, so no queued task writes into the
+        #    collection that is about to be reset.
         for doc_id in active_doc_ids:
             await self._cancel_processing(project_id, doc_id)
 
-        # 4. Reset status to "indexing" and enqueue durable index tasks
-        from app.services.background_task_service import background_task_service
-        for doc_id in doc_ids_to_reindex:
-            async with UnitOfWork(project_id) as uow:
-                await uow.library.reset_processing(doc_id, status=STATUS_INDEXING)
-            await background_task_service.enqueue_rag_index(project_id, doc_id)
+        # 3. Bounded-wait for in-flight handlers to wind down: cancellation
+        #    is cooperative, and a handler past its last cancellation
+        #    checkpoint may still write chunks into the collection that is
+        #    about to be reset.
+        if not await self._wait_for_inflight_tasks(project_id):
+            logger.warning(
+                "Rebuild: library tasks for project %s did not drain within %s seconds; "
+                "leaving the existing index and state untouched",
+                project_id, int(_REBUILD_DRAIN_TIMEOUT_SECONDS),
+            )
+            return {
+                "success": False,
+                "message": "Rebuild could not start because active library tasks did not drain; try again.",
+                "status": "drain_timeout",
+            }
 
-        total = len(doc_ids_to_reindex)
+        # 4. Move every affected document to its target status in a single
+        #    transaction BEFORE the destructive reset: content documents to
+        #    "indexing", content-less ones to "pending". From this point the
+        #    60s maintenance sweep can see and re-enqueue all of them, so a
+        #    crash at any later step self-heals instead of leaving documents
+        #    "completed" while their chunks were deleted with the collection.
+        targets = {doc_id: STATUS_INDEXING for doc_id in doc_ids_to_reindex}
+        targets.update({doc_id: STATUS_PENDING for doc_id in active_without_content})
+        reset_ids = set(targets)
+        async with UnitOfWork(project_id) as uow:
+            await uow.library.bulk_reset_processing(targets)
+
+        # 5. Reset the collection so it is recreated with the current model
+        await rag_service.reset_project_index(project_id)
+
+        # 6. Re-enqueue from a FRESH post-reset read: a document that gained
+        #    content or completed between the snapshot and the reset is
+        #    captured here, and enqueue dedupes on revision so re-enqueueing
+        #    snapshot entries is harmless. The bulk reset keeps every queued
+        #    document visible to the maintenance sweep. A single failed
+        #    enqueue must not strand the remaining documents — the sweep
+        #    re-enqueues pending/indexing documents on its own.
+        fresh_targets = {}
+        async with UnitOfWork(project_id) as uow:
+            for doc in await uow.library.get_all():
+                if doc.is_folder:
+                    continue
+                if doc.content:
+                    fresh_targets[doc.id] = STATUS_INDEXING
+                elif doc.processing_status in ACTIVE_STATUSES:
+                    fresh_targets[doc.id] = STATUS_PENDING
+            fresh_targets = {
+                doc_id: status for doc_id, status in fresh_targets.items()
+                if doc_id not in reset_ids
+            }
+            await uow.library.bulk_reset_processing(fresh_targets)
+        targets.update(fresh_targets)
+
+        from app.services.background_task_service import background_task_service
+        for doc_id, status in targets.items():
+            try:
+                if status == STATUS_INDEXING:
+                    await background_task_service.enqueue_rag_index(project_id, doc_id)
+                else:
+                    await background_task_service.enqueue_document_process(project_id, doc_id)
+            except Exception:
+                logger.warning(
+                    "Rebuild: failed to enqueue %s for document %s; the maintenance "
+                    "sweep will recover it", status, doc_id, exc_info=True,
+                )
+
         return {
             "success": True,
-            "message": f"Rebuild started. {total} documents queued for indexing.",
-            "total": total,
+            "message": f"Rebuild started. {len(targets)} documents queued.",
+            "total": len(targets),
             "status": "queued",
         }
 
-    def _extract_snippets(self, title: str, description: str, content: str,
-                          query: str, context_chars: int = 60, max_snippets: int = 2) -> List[str]:
-        """Extract text snippets around keyword matches."""
-        if not query:
-            return []
-        try:
-            pattern = re.compile(re.escape(query), re.IGNORECASE)
-        except re.error:
-            return []
+    async def _wait_for_inflight_tasks(self, project_id: str) -> bool:
+        """Poll until no library background task has a live handler.
 
-        snippets = []
-        for field_text in [title or "", description or "", content or ""]:
-            if not field_text:
-                continue
-            for match in pattern.finditer(field_text):
-                start = max(0, match.start() - context_chars)
-                end = min(len(field_text), match.end() + context_chars)
-                snippet = field_text[start:end]
-                if start > 0:
-                    snippet = "..." + snippet
-                if end < len(field_text):
-                    snippet = snippet + "..."
-                snippets.append(snippet)
-                if len(snippets) >= max_snippets:
-                    return snippets
-        return snippets
+        Returns False when tasks were still in flight when the bounded
+        timeout elapsed; the caller decides whether to proceed anyway.
+        """
+        from app.services.library_task_protocol import QUEUE_LIBRARY
+
+        deadline = time.monotonic() + _REBUILD_DRAIN_TIMEOUT_SECONDS
+        while True:
+            async with UnitOfWork(project_id) as uow:
+                if not await uow.background_tasks.has_inflight(QUEUE_LIBRARY):
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(_REBUILD_DRAIN_POLL_SECONDS)
 
     async def get_status_summary(self, project_id: str) -> Dict:
         """Return processing status counts and non-completed documents for a project."""
@@ -678,11 +859,9 @@ class LibraryService:
         active_docs = []
         for d in docs:
             status = d["processing_status"]
-            # Normalize pre-rename DB rows: "indexing_failed" was the value
-            # used before the status constants were unified to STATUS_FAILED.
-            # No code writes this value today, but existing project databases
-            # may still contain it. Read-side normalization keeps these rows
-            # visible in the summary instead of silently dropping them.
+            # Existing project databases may still contain the raw value
+            # "indexing_failed"; normalizing it here keeps such rows visible
+            # in the summary instead of silently dropping them.
             if status == "indexing_failed":
                 status = STATUS_FAILED
             summary[status] = summary.get(status, 0) + 1
@@ -695,40 +874,58 @@ class LibraryService:
     # Status transitions — single entry points for state changes
     # ------------------------------------------------------------------
 
-    async def mark_document_processing(self, project_id: str, doc_id: str) -> None:
-        """Transition document to 'processing' state with started_at timestamp."""
+    async def mark_document_processing(self, project_id: str, doc_id: str,
+                                        expected_revision: int | None = None) -> bool:
+        """Transition document to 'processing' state with started_at timestamp.
+
+        Returns False when the document is gone or was edited since the
+        caller snapshotted ``expected_revision``, so a stale task exits
+        instead of overwriting newer state.
+        """
         async with UnitOfWork(project_id) as uow:
-            await uow.library.update_processing_status(
+            return await uow.library.update_processing_status(
                 doc_id,
                 status=STATUS_PROCESSING,
                 started_at=utcnow(),
                 log_append="Processing in progress...",
+                expected_revision=expected_revision,
             )
 
     async def mark_document_indexing(self, project_id: str, doc_id: str,
-                                      log_append: str = "Document processing done. Queued for RAG indexing.") -> None:
-        """Transition document to 'indexing' state (ready for RAG)."""
+                                      log_append: str = "Document processing done. Queued for RAG indexing.",
+                                      expected_revision: int | None = None) -> bool:
+        """Transition document to 'indexing' state (ready for RAG).
+
+        Returns False when the document is gone or was edited since the
+        caller snapshotted ``expected_revision``, so a stale task exits
+        instead of overwriting newer state.
+        """
         async with UnitOfWork(project_id) as uow:
-            await uow.library.update_processing_status(
+            return await uow.library.update_processing_status(
                 doc_id,
                 status=STATUS_INDEXING,
                 log_append=log_append,
+                expected_revision=expected_revision,
             )
 
-    async def mark_document_completed(self, project_id: str, doc_id: str) -> None:
+    async def mark_document_completed(self, project_id: str, doc_id: str,
+                                      expected_revision: int | None = None) -> bool:
         """Transition document to 'completed' state."""
         async with UnitOfWork(project_id) as uow:
-            await uow.library.update_processing_status(
+            return await uow.library.update_processing_status(
                 doc_id,
                 status=STATUS_COMPLETED,
                 completed_at=utcnow(),
+                expected_revision=expected_revision,
             )
 
     async def mark_document_failed(self, project_id: str, doc_id: str,
-                                     reason: str) -> None:
+                                     reason: str, expected_revision: int | None = None) -> bool:
         """Transition document to 'failed' state with error message."""
         async with UnitOfWork(project_id) as uow:
-            await uow.library.mark_failed(doc_id, reason)
+            return await uow.library.mark_failed(
+                doc_id, reason, expected_revision=expected_revision,
+            )
 
     async def append_processing_log(self, project_id: str, doc_id: str,
                                       message: str) -> None:
@@ -737,19 +934,33 @@ class LibraryService:
             await uow.library.update_processing_log(doc_id, message)
 
     async def update_document_content(self, project_id: str, doc_id: str,
-                                        content: str) -> None:
-        """Update document content in the database."""
+                                        content: str,
+                                        expected_revision: int | None = None) -> None:
+        """Update document content in the database.
+
+        When ``expected_revision`` is given, the write is skipped if the
+        document was edited (revision bumped) since processing started, so a
+        stale task cannot clobber newer user content.
+        """
         async with UnitOfWork(project_id) as uow:
-            await uow.library.update_content(doc_id, content)
+            await uow.library.update_content(
+                doc_id, content, expected_revision=expected_revision,
+            )
 
     async def update_document_fields(self, project_id: str, doc_id: str,
                                        title: str = None,
                                        description: str = None,
-                                       keywords: list = None) -> None:
-        """Update document metadata fields (title, description, keywords)."""
+                                       keywords: list = None,
+                                       expected_revision: int | None = None) -> None:
+        """Update document metadata fields (title, description, keywords).
+
+        ``expected_revision`` guards against a stale task overwriting newer
+        user edits, same as ``update_document_content``.
+        """
         async with UnitOfWork(project_id) as uow:
             await uow.library.update_fields(
                 doc_id, title=title, description=description, keywords=keywords,
+                expected_revision=expected_revision,
             )
 
 

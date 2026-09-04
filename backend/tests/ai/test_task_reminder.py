@@ -16,6 +16,11 @@ from app.services.task_service import (
     strip_task_reminder,
     unfinished_tasks,
 )
+from tests.ai.conftest import (
+    FakeConfigRepo,
+    RecordingMessagesRepo,
+    make_fake_uow,
+)
 
 
 def _task_row(task_id, subject, status):
@@ -33,23 +38,12 @@ class _TasksRepo:
         return self.rows
 
 
-class _TaskUow:
-    def __init__(self, tasks):
-        self.tasks = tasks
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        pass
-
-
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_unfinished_tasks_excludes_completed(monkeypatch):
     monkeypatch.setattr(
         task_service_module, "UnitOfWork",
-        lambda pid: _TaskUow(_TasksRepo([
+        make_fake_uow(tasks=_TasksRepo([
             _task_row("1", "Write outline", "completed"),
             _task_row("2", "Translate chapter", "pending"),
             _task_row("3", "Add references", "in_progress"),
@@ -115,41 +109,12 @@ class _MsgRow:
         self.reasoning_content = ""
 
 
-class _HistoryRepo:
-    def __init__(self, rows):
-        self.rows = rows
-
-    async def get_messages_for_llm(self, session_id):
-        return list(self.rows)
-
-
-class _ConfigRepo:
-    async def get(self, key, default=""):
-        return default
-
-
 class _PoisonTasksRepo:
-    """Fails the test if message building ever queries task state."""
+    """Stays local: a poison stub that fails the test if message building
+    ever queries task state."""
 
     def list_active(self, session_id):
         raise AssertionError("message building must not read tasks")
-
-
-class _BuildUow:
-    config_repo = _ConfigRepo()
-    messages_repo = None
-    tasks_repo = _PoisonTasksRepo()
-
-    def __init__(self, project_id):
-        self.config = self.config_repo
-        self.messages = self.messages_repo
-        self.tasks = self.tasks_repo
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
 
 
 @pytest.mark.unit
@@ -165,12 +130,16 @@ async def test_build_messages_is_pure_over_persisted_history(monkeypatch):
         ])
         + "\nnew request"
     )
-    _BuildUow.messages_repo = _HistoryRepo([
-        _MsgRow("user", "keep going"),
-        _MsgRow("assistant", "ok"),
-        _MsgRow("user", persisted),
-    ])
-    monkeypatch.setattr(query_loop_module, "UnitOfWork", _BuildUow)
+    uow_cls = make_fake_uow(
+        config=FakeConfigRepo(),
+        messages=RecordingMessagesRepo(history=[
+            _MsgRow("user", "keep going"),
+            _MsgRow("assistant", "ok"),
+            _MsgRow("user", persisted),
+        ]),
+        tasks=_PoisonTasksRepo(),
+    )
+    monkeypatch.setattr(query_loop_module, "UnitOfWork", uow_cls)
     monkeypatch.setattr(query_loop_module, "model_role_accepts_images", lambda role: False)
     monkeypatch.setattr(query_loop_module, "settings", SimpleNamespace(
         get_project_path=lambda project_id: "/tmp",

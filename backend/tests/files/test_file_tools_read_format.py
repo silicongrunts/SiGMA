@@ -9,27 +9,11 @@ including the explicit-`limit` case that previously produced no footer.
 import pytest
 
 from app.agents.tools.file_tools import _read_file
-from app.agents.tools.read_state import read_state_cache
-
-
-@pytest.fixture(autouse=True)
-def _clear_cache_between_tests():
-    """Ensure each test starts with an empty cache."""
-    read_state_cache.clear("sess")
-    yield
-    read_state_cache.clear("sess")
-
-
-def _patch_file_service(monkeypatch, tmp_path):
-    """Point file_service at a sandbox rooted at tmp_path."""
-    from app.services.file_service import file_service
-    monkeypatch.setattr(file_service, "get_project_path", lambda pid: tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_read_prepends_cat_n_line_numbers(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "f.txt").write_text("alpha\nbeta\ngamma")
+async def test_read_prepends_cat_n_line_numbers(sandbox):
+    (sandbox / "f.txt").write_text("alpha\nbeta\ngamma")
 
     result = await _read_file("proj", "sess", "f.txt")
 
@@ -42,9 +26,8 @@ async def test_read_prepends_cat_n_line_numbers(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_read_default_cap_emits_footer(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "big.txt").write_text("\n".join(f"l{i}" for i in range(250)))
+async def test_read_default_cap_emits_footer(sandbox):
+    (sandbox / "big.txt").write_text("\n".join(f"l{i}" for i in range(250)))
 
     result = await _read_file("proj", "sess", "big.txt")
 
@@ -57,15 +40,14 @@ async def test_read_default_cap_emits_footer(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_read_explicit_limit_truncation_emits_footer(tmp_path, monkeypatch):
+async def test_read_explicit_limit_truncation_emits_footer(sandbox):
     """Regression: an explicit limit that truncates must also emit the footer.
 
     Previously the footer was gated on `defaulted`, so explicit-limit reads
     produced no signal that more lines remained — exactly the pagination
     scenario where the signal matters most.
     """
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "big.txt").write_text("\n".join(f"l{i}" for i in range(100)))
+    (sandbox / "big.txt").write_text("\n".join(f"l{i}" for i in range(100)))
 
     result = await _read_file("proj", "sess", "big.txt", offset=10, limit=30)
 
@@ -76,14 +58,13 @@ async def test_read_explicit_limit_truncation_emits_footer(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_read_offset_window_line_numbers_are_absolute(tmp_path, monkeypatch):
+async def test_read_offset_window_line_numbers_are_absolute(sandbox):
     """Paginated reads expose absolute file line numbers, not window-relative.
 
     This is what makes the output safe for `sigma://...&line=N` citations: the
     first returned line of an offset read already shows the real file line.
     """
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "f.txt").write_text("\n".join(f"l{i}" for i in range(10)))
+    (sandbox / "f.txt").write_text("\n".join(f"l{i}" for i in range(10)))
 
     result = await _read_file("proj", "sess", "f.txt", offset=5, limit=3)
 
@@ -96,9 +77,8 @@ async def test_read_offset_window_line_numbers_are_absolute(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_read_negative_limit_returns_tail_with_real_line_numbers(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "f.txt").write_text("\n".join(f"l{i}" for i in range(10)))
+async def test_read_negative_limit_returns_tail_with_real_line_numbers(sandbox):
+    (sandbox / "f.txt").write_text("\n".join(f"l{i}" for i in range(10)))
 
     result = await _read_file("proj", "sess", "f.txt", limit=-3)
 
@@ -112,9 +92,8 @@ async def test_read_negative_limit_returns_tail_with_real_line_numbers(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_read_no_footer_when_file_fits(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "f.txt").write_text("only\nfour\nlines\nhere")
+async def test_read_no_footer_when_file_fits(sandbox):
+    (sandbox / "f.txt").write_text("only\nfour\nlines\nhere")
 
     result = await _read_file("proj", "sess", "f.txt")
 
@@ -122,9 +101,8 @@ async def test_read_no_footer_when_file_fits(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_read_empty_file_returns_empty_string(tmp_path, monkeypatch):
-    _patch_file_service(monkeypatch, tmp_path)
-    (tmp_path / "empty.txt").write_text("")
+async def test_read_empty_file_returns_empty_string(sandbox):
+    (sandbox / "empty.txt").write_text("")
 
     result = await _read_file("proj", "sess", "empty.txt")
 

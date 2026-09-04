@@ -251,7 +251,7 @@ SiGMA is built on many excellent open-source projects. In particular, we thank:
 
 - [React](https://react.dev/) and [Vite](https://vite.dev/) for the frontend foundation.
 - [Tailwind CSS](https://tailwindcss.com/), [CodeMirror](https://codemirror.net/), [xterm.js](https://xtermjs.org/), and [Lucide](https://lucide.dev/) for the workspace UI.
-- [FastAPI](https://fastapi.tiangolo.com/), [SQLAlchemy](https://www.sqlalchemy.org/), [Alembic](https://alembic.sqlalchemy.org/), and [Huey](https://huey.readthedocs.io/) for the backend runtime.
+- [FastAPI](https://fastapi.tiangolo.com/), [SQLAlchemy](https://www.sqlalchemy.org/), and [Alembic](https://alembic.sqlalchemy.org/) for the backend runtime.
 - [Playwright](https://playwright.dev/), [Chromium](https://www.chromium.org/chromium-projects/), and [noVNC](https://novnc.com/) for browser automation and remote browser access.
 - [Jupyter](https://jupyter.org/) for notebook support.
 - [TeX Live](https://www.tug.org/texlive/) and [KaTeX](https://katex.org/) for LaTeX workflows.

@@ -6,6 +6,7 @@ import pytest
 
 from app.core.exceptions import ValidationError
 import app.services.ai_service as ai_service_module
+from tests.ai.conftest import make_fake_uow
 
 
 def _msg(mid, seq, role, content="", tool_calls=None):
@@ -26,6 +27,9 @@ class _FakeSessionRow(SimpleNamespace):
         }
 
 
+# Both repos stay local: they mirror the SEARCH-specific repo contract
+# (SQLite ASCII-only case folding in the pre-filter, boundary-aware reads),
+# which the shared conftest fakes do not model.
 class _FakeSessionRepo:
     def __init__(self, sessions):
         self.sessions = sessions
@@ -65,28 +69,12 @@ class _FakeMessageRepo:
         return list(self.messages_by_session.get(session_id, [])), None
 
 
-class _FakeUnitOfWork:
-    """Stand-in for UnitOfWork: hands out one fake UoW per context."""
-
-    session_repo = None
-    message_repo = None
-
-    def __init__(self, project_id):
-        self.uow = SimpleNamespace(
-            sessions=self.session_repo, messages=self.message_repo,
-        )
-
-    async def __aenter__(self):
-        return self.uow
-
-    async def __aexit__(self, *args):
-        return False
-
-
 def _install(monkeypatch, sessions, messages_by_session):
-    _FakeUnitOfWork.session_repo = _FakeSessionRepo(sessions)
-    _FakeUnitOfWork.message_repo = _FakeMessageRepo(messages_by_session)
-    monkeypatch.setattr(ai_service_module, "UnitOfWork", _FakeUnitOfWork)
+    uow_cls = make_fake_uow(
+        sessions=_FakeSessionRepo(sessions),
+        messages=_FakeMessageRepo(messages_by_session),
+    )
+    monkeypatch.setattr(ai_service_module, "UnitOfWork", uow_cls)
 
 
 def _session(sid, title, is_archived=False):

@@ -55,14 +55,6 @@ class DocumentNotFoundError(ServiceException):
         )
 
 
-class AnnotationNotFoundError(ServiceException):
-    def __init__(self, annotation_id: str = ""):
-        super().__init__(
-            message=f"Annotation not found: {annotation_id}" if annotation_id else "Annotation not found",
-            code="ANNOTATION_NOT_FOUND", status_code=404,
-        )
-
-
 class FileSystemError(SiGMAException):
     """Filesystem operation failed (path invalid, I/O error, permission, etc.)."""
     def __init__(self, message: str = "File system error", code: str = "FILE_SYSTEM_ERROR",
@@ -109,6 +101,13 @@ class ValidationError(SiGMAException):
         super().__init__(message, "VALIDATION_ERROR", 422, details=details)
 
 
+class AnnotationConflictError(ServiceException):
+    """The file or annotation collection changed after the client loaded it."""
+
+    def __init__(self, message: str = "Annotation data changed; reload and retry", details=None):
+        super().__init__(message, code="ANNOTATION_CONFLICT", status_code=409, details=details)
+
+
 # ---------------------------------------------------------------------------
 # Database exceptions
 # ---------------------------------------------------------------------------
@@ -127,9 +126,14 @@ class SessionNotFoundError(DatabaseException):
         )
 
 
-class ConcurrencyError(DatabaseException):
-    def __init__(self, message: str = "Concurrent write conflict"):
-        super().__init__(message, "CONCURRENCY_ERROR", 409)
+class TaskStateUnavailableError(DatabaseException):
+    """A task_state read failed, so task activity cannot be confirmed (HTTP 503).
+
+    Answering "no active task" from a failed read would mask a running task
+    as an idle session; callers must surface this so the client can retry.
+    """
+    def __init__(self, message: str = "Task state is temporarily unavailable"):
+        super().__init__(message, code="TASK_STATE_UNAVAILABLE", status_code=503)
 
 
 class DatabaseIncompatibleError(DatabaseException):
@@ -268,15 +272,6 @@ class DuplicateTitleError(ServiceException):
         )
 
 
-class MoveFailedError(ServiceException):
-    """Move operation failed."""
-    def __init__(self, detail: str = ""):
-        super().__init__(
-            message=detail or "Move operation failed",
-            code="MOVE_FAILED", status_code=400,
-        )
-
-
 class DocumentProcessingError(SiGMAException):
     """Base exception for document processing pipeline failures."""
     def __init__(self, message: str = "Document processing failed",
@@ -306,16 +301,6 @@ class AIExtractionError(DocumentProcessingError):
             code="AI_EXTRACTION_ERROR", status_code=502,
             doc_id=doc_id, stage="ai_extraction",
         )
-
-
-# ---------------------------------------------------------------------------
-# Permission exception
-# ---------------------------------------------------------------------------
-
-class PermissionDeniedError(ServiceException):
-    """Permission denied for the requested operation."""
-    def __init__(self, detail: str = "Permission denied"):
-        super().__init__(detail, "PERMISSION_DENIED", status_code=403)
 
 
 # ---------------------------------------------------------------------------
@@ -362,13 +347,3 @@ class BrowserNotConnectedError(BrowserException):
     """Browser not connected — Chrome may not be running."""
     def __init__(self, message: str = "Browser not connected. Is Chrome running?"):
         super().__init__(message, "BROWSER_NOT_CONNECTED", 503)
-
-
-class ElementRefStaleError(BrowserException):
-    """Element reference is stale — page may have changed."""
-    def __init__(self, ref: str = ""):
-        super().__init__(
-            f"Element ref '{ref}' not found — the page may have changed. "
-            "Run browser_snapshot to get fresh refs.",
-            "ELEMENT_REF_STALE", 400,
-        )

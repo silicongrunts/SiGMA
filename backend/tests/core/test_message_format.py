@@ -12,16 +12,17 @@ from app.core.message_format import file_edit_stats, page_ui_turns, shape_messag
 from app.core.text_diff import DIFF_LINE_SOFT_LIMIT
 
 
-def _row(seq, role, content="", *, boundary=False, tool_calls=None, tool_call_id=None):
+def _row(seq, role, content="", *, boundary=False, tool_calls=None, tool_call_id=None,
+         token_count=0, cached_tokens=0, input_tokens=0):
     return SimpleNamespace(
         id=f"m{seq}",
         role=role,
         content=content,
         tool_calls=tool_calls,
         tool_call_id=tool_call_id,
-        token_count=0,
-        cached_tokens=0,
-        input_tokens=0,
+        token_count=token_count,
+        cached_tokens=cached_tokens,
+        input_tokens=input_tokens,
         is_boundary=boundary,
         seq=seq,
         created_at=None,
@@ -252,3 +253,116 @@ def test_history_tool_step_carries_file_edit_only_for_successful_calls():
             *_tool_turn(2, "edit", args, failure),
         ], None)
         assert "fileEdit" not in entries[-1]["process"][0]
+
+
+def test_parked_session_marks_unpaired_final_call_as_awaiting_input():
+    call = '[{"id": "t1", "function": {"name": "write", "arguments": "{}"}}]'
+    messages = [
+        _row(1, "user", "go"),
+        _row(2, "assistant", "", tool_calls=call),
+    ]
+
+    parked = shape_messages_for_ui(messages, None, session_parked=True)[-1]
+    step = parked["process"][0]
+    assert step["status"] == "awaiting_input"
+    assert step["tool_call_id"] == "t1"
+
+    # Without the authoritative park fact the same unpaired call is dead.
+    dead = shape_messages_for_ui(messages, None)[-1]
+    assert dead["process"][0]["status"] == "interrupted"
+    assert dead["process"][0]["tool_call_id"] == "t1"
+
+
+def test_parked_flag_applies_only_to_the_final_turn():
+    dead_call = '[{"id": "dead_call", "function": {"name": "bash", "arguments": "{}"}}]'
+    park_call = '[{"id": "park_call", "function": {"name": "agent", "arguments": "{}"}}]'
+    messages = [
+        _row(1, "user", "first"),
+        _row(2, "assistant", "", tool_calls=dead_call),
+        _row(3, "user", "second"),
+        _row(4, "assistant", "", tool_calls=park_call),
+    ]
+
+    entries = shape_messages_for_ui(messages, None, session_parked=True)
+
+    assert entries[1]["process"][0]["status"] == "interrupted"
+    assert entries[3]["process"][0]["status"] == "awaiting_input"
+
+
+def test_parked_turn_paired_call_stays_done():
+    call = '[{"id": "t1", "function": {"name": "read", "arguments": "{}"}}]'
+    messages = [
+        _row(1, "user", "go"),
+        _row(2, "assistant", "", tool_calls=call),
+        _row(3, "tool", "file body", tool_call_id="t1"),
+        _turn(4, "final answer"),
+    ]
+
+    entries = shape_messages_for_ui(messages, None, session_parked=True)
+
+    step = entries[-1]["process"][0]
+    assert step["status"] == "done"
+    assert step["tool_call_id"] == "t1"
+
+
+def test_parked_turn_partial_results_leave_siblings_awaiting():
+    """A parallel batch parked mid-round: the answered call is done, its
+    unanswered siblings are awaiting_input — never interrupted."""
+    calls = (
+        '[{"id": "t1", "function": {"name": "read", "arguments": "{}"}}, '
+        '{"id": "t2", "function": {"name": "write", "arguments": "{}"}}]'
+    )
+    messages = [
+        _row(1, "user", "go"),
+        _row(2, "assistant", "", tool_calls=calls),
+        _row(3, "tool", "file body", tool_call_id="t1"),
+    ]
+
+    entries = shape_messages_for_ui(messages, None, session_parked=True)
+
+    steps = entries[-1]["process"]
+    assert [s["status"] for s in steps] == ["done", "awaiting_input"]
+
+
+def test_mid_turn_boundary_usage_counts_into_turn_totals():
+    """A mid-turn compaction boundary carries the summarization call's own
+    spend on its row; the turn entry must fold it into its totals."""
+    tool_calls = '[{"id": "t1", "function": {"name": "bash", "arguments": "{}"}}]'
+    messages = [
+        _row(20, "user", "go"),
+        _row(21, "assistant", "", tool_calls=tool_calls,
+             token_count=5, input_tokens=100),
+        _row(22, "tool", "ok", tool_call_id="t1", token_count=9, input_tokens=11),
+        _row(23, "system", PASSIVE_SUMMARY_PREFIX + "mid summary", boundary=True,
+             token_count=7, input_tokens=50),
+        _row(24, "assistant", "final answer", token_count=3, input_tokens=60),
+    ]
+
+    entries = shape_messages_for_ui(messages, None)
+
+    turn = entries[-1]
+    assert turn["token_count"] == 5 + 9 + 7 + 3
+    assert turn["input_tokens"] == 100 + 11 + 50 + 60
+    assert turn["cached_tokens"] == 0
+
+
+def test_pending_passive_boundary_usage_leads_next_turn_totals():
+    """A passive boundary staged before the next turn leads that turn's
+    timeline, and its summarization spend counts into the SAME turn's
+    totals — it happened after the user message, before the first call."""
+    messages = [
+        _row(10, "assistant", "earlier reply", token_count=2, input_tokens=10),
+        _row(11, "system", PASSIVE_SUMMARY_PREFIX + "summary body", boundary=True,
+             token_count=7, input_tokens=50),
+        _row(12, "user", "next question"),
+        _row(13, "assistant", "next answer", token_count=3, input_tokens=60),
+    ]
+
+    entries = shape_messages_for_ui(messages, None)
+
+    # The previous turn keeps only its own spend.
+    assert entries[0]["token_count"] == 2
+    next_turn = entries[-1]
+    assert next_turn["process"][0] == {"type": "compact", "content": "summary body"}
+    assert next_turn["token_count"] == 7 + 3
+    assert next_turn["input_tokens"] == 50 + 60
