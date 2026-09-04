@@ -191,7 +191,7 @@ def test_commit_files_reports_renamed_non_ascii_file_as_modified(tmp_path):
     parent = service.get_log(project_id, 1)[0]["hash"]
 
     (project_path / old_name).rename(project_path / new_name)
-    service._run_git_add(project_id, ["add", "-A"])
+    service._run_git_stage(project_id, ["add", "-A"])
     message = service.build_staged_snapshot_message(project_id)
     assert service.commit(project_id, message)["success"] is True
 
@@ -219,7 +219,7 @@ def test_blob_falls_back_to_parent_for_file_deleted_in_commit(tmp_path):
     parent = service.get_log(project_id, 1)[0]["hash"]
 
     (project_path / chinese_name).unlink()
-    service._run_git_add(project_id, ["add", "-A"])
+    service._run_git_stage(project_id, ["add", "-A"])
     assert service.commit(project_id, "delete file")["success"] is True
     commit = service.get_log(project_id, 1)[0]["hash"]
 

@@ -19,9 +19,16 @@ import functools
 import json
 from typing import Dict
 
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.core.exceptions import DatabaseException
 from app.core.logging import get_logger
 from app.core.utils import utcnow, parse_iso
-from app.services.git_service import git_service
+from app.services.git_service import (
+    DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB,
+    git_service,
+    parse_max_new_file_mb,
+)
 from app.database.unit_of_work import UnitOfWork
 
 logger = get_logger(__name__)
@@ -40,6 +47,19 @@ _DEFERRED_RETRY_SEC = 15.0
 _HEALTH_KEY = "snapshot_health"
 
 
+def _outcome_with_skipped(outcome: dict, result: dict) -> dict:
+    """Attach size-capped exclusions to a snapshot outcome.
+
+    Without this the auto pipeline collapses every clean result to a bare
+    status, and files that may sit unprotected forever (only excluded work
+    pending, so no commit ever records them) leave no trace beyond logs.
+    """
+    skipped = result.get("skipped_large_files")
+    if skipped:
+        outcome["skipped_large_files"] = skipped
+    return outcome
+
+
 class SnapshotService:
     """Checks snapshot config and auto-commits on file changes."""
 
@@ -49,6 +69,24 @@ class SnapshotService:
         # accumulate. Bookkeeping is process-local only; correctness never
         # depends on it because the fire-time re-check reads live state.
         self._pending: Dict[str, asyncio.Task] = {}
+
+    async def get_max_new_file_mb(self, project_id: str) -> int:
+        """Read the per-project cap, falling back safely on DB failure."""
+        try:
+            async with UnitOfWork(project_id) as uow:
+                raw = await uow.config.get(
+                    "snapshot_max_new_file_mb",
+                    str(DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB),
+                )
+            return parse_max_new_file_mb(raw)
+        except (DatabaseException, SQLAlchemyError, OSError):
+            logger.warning(
+                "Failed to read snapshot file-size limit for %s; using %d MiB",
+                project_id,
+                DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB,
+                exc_info=True,
+            )
+            return DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB
 
     async def maybe_snapshot(self, project_id: str) -> None:
         """Check if auto-snapshot should fire, then commit the project state."""
@@ -66,11 +104,17 @@ class SnapshotService:
                     interval_min = 5
                 if interval_min < 1:
                     interval_min = 1
+                max_file_mb = parse_max_new_file_mb(
+                    await uow.config.get(
+                        "snapshot_max_new_file_mb",
+                        str(DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB),
+                    )
+                )
 
             # 2. History check + commit run in a thread: git subprocesses must
             #    never block the event loop.
             outcome = await asyncio.to_thread(
-                self._snapshot_if_due, project_id, interval_min)
+                self._snapshot_if_due, project_id, interval_min, max_file_mb)
             if outcome["status"] == "skipped_interval":
                 remaining = (interval_min - outcome["elapsed_min"]) * 60.0
                 delay = min(max(remaining, _MIN_TIMER_DELAY_SEC), interval_min * 60.0)
@@ -82,7 +126,12 @@ class SnapshotService:
             logger.warning("Auto-snapshot failed for project %s: %s", project_id, e, exc_info=True)
             await self.record_health(project_id, {"status": "error", "error": str(e)})
 
-    def _snapshot_if_due(self, project_id: str, interval_min: float) -> dict:
+    def _snapshot_if_due(
+        self,
+        project_id: str,
+        interval_min: float,
+        max_new_file_mb: int = DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB,
+    ) -> dict:
         """Blocking snapshot check + commit, for a worker thread.
 
         All outcome logging happens here on purpose: the awaiting coroutine
@@ -104,16 +153,19 @@ class SnapshotService:
                 logger.debug("Failed to read commit history for auto-snapshot", exc_info=True)
 
             result = git_service.create_snapshot_commit(
-                project_id, defer_unstable=True)
+                project_id,
+                defer_unstable=True,
+                max_new_file_bytes=max_new_file_mb * 1024 * 1024,
+            )
             if result.get("success") is False and result.get("reason") == "deferred":
                 logger.info("Auto-snapshot deferred for %s: %s",
                             project_id, result.get("detail"))
                 return {"status": "deferred"}
             if result.get("success") is False:
                 logger.debug(f"Auto-snapshot skipped (nothing to commit) for {project_id}")
-                return {"status": "noop"}
+                return _outcome_with_skipped({"status": "noop"}, result)
             logger.info(f"Auto-snapshot committed for {project_id}: {result.get('commit', '?')}")
-            return {"status": "committed"}
+            return _outcome_with_skipped({"status": "committed"}, result)
         except Exception as e:
             logger.warning("Auto-snapshot commit failed for project %s: %s", project_id, e, exc_info=True)
             return {"status": "error", "error": str(e)}
@@ -125,6 +177,8 @@ class SnapshotService:
         HTTP request may be cancelled while git is still running, and that
         cancellation must never swallow the outcome.
         """
+        max_file_mb = await self.get_max_new_file_mb(project_id)
+
         loop = asyncio.get_running_loop()
 
         def report(outcome: dict) -> None:
@@ -138,7 +192,10 @@ class SnapshotService:
 
         def work() -> dict:
             try:
-                result = git_service.create_snapshot_commit(project_id)
+                result = git_service.create_snapshot_commit(
+                    project_id,
+                    max_new_file_bytes=max_file_mb * 1024 * 1024,
+                )
             except Exception as e:
                 logger.warning("Manual snapshot failed for %s: %s",
                                project_id, e, exc_info=True)
@@ -146,10 +203,13 @@ class SnapshotService:
                 raise
             if result.get("success") is False:
                 logger.debug("Manual snapshot skipped (nothing to commit) for %s", project_id)
+                # A clean noop still proves the pipeline works; report it so
+                # a stale failure banner clears even when nothing was pending.
+                report(_outcome_with_skipped({"status": "noop"}, result))
             else:
                 logger.info("Manual snapshot committed for %s: %s",
                             project_id, result.get("commit"))
-                report({"status": "committed"})
+                report(_outcome_with_skipped({"status": "committed"}, result))
             return result
 
         return await asyncio.to_thread(work)
@@ -166,13 +226,18 @@ class SnapshotService:
     async def record_health(self, project_id: str, outcome: dict) -> None:
         """Persist snapshot health per project for UI alerting.
 
-        Failures accumulate until a commit succeeds; a deferral (files still
-        being written) is normal during active work and must not trip the
-        failure banner.
+        Failures accumulate until the pipeline runs clean again — a commit
+        or a noop (nothing pending, with the size cap a project can rest in
+        that state indefinitely). A deferral (files still being written) is
+        normal during active work and must not trip the failure banner.
+
+        Clean outcomes also mirror the size-capped files that stayed
+        unprotected, so the UI can list them. Deferred and failed attempts
+        run no size scan, so they keep the previous mirror.
         """
         status = outcome.get("status", "error")
         if status == "noop":
-            return
+            status = "ok"
         try:
             async with UnitOfWork(project_id) as uow:
                 raw = await uow.config.get(_HEALTH_KEY, "")
@@ -180,7 +245,7 @@ class SnapshotService:
                 failures = prev.get("consecutive_failures", 0)
                 if status == "error":
                     failures += 1
-                elif status == "committed":
+                elif status in ("committed", "ok"):
                     failures = 0
                 now_iso = utcnow().isoformat()
                 health = {
@@ -190,7 +255,18 @@ class SnapshotService:
                     "last_success_at": (now_iso if status == "committed"
                                         else prev.get("last_success_at")),
                     "last_error": outcome.get("error"),
+                    "pending_skipped_large_files": prev.get(
+                        "pending_skipped_large_files"),
                 }
+                if status in ("committed", "ok"):
+                    skipped = outcome.get("skipped_large_files") or []
+                    # Full list with sizes: the UI renders every name and
+                    # how much it weighs in its clickable list.
+                    health["pending_skipped_large_files"] = (
+                        {"count": len(skipped), "files": skipped,
+                         "at": now_iso}
+                        if skipped else None
+                    )
                 await uow.config.set(_HEALTH_KEY, json.dumps(health, ensure_ascii=False))
         except Exception:
             logger.debug("Failed to record snapshot health", exc_info=True)
@@ -206,6 +282,8 @@ class SnapshotService:
             "last_attempt_at": health.get("last_attempt_at"),
             "last_success_at": health.get("last_success_at"),
             "last_error": health.get("last_error"),
+            "pending_skipped_large_files": health.get(
+                "pending_skipped_large_files"),
         }
 
     def _arm_trailing_snapshot(self, project_id: str, delay_sec: float) -> None:

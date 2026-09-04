@@ -139,3 +139,28 @@ async def test_repair_heals_lock_then_commits(monkeypatch):
         "commit": {"success": True, "commit": "abc1234"},
     }
     assert calls == ["heal", "commit"]  # healing happens before the retry
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_init_git_reads_configured_cap_and_delegates(monkeypatch):
+    calls = {}
+
+    async def get_max_new_file_mb(project_id):
+        calls["cap"] = project_id
+        return 20
+
+    def init_git(project_id, max_new_file_bytes):
+        calls["init"] = (project_id, max_new_file_bytes)
+        return True
+
+    monkeypatch.setattr(git, "snapshot_service", SimpleNamespace(
+        get_max_new_file_mb=get_max_new_file_mb,
+    ))
+    monkeypatch.setattr(git, "git_service", SimpleNamespace(init_git=init_git))
+
+    result = await git.init_git("project-1")
+
+    assert result["data"] == {"initialized": True}
+    assert calls["cap"] == "project-1"
+    assert calls["init"] == ("project-1", 20 * 1024 * 1024)

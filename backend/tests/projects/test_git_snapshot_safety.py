@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import time
+from urllib.parse import unquote
 from datetime import timedelta
 
 import pytest
@@ -98,18 +99,23 @@ def test_timed_out_staging_leaves_repo_usable(tmp_path, monkeypatch):
     service, project_path = _make_repo(tmp_path)
     monkeypatch.setattr(git_module, "_TERM_GRACE_SEC", 1.0)
     # A clean filter that stalls makes `git add` genuinely slow, the way a
-    # multi-GB dataset would.
+    # multi-GB dataset would. The rule must live in info/attributes after
+    # the filter-guard line: the guard neutralizes every in-tree
+    # .gitattributes, and later lines win within one attributes file.
     service._run_git("proj", ["config", "filter.stall.clean", "sleep 15; cat"])
-    (project_path / ".gitattributes").write_text("*.bin filter=stall\n")
+    attrs = project_path / ".git" / "info" / "attributes"
+    attrs.write_text(
+        attrs.read_text(encoding="utf-8") + "*.bin filter=stall\n",
+        encoding="utf-8")
     (project_path / "big.bin").write_bytes(b"x" * 1024)
 
     monkeypatch.setattr(git_module, "GIT_WRITE_TIMEOUT_SEC", 0.5)
     with pytest.raises(FileSystemError, match="timed out"):
-        service._run_git_add("proj", ["add", "-A"])
+        service._run_git_stage("proj", ["add", "-A"])
 
     monkeypatch.setattr(git_module, "GIT_WRITE_TIMEOUT_SEC", 600)
     service._run_git("proj", ["config", "filter.stall.clean", "cat"])
-    assert service._run_git_add("proj", ["add", "-A"]) is True
+    assert service._run_git_stage("proj", ["add", "-A"]) is True
     assert not (project_path / ".git" / "index.lock").exists()
 
 
@@ -158,7 +164,7 @@ def test_git_add_heals_stale_lock_and_retries(tmp_path, monkeypatch):
     _plant_lock(project_path, age_sec=120)
     (project_path / "note.md").write_text("changed\n", encoding="utf-8")
 
-    assert service._run_git_add("proj", ["add", "-A"]) is True
+    assert service._run_git_stage("proj", ["add", "-A"]) is True
     assert not (project_path / ".git" / "index.lock").exists()
 
 
@@ -336,10 +342,16 @@ def test_startup_maintenance_sweeps_all_repos(tmp_path, monkeypatch):
         gitignore.read_text(encoding="utf-8").replace(".cache/\n", "", 1),
         encoding="utf-8",
     )
+    # Simulate a repo created before the filter guard existed.
+    (project_path / ".git" / "info" / "attributes").unlink()
 
     counts = service.startup_maintenance()
 
-    assert counts == {"gitignore_updated": 1, "stale_locks_removed": 1}
+    assert counts == {
+        "gitignore_updated": 1,
+        "filter_guard_added": 1,
+        "stale_locks_removed": 1,
+    }
     assert not (project_path / ".git" / "index.lock").exists()
 
 
@@ -425,14 +437,45 @@ async def test_deferral_is_not_a_failure(recording_config):
     assert health["consecutive_failures"] == 1
 
 
-async def test_noop_outcome_leaves_health_untouched(recording_config):
+async def test_noop_outcome_clears_stale_failures(recording_config):
+    """A noop ran the pipeline clean; with the size cap a project can rest
+    in noop-only state indefinitely, so stale failures must not outlive the
+    fault that raised them."""
     svc = SnapshotService()
     await svc.record_health("p1", {"status": "error", "error": "x"})
-    before = recording_config.get("snapshot_health")
 
     await svc.record_health("p1", {"status": "noop"})
 
-    assert recording_config.get("snapshot_health") == before
+    health = json.loads(recording_config["snapshot_health"])
+    assert health["status"] == "ok"
+    assert health["consecutive_failures"] == 0
+    assert health["last_error"] is None
+
+
+async def test_pending_skipped_large_files_mirror(recording_config):
+    """Clean outcomes mirror unprotected size-capped files into the health
+    record; deferrals and errors run no size scan and keep the mirror."""
+    svc = SnapshotService()
+
+    files = [{"path": f"chunk_{i}.bin", "size": (i + 1) * 1024 * 1024}
+             for i in range(7)]
+    await svc.record_health("p1", {"status": "noop",
+                                   "skipped_large_files": files})
+    health = json.loads(recording_config["snapshot_health"])
+    # The full list with sizes is mirrored — the UI renders every entry.
+    assert health["pending_skipped_large_files"] == {
+        "count": 7,
+        "files": files,
+        "at": health["last_attempt_at"],
+    }
+
+    await svc.record_health("p1", {"status": "deferred"})
+    health = json.loads(recording_config["snapshot_health"])
+    assert health["pending_skipped_large_files"]["count"] == 7
+
+    await svc.record_health("p1", {"status": "committed"})
+    health = json.loads(recording_config["snapshot_health"])
+    assert health["pending_skipped_large_files"] is None
 
 
 async def test_get_health_defaults_to_healthy(recording_config):
@@ -444,6 +487,7 @@ async def test_get_health_defaults_to_healthy(recording_config):
         "last_attempt_at": None,
         "last_success_at": None,
         "last_error": None,
+        "pending_skipped_large_files": None,
     }
 
 
@@ -458,13 +502,28 @@ class StubGit:
 
 
 class DeferredGit(StubGit):
-    def create_snapshot_commit(self, project_id, defer_unstable=False):
+    def create_snapshot_commit(
+        self, project_id, defer_unstable=False, max_new_file_bytes=None,
+    ):
         return {"success": False, "reason": "deferred",
                 "detail": "files still being written"}
 
 
+class NoopWithSkippedGit(StubGit):
+    """Snapshot result when the only pending work exceeds the size cap."""
+
+    def create_snapshot_commit(
+        self, project_id, defer_unstable=False, max_new_file_bytes=None,
+    ):
+        return {"success": False, "reason": "no changes",
+                "skipped_large_files": [{"path": "huge.parquet",
+                                         "size": 9 * 1024 * 1024}]}
+
+
 class ExplodingGit(StubGit):
-    def create_snapshot_commit(self, project_id, defer_unstable=False):
+    def create_snapshot_commit(
+        self, project_id, defer_unstable=False, max_new_file_bytes=None,
+    ):
         raise FileSystemError("Git add -A failed", code="INTERNAL_ERROR")
 
 
@@ -497,3 +556,273 @@ async def test_maybe_snapshot_records_git_failure(
     health = json.loads(recording_config["snapshot_health"])
     assert health["status"] == "error"
     assert health["consecutive_failures"] == 1
+
+
+@pytest.mark.regression
+async def test_maybe_snapshot_noop_records_pending_skipped(
+        monkeypatch, recording_config):
+    monkeypatch.setattr(snapshot_module, "git_service",
+                        NoopWithSkippedGit(utcnow() - timedelta(minutes=10)))
+
+    svc = SnapshotService()
+    await svc.maybe_snapshot("p1")
+
+    health = json.loads(recording_config["snapshot_health"])
+    assert health["status"] == "ok"
+    assert health["pending_skipped_large_files"]["files"] == [
+        {"path": "huge.parquet", "size": 9 * 1024 * 1024}]
+
+
+# ---------------------------------------------------------------------------
+# L5: filter isolation — imported .gitattributes must never gate snapshots on
+# an external filter binary (git-lfs configured but missing), whatever the
+# directory is named
+# ---------------------------------------------------------------------------
+
+@pytest.mark.regression
+@pytest.mark.timeout(30)
+def test_filter_guard_stays_last_and_wins(tmp_path):
+    service, project_path = _make_repo(tmp_path)
+    attrs = project_path / ".git" / "info" / "attributes"
+    lines = attrs.read_text(encoding="utf-8").splitlines()
+    assert lines[-1] == "* -filter"
+
+    # Unchanged file: no rewrite.
+    assert service._ensure_filter_isolation(project_path) is False
+
+    # A rule appended below the guard is preserved, but the guard relocates
+    # beneath it — later lines win in gitattributes, so only the last line
+    # makes the guard unconditional.
+    attrs.write_text(
+        "\n".join(lines + ["*.bin filter=stall"]) + "\n", encoding="utf-8")
+    assert service._ensure_filter_isolation(project_path) is True
+    new_lines = attrs.read_text(encoding="utf-8").splitlines()
+    assert new_lines[-1] == "* -filter"
+    assert "*.bin filter=stall" in new_lines
+    stdout, _, rc = service._run_git("proj", ["check-attr", "filter", "--", "x.bin"])
+    assert rc == 0
+    assert "filter: unset" in stdout
+
+    # Stable again after relocation.
+    assert service._ensure_filter_isolation(project_path) is False
+
+
+@pytest.mark.regression
+@pytest.mark.timeout(30)
+def test_snapshot_survives_imported_lfs_attributes(tmp_path, local_locks):
+    """The motivating incident in miniature: a dataset's .gitattributes routes
+    files through a configured-but-missing filter binary, and snapshots must
+    still succeed no matter how the containing directory is named."""
+    service, project_path = _make_repo(tmp_path)
+    # Repo-local stand-in for the machine's global gitconfig: lfs filter
+    # configured as required, binary guaranteed absent.
+    service._run_git("proj", ["config", "filter.lfs.process",
+                              "sigma-missing-lfs filter-process"])
+    service._run_git("proj", ["config", "filter.lfs.required", "true"])
+    deep = project_path / "a" / "test"
+    deep.mkdir(parents=True)
+    (deep / ".gitattributes").write_text(
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8")
+    (deep / "data.bin").write_bytes(b"payload" * 10)
+
+    result = service.create_snapshot_commit("proj")
+
+    assert result["success"] is True
+    # Stored raw, not as an LFS pointer blob.
+    stdout, _, rc = service._run_git(
+        "proj", ["cat-file", "-s", ":a/test/data.bin"], as_binary=True)
+    assert rc == 0
+    assert stdout.strip() == b"70"
+
+
+# ---------------------------------------------------------------------------
+# L6: size cap — oversized paths enter snapshots only after they have appeared
+# in repository history
+# ---------------------------------------------------------------------------
+
+@pytest.mark.regression
+@pytest.mark.timeout(30)
+def test_initial_snapshot_skips_oversized_new_file(tmp_path, local_locks):
+    service = GitService()
+    service.USERDATA_DIR = tmp_path
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    (project_path / "initial-large.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+
+    assert service.init_git("proj", max_new_file_bytes=1024 * 1024) is True
+
+    stdout, _, rc = service._run_git("proj", ["ls-files", "-z"], as_binary=True)
+    assert rc == 0
+    assert b".gitignore" in stdout.split(b"\0")
+    assert b"initial-large.bin" not in stdout.split(b"\0")
+
+
+@pytest.mark.regression
+@pytest.mark.timeout(30)
+def test_snapshot_skips_oversized_files_with_tricky_names(
+        tmp_path, local_locks):
+    service, project_path = _make_repo(tmp_path)
+    (project_path / "small.txt").write_text("small", encoding="utf-8")
+    (project_path / "big blob [1]*.bin").write_bytes(b"x" * 100)
+
+    result = service.create_snapshot_commit("proj", max_new_file_bytes=10)
+
+    assert result["success"] is True
+    assert result["skipped_large_files"] == [
+        {"path": "big blob [1]*.bin", "size": 100}]
+    stdout, _, rc = service._run_git("proj", ["ls-files", "-z"], as_binary=True)
+    assert rc == 0
+    assert b"small.txt" in stdout.split(b"\0")
+    assert b"big blob [1]*.bin" not in stdout.split(b"\0")
+
+
+@pytest.mark.regression
+@pytest.mark.timeout(30)
+def test_snapshot_unstages_oversized_never_committed_file(
+        tmp_path, local_locks):
+    """A user-staged new blob must not bypass the snapshot size policy."""
+    service, project_path = _make_repo(tmp_path)
+    path = project_path / "pre-staged [large]*.bin"
+    path.write_bytes(b"x" * 100)
+    service._run_git("proj", ["add", "--", ":(literal)pre-staged [large]*.bin"])
+
+    result = service.create_snapshot_commit("proj", max_new_file_bytes=10)
+
+    assert result["success"] is False
+    assert result["reason"] == "no changes"
+    assert result["skipped_large_files"] == [
+        {"path": "pre-staged [large]*.bin", "size": 100}]
+    stdout, _, rc = service._run_git("proj", ["ls-files", "-z"], as_binary=True)
+    assert rc == 0
+    assert b"pre-staged [large]*.bin" not in stdout.split(b"\0")
+
+
+@pytest.mark.regression
+@pytest.mark.timeout(30)
+def test_oversized_tracked_modification_and_deletion_are_committed(
+        tmp_path, local_locks):
+    """Once a path is versioned, the cap never interrupts its protection."""
+    service, project_path = _make_repo(tmp_path)
+    (project_path / "data.bin").write_bytes(b"small")
+    assert service.create_snapshot_commit("proj")["success"] is True
+
+    (project_path / "data.bin").write_bytes(b"x" * 100)
+    (project_path / "note.txt").write_text("n", encoding="utf-8")
+    result = service.create_snapshot_commit("proj", max_new_file_bytes=10)
+    assert result["success"] is True
+    assert "skipped_large_files" not in result
+    stdout, _, rc = service._run_git(
+        "proj", ["cat-file", "-s", "HEAD:data.bin"], as_binary=True)
+    assert rc == 0
+    assert stdout.strip() == b"100"
+
+    (project_path / "data.bin").unlink()
+    assert service.create_snapshot_commit(
+        "proj", max_new_file_bytes=10)["success"] is True
+    _, _, rc = service._run_git(
+        "proj", ["cat-file", "-s", "HEAD:data.bin"], as_binary=True)
+    assert rc != 0
+
+
+@pytest.mark.regression
+@pytest.mark.timeout(30)
+def test_oversized_recreated_historical_path_is_committed(
+        tmp_path, local_locks):
+    """An untracked path remains protected when it existed in older commits."""
+    service, project_path = _make_repo(tmp_path)
+    data_path = project_path / "data [old]*.bin"
+    data_path.write_bytes(b"small")
+    assert service.create_snapshot_commit("proj")["success"] is True
+
+    data_path.unlink()
+    assert service.create_snapshot_commit("proj")["success"] is True
+
+    data_path.write_bytes(b"x" * 100)
+    result = service.create_snapshot_commit("proj", max_new_file_bytes=10)
+
+    assert result["success"] is True
+    assert "skipped_large_files" not in result
+    stdout, _, rc = service._run_git(
+        "proj", ["cat-file", "-s", "HEAD:data [old]*.bin"], as_binary=True)
+    assert rc == 0
+    assert stdout.strip() == b"100"
+
+
+@pytest.mark.regression
+@pytest.mark.timeout(30)
+def test_oversized_historical_path_with_newline_name_is_committed(
+        tmp_path, local_locks):
+    """Names containing newlines are legal on Linux; the batched history
+    scan must match them exactly (a line-based read mis-splits them, and a
+    mismatch silently downgrades a historically protected path to
+    size-capped)."""
+    service, project_path = _make_repo(tmp_path)
+    data_path = project_path / "data\n[old]*.bin"
+    data_path.write_bytes(b"small")
+    assert service.create_snapshot_commit("proj")["success"] is True
+
+    data_path.unlink()
+    assert service.create_snapshot_commit("proj")["success"] is True
+
+    data_path.write_bytes(b"x" * 100)
+    result = service.create_snapshot_commit("proj", max_new_file_bytes=10)
+
+    assert result["success"] is True
+    assert "skipped_large_files" not in result
+    stdout, _, rc = service._run_git(
+        "proj", ["cat-file", "-s", "HEAD:data\n[old]*.bin"], as_binary=True)
+    assert rc == 0
+    assert stdout.strip() == b"100"
+
+
+def test_snapshot_message_records_skipped_files():
+    message = GitService._format_snapshot_message(
+        {"added": ["main.md"], "deleted": [], "modified": []},
+        skipped=["ds/gsm8k.parquet", "ds/wildchat.parquet"],
+    )
+    payload = json.loads(unquote(
+        message.removeprefix(git_module.SNAPSHOT_MESSAGE_PREFIX)))
+    assert payload["skipped"] == {
+        "names": ["gsm8k.parq...", "wildchat.p..."],
+        "total": 2,
+    }
+
+
+def test_snapshot_message_counts_colliding_skipped_names():
+    """Dataset shards sharing a truncated name must not shrink the reported
+    total — 14 wildchat shards display as two names, not two files."""
+    message = GitService._format_snapshot_message(
+        {"added": [], "deleted": [], "modified": []},
+        skipped=[f"ds/train-{i:05d}-of-00014.parquet" for i in range(14)],
+    )
+    payload = json.loads(unquote(
+        message.removeprefix(git_module.SNAPSHOT_MESSAGE_PREFIX)))
+    assert payload["skipped"] == {
+        "names": ["train-0000...", "train-0001..."],
+        "total": 14,
+    }
+
+
+def test_staging_args_literal_excludes_only_named_paths():
+    assert GitService._staging_args([]) == ["add", "-A"]
+    assert GitService._staging_args([{"path": "a b/*.bin", "size": 1}]) == [
+        "add", "-A", "--", ":(exclude,literal)a b/*.bin",
+    ]
+
+
+@pytest.mark.regression
+@pytest.mark.timeout(30)
+def test_snapshot_with_only_excluded_files_pending_is_noop(
+        tmp_path, local_locks):
+    """The size cap creates a terminal state git describes as "nothing added
+    to commit but untracked files present" — reported on stdout, not stderr.
+    It must read as a clean noop, never as a snapshot failure that trips the
+    health banner."""
+    service, project_path = _make_repo(tmp_path)
+    (project_path / "huge.parquet").write_bytes(b"x" * 100)
+
+    result = service.create_snapshot_commit("proj", max_new_file_bytes=10)
+
+    assert result["success"] is False
+    assert result["reason"] == "no changes"
+    assert result["skipped_large_files"] == [{"path": "huge.parquet", "size": 100}]

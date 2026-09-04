@@ -19,7 +19,11 @@ from app.core.utils import is_within, to_iso, utcnow
 from app.core.atomic_file import ProjectFileLock, atomic_write_json, safe_read_json
 from app.core.exceptions import FileSystemError, ProjectNotFoundError
 from app.core.logging import get_logger
-from app.services.git_service import git_service
+from app.services.git_service import (
+    DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB,
+    git_service,
+    parse_max_new_file_mb,
+)
 
 logger = get_logger(__name__)
 
@@ -249,6 +253,7 @@ class ProjectService:
         result = {
             "snapshot_enabled": True,
             "snapshot_interval_minutes": 5,
+            "snapshot_max_new_file_mb": DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB,
             "tips": "",
         }
         if "snapshot_enabled" in all_config:
@@ -261,6 +266,9 @@ class ProjectService:
                     "Invalid snapshot_interval_minutes value %r for project %s, using default",
                     all_config["snapshot_interval_minutes"], project_id,
                 )
+        if "snapshot_max_new_file_mb" in all_config:
+            result["snapshot_max_new_file_mb"] = parse_max_new_file_mb(
+                all_config["snapshot_max_new_file_mb"])
         if "tips" in all_config:
             result["tips"] = all_config["tips"]
         return result
@@ -273,6 +281,9 @@ class ProjectService:
                 await uow.config.set("snapshot_enabled", "true" if data.snapshot_enabled else "false")
             if data.snapshot_interval_minutes is not None:
                 await uow.config.set("snapshot_interval_minutes", str(data.snapshot_interval_minutes))
+            if data.snapshot_max_new_file_mb is not None:
+                await uow.config.set(
+                    "snapshot_max_new_file_mb", str(data.snapshot_max_new_file_mb))
             if data.tips is not None:
                 await uow.config.set("tips", data.tips)
 

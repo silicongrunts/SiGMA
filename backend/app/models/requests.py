@@ -235,6 +235,7 @@ class ProjectConfigUpdate(BaseModel):
     """Request body for PATCH /projects/{project_id}/config."""
     snapshot_enabled: Optional[bool] = None
     snapshot_interval_minutes: Optional[int] = Field(None, ge=1)
+    snapshot_max_new_file_mb: Optional[int] = Field(None, ge=1)
     tips: Optional[str] = Field(None, max_length=6000)
 
 

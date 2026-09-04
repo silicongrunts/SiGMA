@@ -14,7 +14,9 @@ router = APIRouter(prefix="/git", tags=["git"])
 
 @router.post("/{project_id}/init")
 async def init_git(project_id: str):
-    success = git_service.init_git(project_id)
+    cap_mb = await snapshot_service.get_max_new_file_mb(project_id)
+    success = await asyncio.to_thread(
+        git_service.init_git, project_id, cap_mb * 1024 * 1024)
     return ok({"initialized": success})
 
 

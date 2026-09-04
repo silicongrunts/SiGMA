@@ -276,6 +276,9 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
 
   // Snapshot settings
   const [snapshotInterval, setSnapshotInterval] = useState(5)
+  const [snapshotMaxNewFileMb, setSnapshotMaxNewFileMb] = useState('5')
+  const snapshotMaxNewFileMbSavedRef = useRef(5)
+  const [snapshotLimitUpdating, setSnapshotLimitUpdating] = useState(false)
   const [showSnapshotDisableWarning, setShowSnapshotDisableWarning] = useState(false)
   const [tabSwitching, setTabSwitching] = useState(false)
   const [settingUpdating, setSettingUpdating] = useState(false)
@@ -291,6 +294,9 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
         // Use 0 as the "disabled" sentinel so a single dropdown can express both
         // the off state and the on+N-minutes state.
         setSnapshotInterval(config.snapshot_enabled === false ? 0 : (config.snapshot_interval_minutes || 5))
+        const maxNewFileMb = config.snapshot_max_new_file_mb || 5
+        setSnapshotMaxNewFileMb(String(maxNewFileMb))
+        snapshotMaxNewFileMbSavedRef.current = maxNewFileMb
         setTips(config.tips || "")
       }).catch(e => console.warn('Failed to load project config:', e))
     }
@@ -525,6 +531,32 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
     }
   }
 
+  const handleSnapshotMaxNewFileMbSave = async () => {
+    const parsed = Number(snapshotMaxNewFileMb)
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      setSnapshotMaxNewFileMb(String(snapshotMaxNewFileMbSavedRef.current))
+      return
+    }
+    if (parsed === snapshotMaxNewFileMbSavedRef.current) {
+      setSnapshotMaxNewFileMb(String(parsed))
+      return
+    }
+
+    setSnapshotMaxNewFileMb(String(parsed))
+    setSnapshotLimitUpdating(true)
+    try {
+      await projectsAPI.updateConfig(currentProject.id, {
+        snapshot_max_new_file_mb: parsed,
+      })
+      snapshotMaxNewFileMbSavedRef.current = parsed
+    } catch (e) {
+      setSnapshotMaxNewFileMb(String(snapshotMaxNewFileMbSavedRef.current))
+      toastError(t('editor.toast.updateSnapshotLimitFailed'))
+    } finally {
+      setSnapshotLimitUpdating(false)
+    }
+  }
+
   // Tips save handler
   const handleSaveTips = async (value) => {
     await projectsAPI.updateConfig(currentProject.id, { tips: value })
@@ -661,6 +693,30 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
               <option value={30}>{t('editor.settings.snapshot.minutes', { count: 30 })}</option>
               <option value={60}>{t('editor.settings.snapshot.hour')}</option>
             </select>
+          </div>
+          <div className="mt-3">
+            <label className="flex items-center gap-2 text-[9px] font-semibold text-gray-400 mb-1.5">
+              {t('editor.settings.snapshot.maxNewFileSize')}
+            </label>
+            <div className="relative">
+              <input
+                type="number"
+                min="1"
+                step="1"
+                value={snapshotMaxNewFileMb}
+                onChange={(e) => setSnapshotMaxNewFileMb(e.target.value)}
+                onBlur={handleSnapshotMaxNewFileMbSave}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') e.currentTarget.blur()
+                }}
+                disabled={snapshotLimitUpdating}
+                className="w-full px-3 py-2.5 pr-12 bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-700 rounded-xl text-xs font-bold text-gray-700 dark:text-gray-300 outline-none focus:ring-2 focus:ring-sigma-600/20 disabled:opacity-50 disabled:cursor-not-allowed"
+              />
+              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-bold text-gray-400">MiB</span>
+            </div>
+            <p className="mt-1.5 text-[9px] leading-relaxed text-gray-400 dark:text-gray-500">
+              {t('editor.settings.snapshot.maxNewFileSizeHint')}
+            </p>
           </div>
         </div>
 

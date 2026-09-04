@@ -58,8 +58,14 @@ class FakeGit:
     def get_project_path(self, project_id):
         return self._project_path
 
-    def create_snapshot_commit(self, project_id, defer_unstable=False):
-        self.commits.append("Auto-snapshot")
+    def create_snapshot_commit(
+        self, project_id, defer_unstable=False, max_new_file_bytes=None,
+    ):
+        self.commits.append({
+            "project_id": project_id,
+            "defer_unstable": defer_unstable,
+            "max_new_file_bytes": max_new_file_bytes,
+        })
         return {"success": True, "commit": "fakehash"}
 
 
@@ -98,6 +104,28 @@ async def test_skipped_snapshot_commits_when_interval_elapses(
     await svc._pending["p1"]
 
     assert len(git.commits) == 1  # final state committed
+    assert git.commits[0]["max_new_file_bytes"] == 5 * 1024 * 1024
+    assert svc._pending == {}  # entry released — no accumulation
+
+
+async def test_auto_snapshot_uses_project_file_size_limit(
+    monkeypatch, tmp_path, fast_timers,
+):
+    git = _patch_deps(
+        monkeypatch,
+        [utcnow() - timedelta(minutes=10)],
+        tmp_path,
+        values={
+            "snapshot_enabled": "true",
+            "snapshot_interval_minutes": "1",
+            "snapshot_max_new_file_mb": "20",
+        },
+    )
+
+    svc = SnapshotService()
+    await svc.maybe_snapshot("p1")
+
+    assert git.commits[0]["max_new_file_bytes"] == 20 * 1024 * 1024
     assert svc._pending == {}  # entry released — no accumulation
 
 

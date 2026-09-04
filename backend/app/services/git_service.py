@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any
 from app.core.exceptions import (
     FileSystemError, ProjectNotFoundError, FileMissingError, ValidationError,
 )
-from app.core.atomic_file import ProjectFileLock
+from app.core.atomic_file import ProjectFileLock, atomic_replace_bytes
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.utils import is_within
@@ -66,6 +66,47 @@ GITIGNORE_LATEX_OUTPUTS = ("output.pdf", "output.synctex.gz")
 # slashes) also stays inside git's own refname rules; the extra checks reject
 # the remaining git-forbidden forms that the charset alone still allows.
 TAG_NAME_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$")
+
+# Default per-project cap for files that have never appeared in repository
+# history. Existing versioned paths remain protected even after growing past
+# the cap; only newly introduced bulk files are excluded.
+DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB = 5
+DEFAULT_SNAPSHOT_MAX_NEW_FILE_BYTES = (
+    DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB * 1024 * 1024
+)
+
+
+def parse_max_new_file_mb(raw) -> int:
+    """Parse a configured snapshot file-size cap (MiB), defaulting on
+    invalid input. Single source for the int >= 1 rule shared by the
+    project-config read and the snapshot pipelines."""
+    try:
+        value = int(raw)
+        if value >= 1:
+            return value
+    except (ValueError, TypeError):
+        pass
+    logger.warning("Invalid snapshot_max_new_file_mb value %r; using %d",
+                   raw, DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB)
+    return DEFAULT_SNAPSHOT_MAX_NEW_FILE_MB
+
+
+# Guard rule appended to .git/info/attributes. Imported content (HuggingFace
+# datasets, cloned repos) ships .gitattributes routing matched files through
+# external filters such as git-lfs; with the filter configured in the user's
+# global gitconfig but the binary missing, `git add -A` fails hard
+# (`filter.lfs.required=true`). Snapshot repos are a purely local versioning
+# store, so no external filter process may ever decide their availability.
+# info/attributes outranks every in-tree .gitattributes, and gitattributes
+# resolves later lines first — so the guard is kept as the file's LAST line
+# and relocated there whenever something is appended below it. User lines
+# are preserved; they simply cannot re-enable a filter.
+FILTER_ISOLATION_HEADER = "# SiGMA: snapshot repos never invoke external filter processes"
+FILTER_ISOLATION_RULE = "* -filter"
+
+# Pathspec prefix keeping excluded paths literal: dataset filenames routinely
+# contain spaces, non-ASCII characters, and glob metacharacters.
+_EXCLUDE_PATHSPEC_PREFIX = ":(exclude,literal)"
 
 
 def _validate_tag_name(name: str) -> str:
@@ -155,7 +196,11 @@ class GitService:
             return stdout, stderr.decode('utf-8', errors='replace'), rc
         return stdout.decode('utf-8'), stderr.decode('utf-8', errors='replace'), rc
 
-    def init_git(self, project_id: str) -> bool:
+    def init_git(
+        self,
+        project_id: str,
+        max_new_file_bytes: int = DEFAULT_SNAPSHOT_MAX_NEW_FILE_BYTES,
+    ) -> bool:
         """Initialize a git repo for a new project."""
         try:
             project_path = self.get_project_path(project_id)
@@ -178,7 +223,15 @@ class GitService:
                     encoding="utf-8",
                 )
 
-            self._run_git(project_id, ["add", "-A"], timeout=GIT_WRITE_TIMEOUT_SEC)
+            self._ensure_filter_isolation(project_path)
+            oversized = self._oversized_never_committed_files(
+                project_id, project_path, max_new_file_bytes)
+            self._remove_excluded_paths_from_index(project_id, oversized)
+            self._run_git_stage(project_id, self._staging_args(oversized))
+            if oversized:
+                logger.info("Initial snapshot skipped %d file(s) over the size cap: %s",
+                            len(oversized),
+                            ", ".join(e["path"] for e in oversized[:5]))
             self._run_git(project_id, ["commit", "-m", "Initial commit"],
                           timeout=GIT_WRITE_TIMEOUT_SEC)
             return True
@@ -187,9 +240,9 @@ class GitService:
         except Exception as e:
             raise FileSystemError(f"Git init failed: {e}", code="INTERNAL_ERROR")
 
-    def _run_git_add(self, project_id: str, args: List[str]) -> bool:
-        """Run a staging command, healing a stale index.lock once if it is
-        what made the command fail, then retrying."""
+    def _run_git_stage(self, project_id: str, args: List[str]) -> bool:
+        """Run a staging command (``add`` / ``rm --cached``), healing a stale
+        index.lock once if it is what made the command fail, then retrying."""
         stdout, stderr, rc = self._run_git(project_id, args, timeout=GIT_WRITE_TIMEOUT_SEC)
         if rc == 0:
             return True
@@ -198,11 +251,15 @@ class GitService:
             stdout, stderr, rc = self._run_git(project_id, args,
                                                timeout=GIT_WRITE_TIMEOUT_SEC)
         if rc != 0:
-            raise FileSystemError(f"Git add -A failed: {stderr}", code="INTERNAL_ERROR")
+            raise FileSystemError(f"Git staging failed: {stderr}", code="INTERNAL_ERROR")
         return True
 
-    def create_snapshot_commit(self, project_id: str,
-                               defer_unstable: bool = False) -> Dict[str, Any]:
+    def create_snapshot_commit(
+        self,
+        project_id: str,
+        defer_unstable: bool = False,
+        max_new_file_bytes: int = DEFAULT_SNAPSHOT_MAX_NEW_FILE_BYTES,
+    ) -> Dict[str, Any]:
         """Stage the working tree and commit it as one snapshot step.
 
         Shared by auto-snapshot and the manual-commit route. The index lock
@@ -215,10 +272,16 @@ class GitService:
         may be mid-write (bulk transfers, builds), so the snapshot waits for
         writes to settle. Manual commits pass False and commit
         unconditionally: the user asked for a version right now.
+
+        Files over the size cap are excluded only when their path has never
+        appeared in repository history. Already-versioned paths remain fully
+        protected even after growing past the cap. Exclusions are listed in
+        the commit message and returned result so the gap stays visible.
         """
         project_path = self.get_project_path(project_id)
         with ProjectFileLock(project_path / ".git" / "index",
                              timeout=SNAPSHOT_LOCK_WAIT_SEC):
+            self._ensure_filter_isolation(project_path)
             if defer_unstable and not self._worktree_is_stable(
                     project_id, project_path):
                 return {
@@ -226,9 +289,135 @@ class GitService:
                     "reason": "deferred",
                     "detail": "files still being written",
                 }
-            self._run_git_add(project_id, ["add", "-A"])
-            message = self.build_staged_snapshot_message(project_id)
-            return self.commit(project_id, message)
+            oversized = self._oversized_never_committed_files(
+                project_id, project_path, max_new_file_bytes)
+            self._remove_excluded_paths_from_index(project_id, oversized)
+            self._run_git_stage(project_id, self._staging_args(oversized))
+            message = self.build_staged_snapshot_message(project_id, oversized)
+            result = self.commit(project_id, message)
+            if oversized:
+                result["skipped_large_files"] = oversized
+                logger.info(
+                    "Snapshot excluded %d file(s) over %.0f MB for %s: %s",
+                    len(oversized), max_new_file_bytes / (1024 * 1024),
+                    project_id, ", ".join(e["path"] for e in oversized[:5]),
+                )
+            return result
+
+    def _ensure_filter_isolation(self, project_path: Path) -> bool:
+        """Keep the filter guard as the last line of ``.git/info/attributes``.
+
+        Later lines win in gitattributes, so only the final position makes
+        the guard unconditional. Whenever other lines appear below it, the
+        guard block is rewritten underneath them; user-authored lines are
+        never removed — they just cannot override the guard.
+        """
+        attrs = project_path / ".git" / "info" / "attributes"
+        content = ""
+        try:
+            content = attrs.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        guard_block = (FILTER_ISOLATION_HEADER, FILTER_ISOLATION_RULE)
+        user_lines = [
+            line for line in content.splitlines()
+            if line.strip() not in guard_block
+        ]
+        if content and user_lines + list(guard_block) == content.splitlines():
+            return False
+        attrs.parent.mkdir(parents=True, exist_ok=True)
+        atomic_replace_bytes(
+            attrs,
+            "\n".join(user_lines + list(guard_block)).encode("utf-8") + b"\n",
+        )
+        return True
+
+    def _oversized_never_committed_files(
+        self,
+        project_id: str,
+        project_path: Path,
+        max_new_file_bytes: int,
+    ) -> List[Dict[str, Any]]:
+        """Untracked oversized paths that have never appeared in Git history.
+
+        Returns ``{"path", "size"}`` entries — the size rides along so the UI
+        can show how much each exclusion weighs. User-managed ignore rules
+        are honoured exactly as ``git add -A`` sees them. A currently
+        untracked path may still have historical commits after being
+        deleted, so oversized candidates are filtered against one batched
+        history walk.
+        """
+        untracked_stdout, stderr, rc = self._run_git(project_id, [
+            "ls-files", "-o", "--exclude-standard", "-z",
+        ], as_binary=True)
+        if rc != 0:
+            raise FileSystemError(
+                f"Git size scan failed: {stderr}", code="INTERNAL_ERROR")
+
+        staged_stdout, stderr, rc = self._run_git(project_id, [
+            "diff", "--cached", "--diff-filter=A", "--name-only", "-z",
+        ], as_binary=True)
+        if rc != 0:
+            raise FileSystemError(
+                f"Git staged-file scan failed: {stderr}", code="INTERNAL_ERROR")
+
+        candidates: List[Dict[str, Any]] = []
+        for raw in dict.fromkeys(
+                (untracked_stdout + staged_stdout).split(b"\0")):
+            if not raw:
+                continue
+            path = raw.decode("utf-8", errors="replace")
+            if path == ".SiGMA" or path.startswith(".SiGMA/"):
+                continue
+            try:
+                size = os.lstat(project_path / path).st_size
+            except OSError:
+                continue
+            if size > max_new_file_bytes:
+                candidates.append({"path": path, "size": size})
+        if not candidates:
+            return []
+
+        # Size-capped paths stay untracked, so every snapshot re-checks them;
+        # this one walk replaces a per-candidate `git log` that each had to
+        # traverse the entire history before concluding the path is new.
+        # -z prints names NUL-separated and unmunged, so even names
+        # containing newlines or glob metacharacters match exactly.
+        stdout, stderr, rc = self._run_git(project_id, [
+            "log", "--all", "--format=", "--name-only", "-z",
+        ], as_binary=True)
+        if rc != 0:
+            raise FileSystemError(
+                f"Git history scan failed: {stderr}", code="INTERNAL_ERROR")
+        historic = {
+            raw.decode("utf-8", errors="replace")
+            for raw in stdout.split(b"\0") if raw
+        }
+        return [entry for entry in candidates
+                if entry["path"] not in historic]
+
+    def _remove_excluded_paths_from_index(
+        self, project_id: str, excluded: List[Dict[str, Any]],
+    ) -> None:
+        """Keep pre-staged oversized new paths out of the snapshot index."""
+        if not excluded:
+            return
+        literal_paths = [f":(literal){entry['path']}" for entry in excluded]
+        self._run_git_stage(project_id, [
+            "rm", "--cached", "-q", "-f", "--ignore-unmatch", "--",
+            *literal_paths,
+        ])
+
+    @staticmethod
+    def _staging_args(excluded: List[Dict[str, Any]]) -> List[str]:
+        """``git add`` args staging everything except the given paths."""
+        if not excluded:
+            return ["add", "-A"]
+        return ["add", "-A", "--"] + [
+            f"{_EXCLUDE_PATHSPEC_PREFIX}{entry['path']}" for entry in excluded
+        ]
 
     def _worktree_is_stable(self, project_id: str, project_path: Path) -> bool:
         """True when no git-visible file was modified within the window.
@@ -338,9 +527,14 @@ class GitService:
         return True
 
     def startup_maintenance(self) -> Dict[str, int]:
-        """Boot-time per-repo upkeep: refresh generated .gitignore rules and
-        clear stale index locks (no SiGMA git operation is in flight yet)."""
-        counts = {"gitignore_updated": 0, "stale_locks_removed": 0}
+        """Boot-time per-repo upkeep: refresh generated .gitignore rules,
+        install the filter guard, and clear stale index locks (no SiGMA git
+        operation is in flight yet)."""
+        counts = {
+            "gitignore_updated": 0,
+            "filter_guard_added": 0,
+            "stale_locks_removed": 0,
+        }
         try:
             entries = list(self.USERDATA_DIR.iterdir())
         except OSError:
@@ -351,6 +545,8 @@ class GitService:
             try:
                 counts["gitignore_updated"] += int(
                     self._ensure_generated_gitignore(entry))
+                counts["filter_guard_added"] += int(
+                    self._ensure_filter_isolation(entry))
                 counts["stale_locks_removed"] += int(
                     self._heal_stale_index_lock(entry))
             except Exception:
@@ -400,7 +596,14 @@ class GitService:
                                                timeout=GIT_WRITE_TIMEOUT_SEC)
             if rc != 0:
                 combined = f"{stdout}\n{stderr}".lower()
-                if "nothing to commit" in combined or "no changes" in combined:
+                # The third variant arises with the size cap: pending work
+                # exists only as excluded untracked files, and git reports
+                # it on stdout — it is a clean noop, not a commit failure.
+                if any(marker in combined for marker in (
+                        "nothing to commit",
+                        "no changes",
+                        "nothing added to commit",
+                )):
                     return {"success": False, "reason": "no changes"}
                 raise FileSystemError(f"Commit failed: {stderr}", code="INTERNAL_ERROR")
 
@@ -412,10 +615,17 @@ class GitService:
         except Exception as e:
             raise FileSystemError(f"Commit failed: {e}", code="INTERNAL_ERROR")
 
-    def build_staged_snapshot_message(self, project_id: str) -> str:
-        """Build an auto-snapshot title from currently staged Git changes."""
+    def build_staged_snapshot_message(self, project_id: str,
+                                      skipped: List[Dict[str, Any]] = ()) -> str:
+        """Build an auto-snapshot title from currently staged Git changes.
+
+        ``skipped`` names size-capped worktree files (``{"path", "size"}``
+        entries) that were excluded from staging; they are recorded in the
+        message so the gap in coverage is visible in the history panel.
+        """
         changes = self._get_staged_snapshot_changes(project_id)
-        return self._format_snapshot_message(changes)
+        return self._format_snapshot_message(
+            changes, [entry["path"] for entry in skipped])
 
     @staticmethod
     def _parse_name_status_z(stdout: bytes) -> List[Dict[str, str]]:
@@ -463,21 +673,36 @@ class GitService:
                 category = "deleted"
             else:
                 category = "modified"
-            name = Path(entry["path"]).name
-            if len(name) > 10:
-                name = name[:10] + "..."
+            name = self._short_display_name(entry["path"])
             if name and name not in changes[category]:
                 changes[category].append(name)
         return changes
 
     @staticmethod
-    def _format_snapshot_message(changes: Dict[str, List[str]]) -> str:
+    def _short_display_name(path: str) -> str:
+        """Truncated basename for snapshot messages (full paths stay in git)."""
+        name = Path(path).name
+        return name[:10] + "..." if len(name) > 10 else name
+
+    @staticmethod
+    def _short_display_names(paths: List[str]) -> List[str]:
+        """Deduplicated short display names preserving first occurrence."""
+        names: List[str] = []
+        for path in paths:
+            name = GitService._short_display_name(path)
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def _format_snapshot_message(changes: Dict[str, List[str]],
+                                 skipped: List[str] = ()) -> str:
         """Build a structured, locale-neutral auto-snapshot commit subject."""
         non_empty_categories = [
             category for category in SNAPSHOT_CATEGORY_ORDER
             if changes.get(category)
         ]
-        if not non_empty_categories:
+        if not non_empty_categories and not skipped:
             return "Auto-snapshot"
 
         slots = {category: 1 for category in non_empty_categories}
@@ -502,6 +727,15 @@ class GitService:
             payload[category] = {
                 "names": names[:shown_count],
                 "total": len(names),
+            }
+        if skipped:
+            # Display names are deduped (shards of one dataset often share a
+            # truncated prefix), but the total counts real files — coverage
+            # reporting must not shrink because names collide.
+            names = GitService._short_display_names(skipped)
+            payload["skipped"] = {
+                "names": names[:3],
+                "total": len(skipped),
             }
         encoded = quote(json.dumps(payload, ensure_ascii=True, separators=(",", ":")), safe="")
         return f"{SNAPSHOT_MESSAGE_PREFIX}{encoded}"

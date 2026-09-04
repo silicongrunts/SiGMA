@@ -1,7 +1,8 @@
 /**
  * SnapshotHealthBanner — alerts the user when auto-snapshot protection is
  * broken (consecutive failures) and offers one-click repair (stale-lock
- * healing + immediate commit).
+ * healing + immediate commit). The size-capped-files notice lives in
+ * HistoryPanel, next to the snapshot history it describes.
  */
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'

@@ -7,17 +7,18 @@ import { copyToClipboard } from '../utils/clipboard'
 import { formatBytes } from '../utils/formatBytes'
 import DiffView from './DiffView'
 import ContextMenu from './ContextMenu'
-import { InputModal, ConfirmModal } from './Modal'
+import { InputModal, ConfirmModal, ModalOverlay } from './Modal'
 import { Spinner } from './ui'
 import {
   RefreshCw, GitBranch, GitCommitHorizontal, GitCompare,
   File, Clock, X, ChevronRight, ChevronDown, Tag, Tags,
   Maximize, Minimize,
-  Download, Eye, Code, Binary
+  Download, Eye, Code, Binary, Info
 } from 'lucide-react'
 
 const SNAPSHOT_MESSAGE_PREFIX = 'sigma:snapshot:v1:'
-const SNAPSHOT_CATEGORY_ORDER = ['added', 'deleted', 'modified']
+const SNAPSHOT_CATEGORY_ORDER = ['added', 'deleted', 'modified', 'skipped']
+const HEALTH_POLL_MS = 60_000
 
 export function formatCommitMessage(message, t) {
   if (message === 'Initial commit') return t('history.snapshot.initialCommit')
@@ -394,6 +395,18 @@ function HistoryPanel({ onBeforeCommit }) {
   const [rangeFirst, setRangeFirst] = useState(null)
   const [rangeView, setRangeView] = useState(null)
   const [committing, setCommitting] = useState(false)
+  // Pending size-capped files from snapshot health, { count, files }
+  const [skippedFiles, setSkippedFiles] = useState(null)
+  const [showSkippedList, setShowSkippedList] = useState(false)
+
+  // Health records persisted before sizes were tracked carry plain names.
+  const skippedList = useMemo(() => {
+    if (!skippedFiles) return []
+    if (Array.isArray(skippedFiles.files)) {
+      return skippedFiles.files.map(f => ({ name: f.path, size: f.size }))
+    }
+    return (skippedFiles.names || []).map(name => ({ name, size: null }))
+  }, [skippedFiles])
 
   const loadLog = useCallback(async (reset = false) => {
     if (!currentProjectId) return
@@ -443,6 +456,26 @@ function HistoryPanel({ onBeforeCommit }) {
     loadLog(true)
     loadTags()
   }, [currentProjectId, loadLog, loadTags])
+
+  // Track size-capped files sitting outside version protection while the
+  // panel is open; a manual commit updates this from its own result below.
+  useEffect(() => {
+    if (!currentProjectId) return
+    let cancelled = false
+    const refresh = async () => {
+      try {
+        const health = await gitsAPI.snapshotHealth(currentProjectId)
+        if (cancelled) return
+        const pending = health?.pending_skipped_large_files
+        setSkippedFiles(pending?.count > 0 ? pending : null)
+      } catch {
+        // Backend-down conditions have their own UX; skip silently.
+      }
+    }
+    refresh()
+    const timer = setInterval(refresh, HEALTH_POLL_MS)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [currentProjectId])
 
   // Infinite scroll via IntersectionObserver
   useEffect(() => {
@@ -554,8 +587,23 @@ function HistoryPanel({ onBeforeCommit }) {
       // first so unsaved edits are included in the snapshot.
       if (onBeforeCommit) await onBeforeCommit()
       const result = await gitsAPI.commitNow(currentProjectId)
-      if (result?.success === false) toastInfo(t('history.toast.nothingToCommit'))
-      else toastSuccess(t('history.toast.committed'))
+      const skippedCount = result?.skipped_large_files?.length || 0
+      if (result?.success === false && skippedCount) {
+        toastInfo(t('history.toast.largeFilesSkipped', { count: skippedCount }))
+      } else if (result?.success === false) {
+        toastInfo(t('history.toast.nothingToCommit'))
+      } else if (skippedCount) {
+        toastSuccess(t('history.toast.committedWithSkipped', { count: skippedCount }))
+      } else {
+        toastSuccess(t('history.toast.committed'))
+      }
+      // A clean commit clears the pending list; one with skips replaces it.
+      // A noop with no skips changes nothing, so it keeps the current state.
+      if (skippedCount) {
+        setSkippedFiles({ count: skippedCount, files: result.skipped_large_files })
+      } else if (result?.success) {
+        setSkippedFiles(null)
+      }
       await Promise.all([loadLog(true), loadTags()])
     } catch (err) {
       toastError(err.message || t('history.toast.commitFailed'))
@@ -626,6 +674,18 @@ function HistoryPanel({ onBeforeCommit }) {
           )}
         </button>
       </div>
+
+      {/* Size-capped files outside version protection — one quiet line;
+          clicking opens the full list of unprotected files. */}
+      {skippedFiles?.count > 0 && (
+        <button
+          onClick={() => setShowSkippedList(true)}
+          className="w-full flex items-center gap-2 px-4 py-1.5 border-b border-gray-100 dark:border-gray-800 bg-slate-50 dark:bg-slate-800/60 text-[11px] text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700/40 hover:text-slate-600 dark:hover:text-slate-300 transition-colors flex-shrink-0 text-left"
+        >
+          <Info className="w-3.5 h-3.5 shrink-0" />
+          <span className="flex-1 truncate">{t('snapshot.skippedLargeFiles', { count: skippedFiles.count })}</span>
+        </button>
+      )}
 
       {/* Range-selection hint */}
       {selectingRange && (
@@ -743,6 +803,33 @@ function HistoryPanel({ onBeforeCommit }) {
         placeholder={t('history.tag.namePlaceholder')}
         icon={Tag}
       />
+
+      {/* Size-capped files excluded from version protection */}
+      <ModalOverlay isOpen={showSkippedList} onClose={() => setShowSkippedList(false)}>
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-gray-100 dark:border-gray-800 flex-shrink-0">
+          <div className="flex items-center gap-2 text-sm font-semibold text-gray-700 dark:text-gray-200">
+            <Info className="w-4 h-4 text-amber-500 shrink-0" />
+            {t('snapshot.skippedListTitle')}
+          </div>
+          <button
+            onClick={() => setShowSkippedList(false)}
+            className="p-1 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="max-h-[50vh] overflow-auto p-2">
+          {skippedList.map(({ name, size }) => (
+            <div key={name} className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs text-gray-600 dark:text-gray-300 font-mono">
+              <File className="w-3.5 h-3.5 shrink-0 text-gray-400" />
+              <span className="flex-1 truncate" title={name}>{name}</span>
+              {size != null && (
+                <span className="shrink-0 text-gray-400 dark:text-gray-500">{formatBytes(size)}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      </ModalOverlay>
 
       {contextMenu && (
         <ContextMenu
