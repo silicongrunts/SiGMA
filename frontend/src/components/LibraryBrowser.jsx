@@ -1679,6 +1679,24 @@ function ContentField({ docId, projectId, value, previewValue = '', truncated = 
   const [loadingFull, setLoadingFull] = useState(false)
   const [saving, setSaving] = useState(false)
   const [draft, setDraft] = useState(value || previewValue || '')
+  const previewScrollRef = useRef(null)
+  // True once the user scrolled the clamped preview to its end; a short
+  // preview that fits without scrolling counts as "at end" immediately.
+  const [previewAtEnd, setPreviewAtEnd] = useState(false)
+
+  const checkPreviewAtEnd = useCallback(() => {
+    const el = previewScrollRef.current
+    if (!el) return
+    setPreviewAtEnd(
+      el.scrollHeight <= el.clientHeight + 4 ||
+      el.scrollTop + el.clientHeight >= el.scrollHeight - 32
+    )
+  }, [])
+
+  useLayoutEffect(() => {
+    if (truncated && !fullValue) checkPreviewAtEnd()
+    else setPreviewAtEnd(false)
+  }, [truncated, fullValue, value, previewValue, checkPreviewAtEnd])
 
   const loadFull = async () => {
     if (fullValue || !truncated || !projectId || !docId) return fullValue
@@ -1752,6 +1770,9 @@ function ContentField({ docId, projectId, value, previewValue = '', truncated = 
     )
   }
 
+  const content = fullValue || value || previewValue
+  const clamped = truncated && !fullValue
+
   return (
     <div className="group">
       <div className="flex items-center gap-1.5 mb-1">
@@ -1763,21 +1784,39 @@ function ContentField({ docId, projectId, value, previewValue = '', truncated = 
         >
           <Pencil className="w-3 h-3" />
         </button>
-        {truncated && !fullValue && (
-          <button
-            onClick={loadFull}
-            disabled={loadingFull}
-            className="text-xs text-sigma-600 hover:text-sigma-700 disabled:text-gray-300 dark:disabled:text-gray-600"
-          >
-            {loadingFull ? t('common.loading') : t('library.loadFull')}
-          </button>
-        )}
       </div>
-      <div className="text-sm text-gray-800 dark:text-gray-200 leading-relaxed">
-        {(fullValue || value || previewValue)
-          ? <MarkdownContent content={fullValue || value || previewValue} />
-          : <span className="text-gray-300 dark:text-gray-600 italic">{t('library.emptyContent')}</span>}
-      </div>
+      {content ? (
+        clamped ? (
+          <div className="relative">
+            <div
+              ref={previewScrollRef}
+              onScroll={checkPreviewAtEnd}
+              className="max-h-72 overflow-y-auto text-sm text-gray-800 dark:text-gray-200 leading-relaxed"
+            >
+              <MarkdownContent content={content} />
+            </div>
+            {/* Full-text mask revealed once the preview is scrolled to its end */}
+            <div className={`absolute inset-x-0 bottom-0 flex justify-center pb-2 pt-10 bg-gradient-to-t from-gray-50 via-gray-50/90 dark:from-gray-900 dark:via-gray-900/90 to-transparent transition-opacity duration-200 ${previewAtEnd ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+              <button
+                onClick={loadFull}
+                disabled={loadingFull}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-sigma-700 dark:text-sigma-300 bg-white/90 dark:bg-gray-800/90 border border-sigma-200 dark:border-sigma-500/30 rounded-full shadow-sm hover:bg-sigma-50 dark:hover:bg-gray-700/90 transition-colors disabled:opacity-60"
+              >
+                {loadingFull && <Spinner size="xs" />}
+                {loadingFull ? t('common.loading') : t('library.loadFull')}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="text-sm text-gray-800 dark:text-gray-200 leading-relaxed">
+            <MarkdownContent content={content} />
+          </div>
+        )
+      ) : (
+        <div className="text-sm text-gray-800 dark:text-gray-200 leading-relaxed">
+          <span className="text-gray-300 dark:text-gray-600 italic">{t('library.emptyContent')}</span>
+        </div>
+      )}
     </div>
   )
 }
