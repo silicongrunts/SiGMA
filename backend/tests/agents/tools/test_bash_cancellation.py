@@ -92,21 +92,41 @@ def _is_running(pid: int) -> bool:
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process lifecycle")
-async def test_normal_exit_leaves_no_redirected_background_child(tmp_path, monkeypatch):
+async def test_normal_exit_leaves_redirected_background_child_running(tmp_path, monkeypatch):
+    """A job the command deliberately backgrounded (with redirected output)
+    must survive the tool call returning."""
     monkeypatch.setattr(bash_module, "settings", SimpleNamespace(get_project_path=lambda _: tmp_path))
-    result = await _run_bash("proj", "sleep 60 </dev/null >/dev/null 2>&1 & echo $!", timeout=2)
+    result = await _run_bash("proj", "sleep 30 </dev/null >/dev/null 2>&1 & echo $!", timeout=5)
     assert "exit code: 0" in result, result
     child_pid = int(result.split("stdout: ", 1)[1].splitlines()[0])
     assert child_pid > 1
     try:
-        deadline = asyncio.get_running_loop().time() + 2
-        while _is_running(child_pid) and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.01)
-        assert "exit code: 0" in result
-        assert not _is_running(child_pid)
+        assert _is_running(child_pid), "backgrounded child was killed on normal exit"
     finally:
         if _is_running(child_pid):
             os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux signal semantics")
+async def test_timeout_kills_foreground_but_spares_background_child(tmp_path, monkeypatch):
+    """On timeout the foreground command dies while a backgrounded job —
+    which POSIX starts with SIGINT ignored — keeps running."""
+    monkeypatch.setattr(bash_module, "settings", SimpleNamespace(get_project_path=lambda _: tmp_path))
+    result = await _run_bash("proj", "sleep 120 </dev/null >/dev/null 2>&1 & sleep 300", timeout=2)
+    assert "Command timed out after 2s" in result, result
+    survivors = [pid for pid, _ in _procs_containing("sleep 120") if _is_running(int(pid))]
+    try:
+        assert not _procs_containing("sleep 300") or not any(
+            _is_running(int(pid)) for pid, _ in _procs_containing("sleep 300")
+        ), "foreground command survived the timeout"
+        assert survivors, "backgrounded child was killed by the timeout"
+    finally:
+        for pid, _ in _procs_containing("sleep 120"):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
 
 
 @pytest.mark.asyncio

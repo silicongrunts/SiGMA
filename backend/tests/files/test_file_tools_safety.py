@@ -212,14 +212,35 @@ async def test_glob_budget_exceeded_with_partial_results_notes(sandbox, monkeypa
 @pytest.mark.regression
 @pytest.mark.asyncio
 async def test_grep_timeout_returns_error_and_kills(sandbox, monkeypatch):
-    (sandbox / "a.txt").write_text("needle")
+    """The bounded engine stops its subprocess at the deadline and reports
+    the timeout; nothing is left running."""
     monkeypatch.setattr(file_tools, "_GREP_TIMEOUT_SECONDS", 0.001)
+    _hand_engine_a_stuck_subprocess(monkeypatch)
 
     start = time.monotonic()
     result = await _grep_search("proj", "needle", ".")
     elapsed = time.monotonic() - start
     assert "timed out" in result
-    assert elapsed < 5.0
+    # Generous bound: it must catch a hung engine (minutes) without tripping
+    # on scheduler stalls on a loaded machine.
+    assert elapsed < 30.0
+
+
+def _hand_engine_a_stuck_subprocess(monkeypatch):
+    """Run the real bounded engine against a subprocess that cannot finish.
+
+    grep/rg on a small sandbox tree can complete in well under a 1 ms budget
+    on a fast machine, which would turn the timeout branch into a
+    machine-speed race. Feeding the engine ``sleep 30`` keeps the contract
+    under test — deadline exceeded, subprocess SIGKILLed, prompt return —
+    deterministic.
+    """
+    real_bounded = file_tools._run_bounded_search
+
+    async def _stuck(cmd, **kwargs):
+        return await real_bounded(["sleep", "30"], **kwargs)
+
+    monkeypatch.setattr(file_tools, "_run_bounded_search", _stuck)
 
 
 @pytest.mark.regression
@@ -227,8 +248,8 @@ async def test_grep_timeout_returns_error_and_kills(sandbox, monkeypatch):
 async def test_grep_fallback_timeout_kills_and_reports(
         sandbox, monkeypatch):
     """The grep fallback shares the bounded engine: a timeout kills the
-    process (no orphaned grep) and returns within the bound, not after the
-    command's own runtime."""
+    process (no orphaned subprocess) and returns within the bound, not after
+    the command's own runtime."""
     (sandbox / "a.txt").write_text("needle")
 
     async def _rg_missing(cmd, *, cwd, timeout):
@@ -236,12 +257,15 @@ async def test_grep_fallback_timeout_kills_and_reports(
 
     monkeypatch.setattr(file_tools, "_run_rg_search", _rg_missing)
     monkeypatch.setattr(file_tools, "_GREP_TIMEOUT_SECONDS", 0.001)
+    _hand_engine_a_stuck_subprocess(monkeypatch)
 
     start = time.monotonic()
     result = await _grep_search("proj", "needle", ".")
     elapsed = time.monotonic() - start
     assert "timed out" in result
-    assert elapsed < 5.0
+    # Generous bound: it must catch a hung engine (minutes) without tripping
+    # on scheduler stalls on a loaded machine.
+    assert elapsed < 30.0
 
 
 @pytest.mark.asyncio

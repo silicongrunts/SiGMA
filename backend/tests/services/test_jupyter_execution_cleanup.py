@@ -174,12 +174,25 @@ async def test_unresponsive_kill_is_bounded_and_remains_recoverable(execution):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True])
+@pytest.mark.parametrize("timeout", [-1, float("inf"), float("nan"), True])
 async def test_execution_rejects_unbounded_or_invalid_timeout(execution, timeout):
     service, _ = execution
-    with pytest.raises(ValueError, match="positive finite"):
+    with pytest.raises(ValueError, match="non-negative finite"):
         await service.execute_code("kernel", "work()", timeout=timeout)
     assert service._executions == {}
+
+
+@pytest.mark.asyncio
+async def test_background_execution_returns_without_stopping_kernel(execution):
+    """timeout=0 hands the cell to the kernel and returns immediately: no
+    interrupt, no kill, and the kernel is free for later executions."""
+    service, socket = execution
+    result = await service.execute_code("kernel", "work()", timeout=0)
+    assert result["status"] == "background"
+    service.interrupt_kernel.assert_not_awaited()
+    service.kill_kernel.assert_not_awaited()
+    assert service._executions == {}
+    assert socket.close_code == 1000
 
 
 @pytest.mark.asyncio

@@ -45,7 +45,8 @@ PROMPT_NOTEBOOK_RUN_CELL = """Execute a code cell on the notebook's Jupyter kern
 - Only code cells can be executed; markdown cells return an error.
 - Variables persist on the kernel between executions (e.g. a df created in one cell is usable in the next).
 - Read the notebook first — this is enforced by the tool: it fails if the notebook was not read in this session (one written with the write tool counts) or changed on disk since the last notebook_read/notebook_edit/notebook_run_cell; a compaction resets this state — re-read after compact.
-- Output includes streams, display values, return values, and errors with tracebacks (first 8 lines); total output is capped at 100,000 characters. On timeout the kernel is automatically interrupted.
+- Output includes streams, display values, return values, and errors with tracebacks (first 8 lines); total output is capped at 100,000 characters. On timeout the kernel is interrupted (SIGINT); if it does not return to idle within 10 seconds, the kernel is killed and all its state is lost.
+- timeout=0 runs the cell in the background: the call returns immediately with status "background" and the outputs are NOT collected — the cell keeps running on the kernel until it finishes or you interrupt it. Reserve this for very long-running cells.
 - If the kernel is busy, the tool returns an error suggesting interrupt=true. If it is dead or in an unknown state, no tool can restart it — ask the user to restart the kernel.
 
 Output: "[{status}] Execution count: {N}" followed by <outputs> blocks ("[{status}]" alone when the count is unknown, e.g. on timeout), or "(no output)" when the execution produced none."""

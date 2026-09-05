@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 
 # Maximum characters for collected execution output before truncation
 _MAX_EXECUTION_OUTPUT = 100_000
-_EXECUTION_INTERRUPT_GRACE = 3.0
+_EXECUTION_INTERRUPT_GRACE = 10.0
 _EXECUTION_KILL_TIMEOUT = 5.0
 
 
@@ -434,10 +434,14 @@ class JupyterService:
         """Execute code on a Jupyter kernel via the WebSocket protocol.
 
         Returns a dict containing status, execution_count, and native
-        Jupyter-compatible outputs.
+        Jupyter-compatible outputs. ``timeout == 0`` means unbounded: the
+        request is sent and the call returns immediately with status
+        "background" while the kernel keeps executing (outputs are not
+        collected; stop the kernel with ``stop_execution``).
         """
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("Execution timeout must be a positive finite number of seconds")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("Execution timeout must be a non-negative finite number of seconds (0 = run in background)")
+        background = timeout == 0
         ws_url = self._ws_url(f"kernels/{kernel_id}/channels?token={self.token}")
 
         result = {
@@ -550,8 +554,24 @@ class JupyterService:
                         return
                 raise RuntimeError("Kernel connection ended before execution completed")
 
-            await asyncio.wait_for(_collect(), timeout=timeout)
-            execution_finished = True
+            if background:
+                # Unbounded execution: return immediately and let the kernel
+                # run on. No collector stays attached, so outputs of this
+                # execution are not observed.
+                result["status"] = "background"
+                result["outputs"].append({
+                    "output_type": "stream",
+                    "name": "stdout",
+                    "text": (
+                        "[Execution started in background; it keeps running "
+                        "after this call returns and its outputs are not "
+                        "collected. Use stop_execution / interrupt to stop it, "
+                        "or check the kernel status.]\n"
+                    ),
+                })
+            else:
+                await asyncio.wait_for(_collect(), timeout=timeout)
+                execution_finished = True
 
         except asyncio.TimeoutError:
             result["status"] = "timeout"
@@ -594,7 +614,7 @@ class JupyterService:
         finally:
             async def cleanup():
                 try:
-                    if request_sent and not execution_finished:
+                    if request_sent and not execution_finished and not background:
                         await self.stop_execution(kernel_id)
                     if self._executions.get(kernel_id) is execution:
                         self._executions.pop(kernel_id, None)

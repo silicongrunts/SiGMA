@@ -87,6 +87,12 @@ def _format_run_result(result: dict, warning: str = "") -> str:
 
     if status == "timeout":
         parts.append("Execution timed out and the kernel was interrupted.")
+    elif status == "background":
+        parts.append(
+            "Cell is running in the background: it keeps executing on the kernel "
+            "after this call returns and its outputs are not collected. Use "
+            "interrupt=true to stop it; notebook_read shows the kernel state."
+        )
     elif status == "error":
         error_name = result.get("error_name") or "Error"
         error_value = result.get("error_value") or ""
@@ -513,9 +519,13 @@ tool_registry.register(ToolDefinition(
             },
             "timeout": {
                 "type": "number",
-                "description": "Execution timeout in seconds (default 60; increase for long computations)",
+                "description": (
+                    "Execution timeout in seconds (default 60; increase for long "
+                    "computations). 0 runs the cell in the background: the call "
+                    "returns immediately and outputs are not collected."
+                ),
                 "default": 60,
-                "exclusiveMinimum": 0,
+                "minimum": 0,
             },
             "interrupt": {
                 "type": "boolean",
