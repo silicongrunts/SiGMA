@@ -113,6 +113,32 @@ class ReadStateCache:
         """Drop all read-state for *session_id*. Called after a compaction."""
         self._store.pop(session_id, None)
 
+    def clear_many(self, session_ids) -> None:
+        """Drop read-state for a session tree."""
+        for session_id in session_ids:
+            self.clear(session_id)
+
+    def clear_under(self, root: str | Path) -> None:
+        """Drop entries whose file path belongs to one project tree."""
+        root_path = Path(root).resolve()
+        for session_id, entries in list(self._store.items()):
+            kept = {
+                file_path: entry
+                for file_path, entry in entries.items()
+                if not self._is_under(file_path, root_path)
+            }
+            if kept:
+                self._store[session_id] = kept
+            else:
+                self._store.pop(session_id, None)
+
+    @staticmethod
+    def _is_under(file_path: str, root_path: Path) -> bool:
+        path = Path(file_path)
+        if not path.is_absolute():
+            return False
+        resolved = path.resolve()
+        return resolved == root_path or root_path in resolved.parents
 
 read_state_cache = ReadStateCache()
 

@@ -64,6 +64,7 @@ class DatabaseManager:
         self._initialized: set[str] = set()          # project_ids with DB ready this process
         self._deleted: set[str] = set()              # project_ids marked for deletion
         self._quarantine: set[str] = set()           # project_ids that failed migration this startup
+        self._active_sessions: dict[str, int] = {}
         self._init_lock = asyncio.Lock()
 
     def _get_db_path(self, project_id: str) -> Path:
@@ -131,13 +132,44 @@ class DatabaseManager:
         """
         await self.ensure_db_exists(project_id, allow_inactive=allow_inactive)
         async with self._init_lock:
+            from app.core.project_registry import is_project_active
+
+            if project_id in self._deleted:
+                from app.core.exceptions import FileSystemError
+                raise FileSystemError(f"Project {project_id} has been deleted")
+            if not allow_inactive and not is_project_active(project_id):
+                from app.core.exceptions import ProjectNotFoundError
+                raise ProjectNotFoundError(project_id)
             if project_id not in self._initialized:
                 raise DatabaseException(
                     f"Database for project {project_id} has not been initialized"
                 )
             self._get_engine_unlocked(project_id)
             maker = self._makers[project_id]
-        return maker()
+            session = maker()
+            self._active_sessions[project_id] = self._active_sessions.get(project_id, 0) + 1
+        return session
+
+    async def release_session(self, project_id: str) -> None:
+        async with self._init_lock:
+            remaining = self._active_sessions.get(project_id, 0) - 1
+            if remaining > 0:
+                self._active_sessions[project_id] = remaining
+            else:
+                self._active_sessions.pop(project_id, None)
+
+    async def wait_for_project_sessions(
+        self, project_id: str, timeout: float = 10.0,
+    ) -> bool:
+        """Wait for UnitOfWork sessions opened before a lifecycle barrier."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            async with self._init_lock:
+                if self._active_sessions.get(project_id, 0) == 0:
+                    return True
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
 
     async def ensure_db_exists(self, project_id: str, *, allow_inactive: bool = False):
         """Ensure the database exists and is at the latest schema revision.
@@ -334,7 +366,13 @@ class DatabaseManager:
                     pass
 
     async def reset_project_database(self, project_id: str) -> None:
-        """Dispose cached state and remove the project's SQLite database files."""
+        """Dispose cached state and remove the project's SQLite database files.
+
+        This deliberately does not initialize or migrate the database. The
+        caller has already persisted a lifecycle barrier and drained live
+        work, so reset must remain available when the database is corrupt,
+        incompatible, or otherwise unreadable.
+        """
         db_path = self._get_db_path(project_id)
         async with self._init_lock:
             self._initialized.discard(project_id)
@@ -408,10 +446,11 @@ class DatabaseManager:
 
     async def close_all(self):
         """Close all database connections."""
-        for engine in self._engines.values():
-            await engine.dispose()
-        self._engines.clear()
-        self._makers.clear()
+        async with self._init_lock:
+            for project_id in tuple(self._engines):
+                await self._invalidate_engine(project_id)
+            self._initialized.clear()
+            self._quarantine.clear()
 
 
 # Global database manager instance

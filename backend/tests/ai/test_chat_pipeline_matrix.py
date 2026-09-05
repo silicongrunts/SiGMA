@@ -14,7 +14,7 @@ from importlib import import_module
 import pytest
 
 import_module("app.agents.tools")
-from app.core.exceptions import TaskActiveError, ValidationError
+from app.core.exceptions import SessionDeletingError, TaskActiveError, ValidationError
 from app.core.message_format import shape_messages_for_ui
 from app.core.utils import generate_id
 from app.database.unit_of_work import UnitOfWork
@@ -220,6 +220,59 @@ async def test_delete_session_succeeds_when_idle(project):
 
     async with UnitOfWork(project) as uow:
         assert await uow.sessions.get_by_id(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_session_delete_barrier_persists_and_cancels_descendants(project):
+    async with UnitOfWork(project) as uow:
+        root = await uow.sessions.create()
+        child = await uow.sessions.create_agent_session(
+            "general", parent_session_id=root.id,
+        )
+        root_task = generate_id()
+        child_task = generate_id()
+        await uow.task_state.set_queued(root_task, session_id=root.id)
+        await uow.task_state.set_queued(child_task, session_id=child.id)
+
+    async with UnitOfWork(project, immediate=True) as uow:
+        session_ids, task_ids = await uow.sessions.begin_delete(root.id)
+
+    assert session_ids == [child.id, root.id]
+    assert set(task_ids) == {root_task, child_task}
+    async with UnitOfWork(project) as uow:
+        assert await uow.task_state.get_status(root_task) == "cancelling"
+        assert await uow.task_state.get_status(child_task) == "cancelling"
+        assert (await uow.sessions.get_by_id(root.id)).lifecycle_status == "deleting"
+        assert (await uow.sessions.get_by_id(child.id)).lifecycle_status == "deleting"
+
+
+@pytest.mark.asyncio
+async def test_submit_chat_rejected_after_session_delete_barrier(project):
+    async with UnitOfWork(project) as uow:
+        session = await uow.sessions.create()
+    async with UnitOfWork(project, immediate=True) as uow:
+        await uow.sessions.begin_delete(session.id)
+
+    with pytest.raises(SessionDeletingError):
+        await ai_service.submit_chat(
+            project,
+            "must not restart",
+            {},
+            session_id=session.id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_deleting_session_finishes_after_restart(project):
+    async with UnitOfWork(project) as uow:
+        session = await uow.sessions.create()
+    async with UnitOfWork(project, immediate=True) as uow:
+        await uow.sessions.begin_delete(session.id)
+
+    assert await ai_service.reconcile_deleting_sessions(project) == 1
+
+    async with UnitOfWork(project) as uow:
+        assert await uow.sessions.get_by_id(session.id) is None
 
 
 @pytest.mark.asyncio
@@ -509,3 +562,30 @@ async def test_turn_usage_stays_monotonic_across_pause_resume(project, monkeypat
     assert resume_events[-1]["data"]["usage"] == {
         "input": 300, "output": 35, "cached": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_agent_session_creation_serializes_with_parent_delete(project):
+    async with UnitOfWork(project) as uow:
+        parent = await uow.sessions.create()
+
+    delete_uow = UnitOfWork(project, immediate=True)
+    await delete_uow.__aenter__()
+    try:
+        await delete_uow.sessions.begin_delete(parent.id, commit=False)
+
+        async def create_child():
+            async with UnitOfWork(project) as uow:
+                return await uow.sessions.create_agent_session(
+                    "general", parent_session_id=parent.id,
+                )
+
+        create_task = asyncio.create_task(create_child())
+        await asyncio.sleep(0.05)
+        assert not create_task.done()
+
+        await delete_uow.commit()
+        with pytest.raises(SessionDeletingError):
+            await create_task
+    finally:
+        await delete_uow.__aexit__(None, None, None)

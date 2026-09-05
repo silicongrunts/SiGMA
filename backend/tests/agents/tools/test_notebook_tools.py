@@ -209,7 +209,7 @@ class _FakeJupyter:
     async def get_kernel_status(self, _kernel_id):
         return {"execution_state": "idle"}
 
-    async def execute_code(self, _kernel_id, _source, timeout=60.0):
+    async def execute_code(self, _kernel_id, _source, timeout=60.0, **_owner):
         return {
             "status": "ok",
             "execution_count": 1,

@@ -24,6 +24,18 @@ from tests.ai.matrix_harness import use_fixture_project_root  # noqa: F401 (auto
 # ---------------------------------------------------------------------------
 
 
+async def _seed_annotation(project, annotation_id):
+    settings.get_project_path(project).joinpath("notes.md").write_text("text")
+    async with UnitOfWork(project) as uow:
+        await uow.annotations.apply_mutation_cas(
+            "notes.md",
+            [{"id": annotation_id, "from": 0, "to": 4, "originalText": "text"}],
+            [],
+            0,
+            file_service.compute_hash("text"),
+        )
+
+
 @pytest.mark.asyncio
 async def test_annotation_double_submit_raises_task_active_not_500(
     project, monkeypatch,
@@ -34,6 +46,7 @@ async def test_annotation_double_submit_raises_task_active_not_500(
     from app.services.annotation_service import annotation_service
 
     monkeypatch.setattr(task_runtime, "launch", lambda **kw: None)
+    await _seed_annotation(project, "anno-1")
 
     task_id, _ = await annotation_service.start_ai_reply_stream(
         project, file_path="notes.md", annotation_id="anno-1",
@@ -68,6 +81,7 @@ async def test_annotation_launch_failure_finalizes_queued_row(
         raise launch_error
 
     monkeypatch.setattr(task_runtime, "launch", failing_launch)
+    await _seed_annotation(project, "anno-fail")
 
     with pytest.raises(type(launch_error)):
         await annotation_service.start_ai_reply_stream(
@@ -95,6 +109,7 @@ async def test_annotation_reply_prunes_own_terminal_task_state_rows(
     from app.services.annotation_service import annotation_service
 
     monkeypatch.setattr(task_runtime, "launch", lambda **kw: None)
+    await _seed_annotation(project, "anno-1")
 
     for _ in range(8):
         task_id, _ = await annotation_service.start_ai_reply_stream(
@@ -149,6 +164,22 @@ async def test_delete_annotation_removes_task_state_rows(project, monkeypatch):
             select(TaskState).where(TaskState.owner_id == "anno-del")
         )).scalars())
     assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_deleted_annotation_cannot_start_new_reply(project):
+    from app.core.exceptions import ValidationError
+    from app.services.annotation_service import annotation_service
+
+    with pytest.raises(ValidationError, match="no longer exists"):
+        await annotation_service.start_ai_reply_stream(
+            project, file_path="notes.md", annotation_id="deleted-annotation",
+        )
+
+    async with UnitOfWork(project) as uow:
+        assert await uow.task_state.get_active_by_owner(
+            "annotation", "deleted-annotation",
+        ) is None
 
 
 @pytest.mark.asyncio

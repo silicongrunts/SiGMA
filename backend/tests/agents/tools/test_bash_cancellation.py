@@ -6,6 +6,11 @@ group, so a spawned long-running child cannot outlive the request.
 
 import asyncio
 import os
+import signal
+import subprocess
+import sys
+import shlex
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -75,3 +80,70 @@ async def test_bash_cancellation_kills_subprocess(tmp_path, monkeypatch):
     await asyncio.sleep(0.3)
     assert not _pids_in_pgid(pgid), \
         "bash process group survived task cancellation"
+
+
+def _is_running(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        return state != "Z"
+    except FileNotFoundError:
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process lifecycle")
+async def test_normal_exit_leaves_no_redirected_background_child(tmp_path, monkeypatch):
+    monkeypatch.setattr(bash_module, "settings", SimpleNamespace(get_project_path=lambda _: tmp_path))
+    result = await _run_bash("proj", "sleep 60 </dev/null >/dev/null 2>&1 & echo $!", timeout=2)
+    assert "exit code: 0" in result, result
+    child_pid = int(result.split("stdout: ", 1)[1].splitlines()[0])
+    assert child_pid > 1
+    try:
+        deadline = asyncio.get_running_loop().time() + 2
+        while _is_running(child_pid) and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert "exit code: 0" in result
+        assert not _is_running(child_pid)
+    finally:
+        if _is_running(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux parent-death signal")
+async def test_web_process_crash_terminates_active_shell_group(tmp_path):
+    ready = tmp_path / "ready"
+    command = f"sleep 60 & echo $! > {shlex.quote(str(ready))}; wait"
+    source = (
+        "import asyncio, sys; from pathlib import Path; from types import SimpleNamespace; "
+        "sys.path.insert(0, sys.argv[1]); "
+        "from app.agents.tools import bash; "
+        "bash.settings = SimpleNamespace(get_project_path=lambda _: Path(sys.argv[2])); "
+        "asyncio.run(bash._run_bash('project', sys.argv[3], timeout=60))"
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-c", source, str(Path(__file__).resolve().parents[3]), str(tmp_path), command],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    assert parent.pid > 1
+    child_pid = None
+    try:
+        deadline = asyncio.get_running_loop().time() + 10
+        while not ready.exists() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+        assert ready.exists()
+        child_pid = int(ready.read_text().strip())
+        assert child_pid > 1
+        assert _is_running(child_pid)
+        parent.kill()
+        parent.wait(timeout=5)
+        deadline = asyncio.get_running_loop().time() + 3
+        while _is_running(child_pid) and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+        assert not _is_running(child_pid)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+        parent.wait(timeout=5)
+        if child_pid is not None and _is_running(child_pid):
+            os.kill(child_pid, signal.SIGKILL)

@@ -76,3 +76,37 @@ async def test_execute_tool_cancellable_without_event_awaits_normally():
 async def _return(value):
     await asyncio.sleep(0)
     return value
+
+
+@pytest.mark.asyncio
+async def test_outer_cancel_waits_for_resource_cleanup_before_returning():
+    from app.core.async_cleanup import finish_cleanup
+
+    started = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def cleanup():
+        cleaning.set()
+        await release.wait()
+        cleaned.set()
+
+    async def tool():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await finish_cleanup(cleanup())
+
+    task = asyncio.create_task(LLMLoopRunner.execute_tool_cancellable(asyncio.Event(), tool()))
+    await started.wait()
+    task.cancel()
+    await cleaning.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleaned.is_set()

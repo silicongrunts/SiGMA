@@ -68,6 +68,7 @@ _CANCELLED_EVENT = make_event(SSE_CANCELLED, {"message": "Task cancelled by user
 # task_id -> asyncio.Task running the TaskRunner. Entries remove themselves in
 # the runner's finally block.
 _tasks: dict[str, asyncio.Task] = {}
+_cancel_watchdogs: dict[str, asyncio.Task] = {}
 
 _sweep_task: Optional[asyncio.Task] = None
 
@@ -196,6 +197,9 @@ class TaskRunner:
                 await self._finalize_cancelled_run(terminal_seen)
                 raise
         finally:
+            watchdog = _cancel_watchdogs.pop(self.task_id, None)
+            if watchdog is not None and watchdog is not asyncio.current_task():
+                watchdog.cancel()
             self.session.finish()
             stream_hub.remove(self.task_id, self.session)
             _tasks.pop(self.task_id, None)
@@ -408,10 +412,8 @@ async def wait_for_project(project_id: str, timeout: float = SHUTDOWN_GRACE_SECO
         if remaining <= 0:
             for task in active:
                 task.cancel()
-            # Keep ownership registered until the coroutine actually exits.
-            # The lifecycle caller must not unlink a project while an old
-            # handler can still issue a persistence write.
-            return False
+            _, pending = await asyncio.wait(active, timeout=SHUTDOWN_GRACE_SECONDS)
+            return not pending
         await asyncio.wait(active, timeout=remaining)
 
 
@@ -420,12 +422,11 @@ async def wait_for_task(task_id: str, timeout: float = SHUTDOWN_GRACE_SECONDS) -
     task = _tasks.get(task_id)
     if task is None or task.done():
         return True
-    try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-    except asyncio.TimeoutError:
-        return False
-    except asyncio.CancelledError:
-        raise
+    _, pending = await asyncio.wait([task], timeout=timeout)
+    if pending:
+        task.cancel()
+        _, pending = await asyncio.wait([task], timeout=SHUTDOWN_GRACE_SECONDS)
+        return not pending
     return True
 
 
@@ -455,6 +456,9 @@ async def _stranded_sweep_loop() -> None:
     while True:
         try:
             await _sweep_stranded_rows()
+            from app.services.file_deletion_service import file_deletion_service
+            for project_id in iter_project_ids():
+                await file_deletion_service.recover_deletions(project_id)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -526,12 +530,43 @@ def cancel(task_id: str) -> bool:
 
     Returns True when an active session exists for the task.
     """
-    return stream_hub.cancel_task(task_id)
+    cancelled = stream_hub.cancel_task(task_id)
+    if cancelled:
+        _schedule_cancel_watchdog(task_id)
+    return cancelled
 
 
 def cancel_project(project_id: str) -> int:
     """Signal cooperative cancellation for every active task of a project."""
-    return stream_hub.cancel_project(project_id)
+    cancelled = stream_hub.cancel_project(project_id)
+    for task_id in tuple(_tasks):
+        session = stream_hub.get(task_id)
+        if session is not None and session.project_id == project_id:
+            _schedule_cancel_watchdog(task_id)
+    return cancelled
+
+
+def _schedule_cancel_watchdog(task_id: str) -> None:
+    task = _tasks.get(task_id)
+    if task is None or task.done():
+        return
+    existing = _cancel_watchdogs.get(task_id)
+    if existing is not None and not existing.done():
+        return
+    _cancel_watchdogs[task_id] = asyncio.create_task(
+        _hard_cancel_after_grace(task_id, task),
+    )
+
+
+async def _hard_cancel_after_grace(task_id: str, expected: asyncio.Task) -> None:
+    try:
+        await asyncio.sleep(SHUTDOWN_GRACE_SECONDS)
+        task = _tasks.get(task_id)
+        if task is expected and not task.done():
+            task.cancel()
+    finally:
+        if _cancel_watchdogs.get(task_id) is asyncio.current_task():
+            _cancel_watchdogs.pop(task_id, None)
 
 
 async def shutdown_all() -> None:
@@ -572,3 +607,9 @@ async def shutdown_all() -> None:
         task.cancel()
     if late:
         await asyncio.gather(*(task for _, task in late), return_exceptions=True)
+    watchdogs = list(_cancel_watchdogs.values())
+    _cancel_watchdogs.clear()
+    for watchdog in watchdogs:
+        watchdog.cancel()
+    if watchdogs:
+        await asyncio.gather(*watchdogs, return_exceptions=True)

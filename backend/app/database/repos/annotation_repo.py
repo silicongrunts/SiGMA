@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database.models import Annotation, AnnotationFileState, AnnotationFileTransaction
 from app.database.repos.message_repo import MessageRepository
+from app.database.repos.file_deletion_repo import FileDeletionRepository
 
 
 class AnnotationRepository:
@@ -38,6 +39,7 @@ class AnnotationRepository:
         return result.scalar_one_or_none()
 
     async def ensure_file_state(self, file_path: str, file_hash: str) -> AnnotationFileState:
+        await FileDeletionRepository(self._session).assert_available(file_path)
         state = await self.get_file_state(file_path)
         if state is None:
             state = AnnotationFileState(file_path=file_path, revision=0, file_hash=file_hash)
@@ -50,6 +52,7 @@ class AnnotationRepository:
         resulting_file_hash: Optional[str] = None,
     ) -> AnnotationFileState:
         """Apply explicit upserts/deletes with a conditional state update."""
+        await FileDeletionRepository(self._session).assert_available(file_path)
         state = await self.get_file_state(file_path)
         if state is None:
             if expected_revision != 0:
@@ -119,7 +122,11 @@ class AnnotationRepository:
         )
         return list(result.scalars().all())
 
+    async def get_transaction(self, transaction_id: str) -> Optional[AnnotationFileTransaction]:
+        return await self._session.get(AnnotationFileTransaction, transaction_id)
+
     async def create_transaction(self, **values) -> AnnotationFileTransaction:
+        await FileDeletionRepository(self._session).assert_available(values["file_path"])
         transaction = AnnotationFileTransaction(**values)
         self._session.add(transaction)
         await self._session.commit()

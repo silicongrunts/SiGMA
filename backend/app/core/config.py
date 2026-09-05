@@ -279,6 +279,9 @@ class LibrarySettings(BaseModel):
     # Worker threads shared by RAG init/indexing/search/reset, so a long
     # rebuild does not stall user searches.
     rag_executor_workers: int = 4
+    # Grace period before a cancelled RAG worker is force-killed. The worker
+    # process is always reaped within this bound.
+    rag_index_terminate_grace_seconds: float = Field(default=2.0, gt=0)
     # Wall-clock budget for one document's full processing pipeline
     # (conversion + AI extraction). With the default library concurrency
     # of 1, a hung document would otherwise monopolize the queue runner.
@@ -680,6 +683,10 @@ class Settings(BaseModel):
     @property
     def RAG_EXECUTOR_WORKERS(self) -> int:
         return self.library.rag_executor_workers
+
+    @property
+    def RAG_INDEX_TERMINATE_GRACE_SECONDS(self) -> float:
+        return self.library.rag_index_terminate_grace_seconds
 
     @property
     def LIBRARY_MAX_PROCESSING_SECONDS(self) -> int:

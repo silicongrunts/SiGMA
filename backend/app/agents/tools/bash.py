@@ -8,11 +8,15 @@ per the project architecture rule.
 import asyncio
 import os
 import signal
+import shlex
+import sys
+from pathlib import Path
 
 from app.agents.tools.base import ToolDefinition
 from app.agents.tools.registry import tool_registry
 from app.agents.prompts import PROMPT_BASH
 from app.core.config import settings
+from app.core.async_cleanup import finish_cleanup
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -125,9 +129,11 @@ async def _run_bash(project_id: str, command: str, timeout: int = 120) -> str:
         return f"Error: timeout {timeout!r}s is invalid (must be integer in [1, {MAX_TIMEOUT_SECONDS}])"
 
     project_path = settings.get_project_path(project_id)
+    worker = Path(__file__).resolve().parents[2] / "core" / "bash_worker.py"
+    invocation = shlex.join([sys.executable, str(worker), str(os.getpid()), command])
     try:
         proc = await asyncio.create_subprocess_shell(
-            command,
+            "exec " + invocation,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(project_path),
@@ -135,33 +141,22 @@ async def _run_bash(project_id: str, command: str, timeout: int = 120) -> str:
             # command tree, not just the shell (see _kill_process_group).
             start_new_session=True,
         )
+        note = ""
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout,
             )
         except asyncio.TimeoutError:
+            stdout, stderr = b"", b""
+            note = f"Command timed out after {timeout}s"
+        finally:
             _kill_process_group(proc)
-            # Reap without re-entering communicate(): a second communicate()
-            # blocks until pipe EOF (the command's full runtime), which is the
-            # bug this path fixes.
-            await _reap_after_kill(proc)
-            _close_pipes(proc)
-            return _format_output(
-                b"", b"", proc.returncode,
-                note=f"Command timed out after {timeout}s",
-            )
-        except asyncio.CancelledError:
-            # The task was cancelled (user pressed stop; the loop runner
-            # cancels in-flight tool calls). Without this handler the
-            # cancellation would propagate and leave the command running
-            # with open pipes — a leaked process that keeps consuming
-            # resources until its own timeout.
-            _kill_process_group(proc)
-            await _reap_after_kill(proc)
-            _close_pipes(proc)
-            raise
+            try:
+                await finish_cleanup(_reap_after_kill(proc))
+            finally:
+                _close_pipes(proc)
 
-        return _format_output(stdout, stderr, proc.returncode)
+        return _format_output(stdout, stderr, proc.returncode, note=note)
     except Exception as e:
         logger.exception("bash tool failed")
         return f"Bash error: {e}"

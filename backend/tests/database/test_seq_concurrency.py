@@ -227,6 +227,9 @@ async def test_execute_atomic_stages_message_and_session_touch(db_session_factor
         async def get_session(self, project_id, *, allow_inactive=False):
             return db_session_factory()
 
+        async def release_session(self, project_id):
+            pass
+
     async def fake_get_db_manager():
         return FakeDbManager()
 
@@ -263,6 +266,9 @@ async def test_execute_atomic_rolls_back_staged_steps_when_a_later_step_fails(
 
         async def get_session(self, project_id, *, allow_inactive=False):
             return db_session_factory()
+
+        async def release_session(self, project_id):
+            pass
 
     async def fake_get_db_manager():
         return FakeDbManager()

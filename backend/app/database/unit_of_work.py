@@ -44,6 +44,7 @@ Methods that do **NOT** self-commit (caller must ``uow.commit()``):
   ``stage_copy_messages``, ``stage_create_for_annotation``,
   ``stage_boundary_for_annotation``
 * ``TaskRepository.update`` — modifies ORM attributes only
+* ``FileDeletionRepository``: ``stage_begin``, ``stage_finish``
 
 Atomic bulk methods (self-commit as a single transaction):
 
@@ -71,6 +72,7 @@ from app.database.manager import get_db_manager
 from app.database.repos.session_repo import SessionRepository
 from app.database.repos.message_repo import MessageRepository
 from app.database.repos.annotation_repo import AnnotationRepository
+from app.database.repos.file_deletion_repo import FileDeletionRepository
 from app.database.repos.library_repo import LibraryRepository
 from app.database.repos.task_state_repo import TaskStateRepository
 from app.database.repos.task_repo import TaskRepository
@@ -117,6 +119,7 @@ class UnitOfWork:
         self.sessions: SessionRepository = None  # type: ignore
         self.messages: MessageRepository = None  # type: ignore
         self.annotations: AnnotationRepository = None  # type: ignore
+        self.file_deletions = None
         self.library: LibraryRepository = None  # type: ignore
         self.task_state: TaskStateRepository = None  # type: ignore
         self.tasks: TaskRepository = None  # type: ignore
@@ -136,26 +139,31 @@ class UnitOfWork:
             self.project_id,
             allow_inactive=self.allow_inactive,
         )
+        try:
+            # Initialize repositories with the active session
+            self.sessions = SessionRepository(self._session)
+            self.messages = MessageRepository(self._session)
+            self.annotations = AnnotationRepository(self._session)
+            self.file_deletions = FileDeletionRepository(self._session)
+            self.library = LibraryRepository(self._session)
+            self.task_state = TaskStateRepository(self._session)
+            self.tasks = TaskRepository(self._session)
+            self.config = ProjectConfigRepository(self._session)
+            self.background_tasks = BackgroundTaskRepository(self._session)
 
-        # Initialize repositories with the active session
-        self.sessions = SessionRepository(self._session)
-        self.messages = MessageRepository(self._session)
-        self.annotations = AnnotationRepository(self._session)
-        self.library = LibraryRepository(self._session)
-        self.task_state = TaskStateRepository(self._session)
-        self.tasks = TaskRepository(self._session)
-        self.config = ProjectConfigRepository(self._session)
-        self.background_tasks = BackgroundTaskRepository(self._session)
-
-        if self._immediate:
-            # Begin the transaction as a writer immediately: every statement
-            # below — including guard reads — runs inside one write
-            # transaction, so a concurrent writer either committed before
-            # this read (and is visible to the guard) or serializes after
-            # this commit. A deferred transaction would instead read without
-            # a snapshot and let the later write proceed on fresh data.
-            await self._session.execute(sa_text("BEGIN IMMEDIATE"))
-        return self
+            if self._immediate:
+                # Begin the transaction as a writer immediately: every statement
+                # below — including guard reads — runs inside one write
+                # transaction, so a concurrent writer either committed before
+                # this read (and is visible to the guard) or serializes after
+                # this commit. A deferred transaction would instead read without
+                # a snapshot and let the later write proceed on fresh data.
+                await self._session.execute(sa_text("BEGIN IMMEDIATE"))
+            return self
+        except BaseException:
+            await self._session.close()
+            await self._db_manager.release_session(self.project_id)
+            raise
 
     async def __aexit__(self, exc_type, _exc_val, _exc_tb):
         if exc_type:
@@ -167,6 +175,8 @@ class UnitOfWork:
             await self._session.close()
         except Exception:
             logger.debug("UnitOfWork session close failed", exc_info=True)
+        finally:
+            await self._db_manager.release_session(self.project_id)
 
     async def commit(self):
         await self._session.commit()

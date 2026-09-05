@@ -15,12 +15,16 @@ API surface:
   - search(project_id, query, top_k) -> List[SearchResult]
 """
 import asyncio
+import ctypes
 import hashlib
 import json
+import multiprocessing
 import os
 import math
 import re
+import signal
 import shutil
+import sys
 import threading
 from dataclasses import dataclass
 from collections import Counter, OrderedDict
@@ -42,6 +46,56 @@ logger = get_logger(__name__)
 MAX_CACHED_PROJECTS = 20
 EMBED_BATCH_SIZE = 100
 RAG_INDEX_METADATA_VERSION = 1
+_RAG_WORKER_POLL_SECONDS = 0.1
+_PR_SET_PDEATHSIG = 1
+
+
+def _configure_index_worker_lifecycle() -> None:
+    """Own a process group and die if the web process disappears."""
+    if os.name != "posix":
+        return
+    parent_pid = os.getppid()
+    os.setsid()
+    if sys.platform != "linux":
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _index_worker_entry(
+    result_pipe,
+    project_id: str,
+    doc_id: str,
+    content: str,
+    title: str,
+    description: str,
+    doc_revision: int,
+    index_generation: int,
+) -> None:
+    """Run one complete index write in an isolated process."""
+    try:
+        _configure_index_worker_lifecycle()
+        result = rag_service._sync_index(
+            project_id,
+            doc_id,
+            content,
+            title,
+            description,
+            doc_revision=doc_revision,
+            index_generation=index_generation,
+        )
+        result_pipe.send(("ok", bool(result)))
+    except BaseException as exc:
+        try:
+            result_pipe.send(("error", f"{type(exc).__name__}: {exc}"))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        result_pipe.close()
 
 
 def _resolve_model_path(model_name: str, source: str, hf_endpoint: str) -> str:
@@ -499,11 +553,11 @@ class RAGService:
         if not chroma_dir.exists():
             return set()
         client = self._open_chroma_store(project_id, chroma_dir)
+        from chromadb.errors import NotFoundError
+
         try:
             collection = client.get_collection(name="library")
-        except Exception:
-            # Missing collection: no chunks. A damaged store raises through
-            # to the caller, which decides whether that is recoverable.
+        except NotFoundError:
             return set()
         records = collection.get(include=["metadatas"])
         doc_ids = set()
@@ -863,18 +917,15 @@ class RAGService:
         return "collection" in msg and ("does not exist" in msg or "not found" in msg)
 
     def _sync_index(self, project_id, doc_id, content, title, description,
-                    progress_callback: Optional[Callable[[], None]] = None,
                     should_continue: Optional[Callable[[], bool]] = None,
                     doc_revision: int | None = None,
                     index_generation: int | None = None,
                     _stale_cache_retried: bool = False):
         """Index a document using manual split -> batch embed -> batch store pipeline.
 
-        Thread-safe. Runs inside ThreadPoolExecutor.
+        Thread-safe. Runs inside the task-owned worker process.
 
         Args:
-            progress_callback: Optional callable invoked between embedding batches.
-                Used to heartbeat the owning background task.
             should_continue: Optional callable checked before destructive writes.
                 May raise — a raised check failure aborts the pipeline as an
                 error so the caller can retry, never as a fake success.
@@ -934,7 +985,7 @@ class RAGService:
                     f"{doc_id}:{doc_revision}:{index_generation}:{chunk_number}:{node.get_content()}".encode()
                 ).hexdigest()
 
-            # ── 3. Batch embed + progress updates ───────────────────────
+            # ── 3. Batch embed ─────────────────────────────────────────
             for i in range(0, len(nodes), EMBED_BATCH_SIZE):
                 if should_continue and not should_continue():
                     logger.info("Indexing stopped for stale/cancelled document %s", doc_id)
@@ -944,13 +995,6 @@ class RAGService:
                 embeddings = self._embed_model.get_text_embedding_batch(texts)
                 for node, emb in zip(batch, embeddings):
                     node.embedding = emb
-
-                # Report progress between batches
-                if progress_callback:
-                    try:
-                        progress_callback()
-                    except Exception as e:
-                        logger.warning("Progress callback failed for %s: %s", doc_id, e, exc_info=True)
 
             # ── 4. Store in ChromaDB (embeddings already set on nodes) ───
             if should_continue and not should_continue():
@@ -988,7 +1032,6 @@ class RAGService:
                 # Retry the full pipeline once
                 self._sync_index(
                     project_id, doc_id, content, title, description,
-                    progress_callback=progress_callback,
                     should_continue=should_continue,
                     doc_revision=doc_revision,
                     index_generation=index_generation,
@@ -999,7 +1042,6 @@ class RAGService:
             raise
 
     async def index_document(self, project_id, doc_id, content, title="", description="",
-                             progress_callback: Optional[Callable[[], None]] = None,
                              should_continue: Optional[Callable[[], bool]] = None,
                              doc_revision: int | None = None,
                              index_generation: int | None = None):
@@ -1009,11 +1051,94 @@ class RAGService:
             raise RuntimeError(f"Project {project_id} is not accepting RAG writes")
         if not content.strip() and not title.strip():
             return
-        return await asyncio.get_event_loop().run_in_executor(
-            self._executor, self._sync_index,
-            project_id, doc_id, content, title, description,
-            progress_callback, should_continue, doc_revision, index_generation,
+        if doc_revision is None or index_generation is None:
+            raise ValueError("doc_revision and index_generation are required for RAG writes")
+
+        context = multiprocessing.get_context("spawn")
+        result_pipe, worker_pipe = context.Pipe(duplex=False)
+        worker = context.Process(
+            target=_index_worker_entry,
+            args=(
+                worker_pipe,
+                project_id,
+                doc_id,
+                content,
+                title,
+                description,
+                doc_revision,
+                index_generation,
+            ),
+            name=f"sigma-rag-{doc_id}",
+            daemon=True,
         )
+        worker.start()
+        worker_pipe.close()
+
+        cancelled = False
+        try:
+            while worker.is_alive():
+                if should_continue is not None and not await asyncio.to_thread(
+                    should_continue,
+                ):
+                    cancelled = True
+                    await self._stop_index_worker(worker)
+                    break
+                await asyncio.sleep(_RAG_WORKER_POLL_SECONDS)
+
+            if cancelled:
+                # The caller performs generation cleanup when cancellation is
+                # observed. Returning a write-shaped result makes that cleanup
+                # happen even if the process was killed during its final store.
+                self._evict_project(project_id)
+                return True
+
+            await asyncio.to_thread(worker.join, settings.RAG_INDEX_TERMINATE_GRACE_SECONDS)
+            if worker.is_alive():
+                await self._stop_index_worker(worker)
+
+            if result_pipe.poll():
+                result_kind, result_value = result_pipe.recv()
+                if result_kind == "error":
+                    raise RuntimeError(result_value)
+                self._evict_project(project_id)
+                return result_value
+            if worker.exitcode:
+                raise RuntimeError(
+                    f"RAG index worker exited with code {worker.exitcode}"
+                )
+            raise RuntimeError("RAG index worker exited without a result")
+        finally:
+            result_pipe.close()
+            if worker.is_alive():
+                await self._stop_index_worker(worker)
+            worker.close()
+
+    async def _stop_index_worker(self, worker) -> None:
+        """Terminate and reap a worker within the configured hard bound."""
+        if worker.is_alive():
+            self._signal_index_worker(worker, signal.SIGTERM)
+        grace = settings.RAG_INDEX_TERMINATE_GRACE_SECONDS
+        await asyncio.to_thread(worker.join, grace)
+        if worker.is_alive():
+            self._signal_index_worker(worker, signal.SIGKILL)
+            await asyncio.to_thread(worker.join, grace)
+        if worker.is_alive():
+            raise RuntimeError("RAG index worker could not be reaped")
+
+    @staticmethod
+    def _signal_index_worker(worker, sig: signal.Signals) -> None:
+        pid = getattr(worker, "pid", None)
+        if os.name == "posix" and isinstance(pid, int) and pid > 1:
+            try:
+                if os.getpgid(pid) == pid:
+                    os.killpg(pid, sig)
+                    return
+            except ProcessLookupError:
+                return
+        if sig == signal.SIGKILL:
+            worker.kill()
+        else:
+            worker.terminate()
 
     # ------------------------------------------------------------------
     # Remove

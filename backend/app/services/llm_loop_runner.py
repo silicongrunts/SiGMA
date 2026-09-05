@@ -24,6 +24,7 @@ from app.core.chat_events import (
 from app.core.logging import get_logger
 from app.core.message_format import file_edit_stats, is_failed_tool_result
 from app.core.task_status import SSE_CANCELLED, SSE_DONE, SSE_ERROR
+from app.core.async_cleanup import finish_cleanup
 from app.agents.tools.registry import tool_registry
 from app.services.pauses import InteractiveToolPause, is_permission_pause
 from app.services.message_persist import CHECKPOINT_FLAG, clear_checkpoint_markers
@@ -1354,6 +1355,9 @@ class LLMLoopRunner:
             # what kills the tool's subprocesses.
             if not tool_task.done():
                 tool_task.cancel()
+            await finish_cleanup(asyncio.gather(
+                tool_task, cancel_task, return_exceptions=True,
+            ))
 
     @staticmethod
     async def execute_tool_default(tool_name: str, tool_args: dict) -> str:

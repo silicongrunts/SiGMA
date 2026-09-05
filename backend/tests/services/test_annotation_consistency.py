@@ -202,11 +202,11 @@ async def test_write_failure_leaves_journal_for_next_access(project, monkeypatch
     settings.get_project_path(project).joinpath(path).write_text("old")
     loaded = await annotation_service.get_annotations(project, path)
 
-    async def fail_write(*args, **kwargs):
+    def fail_write(*args, **kwargs):
         raise OSError("injected write failure")
 
-    original_write = file_service.write_file
-    monkeypatch.setattr(file_service, "write_file", fail_write)
+    original_write = file_service.write_file_content
+    monkeypatch.setattr(file_service, "write_file_content", fail_write)
     with pytest.raises(OSError):
         await annotation_service.save_document(
             project, path, "new", loaded["fileHash"], loaded["revision"], [], [],
@@ -214,7 +214,7 @@ async def test_write_failure_leaves_journal_for_next_access(project, monkeypatch
     async with UnitOfWork(project) as uow:
         assert len(await uow.annotations.get_transactions()) == 1
 
-    monkeypatch.setattr(file_service, "write_file", original_write)
+    monkeypatch.setattr(file_service, "write_file_content", original_write)
     await annotation_service.get_annotations(project, path)
     async with UnitOfWork(project) as uow:
         assert await uow.annotations.get_transactions() == []
@@ -256,24 +256,20 @@ async def test_save_conflict_restores_file_without_applying_mutation(project, mo
     other_id = generate_id()
     requested_id = generate_id()
 
-    original_write = file_service.write_file
     injected = False
 
-    async def write_then_mutate(*args, **kwargs):
+    async def apply_after_other_mutation(repository, *args, **kwargs):
         nonlocal injected
-        result = await original_write(*args, **kwargs)
-        if injected:
-            return result
-        injected = True
-        async with UnitOfWork(project, immediate=True) as other:
+        if not injected:
+            injected = True
             await original_apply(
-                other.annotations, path,
+                repository, path,
                 [{"id": other_id, "from": 0, "to": 3, "originalText": "old"}],
                 [], loaded["revision"], loaded["fileHash"],
             )
-        return result
+        return await original_apply(repository, *args, **kwargs)
 
-    monkeypatch.setattr(file_service, "write_file", write_then_mutate)
+    monkeypatch.setattr(AnnotationRepository, "apply_mutation_cas", apply_after_other_mutation)
     with pytest.raises(AnnotationConflictError) as caught:
         await annotation_service.save_document(
             project, path, "new", loaded["fileHash"], loaded["revision"],
@@ -304,17 +300,17 @@ async def test_failed_compensation_keeps_journal_until_next_access(project, monk
             [], loaded["revision"], loaded["fileHash"],
         )
     settings.get_project_path(project).joinpath(path).write_text("new")
-    original_write = file_service.write_file
+    original_write = file_service.write_file_content
 
-    async def fail_restore(*args, **kwargs):
+    def fail_restore(*args, **kwargs):
         return {"conflict": True}
 
-    monkeypatch.setattr(file_service, "write_file", fail_restore)
+    monkeypatch.setattr(file_service, "write_file_content", fail_restore)
     await annotation_service.recover_transactions(project)
     async with UnitOfWork(project) as uow:
         assert len(await uow.annotations.get_transactions()) == 1
 
-    monkeypatch.setattr(file_service, "write_file", original_write)
+    monkeypatch.setattr(file_service, "write_file_content", original_write)
     await annotation_service.get_annotations(project, path)
     assert settings.get_project_path(project).joinpath(path).read_text() == "old"
     async with UnitOfWork(project) as uow:
@@ -367,14 +363,14 @@ async def test_restore_race_keeps_journal_as_recovery_evidence(project, monkeypa
             [], loaded["revision"], loaded["fileHash"],
         )
     full_path.write_text("new")
-    original_write = file_service.write_file
+    original_write = file_service.write_file_content
 
-    async def restore_then_replace(*args, **kwargs):
-        result = await original_write(*args, **kwargs)
+    def restore_then_replace(*args, **kwargs):
+        result = original_write(*args, **kwargs)
         full_path.write_text("someone else")
         return result
 
-    monkeypatch.setattr(file_service, "write_file", restore_then_replace)
+    monkeypatch.setattr(file_service, "write_file_content", restore_then_replace)
     await annotation_service.recover_transactions(project)
 
     assert full_path.read_text() == "someone else"

@@ -51,3 +51,20 @@ def test_record_read_overwrites_prior_entry():
     assert entry.content == "v2"
     assert entry.mtime == 2.0
     assert entry.is_partial is False
+
+
+def test_clear_under_only_removes_one_project(tmp_path):
+    cache = ReadStateCache()
+    project_a = tmp_path / "a"
+    project_b = tmp_path / "b"
+    project_a.mkdir()
+    project_b.mkdir()
+    file_a = project_a / "paper.md"
+    file_b = project_b / "paper.md"
+    cache.record_read("session-a", str(file_a), "a", 1.0, False)
+    cache.record_read("session-b", str(file_b), "b", 1.0, False)
+
+    cache.clear_under(project_a)
+
+    assert cache.get("session-a", str(file_a)) is None
+    assert cache.get("session-b", str(file_b)) is not None

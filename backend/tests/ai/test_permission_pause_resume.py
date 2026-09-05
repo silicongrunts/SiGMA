@@ -404,6 +404,7 @@ class _FakeJupyterService:
 
     def __init__(self):
         self.executed = []
+        self.owners = []
 
     async def is_running(self):
         return True
@@ -414,8 +415,9 @@ class _FakeJupyterService:
     async def get_kernel_status(self, kernel_id):
         return {"execution_state": "idle"}
 
-    async def execute_code(self, kernel_id, source, timeout=60.0):
+    async def execute_code(self, kernel_id, source, timeout=60.0, *, project_id="", session_id=""):
         self.executed.append(source)
+        self.owners.append((project_id, session_id))
         return {"status": "ok", "outputs": [], "execution_count": 1}
 
 
@@ -453,6 +455,7 @@ async def test_notebook_resume_executes_when_cell_unchanged(project, monkeypatch
     assert "changed since approval" not in summary
     # The approved run actually executed the approved cell source.
     assert fake_jupyter.executed == ["print('approved')"]
+    assert fake_jupyter.owners == [(project, session_id)]
 
 
 @pytest.mark.asyncio

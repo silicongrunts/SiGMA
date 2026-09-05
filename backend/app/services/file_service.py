@@ -616,10 +616,25 @@ class FileService:
                          force: bool = False, expected_hash: Optional[str] = None,
                          require_expected_hash: bool = False,
                          encoding: str = "utf-8") -> dict:
+        result = self.write_file_content(
+            project_id, path, content, force=force, expected_hash=expected_hash,
+            require_expected_hash=require_expected_hash, encoding=encoding,
+        )
+        if not result.get("conflict"):
+            await self._after_file_mutation(project_id)
+        return result
+
+    def write_file_content(self, project_id: str, path: str, content: str,
+                           force: bool = False, expected_hash: Optional[str] = None,
+                           require_expected_hash: bool = False,
+                           encoding: str = "utf-8") -> dict:
+        """Write without async side effects so journal owners can hold their transaction."""
         root = self.get_project_path(project_id)
         full_path = self.safe_join(root, path)
 
         with ProjectFileLock(full_path):
+            if not force and expected_hash and not full_path.exists():
+                raise FileMissingError(path)
             if not force and require_expected_hash and full_path.exists() and not expected_hash:
                 try:
                     disk_content = full_path.read_text(encoding='utf-8', errors='replace')
@@ -643,7 +658,6 @@ class FileService:
             full_path.parent.mkdir(parents=True, exist_ok=True)
             atomic_replace_bytes(full_path, content.encode(encoding))
 
-        await self._after_file_mutation(project_id)
         return {"conflict": False, "hash": self.compute_hash(content)}
 
     @staticmethod
@@ -695,11 +709,8 @@ class FileService:
         await self._after_file_mutation(project_id)
 
     async def delete_item(self, project_id: str, path: str):
-        root = self.get_project_path(project_id)
-        full_path = self.safe_join(root, path)
-        if not full_path.exists(): raise FileMissingError(path)
-        if full_path.is_dir(): shutil.rmtree(full_path)
-        else: full_path.unlink()
+        from app.services.file_deletion_service import file_deletion_service
+        await file_deletion_service.delete_item(project_id, path)
         await self._after_file_mutation(project_id)
 
     async def move_item(self, project_id: str, src_path: str, dest_path: str):

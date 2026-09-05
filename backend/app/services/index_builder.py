@@ -9,7 +9,6 @@ Responsibilities:
 - Mark documents as "completed" (success) or "failed" (permanent error)
 - Stop cleanly when a document is cancelled, deleted, or superseded by a
   newer revision
-- Report progress between embedding batches via progress_callback
 """
 import asyncio
 
@@ -124,22 +123,8 @@ class IndexBuilderService:
                     )
                 return True
 
-            # 3. Create progress callback for task heartbeat between embedding batches
+            # 3. Create the cancellation and stale-revision check used while indexing
             loop = asyncio.get_running_loop()
-
-            def progress_cb():
-                if task_context is None:
-                    return
-                future = asyncio.run_coroutine_threadsafe(
-                    task_context.heartbeat(), loop
-                )
-                try:
-                    alive = future.result(timeout=5.0)
-                except Exception as e:
-                    logger.warning("Task heartbeat failed for %s: %s", doc_id, e, exc_info=True)
-                    return
-                if not alive:
-                    loop.call_soon_threadsafe(task_context.cancel_event.set)
 
             def should_continue() -> bool:
                 # A lost lease stops indexing exactly like a cancelled
@@ -160,7 +145,6 @@ class IndexBuilderService:
             index_written = bool(await rag_service.index_document(
                 project_id, doc_id, doc.content,
                 title=doc.title, description=doc.description or "",
-                progress_callback=progress_cb,
                 should_continue=should_continue,
                 doc_revision=expected_revision,
                 index_generation=doc.index_generation,

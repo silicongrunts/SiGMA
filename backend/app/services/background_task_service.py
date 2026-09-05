@@ -10,6 +10,7 @@ from typing import Any
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.project_registry import get_project_status, is_project_active, iter_project_ids
+from app.core.task_status import TERMINAL_STATUSES
 from app.database.unit_of_work import UnitOfWork
 from app.services.library_task_protocol import (
     KIND_DOCUMENT_PROCESS,
@@ -101,7 +102,11 @@ class BackgroundTaskService:
         *,
         priority: int = 100,
         wake: bool = True,
-    ) -> str:
+        explicit: bool = False,
+    ) -> str | None:
+        """Queue processing unless the document needs explicit recovery."""
+        if not await self._document_allows_enqueue(project_id, doc_id, explicit=explicit):
+            return None
         revision = await self._get_document_revision(project_id, doc_id)
         return await self.enqueue(
             project_id=project_id,
@@ -120,7 +125,11 @@ class BackgroundTaskService:
         *,
         priority: int = 100,
         wake: bool = True,
-    ) -> str:
+        explicit: bool = False,
+    ) -> str | None:
+        """Queue indexing unless the document needs explicit recovery."""
+        if not await self._document_allows_enqueue(project_id, doc_id, explicit=explicit):
+            return None
         revision = await self._get_document_revision(project_id, doc_id)
         return await self.enqueue(
             project_id=project_id,
@@ -136,6 +145,17 @@ class BackgroundTaskService:
         async with UnitOfWork(project_id) as uow:
             doc = await uow.library.get_by_id(doc_id)
             return doc.revision if doc else 0
+
+    async def _document_allows_enqueue(
+        self, project_id: str, doc_id: str, *, explicit: bool,
+    ) -> bool:
+        if explicit:
+            return True
+        from app.core.document_status import ACTIVE_STATUSES
+
+        async with UnitOfWork(project_id) as uow:
+            doc = await uow.library.get_by_id(doc_id)
+        return bool(doc and doc.processing_status in ACTIVE_STATUSES)
 
     async def enqueue(
         self,
@@ -329,11 +349,21 @@ class BackgroundTaskService:
         cancelling_docs = []
         for doc in sweep_docs:
             if doc.processing_status == STATUS_INDEXING:
+                if await self._settle_terminal_document_task(
+                    project_id, doc, KIND_RAG_INDEX,
+                ):
+                    recovered += 1
+                    continue
                 await self.enqueue_rag_index(project_id, doc.id, wake=False)
                 recovered += 1
             elif doc.processing_status == STATUS_CANCELLING:
                 cancelling_docs.append(doc)
             else:
+                if await self._settle_terminal_document_task(
+                    project_id, doc, KIND_DOCUMENT_PROCESS,
+                ):
+                    recovered += 1
+                    continue
                 await self.enqueue_document_process(project_id, doc.id, wake=False)
                 recovered += 1
         for doc in cancelling_docs:
@@ -365,19 +395,31 @@ class BackgroundTaskService:
                     doc.id, project_id,
                 )
 
-        recovered += await self._reindex_emptied_collection(project_id)
+        await self._reindex_emptied_collection(project_id)
 
         return recovered
 
-    async def _reindex_emptied_collection(self, project_id: str) -> int:
-        """Self-heal a vanished/emptied RAG collection.
+    async def _settle_terminal_document_task(self, project_id: str, doc, kind: str) -> bool:
+        """Keep a terminal queue row from silently starting a fresh attempt budget."""
+        dedupe_key = f"{kind}:{project_id}:{doc.id}:{doc.revision}"
+        async with UnitOfWork(project_id) as uow:
+            task = await uow.background_tasks.get_by_dedupe_key(dedupe_key)
+            if task is None or task.status not in TERMINAL_STATUSES:
+                return False
+            await uow.library.mark_failed(
+                doc.id,
+                task.error or "Background processing stopped. Reprocess to continue.",
+                expected_revision=doc.revision,
+            )
+        return True
 
-        A deleted or reset-out-from-under Chroma store leaves completed
-        content documents returning no search results. When the persisted
-        collection holds zero chunks while such documents exist, re-enqueue
-        them; the deterministic-id queue dedupes, so this is safe to run on
-        every sweep. The id query filters blank content in SQL, so the
-        content column is never loaded here.
+    async def _reindex_emptied_collection(self, project_id: str) -> int:
+        """Report an empty RAG collection without spending embedding tokens.
+
+        A deleted or reset-out-from-under RAG store leaves completed content
+        documents returning no search results. Rebuilding is an explicit user
+        action because automatically re-embedding completed or failed
+        documents consumes provider tokens.
         """
         from app.core.document_status import STATUS_COMPLETED
         from app.services.rag_service import rag_service
@@ -395,17 +437,13 @@ class BackgroundTaskService:
 
         async with UnitOfWork(project_id) as uow:
             indexable_ids = await uow.library.list_ids_with_content(STATUS_COMPLETED)
-        recovered = 0
-        for doc_id in indexable_ids:
-            await self.enqueue_rag_index(project_id, doc_id, wake=False)
-            recovered += 1
-        if recovered:
+        if indexable_ids:
             logger.warning(
-                "Sweep: RAG collection for project %s was empty with %d completed "
-                "content document(s); re-enqueued them for indexing",
-                project_id, recovered,
+                "Sweep: RAG collection for project %s is empty with %d completed "
+                "content document(s); explicit rebuild is required",
+                project_id, len(indexable_ids),
             )
-        return recovered
+        return 0
 
     async def _cleanup_all_projects(self) -> None:
         """Daily upkeep: prune terminal task rows, RAG orphan chunks, and
@@ -463,7 +501,7 @@ class BackgroundTaskService:
         removed_doc_ids = await rag_service.cleanup_orphans(project_id, valid_doc_ids)
         async with UnitOfWork(project_id) as uow:
             docs = await uow.library.get_all()
-        from app.core.document_status import ACTIVE_STATUSES
+        from app.core.document_status import ACTIVE_STATUSES, STATUS_INDEXING
         retained = {}
         for doc in docs:
             if doc.is_folder:
@@ -478,10 +516,15 @@ class BackgroundTaskService:
         if not removed_doc_ids:
             return
 
-        surviving_docs = [doc for doc in docs if doc.id in removed_doc_ids]
+        surviving_docs = [
+            doc for doc in docs
+            if doc.id in removed_doc_ids and doc.processing_status in ACTIVE_STATUSES
+        ]
         reindexed = 0
         for doc in surviving_docs:
             if not (doc.content or "").strip():
+                continue
+            if doc.processing_status != STATUS_INDEXING:
                 continue
             await self.enqueue_rag_index(project_id, doc.id, wake=False)
             reindexed += 1

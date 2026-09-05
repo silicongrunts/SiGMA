@@ -11,6 +11,7 @@ Query-time behavior (candidate pool, rerank, BM25 cache) lives in
 """
 
 import threading
+import signal
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +19,81 @@ import pytest
 from app.core.config import Settings
 from app.core.exceptions import RAGIndexModelMismatchError
 from app.core.model_config import ModelEndpoint
+from app.services import rag_service as rag_service_module
 from app.services.rag_service import RAGService
+
+
+class _StuckWorker:
+    def __init__(self):
+        self.terminated = False
+        self.killed = False
+        self.join_calls = []
+
+    def is_alive(self):
+        return not self.killed
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def join(self, timeout):
+        self.join_calls.append(timeout)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_rag_worker_is_force_killed_and_reaped(monkeypatch):
+    service = RAGService()
+    worker = _StuckWorker()
+    monkeypatch.setattr(
+        "app.services.rag_service.settings",
+        SimpleNamespace(RAG_INDEX_TERMINATE_GRACE_SECONDS=0.01),
+    )
+
+    await service._stop_index_worker(worker)
+
+    assert worker.terminated is True
+    assert worker.killed is True
+    assert worker.join_calls == [0.01, 0.01]
+
+
+def test_rag_worker_signal_targets_owned_process_group(monkeypatch):
+    worker = SimpleNamespace(pid=4123, terminate=lambda: None, kill=lambda: None)
+    signals = []
+    monkeypatch.setattr(rag_service_module.os, "name", "posix")
+    monkeypatch.setattr(rag_service_module.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(
+        rag_service_module.os,
+        "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    RAGService._signal_index_worker(worker, signal.SIGTERM)
+
+    assert signals == [(4123, signal.SIGTERM)]
+
+
+def test_rag_worker_configures_parent_death_signal(monkeypatch):
+    calls = []
+
+    class FakeLibC:
+        def prctl(self, option, sig, arg2, arg3, arg4):
+            calls.append((option, sig, arg2, arg3, arg4))
+            return 0
+
+    monkeypatch.setattr(rag_service_module.os, "name", "posix")
+    monkeypatch.setattr(rag_service_module.sys, "platform", "linux")
+    monkeypatch.setattr(rag_service_module.os, "getppid", lambda: 4000)
+    monkeypatch.setattr(rag_service_module.os, "setsid", lambda: calls.append("setsid"))
+    monkeypatch.setattr(rag_service_module.ctypes, "CDLL", lambda *args, **kwargs: FakeLibC())
+
+    rag_service_module._configure_index_worker_lifecycle()
+
+    assert calls == [
+        "setsid",
+        (rag_service_module._PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0),
+    ]
 
 
 # ---------------------------------------------------------------------------

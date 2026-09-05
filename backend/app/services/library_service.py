@@ -5,6 +5,7 @@ All database access goes through UnitOfWork + LibraryRepository.
 No direct SQLAlchemy or ORM model imports in this file.
 """
 import asyncio
+import threading
 import time
 from typing import List, Dict, Optional
 
@@ -40,6 +41,30 @@ _REBUILD_DRAIN_POLL_SECONDS = 1.0
 
 class LibraryService:
     """Manages library documents for projects."""
+
+    def __init__(self) -> None:
+        self._rebuild_claim_lock = threading.Lock()
+        self._rebuilding_projects: dict[str, asyncio.Task] = {}
+
+    def _claim_rebuild(self, project_id: str) -> bool:
+        with self._rebuild_claim_lock:
+            if project_id in self._rebuilding_projects:
+                return False
+            self._rebuilding_projects[project_id] = asyncio.current_task()
+            return True
+
+    def _release_rebuild(self, project_id: str) -> None:
+        with self._rebuild_claim_lock:
+            self._rebuilding_projects.pop(project_id, None)
+
+    async def wait_for_rebuild(self, project_id: str) -> bool:
+        """Wait for a rebuild request that started before a project barrier."""
+        with self._rebuild_claim_lock:
+            task = self._rebuilding_projects.get(project_id)
+        if task is None or task is asyncio.current_task():
+            return True
+        _, pending = await asyncio.wait([task], timeout=_REBUILD_DRAIN_TIMEOUT_SECONDS)
+        return not pending
 
     async def list_documents(
         self, project_id: str,
@@ -735,6 +760,19 @@ class LibraryService:
         to full processing. The caller gets an immediate response without
         waiting for the actual indexing to complete.
         """
+        if not self._claim_rebuild(project_id):
+            return {
+                "success": False,
+                "message": "An index rebuild is already starting for this project.",
+                "status": "already_running",
+            }
+        try:
+            return await self._rebuild_index_claimed(project_id)
+        finally:
+            self._release_rebuild(project_id)
+
+    async def _rebuild_index_claimed(self, project_id: str) -> Dict:
+        """Start one exclusively claimed project index rebuild."""
         from app.services.rag_service import rag_service
 
         # 1. Snapshot docs that need re-indexing plus docs with active
@@ -816,9 +854,13 @@ class LibraryService:
         for doc_id, status in targets.items():
             try:
                 if status == STATUS_INDEXING:
-                    await background_task_service.enqueue_rag_index(project_id, doc_id)
+                    await background_task_service.enqueue_rag_index(
+                        project_id, doc_id, explicit=True,
+                    )
                 else:
-                    await background_task_service.enqueue_document_process(project_id, doc_id)
+                    await background_task_service.enqueue_document_process(
+                        project_id, doc_id, explicit=True,
+                    )
             except Exception:
                 logger.warning(
                     "Rebuild: failed to enqueue %s for document %s; the maintenance "
@@ -868,7 +910,28 @@ class LibraryService:
             if status != STATUS_COMPLETED:
                 active_docs.append(d)
 
-        return {"summary": summary, "documents": active_docs}
+        rebuild_needed = False
+        try:
+            from app.services.rag_service import rag_service
+
+            chunk_count = await rag_service.collection_count(project_id)
+            async with UnitOfWork(project_id) as uow:
+                completed_with_content = await uow.library.list_ids_with_content(
+                    STATUS_COMPLETED,
+                )
+            rebuild_needed = chunk_count == 0 and bool(completed_with_content)
+        except Exception:
+            logger.warning(
+                "Could not determine whether the RAG index needs a rebuild for %s",
+                project_id,
+                exc_info=True,
+            )
+
+        return {
+            "summary": summary,
+            "documents": active_docs,
+            "rebuild_needed": rebuild_needed,
+        }
 
     # ------------------------------------------------------------------
     # Status transitions — single entry points for state changes

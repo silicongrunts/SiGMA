@@ -36,10 +36,6 @@ async def startup_event():
     # before they can confuse later scans or leak disk.
     from app.services.project_service import project_service
     try:
-        await project_service.reconcile_lifecycle()
-    except Exception as exc:
-        logger.warning("Project lifecycle reconciliation failed: %s", exc, exc_info=True)
-    try:
         swept = project_service.cleanup_interrupted_imports()
         if swept:
             logger.info("Cleaned up %d interrupted import(s)", swept)
@@ -47,7 +43,30 @@ async def startup_event():
         logger.warning("Interrupted-import cleanup failed: %s", exc, exc_info=True)
     await db_mgr.migrate_all_projects()
 
+    # Repair interrupted destructive operations only after eligible active
+    # projects have reached the current schema. Barriered projects are not
+    # migration candidates and recovery can remove unreadable databases after
+    # draining live work.
+    try:
+        await project_service.reconcile_lifecycle()
+    except Exception as exc:
+        logger.warning("Project lifecycle reconciliation failed: %s", exc, exc_info=True)
+
     from app.core.project_registry import iter_project_ids
+    from app.services.ai_service import ai_service
+    for project_id in iter_project_ids():
+        try:
+            await ai_service.reconcile_deleting_sessions(project_id)
+        except Exception as exc:
+            logger.warning("Session deletion reconciliation failed for %s: %s", project_id, exc, exc_info=True)
+
+    from app.services.file_deletion_service import file_deletion_service
+    for project_id in iter_project_ids():
+        try:
+            await file_deletion_service.recover_deletions(project_id)
+        except Exception:
+            logger.warning("File deletion recovery failed for %s", project_id, exc_info=True)
+
     from app.services.annotation_service import annotation_service
     for project_id in iter_project_ids():
         try:
@@ -157,6 +176,13 @@ async def shutdown_event():
         await library_task_runner.stop()
     except Exception as e:
         logger.warning("Failed to stop library background runner: %s", e, exc_info=True)
+
+    # ---- Project databases ----
+    from app.database.manager import get_db_manager
+    try:
+        await (await get_db_manager()).close_all()
+    except Exception as e:
+        logger.warning("Failed to close project databases: %s", e, exc_info=True)
 
     # ---- Jupyter ----
     jupyter_service.stop()

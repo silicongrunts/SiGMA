@@ -5,6 +5,7 @@ Uses mocks for all external services to verify that delete_project()
 calls each step in order and handles partial failures gracefully.
 """
 
+import asyncio
 import json
 from unittest.mock import patch, MagicMock, AsyncMock
 
@@ -13,6 +14,12 @@ import pytest
 from app.core.exceptions import DatabaseException, ProjectNotFoundError
 from app.database.manager import DatabaseManager
 from app.services.project_service import ProjectService
+
+
+def _mock_db_manager():
+    manager = MagicMock()
+    manager.wait_for_project_sessions = AsyncMock(return_value=True)
+    return manager
 
 
 @pytest.fixture
@@ -40,7 +47,7 @@ async def test_delete_project_calls_all_steps(seeded_ps):
     """delete_project calls each helper method in order."""
     svc, project_id = seeded_ps
 
-    mock_db = MagicMock()
+    mock_db = _mock_db_manager()
 
     # One parent recorder: every step mock is attached to it, so a single
     # mock_calls sequence proves the orchestration order, not just counts.
@@ -53,7 +60,11 @@ async def test_delete_project_calls_all_steps(seeded_ps):
     mock_mark_deleting = _tracked(MagicMock(), "mark_project_deleting")
     mock_mark_deleted = _tracked(MagicMock(), "mark_project_deleted")
     mock_cancel = _tracked(AsyncMock(), "_cancel_library_tasks")
+    mock_wait_rebuild = _tracked(AsyncMock(), "_wait_for_library_rebuild")
     mock_kill = _tracked(AsyncMock(), "_kill_project_kernels")
+    mock_db.wait_for_project_sessions = _tracked(
+        AsyncMock(return_value=True), "wait_for_project_sessions",
+    )
     mock_db.mark_deleted = _tracked(MagicMock(), "mark_deleted")
     mock_cancel_tasks = _tracked(MagicMock(), "cancel_project")
     mock_evict = _tracked(AsyncMock(), "_evict_project_caches")
@@ -63,6 +74,7 @@ async def test_delete_project_calls_all_steps(seeded_ps):
         patch.object(svc, 'mark_project_deleting', mock_mark_deleting),
         patch.object(svc, 'mark_project_deleted', mock_mark_deleted),
         patch.object(svc, '_cancel_library_tasks', mock_cancel),
+        patch.object(svc, '_wait_for_library_rebuild', mock_wait_rebuild),
         patch("app.services.task_runtime.cancel_project", mock_cancel_tasks),
         patch.object(svc, '_evict_project_caches', mock_evict),
         patch.object(svc, '_delete_project_directory', mock_rmdir),
@@ -71,14 +83,16 @@ async def test_delete_project_calls_all_steps(seeded_ps):
     ):
         await svc.delete_project(project_id)
 
-    # Verify call order: barrier first, then drain, then DB tombstone,
-    # runner drain, caches, directory, and only then barrier release.
+    # Verify call order: barrier first, then every runner drain, then
+    # resource cleanup, DB tombstone, caches, directory, and barrier release.
     assert [call[0] for call in recorder.mock_calls] == [
         "mark_project_deleting",
         "_cancel_library_tasks",
-        "_kill_project_kernels",      # via _cleanup_project_resources
-        "mark_deleted",
+        "_wait_for_library_rebuild",
         "cancel_project",             # via _cleanup_worker_state
+        "_kill_project_kernels",      # via _cleanup_project_resources
+        "wait_for_project_sessions",
+        "mark_deleted",
         "_evict_project_caches",
         "_delete_project_directory",
         "mark_project_deleted",
@@ -87,11 +101,50 @@ async def test_delete_project_calls_all_steps(seeded_ps):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
+async def test_delete_project_waits_for_active_index_rebuild(seeded_ps):
+    svc, project_id = seeded_ps
+    from app.services.library_service import library_service
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_rebuild(_project_id):
+        entered.set()
+        await release.wait()
+        return {"success": True}
+
+    mock_db = _mock_db_manager()
+    mock_db.mark_deleted = MagicMock()
+    with (
+        patch.object(library_service, '_rebuild_index_claimed', blocked_rebuild),
+        patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock),
+        patch.object(svc, '_cleanup_worker_state', new_callable=AsyncMock, return_value=True),
+        patch.object(svc, '_cleanup_project_resources', new_callable=AsyncMock),
+        patch.object(svc, '_evict_project_caches', new_callable=AsyncMock),
+        patch("app.database.manager.get_db_manager", new_callable=AsyncMock, return_value=mock_db),
+    ):
+        rebuild = asyncio.create_task(library_service.rebuild_index(project_id))
+        await entered.wait()
+        deletion = asyncio.create_task(svc.delete_project(project_id))
+        await asyncio.sleep(0)
+
+        assert not deletion.done()
+        assert (svc.USERDATA_DIR / project_id).exists()
+
+        release.set()
+        await rebuild
+        await deletion
+
+    assert not (svc.USERDATA_DIR / project_id).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
 async def test_delete_project_marks_metadata_deleted(seeded_ps):
     """delete_project keeps a deleted tombstone in projects.json."""
     svc, project_id = seeded_ps
 
-    mock_db = MagicMock()
+    mock_db = _mock_db_manager()
     mock_db.mark_deleted = MagicMock()
     with (
         patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock),
@@ -109,7 +162,7 @@ async def test_delete_project_marks_metadata_deleted(seeded_ps):
 @pytest.mark.asyncio
 async def test_delete_project_stops_when_worker_drain_times_out(seeded_ps):
     svc, project_id = seeded_ps
-    mock_db = MagicMock()
+    mock_db = _mock_db_manager()
     mock_db.mark_deleted = MagicMock()
     with (
         patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock) as cancel,
@@ -122,6 +175,25 @@ async def test_delete_project_stops_when_worker_drain_times_out(seeded_ps):
             await svc.delete_project(project_id)
 
     assert getattr(exc_info.value, "code", None) == "PROJECT_DRAIN_TIMEOUT"
+    rmdir.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_project_waits_for_open_database_work(seeded_ps):
+    svc, project_id = seeded_ps
+    mock_db = _mock_db_manager()
+    mock_db.wait_for_project_sessions.return_value = False
+    with (
+        patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock),
+        patch.object(svc, '_cleanup_project_resources', new_callable=AsyncMock),
+        patch.object(svc, '_delete_project_directory') as rmdir,
+        patch("app.database.manager.get_db_manager", new_callable=AsyncMock, return_value=mock_db),
+    ):
+        with pytest.raises(Exception) as exc_info:
+            await svc.delete_project(project_id)
+
+    assert getattr(exc_info.value, "code", None) == "PROJECT_DATABASE_DRAIN_TIMEOUT"
+    mock_db.mark_deleted.assert_not_called()
     rmdir.assert_not_called()
     assert json.loads(svc.PROJECTS_FILE.read_text())[project_id]["status"] == "deleting"
 
@@ -184,7 +256,7 @@ async def test_lifecycle_reconcile_converges_crashed_barriers(seeded_ps):
         reset_id: {"name": "Resetting", "status": "resetting"},
     }))
 
-    db_manager = MagicMock()
+    db_manager = _mock_db_manager()
     db_manager.reset_project_database = AsyncMock()
     with patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock) as cancel_library, \
          patch.object(svc, '_cleanup_project_resources', new_callable=AsyncMock) as cleanup, \
@@ -217,7 +289,7 @@ async def test_reconcile_keeps_barrier_when_resource_cleanup_fails(seeded_ps):
     async def fail_cleanup(pid):
         raise RuntimeError(f"resources remain for {pid}")
 
-    db_manager = MagicMock()
+    db_manager = _mock_db_manager()
     db_manager.reset_project_database = AsyncMock()
     with patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock), \
          patch.object(svc, '_cleanup_project_resources', new_callable=AsyncMock,
@@ -241,7 +313,7 @@ async def test_delete_project_removes_directory(seeded_ps):
     project_path = svc.USERDATA_DIR / project_id
     assert project_path.is_dir()
 
-    mock_db = MagicMock()
+    mock_db = _mock_db_manager()
     mock_db.mark_deleted = MagicMock()
     with (
         patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock),
@@ -260,7 +332,7 @@ async def test_reset_database_uses_barrier_and_restores_active(seeded_ps):
     """reset_database blocks new project work while DB files are removed."""
     svc, project_id = seeded_ps
 
-    mock_db = MagicMock()
+    mock_db = _mock_db_manager()
     mock_db.reset_project_database = AsyncMock()
 
     async def _assert_resetting(pid):
@@ -292,7 +364,7 @@ async def test_reset_database_uses_barrier_and_restores_active(seeded_ps):
 @pytest.mark.asyncio
 async def test_reset_library_drain_failure_keeps_resetting_barrier(seeded_ps):
     svc, project_id = seeded_ps
-    mock_db = MagicMock()
+    mock_db = _mock_db_manager()
     mock_db.reset_project_database = AsyncMock()
     with (
         patch.object(
@@ -306,6 +378,34 @@ async def test_reset_library_drain_failure_keeps_resetting_barrier(seeded_ps):
 
     assert json.loads(svc.PROJECTS_FILE.read_text())[project_id]["status"] == "resetting"
     mock_db.reset_project_database.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_library_cancel_db_failure_still_drains_live_handlers(seeded_ps):
+    svc, project_id = seeded_ps
+    from app.core.exceptions import DatabaseIncompatibleError
+
+    mock_background = MagicMock()
+    mock_background.cancel_project_tasks = AsyncMock(
+        side_effect=DatabaseIncompatibleError("unknown revision")
+    )
+    mock_runner = MagicMock()
+    mock_runner.wait_for_project = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "app.services.background_task_service.background_task_service",
+            mock_background,
+        ),
+        patch(
+            "app.services.background_task_service.library_task_runner",
+            mock_runner,
+        ),
+    ):
+        assert await svc._cancel_library_tasks(project_id) is True
+
+    mock_runner.cancel_project.assert_called_once_with(project_id)
+    mock_runner.wait_for_project.assert_awaited_once_with(project_id)
 
 
 # ---------------------------------------------------------------------------

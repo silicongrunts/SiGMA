@@ -6,12 +6,11 @@ branch, and the self-heal backstop that re-enqueues a document whose
 chunks were removed while the document still exists.
 """
 
-import json
 import threading
 from types import SimpleNamespace
 
 from app.core.config import settings
-from app.core.document_status import STATUS_COMPLETED
+from app.core.document_status import STATUS_COMPLETED, STATUS_INDEXING
 from app.database.unit_of_work import UnitOfWork
 from app.services import background_task_service as bts
 from app.services.rag_service import rag_service
@@ -174,11 +173,11 @@ async def test_phase_deletion_keeps_document_created_between_phases(project, mon
 
 
 # ---------------------------------------------------------------------------
-# Self-heal backstop: a removed doc that exists gets re-enqueued
+# Cleanup never starts a paid rebuild without user action
 # ---------------------------------------------------------------------------
 
 
-async def test_cleanup_reenqueues_existing_document_that_lost_chunks(
+async def test_cleanup_does_not_reenqueue_completed_document_that_lost_chunks(
     project, monkeypatch,
 ):
     doc = await _create_doc(project)
@@ -194,10 +193,28 @@ async def test_cleanup_reenqueues_existing_document_that_lost_chunks(
 
     await bts.background_task_service._cleanup_project_orphan_chunks(project)
 
+    assert await _claim_next(project) is None
+
+
+async def test_cleanup_reenqueues_active_indexing_document_that_lost_chunks(
+    project, monkeypatch,
+):
+    doc = await _create_doc(project, processing_status=STATUS_INDEXING)
+
+    async def fake_cleanup(_project_id, _provider):
+        return {doc.id}
+
+    async def fake_stale_cleanup(*_args):
+        return set()
+
+    monkeypatch.setattr(rag_service, "cleanup_orphans", fake_cleanup)
+    monkeypatch.setattr(rag_service, "cleanup_stale_generations", fake_stale_cleanup)
+
+    await bts.background_task_service._cleanup_project_orphan_chunks(project)
+
     task = await _claim_next(project)
     assert task is not None
     assert task.kind == bts.KIND_RAG_INDEX
-    assert json.loads(task.payload_json)["doc_id"] == doc.id
 
 
 async def test_cleanup_does_not_reenqueue_removed_missing_document(
@@ -217,7 +234,7 @@ async def test_cleanup_does_not_reenqueue_removed_missing_document(
     assert await _claim_next(project) is None
 
 
-async def test_legacy_chunk_without_revision_is_rebuilt_by_maintenance(
+async def test_legacy_chunk_without_revision_requires_explicit_rebuild(
     project, monkeypatch,
 ):
     doc = await _create_doc(project)
@@ -251,6 +268,4 @@ async def test_legacy_chunk_without_revision_is_rebuilt_by_maintenance(
 
     await bts.background_task_service._cleanup_project_orphan_chunks(project)
 
-    task = await _claim_next(project)
-    assert task is not None
-    assert task.kind == bts.KIND_RAG_INDEX
+    assert await _claim_next(project) is None

@@ -4,15 +4,19 @@ Covers the maintenance sweep's self-heal for an emptied collection and the
 clear, actionable error (plus rebuild recovery) for a damaged Chroma store.
 """
 
-import json
 from types import SimpleNamespace
 
 import pytest
 
-from app.core.document_status import STATUS_COMPLETED
+from app.core.document_status import (
+    STATUS_CANCELLING,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+)
 from app.core.exceptions import ServiceException
 from app.database.unit_of_work import UnitOfWork
 from app.services import background_task_service as bts
+from app.services.library_service import library_service
 from app.services.rag_service import rag_service
 
 
@@ -37,11 +41,11 @@ async def _claim_next(project_id):
 
 
 # ---------------------------------------------------------------------------
-# (a) Empty collection with completed content docs → sweep re-enqueues
+# (a) Empty collection with completed content docs → report only
 # ---------------------------------------------------------------------------
 
 
-async def test_sweep_reenqueues_completed_docs_when_collection_empty(project, monkeypatch):
+async def test_sweep_reports_empty_collection_without_reenqueueing(project, monkeypatch):
     doc = await _create_doc(project, content="indexable body")
 
     async def empty_collection(_project_id):
@@ -51,11 +55,11 @@ async def test_sweep_reenqueues_completed_docs_when_collection_empty(project, mo
 
     recovered = await bts.background_task_service._scan_library_project(project)
 
-    assert recovered >= 1
-    task = await _claim_next(project)
-    assert task is not None
-    assert task.kind == bts.KIND_RAG_INDEX
-    assert json.loads(task.payload_json)["doc_id"] == doc.id
+    assert recovered == 0
+    assert await _claim_next(project) is None
+
+    summary = await library_service.get_status_summary(project)
+    assert summary["rebuild_needed"] is True
 
 
 async def test_sweep_leaves_projects_with_indexed_chunks_alone(project, monkeypatch):
@@ -69,6 +73,43 @@ async def test_sweep_leaves_projects_with_indexed_chunks_alone(project, monkeypa
     recovered = await bts.background_task_service._scan_library_project(project)
 
     assert recovered == 0
+    assert await _claim_next(project) is None
+
+
+@pytest.mark.parametrize("status", [STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLING])
+async def test_non_active_documents_do_not_accept_implicit_enqueue(project, status):
+    doc = await _create_doc(project, content="indexable body", processing_status=status)
+
+    task_id = await bts.background_task_service.enqueue_rag_index(
+        project, doc.id, wake=False,
+    )
+
+    assert task_id is None
+    assert await _claim_next(project) is None
+
+
+async def test_terminal_task_does_not_receive_a_fresh_retry_budget(project):
+    doc = await _create_doc(
+        project,
+        content="indexable body",
+        processing_status="indexing",
+    )
+    task_id = await bts.background_task_service.enqueue_rag_index(
+        project, doc.id, wake=False,
+    )
+    async with UnitOfWork(project) as uow:
+        task = await uow.background_tasks.get_by_id(task_id)
+        task.status = "failed"
+        task.error = "retry budget exhausted"
+        await uow.commit()
+
+    await bts.background_task_service._scan_library_project(project)
+
+    async with UnitOfWork(project) as uow:
+        task = await uow.background_tasks.get_by_id(task_id)
+        fresh = await uow.library.get_by_id(doc.id)
+    assert task.status == "failed"
+    assert fresh.processing_status == "failed"
     assert await _claim_next(project) is None
 
 
@@ -183,6 +224,16 @@ def test_collection_count_raises_on_transient_chroma_error(tmp_path, monkeypatch
 
     with pytest.raises(RuntimeError, match="database is locked"):
         rag_service._sync_collection_count("p1")
+
+
+def test_collection_doc_ids_raises_on_transient_chroma_error(tmp_path, monkeypatch):
+    _stub_chroma_env(
+        tmp_path, monkeypatch,
+        _StubChromaClient(error=RuntimeError("database is locked")),
+    )
+
+    with pytest.raises(RuntimeError, match="database is locked"):
+        rag_service._sync_collection_doc_ids("p1")
 
 
 async def test_sweep_does_not_reenqueue_on_transient_count_error(project, monkeypatch):

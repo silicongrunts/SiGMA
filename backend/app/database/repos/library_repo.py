@@ -841,6 +841,7 @@ class LibraryRepository:
                 LibraryDocument.id,
                 LibraryDocument.processing_status,
                 LibraryDocument.processing_started_at,
+                LibraryDocument.revision,
             )
             .where(LibraryDocument.processing_status.in_(list(statuses)))
             .order_by(LibraryDocument.updated_at.desc())

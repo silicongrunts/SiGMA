@@ -125,6 +125,15 @@ class BackgroundTaskRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_by_dedupe_key(self, dedupe_key: str) -> Optional[BackgroundTask]:
+        result = await self._session.execute(
+            select(BackgroundTask)
+            .where(BackgroundTask.dedupe_key == dedupe_key)
+            .order_by(BackgroundTask.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def claim_next(
         self,
         *,

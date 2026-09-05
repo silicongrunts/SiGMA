@@ -195,6 +195,8 @@ async def _browser_navigate(
     mode: str = "dom",
     tab_id: str = "",
     wait_until: str = "domcontentloaded",
+    project_id: str = "",
+    session_id: str = "",
 ) -> str:
     """Navigate to a URL or search query."""
     mgr = get_browser_manager()
@@ -206,7 +208,8 @@ async def _browser_navigate(
 
         if tab_id:
             page = await _with_timeout(
-                mgr.get_page(tab_id), _TIMEOUT, f"get_page(tab={tab_id})"
+                mgr.get_page(tab_id, project_id=project_id, session_id=session_id),
+                _TIMEOUT, f"get_page(tab={tab_id})"
             )
             if isinstance(page, str):
                 return page
@@ -224,11 +227,14 @@ async def _browser_navigate(
             ):
                 page = active_page
                 tab_id = active_entry["id"]
+                mgr.claim_tab(tab_id, project_id=project_id, session_id=session_id)
                 await page.goto(target, wait_until=wait_until, timeout=_NAV_TIMEOUT_MS)
                 new_tab = False
             else:
                 result = await _with_timeout(
-                    mgr.create_page(target), _TIMEOUT, "create_page()"
+                    mgr.create_page(
+                        target, project_id=project_id, session_id=session_id,
+                    ), _TIMEOUT, "create_page()"
                 )
                 if isinstance(result, str):
                     return result
@@ -746,8 +752,13 @@ tool_registry.register(ToolDefinition(
         },
         "required": ["url"],
     },
-    call=lambda url, mode="dom", tab_id="", wait_until="domcontentloaded":
-        _dispatch(_browser_navigate(url, mode, tab_id, wait_until)),
+    call=lambda url, mode="dom", tab_id="", wait_until="domcontentloaded",
+               project_id="", session_id="":
+        _dispatch(_browser_navigate(
+            url, mode, tab_id, wait_until, project_id, session_id,
+        )),
+    requires_project_id=True,
+    requires_session_id=True,
     is_read_only=True,
 ))
 

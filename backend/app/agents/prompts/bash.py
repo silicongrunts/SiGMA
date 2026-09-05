@@ -11,6 +11,7 @@ Prefer dedicated tools over shell commands: glob for finding files, grep for con
 Usage:
 - Quote file paths containing spaces with double quotes.
 - timeout is seconds: default 120, max 600.
+- Commands are scoped to this call. Remaining background children are terminated when it ends; do not launch detached services or daemons.
 - Always provide a `description`: one short sentence stating what the command does and any risk or side effect (e.g. deletes files, writes outside the project, mutates git state). The user sees it when approving non-read-only commands.
 - Multiple commands: issue independent commands as separate parallel bash calls; chain dependent commands in one call with && (use ; only when later commands must run even if earlier ones fail). Do not separate commands with newlines (newlines inside quoted strings are fine).
 - To wait, use the sleep tool, not bash sleep.

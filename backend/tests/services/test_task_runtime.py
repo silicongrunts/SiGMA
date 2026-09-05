@@ -1236,6 +1236,44 @@ async def test_cancel_signals_running_source_for_cooperative_winddown(project):
     assert (await get_row(project, task_id))["status"] == "cancelled"
 
 
+async def test_cancel_hard_stops_source_after_grace(project, monkeypatch):
+    monkeypatch.setattr(task_runtime, "SHUTDOWN_GRACE_SECONDS", 0.05)
+    task_id = await make_queued(project)
+
+    def factory(cancel_event):
+        async def gen():
+            yield make_event("delta", {"content": "x"})
+            await asyncio.sleep(3600)
+        return gen()
+
+    task_runtime.launch(
+        task_id=task_id, project_id=project, source_factory=factory,
+    )
+    await wait_until_status(project, task_id, "running")
+
+    assert task_runtime.cancel(task_id) is True
+
+    await wait_until(lambda: stream_hub.get(task_id) is None)
+    assert (await get_row(project, task_id))["status"] == "cancelled"
+    assert task_id not in task_runtime._cancel_watchdogs
+
+
+async def test_wait_for_task_accepts_hard_cancelled_runner(monkeypatch):
+    started = asyncio.Event()
+
+    async def runner():
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(runner())
+    monkeypatch.setitem(task_runtime._tasks, "hard-cancel", task)
+    await started.wait()
+    waiter = asyncio.create_task(task_runtime.wait_for_task("hard-cancel"))
+    task.cancel()
+    assert await waiter is True
+    assert task.cancelled()
+
+
 async def test_shutdown_all_finalizes_cooperative_and_hard_cancelled_as_cancelled(
     project, monkeypatch,
 ):

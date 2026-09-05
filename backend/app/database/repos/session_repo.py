@@ -10,7 +10,13 @@ from sqlalchemy import select, update, delete as sql_delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Session, Message, Task, TaskState
+from app.database.repos.task_state_repo import TaskStateRepository
 from app.core.utils import generate_id, utcnow
+from app.core.exceptions import SessionNotFoundError, SessionDeletingError
+
+
+SESSION_STATUS_ACTIVE = "active"
+SESSION_STATUS_DELETING = "deleting"
 
 
 class SessionRepository:
@@ -68,6 +74,60 @@ class SessionRepository:
             select(Session).where(Session.id == session_id)
         )
         return result.scalar_one_or_none()
+
+    async def assert_writable(self, session_id: str) -> Session:
+        """Return a session that accepts new persistent work."""
+        db_session = await self.get_by_id(session_id)
+        if db_session is None:
+            raise SessionNotFoundError(session_id)
+        if db_session.lifecycle_status == SESSION_STATUS_DELETING:
+            raise SessionDeletingError(session_id)
+        return db_session
+
+    async def begin_delete(self, session_id: str, *, commit: bool = True) -> tuple[list[str], list[str]]:
+        """Install the deleting barrier and cancel descendant task rows."""
+        root = await self.get_by_id(session_id)
+        if root is None:
+            return [], []
+        session_ids = await self.collect_descendant_session_ids(session_id)
+        task_state = TaskStateRepository(self._session)
+        task_ids = await task_state.cancel_for_sessions(
+            session_ids, commit=False,
+        )
+        await self._session.execute(
+            update(Session)
+            .where(
+                Session.id.in_(session_ids),
+                Session.lifecycle_status == SESSION_STATUS_ACTIVE,
+            )
+            .values(lifecycle_status=SESSION_STATUS_DELETING)
+        )
+        if commit:
+            await self._session.commit()
+        return session_ids, task_ids
+
+    async def delete_marked(self, session_id: str) -> bool:
+        """Delete a session tree only after its durable barrier is present."""
+        root = await self.get_by_id(session_id)
+        if root is None:
+            return False
+        if root.lifecycle_status != SESSION_STATUS_DELETING:
+            raise SessionDeletingError(session_id)
+        return await self.delete(session_id)
+
+    async def list_deleting(self) -> list[str]:
+        """Return root sessions carrying a deletion barrier."""
+        result = await self._session.execute(
+            select(Session.id, Session.parent_session_id).where(
+                Session.lifecycle_status == SESSION_STATUS_DELETING,
+            )
+        )
+        rows = list(result)
+        deleting = {row.id for row in rows}
+        return [
+            row.id for row in rows
+            if row.parent_session_id not in deleting
+        ]
 
     async def list_all(
         self, include_archived: bool = False,
@@ -166,6 +226,17 @@ class SessionRepository:
         parent_tool_call_id: str = "",
     ) -> Session:
         """Create a hidden agent session. Not visible in session list UI."""
+        if parent_session_id:
+            claimed = await self._session.execute(
+                update(Session)
+                .where(
+                    Session.id == parent_session_id,
+                    Session.lifecycle_status == SESSION_STATUS_ACTIVE,
+                )
+                .values(updated_at=Session.updated_at)
+            )
+            if claimed.rowcount != 1:
+                await self.assert_writable(parent_session_id)
         title = f"Agent: {agent_type}"
         db_session = Session(
             title=title,

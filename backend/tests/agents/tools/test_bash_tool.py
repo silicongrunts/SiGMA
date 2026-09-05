@@ -270,3 +270,31 @@ async def test_run_bash_timeout_returns_within_timeout_not_command_duration(
     # Normal case: ~2s. If the bug regresses, elapsed ≈ 30s. The 15s bound
     # allows generous slack for CI load without masking a real regression.
     assert elapsed < 15, f"timeout did not bound elapsed time: {elapsed:.1f}s"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 2])
+async def test_normal_exit_also_cleans_background_group(returncode):
+    process = MagicMock(pid=4242, returncode=returncode)
+    process.communicate = AsyncMock(return_value=(b"output", b""))
+    with patch("app.agents.tools.bash.asyncio.create_subprocess_shell", return_value=process), \
+         patch("app.agents.tools.bash.os.killpg") as kill_group:
+        result = await _run_bash("proj", "background-command &")
+    kill_group.assert_called_once_with(4242, signal.SIGKILL)
+    assert f"exit code: {returncode}" in result
+
+
+@pytest.mark.asyncio
+async def test_communication_failure_still_cleans_process_and_pipes():
+    process = MagicMock(pid=4242, returncode=None)
+    process.communicate = AsyncMock(side_effect=OSError("pipe failed"))
+    process.wait = AsyncMock()
+    process.stdout._transport.is_closing.return_value = False
+    process.stderr._transport.is_closing.return_value = False
+    with patch("app.agents.tools.bash.asyncio.create_subprocess_shell", return_value=process), \
+         patch("app.agents.tools.bash.os.killpg") as kill_group:
+        result = await _run_bash("proj", "command")
+    kill_group.assert_called_once_with(4242, signal.SIGKILL)
+    process.stdout._transport.close.assert_called_once()
+    process.stderr._transport.close.assert_called_once()
+    assert "pipe failed" in result

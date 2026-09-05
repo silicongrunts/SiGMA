@@ -178,7 +178,7 @@ class BrowserManager:
         if self._pages and self._active_idx < len(self._pages):
             old_active_id = self._pages[self._active_idx]["id"]
 
-        old_by_url: dict[str, str] = {}  # url → tab_id
+        old_by_url: dict[str, collections.deque[dict]] = {}
         for entry in self._pages:
             page = entry["page"]
             try:
@@ -187,8 +187,7 @@ class BrowserManager:
                 logger.debug("Failed to read old browser tab URL", exc_info=True)
                 url = ""
             if url and url != "about:blank":
-                # Only keep first match (avoid duplicates)
-                old_by_url.setdefault(url, entry["id"])
+                old_by_url.setdefault(url, collections.deque()).append(entry)
 
         # Clear mutable state — but NOT _tab_counter (keep it increasing)
         self._pages.clear()
@@ -205,9 +204,16 @@ class BrowserManager:
                 except Exception:
                     logger.debug("Failed to read browser tab URL during reconnect", exc_info=True)
                     url = ""
-                matched_id = old_by_url.get(url) if url else None
+                matches = old_by_url.get(url) if url else None
+                matched = matches.popleft() if matches else None
+                matched_id = matched["id"] if matched else None
                 if matched_id and matched_id not in matched_old_ids:
-                    self._pages.append({"id": matched_id, "page": p})
+                    self._pages.append({
+                        "id": matched_id,
+                        "page": p,
+                        "project_id": matched.get("project_id", ""),
+                        "session_id": matched.get("session_id", ""),
+                    })
                     matched_old_ids.add(matched_id)
                     self._attach_listeners(p)
                 else:
@@ -305,7 +311,9 @@ class BrowserManager:
             raise BrowserNotConnectedError("No tabs. Navigate to a URL first.")
         return self._pages[self._active_idx]
 
-    async def get_page(self, tab_id: str | None = None):
+    async def get_page(
+        self, tab_id: str | None = None, *, project_id: str = "", session_id: str = "",
+    ):
         """Get a page by tab_id, or the active page if tab_id is None.
 
         Sets _active_idx to the requested tab and calls bringToFront
@@ -331,6 +339,9 @@ class BrowserManager:
 
         # If the page was closed externally (reaper or VNC user), remove it
         entry = self._pages[idx]
+        if project_id or session_id:
+            entry["project_id"] = project_id or entry.get("project_id", "")
+            entry["session_id"] = session_id or entry.get("session_id", "")
         page = entry["page"]
         if page.is_closed():
             closed_id = entry["id"]
@@ -344,7 +355,9 @@ class BrowserManager:
         await self._bring_to_front(page)
         return page
 
-    async def create_page(self, url: str | None = None) -> dict:
+    async def create_page(
+        self, url: str | None = None, *, project_id: str = "", session_id: str = "",
+    ) -> dict:
         """Create a new tab in the default context, optionally navigate.
 
         Returns {"id": "tab-N", "url": ..., "title": ...}
@@ -357,7 +370,10 @@ class BrowserManager:
 
         tid = f"tab-{self._tab_counter}"
         self._tab_counter += 1
-        self._pages.append({"id": tid, "page": page})
+        self._pages.append({
+            "id": tid, "page": page,
+            "project_id": project_id, "session_id": session_id,
+        })
         self._active_idx = len(self._pages) - 1
 
         self._attach_listeners(page)
@@ -368,6 +384,32 @@ class BrowserManager:
                             timeout=settings.BROWSER_TOOL_TIMEOUT * 1000)
 
         return {"id": tid, "url": page.url, "title": await page.title()}
+
+    async def close_owned_tabs(
+        self, *, project_id: str = "", session_ids: list[str] | None = None,
+    ) -> int:
+        """Close tabs owned by a project or any session in its tree."""
+        wanted_sessions = set(session_ids or [])
+        closed = 0
+        for entry in list(self._pages):
+            if (
+                (project_id and entry.get("project_id") == project_id)
+                or (wanted_sessions and entry.get("session_id") in wanted_sessions)
+            ):
+                try:
+                    await entry["page"].close()
+                except Exception:
+                    if not entry["page"].is_closed():
+                        raise
+                idx = self._find_tab(entry["id"])
+                if idx is not None:
+                    self._remove_closed_tab(idx)
+                closed += 1
+        return closed
+
+    async def cleanup_project(self, project_id: str) -> int:
+        """Close all tabs attributed to a project."""
+        return await self.close_owned_tabs(project_id=project_id)
 
     async def list_pages(self) -> list[dict]:
         """Return tab metadata for browser_pages tool.
@@ -448,6 +490,13 @@ class BrowserManager:
     def has_tab(self, tab_id: str) -> bool:
         """Return True if tab_id currently tracks a page."""
         return self._find_tab(tab_id) is not None
+
+    def claim_tab(self, tab_id: str, *, project_id: str = "", session_id: str = "") -> None:
+        """Attach minimal project/session ownership to an existing tab."""
+        idx = self._find_tab(tab_id)
+        if idx is not None:
+            self._pages[idx]["project_id"] = project_id
+            self._pages[idx]["session_id"] = session_id
 
     def available_tab_ids(self) -> list[str]:
         """Return IDs of all currently tracked tabs."""

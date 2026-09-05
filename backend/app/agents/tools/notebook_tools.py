@@ -9,7 +9,6 @@ that shared layer; in particular `ensure_cell_ids` is invoked from the write
 paths only, keeping `read_notebook_json` side-effect-free.
 """
 
-import asyncio
 from html import escape as _html_escape
 import re as _re
 
@@ -107,17 +106,6 @@ def _format_run_result(result: dict, warning: str = "") -> str:
         parts.append("(no output)")
 
     return "\n".join(parts)
-
-
-async def _wait_until_not_busy(jupyter_svc, kernel_id: str) -> str:
-    for _ in range(10):
-        await asyncio.sleep(0.5)
-        status = await jupyter_svc.get_kernel_status(kernel_id)
-        state = status.get("execution_state", "unknown")
-        if state != "busy":
-            return state
-    status = await jupyter_svc.get_kernel_status(kernel_id)
-    return status.get("execution_state", "unknown")
 
 
 # ── notebook_read ────────────────────────────────────────────────────
@@ -338,11 +326,8 @@ async def _notebook_run_cell(
         return "Error: Session has no kernel ID."
 
     if interrupt:
-        success = await jupyter_svc.interrupt_kernel(kernel_id)
-        if not success:
-            return "Error: Failed to send interrupt to kernel."
-        state = await _wait_until_not_busy(jupyter_svc, kernel_id)
-        return f"Kernel interrupted. Current state: {state}"
+        await jupyter_svc.stop_execution(kernel_id)
+        return "Kernel execution stopped."
 
     if not cell_id:
         return "Error: cell_id is required when not using interrupt mode."
@@ -371,11 +356,10 @@ async def _notebook_run_cell(
     if execution_state in ("dead", "unknown"):
         return f"Error: Kernel is not available (state: {execution_state}). Restart the notebook kernel and try again."
 
-    result = await jupyter_svc.execute_code(kernel_id, source, timeout=timeout)
-
-    if result.get("status") == "timeout":
-        await jupyter_svc.interrupt_kernel(kernel_id)
-        await _wait_until_not_busy(jupyter_svc, kernel_id)
+    result = await jupyter_svc.execute_code(
+        kernel_id, source, timeout=timeout,
+        project_id=project_id, session_id=session_id,
+    )
 
     result["traceback"] = _clean_traceback(result.get("traceback"))
     for output in result.get("outputs") or []:
@@ -531,6 +515,7 @@ tool_registry.register(ToolDefinition(
                 "type": "number",
                 "description": "Execution timeout in seconds (default 60; increase for long computations)",
                 "default": 60,
+                "exclusiveMinimum": 0,
             },
             "interrupt": {
                 "type": "boolean",

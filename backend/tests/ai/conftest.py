@@ -122,6 +122,8 @@ class FakeTaskStateRepo:
         self.get_by_id_calls.append(task_id)
         return self._row
 
+    async def cancel_for_sessions(self, session_ids, *, commit=True):
+        return []
 
 class _StagedSessionRow(SimpleNamespace):
     """Staged session row carrying a ``to_dict()`` like real repo rows."""
@@ -142,6 +144,19 @@ class FakeSessionRepo:
 
     async def get_by_id(self, session_id):
         return self.sessions.get(session_id)
+
+    async def assert_writable(self, session_id):
+        row = self.sessions.get(session_id)
+        return row
+
+    async def begin_delete(self, session_id, *, commit=True):
+        if session_id not in self.descendants:
+            return [], []
+        task_ids = []
+        return self.descendants[session_id], task_ids
+
+    async def delete_marked(self, session_id):
+        return await self.delete(session_id)
 
     async def collect_descendant_session_ids(self, session_id):
         return self.descendants[session_id]

@@ -33,9 +33,11 @@ from app.agents.tools.browser_tools import (
 class _FakePage:
     """Minimal stand-in for playwright.Page used by listener tests."""
 
-    def __init__(self):
+    def __init__(self, fail_close=False, url="about:blank"):
         self._listeners: dict[str, callable] = {}
         self._closed = False
+        self._fail_close = fail_close
+        self.url = url
 
     def on(self, event, callback):
         self._listeners[event] = callback
@@ -47,6 +49,82 @@ class _FakePage:
 
     def is_closed(self):
         return self._closed
+
+    async def close(self):
+        if self._fail_close:
+            raise RuntimeError("close failed")
+        self._closed = True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_if_running_does_not_create_an_operation_without_browser_thread():
+    from app.agents.tools import browser_thread
+
+    operation = MagicMock()
+    with patch.object(browser_thread, "_browser_thread", None):
+        assert await browser_thread.dispatch_if_running(operation) is None
+
+    operation.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_close_owned_tabs_only_removes_matching_sessions():
+    mgr = BrowserManager()
+    owned = _FakePage()
+    unrelated = _FakePage()
+    mgr._pages = [
+        {"id": "tab-0", "page": owned, "project_id": "p1", "session_id": "s1"},
+        {"id": "tab-1", "page": unrelated, "project_id": "p1", "session_id": "s2"},
+    ]
+
+    assert await mgr.close_owned_tabs(session_ids=["s1"]) == 1
+
+    assert owned.is_closed()
+    assert not unrelated.is_closed()
+    assert mgr.available_tab_ids() == ["tab-1"]
+
+
+@pytest.mark.asyncio
+async def test_close_owned_tabs_keeps_failed_tab_tracked_for_retry():
+    mgr = BrowserManager()
+    page = _FakePage(fail_close=True)
+    mgr._pages = [
+        {"id": "tab-0", "page": page, "project_id": "p1", "session_id": "s1"},
+    ]
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await mgr.close_owned_tabs(session_ids=["s1"])
+
+    assert mgr.available_tab_ids() == ["tab-0"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_preserves_ownership_for_duplicate_urls(monkeypatch):
+    mgr = BrowserManager()
+    mgr._pages = [
+        {"id": "tab-0", "page": _FakePage(url="https://example.com"),
+         "project_id": "p1", "session_id": "s1"},
+        {"id": "tab-1", "page": _FakePage(url="https://example.com"),
+         "project_id": "p1", "session_id": "s2"},
+    ]
+
+    browser = MagicMock()
+    browser.contexts = [MagicMock(pages=[
+        _FakePage(url="https://example.com"),
+        _FakePage(url="https://example.com"),
+    ])]
+    chromium = MagicMock()
+    chromium.connect_over_cdp = AsyncMock(return_value=browser)
+    mgr._pw = MagicMock(chromium=chromium)
+
+    monkeypatch.setattr(mgr, "_probe_cdp", AsyncMock(return_value=True))
+    monkeypatch.setattr(mgr, "_bring_to_front", AsyncMock())
+    monkeypatch.setattr("app.agents.tools.browser_manager.asyncio.sleep", AsyncMock())
+
+    await mgr._connect()
+
+    assert [entry["id"] for entry in mgr._pages] == ["tab-0", "tab-1"]
+    assert [entry["session_id"] for entry in mgr._pages] == ["s1", "s2"]
 
 
 class _FakeMsg:

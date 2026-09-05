@@ -58,6 +58,7 @@ from app.services.task_service import (
     unfinished_tasks,
 )
 from app.services.session_temp_service import session_temp_service
+from app.agents.tools.read_state import read_state_cache
 from app.models.requests import InteractionResponse
 
 logger = get_logger(__name__)
@@ -152,6 +153,7 @@ class AIService:
     async def _append_session_message(self, project_id: str, session_id: str, **message_fields):
         """Append one session message and touch the session atomically."""
         async def _operation(uow):
+            await uow.sessions.assert_writable(session_id)
             message = await uow.messages.stage_create(
                 session_id=session_id,
                 **message_fields,
@@ -171,6 +173,20 @@ class AIService:
             sessions = await uow.sessions.list_all(include_archived=include_archived)
             return [s.to_dict() for s in sessions]
 
+    async def reconcile_deleting_sessions(self, project_id: str) -> int:
+        """Retry durable session deletions left by a crash or failed cleanup."""
+        async with UnitOfWork(project_id) as uow:
+            roots = await uow.sessions.list_deleting()
+        for session_id in roots:
+            try:
+                await self.delete_session(project_id, session_id)
+            except Exception:
+                logger.warning(
+                    "Session deletion reconciliation remains blocked for %s",
+                    session_id, exc_info=True,
+                )
+        return len(roots)
+
     async def create_session(self, project_id: str) -> Dict:
         """Create a new session. Returns the session dict."""
         async with UnitOfWork(project_id) as uow:
@@ -189,6 +205,7 @@ class AIService:
             fields["is_archived"] = is_archived
         if fields:
             async with UnitOfWork(project_id) as uow:
+                await uow.sessions.assert_writable(session_id)
                 await uow.sessions.update(session_id, **fields)
 
     async def delete_session(self, project_id: str, session_id: str) -> None:
@@ -200,66 +217,54 @@ class AIService:
         """
         from app.services import task_runtime
 
-        session_ids: list[str] = []
-        for _ in range(MAX_RETRIES):
-            async with UnitOfWork(project_id) as uow:
-                session_ids = await uow.sessions.collect_descendant_session_ids(session_id)
-                active_tasks = []
-                for sid in session_ids:
-                    active = await uow.task_state.get_active_by_session(sid)
+        async with UnitOfWork(project_id, immediate=True) as uow:
+            session_ids, task_ids = await uow.sessions.begin_delete(session_id)
+            if session_ids and not task_ids:
+                for descendant_id in session_ids:
+                    active = await uow.task_state.get_active_by_session(descendant_id)
                     if active:
-                        active_tasks.append(active["task_id"])
+                        task_ids.append(active["task_id"])
+        if not session_ids:
+            raise SessionNotFoundError(session_id)
 
-            for task_id in active_tasks:
-                task_runtime.cancel(task_id)
-            drained = await asyncio.gather(
-                *(task_runtime.wait_for_task(task_id) for task_id in active_tasks),
-            )
-            if not all(drained):
-                raise TaskActiveError(task_id=active_tasks[drained.index(False)])
+        for task_id in task_ids:
+            if not task_runtime.cancel(task_id):
+                async with UnitOfWork(project_id) as uow:
+                    await uow.task_state.mark_cancelled(task_id)
+        drained = await asyncio.gather(
+            *(task_runtime.wait_for_task(task_id) for task_id in task_ids),
+        ) if task_ids else []
+        if drained and not all(drained):
+            raise TaskActiveError(task_id=task_ids[drained.index(False)])
 
-            async with UnitOfWork(project_id, immediate=True) as uow:
-                session_ids = await uow.sessions.collect_descendant_session_ids(session_id)
-                late_tasks = []
-                for sid in session_ids:
-                    active = await uow.task_state.get_active_by_session(sid)
-                    if active and task_runtime.cancel(active["task_id"]):
-                        late_tasks.append(active["task_id"])
+        from app.services.jupyter_service import get_jupyter
+        jupyter = get_jupyter()
+        if jupyter is not None:
+            await jupyter.stop_session_executions(project_id, session_ids)
 
-            if late_tasks:
-                drained = await asyncio.gather(
-                    *(task_runtime.wait_for_task(task_id) for task_id in late_tasks),
-                )
-                if not all(drained):
-                    raise TaskActiveError(task_id=late_tasks[drained.index(False)])
-                continue
+        try:
+            for sid in session_ids:
+                session_temp_service.delete_session_dir(project_id, sid)
+        except Exception as exc:
+            if isinstance(exc, FileSystemError):
+                raise
+            raise FileSystemError(
+                f"Could not remove temporary storage for session {session_id}; retry later.",
+                code="SESSION_TEMP_CLEANUP_FAILED",
+            ) from exc
 
-            try:
-                for sid in session_ids:
-                    session_temp_service.delete_session_dir(project_id, sid)
-            except Exception as exc:
-                if isinstance(exc, FileSystemError):
-                    raise
-                raise FileSystemError(
-                    f"Could not remove temporary storage for session {session_id}; retry later.",
-                    code="SESSION_TEMP_CLEANUP_FAILED",
-                ) from exc
+        from app.agents.tools.browser_manager import get_browser_manager
+        from app.agents.tools.browser_thread import dispatch_if_running
+        await dispatch_if_running(
+            lambda: get_browser_manager().close_owned_tabs(session_ids=session_ids)
+        )
+        read_state_cache.clear_many(session_ids)
 
-            async with UnitOfWork(project_id, immediate=True) as uow:
-                session_ids = await uow.sessions.collect_descendant_session_ids(session_id)
-                late_tasks = []
-                for sid in session_ids:
-                    active = await uow.task_state.get_active_by_session(sid)
-                    if active and task_runtime.cancel(active["task_id"]):
-                        late_tasks.append(active["task_id"])
-                if late_tasks:
-                    for task_id in late_tasks:
-                        task_runtime.cancel(task_id)
-                    continue
-                await uow.sessions.delete(session_id)
-            break
-        else:
-            raise TaskActiveError(task_id=session_id)
+        async with UnitOfWork(project_id, immediate=True) as uow:
+            _, late_task_ids = await uow.sessions.begin_delete(session_id)
+            for task_id in late_task_ids:
+                await uow.task_state.mark_cancelled(task_id)
+            await uow.sessions.delete_marked(session_id)
 
     async def fork_session(
         self, project_id: str, session_id: str, message_id: str, title: str = "",
@@ -281,6 +286,7 @@ class AIService:
                 raise SessionNotFoundError(session_id)
             if source.session_kind != "chat":
                 raise ValidationError("Only chat sessions can be forked")
+            await uow.sessions.assert_writable(session_id)
             active = await uow.task_state.get_active_by_session(session_id)
             if active:
                 raise TaskActiveError(task_id=active["task_id"])
@@ -336,6 +342,7 @@ class AIService:
             current_source = await uow.sessions.get_by_id(session_id)
             if current_source is None:
                 raise SessionNotFoundError(session_id)
+            await uow.sessions.assert_writable(session_id)
             if await uow.task_state.get_active_by_session(session_id):
                 raise TaskActiveError()
             current_messages = await uow.messages.get_messages(session_id)
@@ -584,6 +591,7 @@ class AIService:
                     # BEGIN IMMEDIATE transaction the delete commits in, so a
                     # concurrent claim insert is either visible to the guard
                     # or serializes after the cleared history.
+                    await uow.sessions.assert_writable(session_id)
                     active = await uow.task_state.get_active_by_session(session_id)
                     if active:
                         raise TaskActiveError(task_id=active["task_id"])
@@ -748,6 +756,8 @@ class AIService:
                             "Cannot resume: session not found in this project",
                         )
                     session_id = None
+                else:
+                    await uow.sessions.assert_writable(session_id)
             if session_id is None:
                 async with UnitOfWork(project_id) as uow:
                     db_session = await uow.sessions.create()
@@ -888,6 +898,7 @@ class AIService:
         for attempt in range(MAX_RETRIES):
             try:
                 async with UnitOfWork(project_id, immediate=True) as uow:
+                    await uow.sessions.assert_writable(session_id)
                     existing = await uow.task_state.get_active_by_session(session_id)
                     if existing and existing["task_id"] == task_id:
                         # A prior attempt's insert committed and only a later
@@ -983,6 +994,7 @@ class AIService:
         )
 
         async def _operation(uow):
+            await uow.sessions.assert_writable(session_id)
             await uow.messages.stage_truncate_from(session_id, target_seq)
             await uow.messages.stage_create(
                 session_id=session_id,

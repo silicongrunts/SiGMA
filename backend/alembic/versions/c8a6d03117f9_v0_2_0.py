@@ -225,6 +225,13 @@ def _upgrade_schema() -> None:
             server_default="0",
         )
 
+    if not _table_exists("file_deletions"):
+        op.create_table(
+            "file_deletions",
+            sa.Column("path", sa.String(length=1000), nullable=False),
+            sa.Column("is_directory", sa.Boolean(), nullable=False),
+            sa.PrimaryKeyConstraint("path", name="pk_file_deletions"),
+        )
     if not _table_exists("annotation_file_states"):
         op.create_table(
             "annotation_file_states",
@@ -258,11 +265,20 @@ def _upgrade_schema() -> None:
     # ``project_id`` columns (and their indexes) on ``sessions`` and
     # ``background_tasks`` are dead weight, and
     # ``library_documents.embedding_id`` was never used.
-    if "project_id" in _columns_of("sessions"):
+    session_columns = _columns_of("sessions")
+    if "project_id" in session_columns or "lifecycle_status" not in session_columns:
         with op.batch_alter_table("sessions") as batch_op:
             if _index_exists("ix_sessions_project_id"):
                 batch_op.drop_index("ix_sessions_project_id")
-            batch_op.drop_column("project_id")
+            if "project_id" in session_columns:
+                batch_op.drop_column("project_id")
+            if "lifecycle_status" not in session_columns:
+                batch_op.add_column(sa.Column(
+                    "lifecycle_status",
+                    sa.String(length=20),
+                    nullable=False,
+                    server_default="active",
+                ))
     if "project_id" in _columns_of("background_tasks"):
         with op.batch_alter_table("background_tasks") as batch_op:
             if _index_exists("ix_background_tasks_project_id"):
@@ -310,6 +326,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.drop_table("file_deletions")
     op.drop_index(
         "ix_annotation_file_transactions_file_path",
         table_name="annotation_file_transactions",
@@ -345,11 +362,12 @@ def downgrade() -> None:
     # Restore the columns dropped above. ADD COLUMN never rebuilds the
     # table, so no foreign-key/trigger dance is needed; rows migrated out
     # keep project_id="" (the value no longer matters — nothing reads it).
-    op.add_column(
-        "sessions",
-        sa.Column("project_id", sa.String(length=36), nullable=False,
-                  server_default=""),
-    )
+    with op.batch_alter_table("sessions") as batch_op:
+        batch_op.drop_column("lifecycle_status")
+        batch_op.add_column(
+            sa.Column("project_id", sa.String(length=36), nullable=False,
+                      server_default=""),
+        )
     op.create_index("ix_sessions_project_id", "sessions", ["project_id"],
                     unique=False)
     op.add_column(

@@ -34,6 +34,30 @@ async def test_delete_session_removes_descendant_temp_dirs(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_session_delete_retries_failed_notebook_cleanup(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    session_repo = FakeSessionRepo(descendants={"s1": ["agent-1", "s1"]})
+    temp = FakeSessionTempService()
+    _install(monkeypatch, session_repo, FakeTaskStateRepo(), temp)
+    stop = AsyncMock(side_effect=RuntimeError("kernel cleanup failed"))
+    monkeypatch.setattr(
+        "app.services.jupyter_service.get_jupyter",
+        lambda: SimpleNamespace(stop_session_executions=stop),
+    )
+    with pytest.raises(RuntimeError, match="kernel cleanup failed"):
+        await ai_service_module.ai_service.delete_session("p1", "s1")
+    assert session_repo.deleted == []
+    assert temp.deleted == []
+    stop.side_effect = None
+    await ai_service_module.ai_service.delete_session("p1", "s1")
+    stop.assert_awaited_with("p1", ["agent-1", "s1"])
+    assert session_repo.deleted == ["s1"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_delete_session_drains_active_descendant(monkeypatch):
     """An active task on any descendant session is cancelled before delete."""
     session_repo = FakeSessionRepo(descendants={"s1": ["agent-1", "s1"]})

@@ -236,10 +236,14 @@ class AnnotationService:
                 new_file_hash=new_hash, old_content=old_content,
                 mutations=json.dumps(mutations),
             )
-        write_result = await file_service.write_file(
-            project_id, file_path, content, expected_hash=expected_file_hash,
-            require_expected_hash=True,
-        )
+        async with UnitOfWork(project_id, immediate=True) as uow:
+            await uow.file_deletions.assert_available(file_path)
+            if await uow.annotations.get_transaction(transaction_id) is None:
+                raise AnnotationConflictError()
+            write_result = file_service.write_file_content(
+                project_id, file_path, content, expected_hash=expected_file_hash,
+                require_expected_hash=True,
+            )
         if write_result.get("conflict"):
             async with UnitOfWork(project_id, immediate=True) as uow:
                 await uow.annotations.delete_transaction(transaction_id)
@@ -258,6 +262,8 @@ class AnnotationService:
             ) from exc
         project_service.touch_project(project_id)
         await self._cleanup_annotation_task_state(project_id, delete_ids or [])
+        from app.services.snapshot_service import snapshot_service
+        await snapshot_service.maybe_snapshot(project_id)
         return {"success": True, "revision": next_state.revision, "fileHash": new_hash}
 
     async def _drain_annotation_tasks(
@@ -284,6 +290,7 @@ class AnnotationService:
     async def _cleanup_annotation_task_state(
         self, project_id: str, annotation_ids: List[str],
     ) -> None:
+        await self._drain_annotation_tasks(project_id, annotation_ids)
         for annotation_id in dict.fromkeys(annotation_ids):
             async with UnitOfWork(project_id) as uow:
                 await uow.task_state.delete_by_owner("annotation", annotation_id)
@@ -292,7 +299,7 @@ class AnnotationService:
         self, project_id: str, transaction,
     ) -> None:
         """Restore a failed save only while the journal version is on disk."""
-        await file_service.write_file(
+        file_service.write_file_content(
             project_id,
             transaction.file_path,
             transaction.old_content,
@@ -306,11 +313,15 @@ class AnnotationService:
         async with UnitOfWork(project_id) as uow:
             transactions = await uow.annotations.get_transactions()
         for transaction in transactions:
-            raw = await file_service.read_file(project_id, transaction.file_path)
-            disk_content = _text_content(raw)
-            disk_hash = file_service.compute_hash(disk_content)
-            mutations = json.loads(transaction.mutations)
             async with UnitOfWork(project_id, immediate=True) as uow:
+                if await uow.annotations.get_transaction(transaction.id) is None:
+                    continue
+                if await uow.file_deletions.is_deleting(transaction.file_path):
+                    continue
+                raw = await file_service.read_file(project_id, transaction.file_path)
+                disk_content = _text_content(raw)
+                disk_hash = file_service.compute_hash(disk_content)
+                mutations = json.loads(transaction.mutations)
                 state = await uow.annotations.get_file_state(transaction.file_path)
                 if disk_hash == transaction.expected_file_hash:
                     await uow.annotations.delete_transaction(transaction.id)
@@ -342,6 +353,10 @@ class AnnotationService:
                     continue
             if disk_hash == transaction.new_file_hash:
                 async with UnitOfWork(project_id, immediate=True) as uow:
+                    if await uow.annotations.get_transaction(transaction.id) is None:
+                        continue
+                    if await uow.file_deletions.is_deleting(transaction.file_path):
+                        continue
                     state = await uow.annotations.get_file_state(transaction.file_path)
                     is_other_mutation = state and (
                         state.revision > transaction.expected_revision
@@ -483,6 +498,8 @@ class AnnotationService:
                     details={"revision": state.revision, "fileHash": current_hash},
                 ) from exc
         await self._cleanup_annotation_task_state(project_id, [annotation_id])
+        from app.agents.tools.read_state import read_state_cache
+        read_state_cache.clear(f"annotation:{annotation_id}")
         project_service.touch_project(project_id)
         return {
             "deleted": True,
@@ -507,14 +524,16 @@ class AnnotationService:
         from app.services.annotation_loop import AnnotationLoop
         from app.services import task_runtime
 
+        if not project_service.is_project_active(project_id):
+            raise ValidationError("Project is unavailable")
+
         task_id = generate_id()
         try:
-            async with UnitOfWork(project_id) as uow:
-                # Terminal rows are never read back for an annotation
-                # (arbitration uses the partial unique index over runnable
-                # statuses only); prune the old ones so the table does not
-                # grow without bound.
-                await uow.task_state.prune_terminal_by_owner("annotation", annotation_id)
+            async with UnitOfWork(project_id, immediate=True) as uow:
+                annotation = await uow.annotations.get_by_id(annotation_id)
+                if annotation is None:
+                    raise ValidationError("Annotation no longer exists")
+                await uow.file_deletions.assert_available(annotation.file_path)
                 await uow.task_state.set_queued(
                     task_id,
                     task_type="annotation_reply",
@@ -531,6 +550,16 @@ class AnnotationService:
                 )
             raise TaskActiveError(
                 task_id=existing["task_id"] if existing else "",
+            )
+
+        try:
+            async with UnitOfWork(project_id) as uow:
+                await uow.task_state.prune_terminal_by_owner("annotation", annotation_id)
+        except Exception:
+            logger.debug(
+                "Terminal-row prune failed for annotation %s",
+                annotation_id,
+                exc_info=True,
             )
 
         try:

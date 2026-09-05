@@ -941,7 +941,19 @@ class ProjectService:
                 "Background task runtime is unavailable; lifecycle remains blocked.",
                 code="PROJECT_DRAIN_UNAVAILABLE",
             )
-        await background_task_service.cancel_project_tasks(project_id)
+        try:
+            await background_task_service.cancel_project_tasks(project_id)
+        except Exception:
+            # The durable barrier prevents new work. A corrupt or incompatible
+            # database must not prevent cancellation and draining of handlers
+            # that already exist in this process; reset/delete removes the
+            # unreadable files only after that drain completes.
+            logger.warning(
+                "Could not persist library cancellation for project %s; "
+                "draining live handlers instead",
+                project_id,
+                exc_info=True,
+            )
         library_task_runner.cancel_project(project_id)
         drained = await library_task_runner.wait_for_project(project_id)
         if not drained:
@@ -979,11 +991,18 @@ class ProjectService:
 
     async def _cleanup_project_resources(self, project_id: str) -> None:
         """Stop project-scoped interactive resources before destructive work."""
+        from app.agents.tools.browser_manager import get_browser_manager
+        from app.agents.tools.browser_thread import dispatch_if_running
+        from app.agents.tools.read_state import read_state_cache
         from app.services.terminal_service import terminal_service
 
         if terminal_service.list_project_sessions(project_id):
             await terminal_service.kill_project_sessions(project_id)
         await self._kill_project_kernels(project_id)
+        await dispatch_if_running(
+            lambda: get_browser_manager().cleanup_project(project_id)
+        )
+        read_state_cache.clear_under(self.USERDATA_DIR / project_id)
 
     async def _cleanup_worker_state(self, project_id: str) -> bool:
         """Cancel project tasks and report whether runners drained."""
@@ -1005,6 +1024,22 @@ class ProjectService:
             )
             return False
 
+    async def _wait_for_database_users(self, project_id: str, db_manager) -> None:
+        if not await db_manager.wait_for_project_sessions(project_id):
+            raise FileSystemError(
+                f"Project {project_id} still has active database work; retry later.",
+                code="PROJECT_DATABASE_DRAIN_TIMEOUT",
+            )
+
+    async def _wait_for_library_rebuild(self, project_id: str) -> None:
+        from app.services.library_service import library_service
+
+        if not await library_service.wait_for_rebuild(project_id):
+            raise FileSystemError(
+                f"Project {project_id} still has an index rebuild in progress; retry later.",
+                code="PROJECT_DRAIN_TIMEOUT",
+            )
+
     async def delete_project(self, project_id: str):
         """Delete a project after the durable barrier and resource drain."""
         from app.database.manager import get_db_manager
@@ -1012,17 +1047,17 @@ class ProjectService:
         self.mark_project_deleting(project_id)
 
         await self._cancel_library_tasks(project_id)
-
-        await self._cleanup_project_resources(project_id)
-
-        db_manager = await get_db_manager()
-        db_manager.mark_deleted(project_id)
-
+        await self._wait_for_library_rebuild(project_id)
         if not await self._cleanup_worker_state(project_id):
             raise FileSystemError(
                 f"Project {project_id} still has running task work; retry later.",
                 code="PROJECT_DRAIN_TIMEOUT",
             )
+        await self._cleanup_project_resources(project_id)
+
+        db_manager = await get_db_manager()
+        await self._wait_for_database_users(project_id, db_manager)
+        db_manager.mark_deleted(project_id)
 
         await self._evict_project_caches(project_id, db_manager)
         self._delete_project_directory(project_id)
@@ -1040,15 +1075,17 @@ class ProjectService:
         reset_succeeded = False
         try:
             await self._cancel_library_tasks(project_id)
-            await self._cleanup_project_resources(project_id)
+            await self._wait_for_library_rebuild(project_id)
             drained = await self._cleanup_worker_state(project_id)
             if not drained:
                 raise FileSystemError(
                     f"Project {project_id} still has running task work; retry later.",
                     code="PROJECT_DRAIN_TIMEOUT",
                 )
+            await self._cleanup_project_resources(project_id)
 
             db_manager = await get_db_manager()
+            await self._wait_for_database_users(project_id, db_manager)
             await self._evict_project_caches(project_id, db_manager)
             await db_manager.reset_project_database(project_id)
             logger.info("Reset database for project %s", project_id)
@@ -1058,7 +1095,12 @@ class ProjectService:
                 self.mark_project_active(project_id)
 
     async def reconcile_lifecycle(self) -> None:
-        """Retry interrupted barriers; failures leave them in place."""
+        """Retry interrupted barriers; failures leave them in place.
+
+        Recovery intentionally does not require a readable or migratable
+        database. The barrier is the durable ownership hand-off; after live
+        work is drained, reset/delete can remove the database files directly.
+        """
         from app.database.manager import get_db_manager
 
         projects = self._load_projects_readonly()
@@ -1069,14 +1111,16 @@ class ProjectService:
             if status == PROJECT_STATUS_DELETING:
                 try:
                     await self._cancel_library_tasks(project_id)
-                    await self._cleanup_project_resources(project_id)
-                    db_manager = await get_db_manager()
-                    db_manager.mark_deleted(project_id)
+                    await self._wait_for_library_rebuild(project_id)
                     if not await self._cleanup_worker_state(project_id):
                         raise FileSystemError(
                             f"Project {project_id} still has running task work; retry later.",
                             code="PROJECT_DRAIN_TIMEOUT",
                         )
+                    await self._cleanup_project_resources(project_id)
+                    db_manager = await get_db_manager()
+                    await self._wait_for_database_users(project_id, db_manager)
+                    db_manager.mark_deleted(project_id)
                     await self._evict_project_caches(project_id, db_manager)
                     self._delete_project_directory(project_id)
                     self.mark_project_deleted(project_id)
@@ -1088,13 +1132,15 @@ class ProjectService:
             elif status == PROJECT_STATUS_RESETTING:
                 try:
                     await self._cancel_library_tasks(project_id)
-                    await self._cleanup_project_resources(project_id)
+                    await self._wait_for_library_rebuild(project_id)
                     if not await self._cleanup_worker_state(project_id):
                         raise FileSystemError(
                             f"Project {project_id} still has running task work; retry later.",
                             code="PROJECT_DRAIN_TIMEOUT",
                         )
+                    await self._cleanup_project_resources(project_id)
                     db_manager = await get_db_manager()
+                    await self._wait_for_database_users(project_id, db_manager)
                     await self._evict_project_caches(project_id, db_manager)
                     await db_manager.reset_project_database(project_id)
                     self.mark_project_active(project_id)

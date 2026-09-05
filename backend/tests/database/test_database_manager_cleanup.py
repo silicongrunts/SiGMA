@@ -1,5 +1,6 @@
 import pytest
 
+from app.core import config as config_module
 from app.database.manager import DatabaseManager
 
 
@@ -33,3 +34,30 @@ async def test_cleanup_inactive_projects_disposes_cached_engines(monkeypatch):
     assert "old-project" not in manager._initialized
     assert "old-project" not in manager._engines
     assert "old-project" not in manager._makers
+
+
+@pytest.mark.asyncio
+async def test_reset_unlinks_unreadable_database_after_disposing_engine(tmp_path, monkeypatch):
+    root = tmp_path / "userdata"
+    db_path = root / "project-a" / ".SiGMA" / "project_data.db"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"not a sqlite database")
+    monkeypatch.setattr(config_module, "USERDATA_DIR", root)
+
+    manager = DatabaseManager()
+    disposed_while_file_exists = []
+
+    class FakeEngine:
+        async def dispose(self):
+            disposed_while_file_exists.append(db_path.exists())
+
+    manager._initialized.add("project-a")
+    manager._engines["project-a"] = FakeEngine()
+    manager._makers["project-a"] = object()
+
+    await manager.reset_project_database("project-a")
+
+    assert disposed_while_file_exists == [True]
+    assert not db_path.exists()
+    assert not db_path.with_name("project_data.db-wal").exists()
+    assert not db_path.with_name("project_data.db-shm").exists()

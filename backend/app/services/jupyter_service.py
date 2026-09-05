@@ -4,13 +4,16 @@ import secrets
 import asyncio
 import uuid
 import json as _json
+import math
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 import websockets
 
 from app.core.config import settings
+from app.core.async_cleanup import finish_cleanup
 from app.core.logging import get_logger
 from app.core.utils import to_iso, utcnow
 
@@ -18,6 +21,15 @@ logger = get_logger(__name__)
 
 # Maximum characters for collected execution output before truncation
 _MAX_EXECUTION_OUTPUT = 100_000
+_EXECUTION_INTERRUPT_GRACE = 3.0
+_EXECUTION_KILL_TIMEOUT = 5.0
+
+
+@dataclass
+class _KernelExecution:
+    project_id: str
+    session_id: str
+    running: bool = True
 
 
 class JupyterService:
@@ -35,6 +47,7 @@ class JupyterService:
         self.token = secrets.token_hex(16)
         self.process: Optional[subprocess.Popen] = None
         self._config_path: Optional[Path] = None
+        self._executions: dict[str, _KernelExecution] = {}
 
     # ------------------------------------------------------------------
     # URL helpers
@@ -351,6 +364,9 @@ class JupyterService:
                             raise JupyterKernelError(
                                 kernel_id, response.status_code, response.text,
                             )
+        for kernel_id, execution in list(self._executions.items()):
+            if execution.project_id == project_id and not execution.running:
+                self._executions.pop(kernel_id, None)
 
     async def kill_kernel(self, kernel_id: str) -> None:
         """Kill a specific kernel via Jupyter API."""
@@ -360,8 +376,52 @@ class JupyterService:
             resp = await client.delete(
                 self._api_url(f"kernels/{kernel_id}?token={self.token}")
             )
-        if resp.status_code >= 400:
+        if resp.status_code >= 400 and resp.status_code != 404:
             raise JupyterKernelError(kernel_id, resp.status_code, resp.text)
+        execution = self._executions.get(kernel_id)
+        if execution is not None and not execution.running:
+            self._executions.pop(kernel_id, None)
+
+    async def stop_execution(self, kernel_id: str) -> None:
+        """Interrupt one owned execution, then terminate a nonresponsive kernel."""
+        execution = self._executions.get(kernel_id)
+        async def interrupt_and_wait():
+            if not await self.interrupt_kernel(kernel_id):
+                return False
+            while True:
+                state = await self.get_kernel_status(kernel_id)
+                if state.get("execution_state") in ("idle", "dead"):
+                    return True
+                await asyncio.sleep(0.1)
+
+        try:
+            stopped = await asyncio.wait_for(
+                interrupt_and_wait(), timeout=_EXECUTION_INTERRUPT_GRACE,
+            )
+        except Exception:
+            logger.debug("Kernel interrupt did not finish for %s; escalating", kernel_id, exc_info=True)
+            stopped = False
+        if not stopped:
+            if self._executions.get(kernel_id) is not execution:
+                return
+            try:
+                await asyncio.wait_for(
+                    self.kill_kernel(kernel_id), timeout=_EXECUTION_KILL_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, httpx.HTTPError) as exc:
+                from app.core.exceptions import JupyterKernelError
+                raise JupyterKernelError(
+                    kernel_id, 503, "Kernel termination could not be confirmed; retry stop or restart the kernel.",
+                ) from exc
+        if execution is not None and not execution.running and self._executions.get(kernel_id) is execution:
+            self._executions.pop(kernel_id, None)
+
+    async def stop_session_executions(self, project_id: str, session_ids: list[str]) -> None:
+        """Retry unfinished cleanup before deleting an execution's owner."""
+        owners = set(session_ids)
+        for kernel_id, execution in list(self._executions.items()):
+            if execution.project_id == project_id and execution.session_id in owners:
+                await finish_cleanup(self.stop_execution(kernel_id))
 
     # ------------------------------------------------------------------
     # Code execution via WebSocket
@@ -369,12 +429,15 @@ class JupyterService:
 
     async def execute_code(
         self, kernel_id: str, code: str, timeout: float = 60.0,
+        *, project_id: str = "", session_id: str = "",
     ) -> dict:
         """Execute code on a Jupyter kernel via the WebSocket protocol.
 
         Returns a dict containing status, execution_count, and native
         Jupyter-compatible outputs.
         """
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Execution timeout must be a positive finite number of seconds")
         ws_url = self._ws_url(f"kernels/{kernel_id}/channels?token={self.token}")
 
         result = {
@@ -387,14 +450,18 @@ class JupyterService:
         }
 
         msg_id = str(uuid.uuid4())
-        session_id = str(uuid.uuid4())
+        if kernel_id in self._executions:
+            raise RuntimeError("Kernel execution is still active; stop or restart it before retrying.")
+        execution = _KernelExecution(project_id, session_id)
+        self._executions[kernel_id] = execution
+        protocol_session_id = str(uuid.uuid4())
 
         execute_request = {
             "header": {
                 "msg_id": msg_id,
                 "msg_type": "execute_request",
                 "username": "sigma",
-                "session": session_id,
+                "session": protocol_session_id,
                 "version": "5.4",
                 "date": to_iso(utcnow()),
             },
@@ -413,6 +480,8 @@ class JupyterService:
         }
 
         ws = None
+        request_sent = False
+        execution_finished = False
         try:
             ws = await websockets.connect(
                 ws_url,
@@ -422,6 +491,7 @@ class JupyterService:
                 close_timeout=5,
             )
 
+            request_sent = True
             await ws.send(_json.dumps(execute_request))
 
             async def _collect():
@@ -478,8 +548,10 @@ class JupyterService:
                         if content.get("status") == "error":
                             result["status"] = "error"
                         return
+                raise RuntimeError("Kernel connection ended before execution completed")
 
             await asyncio.wait_for(_collect(), timeout=timeout)
+            execution_finished = True
 
         except asyncio.TimeoutError:
             result["status"] = "timeout"
@@ -488,27 +560,6 @@ class JupyterService:
                 "name": "stderr",
                 "text": "[Execution timed out]\n",
             })
-            # Attempt to interrupt the kernel
-            if ws and ws.close_code is None:
-                try:
-                    interrupt = {
-                        "header": {
-                            "msg_id": str(uuid.uuid4()),
-                            "msg_type": "interrupt_request",
-                            "username": "sigma",
-                            "session": session_id,
-                            "version": "5.4",
-                            "date": to_iso(utcnow()),
-                        },
-                        "parent_header": {},
-                        "metadata": {},
-                        "content": {},
-                        "buffers": [],
-                        "channel": "control",
-                    }
-                    await ws.send(_json.dumps(interrupt))
-                except Exception:
-                    logger.debug("Failed to send Jupyter interrupt for kernel %s", kernel_id, exc_info=True)
         except websockets.ConnectionClosed:
             result["status"] = "error"
             result["error_name"] = "KernelDisconnected"
@@ -541,11 +592,23 @@ class JupyterService:
                 "traceback": [],
             })
         finally:
-            if ws and ws.close_code is None:
+            async def cleanup():
                 try:
-                    await ws.close()
-                except Exception:
-                    logger.debug("Failed to close Jupyter websocket for kernel %s", kernel_id, exc_info=True)
+                    if request_sent and not execution_finished:
+                        await self.stop_execution(kernel_id)
+                    if self._executions.get(kernel_id) is execution:
+                        self._executions.pop(kernel_id, None)
+                finally:
+                    if ws and ws.close_code is None:
+                        try:
+                            await asyncio.wait_for(ws.close(), timeout=2.0)
+                        except Exception:
+                            logger.debug("Failed to close Jupyter websocket for kernel %s", kernel_id, exc_info=True)
+
+            try:
+                await finish_cleanup(cleanup())
+            finally:
+                execution.running = False
 
         self._truncate_execution_outputs(result["outputs"])
 

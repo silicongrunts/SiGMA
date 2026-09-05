@@ -92,6 +92,12 @@ only where the API contract explicitly models them.
   recoverable or visibly terminal.
 - Persistent checkpoints and permission decisions never depend solely on
   process memory.
+- Tool completion includes resource cleanup. Shell commands are call-scoped;
+  Notebook cancellation interrupts the owned execution and escalates to kernel
+  termination after a bounded grace period.
+- File deletion persists its intent before draining annotation tasks. It removes
+  annotation messages, task state, and save journals together; startup and
+  periodic recovery retry interrupted deletions without starting model work.
 - Multi-worker or multi-replica deployment is forbidden until task ownership
   and stream coordination are redesigned for it.
 

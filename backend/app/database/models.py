@@ -73,6 +73,9 @@ class Session(Base):
         nullable=True, index=True,
     )
     parent_tool_call_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(20), default="active", nullable=False,
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
@@ -202,6 +205,13 @@ class AnnotationFileState(Base):
     revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     file_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class FileDeletion(Base):
+    __tablename__ = "file_deletions"
+
+    path: Mapped[str] = mapped_column(String(1000), primary_key=True)
+    is_directory: Mapped[bool] = mapped_column(Boolean, nullable=False)
 
 
 class AnnotationFileTransaction(Base):

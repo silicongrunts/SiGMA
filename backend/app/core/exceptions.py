@@ -126,6 +126,16 @@ class SessionNotFoundError(DatabaseException):
         )
 
 
+class SessionDeletingError(DatabaseException):
+    """A session has a durable deletion barrier and rejects new work."""
+
+    def __init__(self, session_id: str = ""):
+        super().__init__(
+            f"Session is being deleted: {session_id}" if session_id else "Session is being deleted",
+            code="SESSION_DELETING", status_code=409,
+        )
+
+
 class TaskStateUnavailableError(DatabaseException):
     """A task_state read failed, so task activity cannot be confirmed (HTTP 503).
 

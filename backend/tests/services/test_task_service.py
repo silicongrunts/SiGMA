@@ -19,6 +19,7 @@ def _make_mock_manager(db_session_factory):
         return db_session_factory()
 
     mock_manager.get_session = get_session
+    mock_manager.release_session = AsyncMock()
     return mock_manager
 
 

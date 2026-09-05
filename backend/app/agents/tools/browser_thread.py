@@ -148,3 +148,15 @@ def get_browser_thread() -> BrowserThread:
 async def dispatch(coro):
     """Schedule *coro* on the browser thread's event loop.  Awaitable."""
     return await get_browser_thread().dispatch(coro)
+
+
+async def dispatch_if_running(operation):
+    """Create and dispatch an operation only when the browser loop is live."""
+    if (
+        _browser_thread is None
+        or _browser_thread._loop is None
+        or _browser_thread._loop.is_closed()
+        or _browser_thread._shutting_down
+    ):
+        return None
+    return await _browser_thread.dispatch(operation())

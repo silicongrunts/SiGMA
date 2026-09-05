@@ -191,10 +191,7 @@ async def test_sweep_leaves_recent_cancelling_doc_in_place(project):
 
 
 async def test_sweep_unblocks_task_row_stuck_in_cancelling_past_its_lease(project):
-    """End to end: a CANCELLING task row whose runner died (expired lease, no
-    finalize possible) is terminalized by the sweep's recovery, so the
-    document's re-enqueue on the same dedupe key resets the row and the task
-    is claimable again instead of blocking the document forever."""
+    """A cancelled attempt never receives a hidden fresh retry budget."""
     doc = await _create_doc(
         project, content="indexable body", processing_status=STATUS_INDEXING,
     )
@@ -218,16 +215,15 @@ async def test_sweep_unblocks_task_row_stuck_in_cancelling_past_its_lease(projec
 
     await bts.background_task_service._scan_library_project(project)
 
-    # The recovery terminalized the stuck row, so the document's re-enqueue
-    # (same dedupe key) reset it and the task is claimable again.
+    # Recovery terminalizes the stuck row and makes the document visibly
+    # failed. A user-triggered reprocess is required for another paid attempt.
     async with UnitOfWork(project) as uow:
         task = await uow.background_tasks.claim_next(
             queue=bts.QUEUE_LIBRARY, owner="runner-2", lease_seconds=60,
         )
-    assert task is not None
-    assert task.id == claimed.id
-    assert task.status == "running"
-    assert task.attempt_count == 0  # a fresh run, not a leftover attempt
+        fresh = await uow.library.get_by_id(doc.id)
+    assert task is None
+    assert fresh.processing_status == "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +245,7 @@ async def test_status_check_failure_fails_index_task(project, monkeypatch):
     monkeypatch.setattr(index_builder, "_doc_gone_or_stale", broken_check)
 
     async def fake_index_document(_project_id, _doc_id, _content, title="",
-                                  description="", progress_callback=None,
-                                  should_continue=None, doc_revision=None,
+                                  description="", should_continue=None, doc_revision=None,
                                   index_generation=None):
         # Mimic the real pipeline: the check runs in a worker thread.
         await asyncio.get_running_loop().run_in_executor(None, should_continue)
@@ -269,13 +264,10 @@ async def test_status_check_failure_fails_index_task(project, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_heartbeat_loss_mid_indexing_stops_writes_and_leaves_no_stale_finalize(
+async def test_lease_loss_mid_indexing_stops_writes_and_leaves_no_stale_finalize(
     project, monkeypatch,
 ):
-    """When the heartbeat reports the lease was re-claimed mid-indexing, the
-    embedding loop must stop before writing more chunks, and the stale run
-    must leave the document status and the task row to the new claimant —
-    no chunk removal, no completion write, no task-row finalize."""
+    """A lease-loss signal stops writes and leaves state to the new claimant."""
     from app.services.library_task_protocol import RunningTaskContext
 
     doc = await _create_doc(
@@ -293,31 +285,20 @@ async def test_heartbeat_loss_mid_indexing_stops_writes_and_leaves_no_stale_fina
         owner=claimed.lease_owner, lease_seconds=60,
     )
 
-    async def lost_heartbeat():
-        return False  # the lease was re-claimed elsewhere
-
-    monkeypatch.setattr(ctx, "heartbeat", lost_heartbeat)
-
     writes = []
     stored = []
 
     async def fake_index_document(_project_id, _doc_id, _content, title="",
-                                  description="", progress_callback=None,
-                                  should_continue=None, doc_revision=None,
+                                  description="", should_continue=None, doc_revision=None,
                                   index_generation=None):
-        # Mimic the real pipeline: the stop check runs in a worker thread
-        # before each batch, the heartbeat runs after each batch's write,
-        # and the final store only happens if the loop ran to completion.
+        # The queue runner's heartbeat task signals lease loss through the
+        # shared cancel event; indexing checks it before every batch.
         loop = asyncio.get_running_loop()
         for _ in range(10):
             if not await loop.run_in_executor(None, should_continue):
                 break
             writes.append("chunk")
-            if progress_callback:
-                await loop.run_in_executor(None, progress_callback)
-                # The loop is idle here while the executor embeds the next
-                # batch, so the scheduled lease-loss signal is delivered.
-                await asyncio.sleep(0.01)
+            ctx.cancel_event.set()
         else:
             stored.append("store")
 
@@ -329,7 +310,7 @@ async def test_heartbeat_loss_mid_indexing_stops_writes_and_leaves_no_stale_fina
 
     assert completed is True
     assert ctx.cancel_event.is_set()
-    # Indexing stopped after the heartbeat reported the loss; the final
+    # Indexing stopped after the runner signalled the lease loss; the final
     # store never ran.
     assert writes == ["chunk"]
     assert stored == []
@@ -711,6 +692,30 @@ async def test_rebuild_index_waits_for_inflight_task_before_reset(project, monke
 
     assert "handler_finalized" in events
     assert events.index("handler_finalized") < events.index("reset_collection")
+
+
+async def test_concurrent_rebuild_is_rejected_before_duplicate_work(project, monkeypatch):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def claimed(project_id):
+        calls.append(project_id)
+        entered.set()
+        await release.wait()
+        return {"success": True, "status": "queued"}
+
+    monkeypatch.setattr(library_service, "_rebuild_index_claimed", claimed)
+
+    first = asyncio.create_task(library_service.rebuild_index(project))
+    await entered.wait()
+    second = await library_service.rebuild_index(project)
+    release.set()
+
+    assert await first == {"success": True, "status": "queued"}
+    assert second["success"] is False
+    assert second["status"] == "already_running"
+    assert calls == [project]
 
 
 # ---------------------------------------------------------------------------

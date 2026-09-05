@@ -31,7 +31,6 @@ from app.core.utils import utcnow
 
 logger = get_logger(__name__)
 
-
 def _utcnow_iso() -> str:
     """SQLite-compatible ISO timestamp for String-column storage.
 
@@ -84,6 +83,56 @@ class TaskStateRepository:
         )
         await self._session.execute(stmt)
         await self._session.commit()  # Required: raw execute() doesn't auto-commit in async sessions
+
+    async def cancel_for_sessions(
+        self, session_ids: list[str], *, commit: bool = True,
+    ) -> list[str]:
+        """Durably cancel every active task belonging to the sessions.
+
+        Runnable rows become ``cancelling`` so a live runner can wind down;
+        parked interaction rows become terminal immediately because they have
+        no runner. The update is guarded and idempotent.
+        """
+        if not session_ids:
+            return []
+        result = await self._session.execute(
+            select(TaskState.task_id).where(
+                TaskState.session_id.in_(session_ids),
+                TaskState.status.in_((
+                    STATUS_QUEUED, STATUS_RUNNING, STATUS_CANCELLING,
+                    STATUS_AWAITING_INPUT, STATUS_INTERACTION_CONSUMING,
+                    STATUS_INTERACTION_FAILED,
+                )),
+            )
+        )
+        task_ids = list(result.scalars().all())
+        now = _utcnow_iso()
+        await self._session.execute(
+            update(TaskState)
+            .where(
+                TaskState.session_id.in_(session_ids),
+                TaskState.status.in_((STATUS_QUEUED, STATUS_RUNNING, STATUS_CANCELLING)),
+            )
+            .values(status=STATUS_CANCELLING, updated_at=now)
+        )
+        await self._session.execute(
+            update(TaskState)
+            .where(
+                TaskState.session_id.in_(session_ids),
+                TaskState.status.in_((
+                    STATUS_AWAITING_INPUT, STATUS_INTERACTION_CONSUMING,
+                    STATUS_INTERACTION_FAILED,
+                )),
+            )
+            .values(
+                status=STATUS_CANCELLED,
+                interaction_state=None,
+                updated_at=now,
+            )
+        )
+        if commit:
+            await self._session.commit()
+        return task_ids
 
     async def mark_completed(self, task_id: str) -> None:
         """Mark a runnable task completed.
