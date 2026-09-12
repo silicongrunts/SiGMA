@@ -140,27 +140,44 @@ def with_complete_tool_results(messages: list[dict]) -> list[dict]:
     return out if changed else messages
 
 
-def _with_single_leading_system(messages: list[dict]) -> list[dict]:
-    """Fold every system message into a single leading one; copy if changed.
+# Appended when a request carries no user message at all. Legitimate
+# builders always include one, but system-only views can still reach this
+# boundary through unforeseen paths (e.g. a rebuilt history that starts at a
+# compaction boundary). Providers differ in how they reject such lists —
+# Responses-style endpoints answer with 400 "One of \"input\" or
+# \"previous_response_id\" or 'prompt' or 'conversation' must be provided" —
+# so the outbound boundary guarantees the shape instead of trusting callers.
+FALLBACK_USER_MESSAGE = (
+    "(No user message in this context. Continue with the task described in "
+    "the messages above.)"
+)
+
+
+def normalize_request_messages(messages: list[dict]) -> list[dict]:
+    """Enforce the outbound message contract: one leading system, >=1 user.
 
     Serving-side chat templates (strict Jinja templates behind
     OpenAI-compatible endpoints) may reject a system message in any position
-    but the first. SiGMA legitimately builds a second system message — the
-    compaction boundary summary sits right after the system prompt — so every
-    outbound call flattens system content, in original order, into the first
-    system message. Lists that already comply are passed through unchanged.
+    but the first, so every system message is folded — in original order —
+    into a single leading one. Message lists without any user message get a
+    fallback user message appended (see ``FALLBACK_USER_MESSAGE``). Lists
+    that already comply are passed through unchanged.
     """
     system_msgs = [m for m in messages if m.get("role") == "system"]
     first_is_system = bool(messages) and messages[0].get("role") == "system"
     if len(system_msgs) <= 1 and (not system_msgs or first_is_system):
-        return messages
-    merged = {
-        **system_msgs[0],
-        "content": "\n\n".join(
-            str(m.get("content") or "") for m in system_msgs if m.get("content")
-        ),
-    }
-    return [merged, *[m for m in messages if m.get("role") != "system"]]
+        normalized = messages
+    else:
+        merged = {
+            **system_msgs[0],
+            "content": "\n\n".join(
+                str(m.get("content") or "") for m in system_msgs if m.get("content")
+            ),
+        }
+        normalized = [merged, *[m for m in messages if m.get("role") != "system"]]
+    if not any(m.get("role") == "user" for m in normalized):
+        normalized = [*normalized, {"role": "user", "content": FALLBACK_USER_MESSAGE}]
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -357,7 +374,7 @@ class LLMService:
         payload = {
             "model": endpoint.litellm_model,
             "messages": with_complete_tool_results(
-                _with_single_leading_system(messages)
+                normalize_request_messages(messages)
             ),
             "stream": True,
             "stream_options": {"include_usage": True},
@@ -540,7 +557,7 @@ class LLMService:
             payload = {
                 "model": endpoint.litellm_model,
                 "messages": with_complete_tool_results(
-                    _with_single_leading_system(messages)
+                    normalize_request_messages(messages)
                 ),
                 "stream": stream,
                 "drop_params": True,

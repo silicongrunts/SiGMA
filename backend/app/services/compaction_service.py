@@ -377,10 +377,23 @@ class CompactionService:
 
     @staticmethod
     def _build_compacted_messages(messages: list[dict], boundary_content: str) -> list[dict]:
+        """Build the post-compaction view with the boundary as a user message.
+
+        The boundary must be ``user``, not ``system``: subagent loops (explore,
+        plan, fork) compact mid-turn and immediately issue the next LLM call
+        with only the system prompt and the boundary. A system-role boundary
+        leaves the request without any user message, which Responses-style
+        provider endpoints reject outright (400: one of ``input`` /
+        ``previous_response_id`` / ``prompt`` / ``conversation`` must be
+        provided). A user-role boundary also satisfies the outbound contract
+        of at least one user message per request (see
+        ``llm_service.normalize_request_messages``).
+        """
         system_messages = [m for m in messages if m.get("role") == "system"]
+        boundary = {"role": "user", "content": boundary_content}
         if system_messages:
-            return [system_messages[0], {"role": "system", "content": boundary_content}]
-        return [{"role": "system", "content": boundary_content}]
+            return [system_messages[0], boundary]
+        return [boundary]
 
     async def stage_session_boundary(
         self,
@@ -390,6 +403,13 @@ class CompactionService:
         usage: dict | None = None,
     ) -> None:
         """Stage the compaction boundary row.
+
+        The row keeps ``role="system"`` — UI timeline grouping and pagination
+        key on that shape — while every row→LLM-message conversion presents
+        boundary rows as user messages (see
+        ``LLMLoopRunner.entry_from_history`` and
+        ``AgentService._messages_from_history``), matching the in-memory
+        boundary view built by ``_build_compacted_messages``.
 
         ``usage`` is the summarization call's own token spend: the boundary
         row is the only durable place inside the turn that can carry it, so

@@ -146,7 +146,7 @@ async def test_compact_messages_builds_boundary_view(monkeypatch):
 
     assert result.messages == [
         {"role": "system", "content": "system prompt"},
-        {"role": "system", "content": result.boundary_content},
+        {"role": "user", "content": result.boundary_content},
     ]
     assert "Continue the user's latest request" in result.boundary_content
     assert "Current goal: finish the task." in result.boundary_content

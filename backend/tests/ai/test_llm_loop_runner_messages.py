@@ -16,6 +16,7 @@ import app.services.query_loop as query_loop_module
 from app.core.chat_attachments import render_image_refs_tag
 from app.core.config import ModelSettings, settings
 from app.services.agent_service import AgentService
+from app.services.llm_loop_runner import LLMLoopRunner
 from app.services.query_loop import QueryLoop
 from tests.ai.conftest import (
     FakeConfigRepo,
@@ -259,3 +260,40 @@ async def test_agent_persist_does_not_update_old_assistant_without_persisted_mar
 
     # Only a system message was passed; nothing should be persisted.
     assert fake_messages.created == []
+
+
+# ---------------------------------------------------------------------------
+# Compaction boundary rows are presented to the LLM as user messages
+# ---------------------------------------------------------------------------
+
+def _history_row(role: str, is_boundary: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        role=role, content="[passive] summary", tool_calls=None,
+        tool_call_id=None, reasoning_content=None, input_tokens=0,
+        is_boundary=is_boundary,
+    )
+
+
+def test_entry_from_history_maps_boundary_row_to_user():
+    entry = LLMLoopRunner.entry_from_history(
+        _history_row("system", is_boundary=True), "[passive] summary",
+    )
+    assert entry == {"role": "user", "content": "[passive] summary"}
+
+
+def test_entry_from_history_keeps_regular_system_row():
+    entry = LLMLoopRunner.entry_from_history(
+        _history_row("system", is_boundary=False), "system prompt",
+    )
+    assert entry == {"role": "system", "content": "system prompt"}
+
+
+def test_messages_from_history_maps_boundary_row_to_user():
+    messages, baseline = AgentService._messages_from_history(
+        "system prompt", [_history_row("system", is_boundary=True)],
+    )
+    assert messages == [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "[passive] summary"},
+    ]
+    assert baseline == {"input": 0, "index": 0}

@@ -1,7 +1,7 @@
 """Unit tests for llm_service with a fake litellm backend: stream delta
 parsing, retry/timeout and iterator-cleanup contracts, litellm error
-classification, and outbound payload shaping (system folding, tool-result
-pairing)."""
+classification, and outbound payload shaping (message normalization,
+tool-result pairing)."""
 
 import asyncio
 
@@ -12,8 +12,9 @@ from app.core.config import ModelSettings
 from app.core.exceptions import LLMException
 from app.core.exceptions import LLMTimeoutError
 from app.services.llm_service import LLMService
+from app.services.llm_service import FALLBACK_USER_MESSAGE
 from app.services.llm_service import INTERRUPTED_TOOL_RESULT
-from app.services.llm_service import _with_single_leading_system
+from app.services.llm_service import normalize_request_messages
 from app.services.llm_service import with_complete_tool_results
 
 
@@ -593,11 +594,12 @@ async def test_call_chat_text_omits_tools_when_none(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# System-message folding at the outbound boundary
+# Message normalization at the outbound boundary: one leading system message
+# and at least one user message per request.
 # ---------------------------------------------------------------------------
 
-def test_with_single_leading_system_merges_boundary_summary_into_prompt():
-    folded = _with_single_leading_system([
+def test_normalize_request_messages_merges_boundary_summary_into_prompt():
+    folded = normalize_request_messages([
         {"role": "system", "content": "system prompt"},
         {"role": "system", "content": "[passive] summary"},
         {"role": "user", "content": "hi"},
@@ -607,20 +609,42 @@ def test_with_single_leading_system_merges_boundary_summary_into_prompt():
     assert folded[1] == {"role": "user", "content": "hi"}
 
 
-def test_with_single_leading_system_passes_compliant_lists_through():
+def test_normalize_request_messages_passes_compliant_lists_through():
     leading_only = [{"role": "system", "content": "prompt"}, {"role": "user", "content": "hi"}]
-    assert _with_single_leading_system(leading_only) is leading_only
+    assert normalize_request_messages(leading_only) is leading_only
     no_system = [{"role": "user", "content": "hi"}]
-    assert _with_single_leading_system(no_system) is no_system
+    assert normalize_request_messages(no_system) is no_system
 
 
-def test_with_single_leading_system_promotes_lone_mid_list_system():
-    folded = _with_single_leading_system([
+def test_normalize_request_messages_promotes_lone_mid_list_system():
+    folded = normalize_request_messages([
         {"role": "user", "content": "hi"},
         {"role": "system", "content": "note"},
     ])
     assert [m["role"] for m in folded] == ["system", "user"]
     assert folded[0]["content"] == "note"
+
+
+def test_normalize_request_messages_appends_user_to_system_only_list():
+    # The shape a mid-turn compaction produced before the boundary became a
+    # user message: Responses-style endpoints reject it with an empty-input 400.
+    normalized = normalize_request_messages([
+        {"role": "system", "content": "system prompt"},
+        {"role": "system", "content": "[passive] summary"},
+    ])
+    assert [m["role"] for m in normalized] == ["system", "user"]
+    assert normalized[0]["content"] == "system prompt\n\n[passive] summary"
+    assert normalized[1] == {"role": "user", "content": FALLBACK_USER_MESSAGE}
+
+
+def test_normalize_request_messages_appends_user_after_tool_history():
+    normalized = normalize_request_messages([
+        {"role": "system", "content": "prompt"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "t1"}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "result"},
+    ])
+    assert [m["role"] for m in normalized] == ["system", "assistant", "tool", "user"]
+    assert normalized[-1] == {"role": "user", "content": FALLBACK_USER_MESSAGE}
 
 
 @pytest.mark.asyncio

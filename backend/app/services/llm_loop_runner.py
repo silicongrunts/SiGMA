@@ -1535,8 +1535,16 @@ class LLMLoopRunner:
         both walk the DB history and need the same tool_calls / tool_call_id /
         reasoning_content handling. ``content`` is the already-prepared text
         (the caller is responsible for image/attachment rewriting).
+
+        Persisted compaction boundary rows are staged with ``role="system"``
+        for UI timeline grouping, but the LLM must see the boundary as a user
+        message: the rebuild starts at the boundary, so a system-role boundary
+        can leave the request without any user message, which Responses-style
+        provider endpoints reject (see
+        ``CompactionService._build_compacted_messages``).
         """
-        entry = LLMLoopRunner.msg(msg.role, content)
+        role = "user" if getattr(msg, "is_boundary", False) else msg.role
+        entry = LLMLoopRunner.msg(role, content)
         if msg.tool_calls:
             try:
                 entry["tool_calls"] = json.loads(msg.tool_calls)

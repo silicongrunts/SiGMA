@@ -779,9 +779,14 @@ class AgentService:
         baseline = {"input": 0, "index": 0}
 
         for msg in history:
+            # Boundary rows are staged as system for UI grouping; the LLM
+            # sees the compaction boundary as a user message so the rebuilt
+            # array keeps a user message after it (see
+            # CompactionService._build_compacted_messages).
+            role = "user" if getattr(msg, "is_boundary", False) else msg.role
             if msg.role == "assistant" and (msg.input_tokens or 0) > 0:
                 baseline = {"input": msg.input_tokens, "index": len(messages)}
-            entry = LLMLoopRunner.msg(msg.role, msg.content)
+            entry = LLMLoopRunner.msg(role, msg.content)
             if msg.tool_calls:
                 try:
                     entry["tool_calls"] = json.loads(msg.tool_calls)
