@@ -264,6 +264,14 @@ def _line_number_for_chunk(full_text: str, chunk_text: str) -> int:
 class RAGService:
     """LlamaIndex-powered RAG with hybrid search + reranking."""
 
+    # chromadb caches clients in a process-global dict keyed by persist path
+    # and mutates that dict without a lock (check-then-act in
+    # _create_system_if_not_exists, pops in _release_system), so two threads
+    # opening the same store could crash with a KeyError inside chromadb.
+    # Every open in this service funnels through _open_chroma_store, so one
+    # lock around open/drop closes that window.
+    _chroma_store_lock = threading.RLock()
+
     def __init__(self):
         self._embed_model = None
         self._embedding_identity = None
@@ -428,8 +436,8 @@ class RAGService:
             # Evict from cache so next access creates fresh collection
             self._evict_project(project_id)
 
-    @staticmethod
-    def _drop_cached_chroma_system(chroma_dir: Path) -> None:
+    @classmethod
+    def _drop_cached_chroma_system(cls, chroma_dir: Path) -> None:
         """Drop chromadb's in-process cached system for this path.
 
         chromadb caches one system per persist directory; a store that
@@ -437,16 +445,20 @@ class RAGService:
         the recreated directory can be reopened in this process. The cache
         key is the persist directory for persistent local clients; a no-op
         pop keeps this safe across chroma versions.
+
+        Only the system entry is dropped. chromadb stops a system when its
+        refcount reaches zero, so removing the refcount entry would let the
+        next reference release stop a system that live clients still use.
         """
         try:
             from chromadb.api.shared_system_client import SharedSystemClient
-            SharedSystemClient._identifier_to_system.pop(str(chroma_dir), None)
-            SharedSystemClient._identifier_to_refcount.pop(str(chroma_dir), None)
+            with cls._chroma_store_lock:
+                SharedSystemClient._identifier_to_system.pop(str(chroma_dir), None)
         except Exception:
             logger.debug("Failed to drop cached chroma system", exc_info=True)
 
-    @staticmethod
-    def _open_chroma_store(project_id: str, chroma_dir: Path):
+    @classmethod
+    def _open_chroma_store(cls, project_id: str, chroma_dir: Path):
         """Open the project's persistent Chroma store.
 
         Raises a user-actionable ServiceException when the store cannot be
@@ -454,8 +466,20 @@ class RAGService:
         error; rebuilding the index removes and recreates the store.
         """
         import chromadb
+
+        def _open():
+            with cls._chroma_store_lock:
+                return chromadb.PersistentClient(path=str(chroma_dir))
+
         try:
-            return chromadb.PersistentClient(path=str(chroma_dir))
+            try:
+                return _open()
+            except KeyError:
+                # chromadb's client cache is an unlocked process-global dict;
+                # a concurrent release can drop the entry between chroma's
+                # membership check and its lookup. Nothing on disk was
+                # touched, so reopen once before calling the store damaged.
+                return _open()
         except Exception as exc:
             raise ServiceException(
                 "The RAG index store is damaged. Rebuild the index to "
