@@ -9,7 +9,8 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { MarkdownContent, ThinkingProcess, CompactSummaryNote, STREAM_RECOVERY_MAX_ATTEMPTS, STREAM_RECOVERY_DELAY_MS, isAgentToolName, streamStatusText, withTransientHint } from './ChatShared'
-import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Menu, Loader2, GitBranch, Search, AlertTriangle } from 'lucide-react'
+import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Loader2, GitBranch, Search, AlertTriangle } from 'lucide-react'
+import ContextPuck from './ContextPuck'
 import { toastError, toastSuccess } from './Toast'
 import { ModalOverlay, ConfirmModal } from './Modal'
 import ChatSearchModal from './ChatSearchModal'
@@ -29,6 +30,15 @@ function formatTokenCount(value) {
   if (n >= 1e3) return `${(n / 1e3).toFixed(1).replace(/\.0$/, '')}K`
   return String(n)
 }
+
+// Auto-approve categories in fixed display order — single source shared by
+// the ContextPuck dots, the hover legend, and the settings menu rows.
+const APPROVAL_CATEGORIES = [
+  { key: 'file_external', labelKey: 'permission.cat.fileExternal', descKey: 'permission.cat.fileExternalDesc' },
+  { key: 'file_internal', labelKey: 'permission.cat.fileInternal', descKey: 'permission.cat.fileInternalDesc' },
+  { key: 'bash', labelKey: 'permission.cat.bash', descKey: 'permission.cat.bashDesc' },
+  { key: 'notebook', labelKey: 'permission.cat.notebook', descKey: 'permission.cat.notebookDesc' },
+]
 
 // Mark a running tool step done; edit/write calls additionally carry the
 // backend's file_edit diff metadata for the timeline card.
@@ -2771,6 +2781,17 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   })()
   const skillActiveSafe = skillSuggestions.length > 0 ? Math.min(skillActiveIdx, skillSuggestions.length - 1) : 0
 
+  // Context gauge numbers. Fill is relative to the compaction threshold —
+  // the hard max only appears in the hover bubble's threshold-vs-max strip.
+  const ctxCurrent = contextStats ? Number(contextStats.current_tokens || 0) : 0
+  const ctxThreshold = contextStats ? Number(contextStats.compact_threshold || 0) : 0
+  const ctxMax = contextStats ? Number(contextStats.max_context_length || 0) : 0
+  const ctxRatio = ctxThreshold > 0 ? Math.min(100, (ctxCurrent / ctxThreshold) * 100) : 0
+  const ctxOver = ctxThreshold > 0 && ctxCurrent > ctxThreshold
+  const ctxPct = ctxThreshold > 0 ? ((ctxCurrent / ctxThreshold) * 100).toFixed(1) : '0.0'
+  const ctxPctOfMax = ctxMax > 0 ? Math.min(100, (ctxCurrent / ctxMax) * 100) : 0
+  const ctxThresholdPctOfMax = ctxMax > 0 ? Math.min(100, (ctxThreshold / ctxMax) * 100) : 0
+
   function applySlashSuggestion(command) {
     // Suggestions are only shown when the input is exactly `/` or `/word` with
     // nothing after, so we can replace the whole input.
@@ -3154,7 +3175,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         )}
       </div>
 
-      <div className="px-4 pt-4 pb-2 bg-white dark:bg-gray-900 border-t border-gray-100 dark:border-gray-800 space-y-3 shadow-[0_-10px_20px_rgba(0,0,0,0.02)]">
+      <div className="px-4 pt-2 pb-2 bg-white dark:bg-gray-900 border-t border-gray-100 dark:border-gray-800 space-y-3 shadow-[0_-10px_20px_rgba(0,0,0,0.02)]">
         {tokenBudget && (
           <div className="flex items-center justify-between rounded-xl border border-amber-100 dark:border-amber-800/50 bg-amber-50 dark:bg-amber-900/30 px-3 py-2 text-[10px] font-medium text-amber-700 dark:text-amber-300">
             <span>{t('chat.tokenBudget')}{formatTokenCount(tokenBudget)}{t('chat.tokenBudgetFor')}</span>
@@ -3236,153 +3257,167 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               </div>
             </div>
           )}
-          <div className="flex items-end gap-2 bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-2xl px-4 py-1.5 focus-within:ring-2 focus-within:ring-sigma-600/20 focus-within:bg-white dark:focus-within:bg-gray-900 transition-all">
-          <input
-            ref={imageInputRef}
-            type="file"
-            accept="image/png,image/jpeg,image/webp,image/gif"
-            multiple
-            className="hidden"
-            onChange={e => uploadImageFiles(e.target.files)}
-          />
-          <button
-            ref={autoApproveBtnRef}
-            onClick={() => {
-              const opening = !showAutoApproveMenu
-              setShowAutoApproveMenu(opening)
-              if (opening && autoApproveBtnRef.current) {
-                setSettingsPanel('main')
-                // Re-read from the backend on every open — the store is only a
-                // snapshot and other tabs / the dialog checkbox can change it.
-                if (currentProject) loadAutoApproveSettings(currentProject.id)
-                const rect = autoApproveBtnRef.current.getBoundingClientRect()
-                setAutoApproveMenuPos({
-                  bottom: window.innerHeight - rect.top + 4,
-                  left: Math.max(4, rect.left),
-                })
-              }
-            }}
-            className={`p-2 rounded-xl transition-colors flex-shrink-0 ${showAutoApproveMenu ? 'text-sigma-600 bg-sigma-50 dark:bg-sigma-600/20' : 'text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'}`}
-            title={t('chat.autoApproveSettings')}
-          >
-            <Menu className="w-4 h-4" />
-          </button>
-          {awaiting && dismissedAny && reopenTarget ? (
-            <button type="button"
-              onClick={() => setInteractionDismissed(false)}
-              className="flex-1 flex items-center justify-center text-sm font-medium text-sigma-600 dark:text-sigma-400 hover:text-sigma-700 dark:hover:text-sigma-300 cursor-pointer py-1.5 transition-colors">
-              {t('chat.reopenQuestion')}
-            </button>
-          ) : (
-          <textarea
-            ref={textareaRef}
-            disabled={awaiting}
-            value={chatInput}
-            onChange={e => { setChatInput(e.target.value); setSlashActiveIdx(0); setSkillActiveIdx(0); autoResizeTextarea() }}
-            onPaste={e => {
-              const images = imageFilesFromList(e.clipboardData?.files?.length ? e.clipboardData.files : e.clipboardData?.items)
-              if (images.length > 0) {
-                e.preventDefault()
-                uploadImageFiles(images)
-              }
-            }}
-            onDrop={e => {
-              const images = imageFilesFromList(e.dataTransfer?.files)
-              if (images.length > 0) {
-                e.preventDefault()
-                uploadImageFiles(images)
-              }
-            }}
-            onDragOver={e => {
-              if (imageFilesFromList(e.dataTransfer?.items || []).length > 0) e.preventDefault()
-            }}
-            onKeyDown={e => {
-              if (slashSuggestions.length > 0) {
-                if (e.key === 'Tab') {
-                  e.preventDefault()
-                  applySlashSuggestion(slashSuggestions[slashActiveSafe].command)
-                  return
-                }
-                if (e.key === 'ArrowDown') {
-                  e.preventDefault()
-                  setSlashActiveIdx(i => (i + 1) % slashSuggestions.length)
-                  return
-                }
-                if (e.key === 'ArrowUp') {
-                  e.preventDefault()
-                  setSlashActiveIdx(i => (i - 1 + slashSuggestions.length) % slashSuggestions.length)
-                  return
-                }
-              }
-              // Skill submenu navigation (mutually exclusive with the slash popup)
-              if (skillSuggestions.length > 0) {
-                if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
-                  e.preventDefault()
-                  applySkillSuggestion(skillSuggestions[skillActiveSafe].id)
-                  return
-                }
-                if (e.key === 'ArrowDown') {
-                  e.preventDefault()
-                  setSkillActiveIdx(i => (i + 1) % skillSuggestions.length)
-                  return
-                }
-                if (e.key === 'ArrowUp') {
-                  e.preventDefault()
-                  setSkillActiveIdx(i => (i - 1 + skillSuggestions.length) % skillSuggestions.length)
-                  return
-                }
-              }
-              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage() }
-            }}
-            onFocus={autoResizeTextarea}
-            placeholder={resolvedPlaceholder}
-            rows={1}
-            className="flex-1 bg-transparent text-sm outline-none py-1.5 resize-none max-h-[200px] overflow-y-auto text-gray-800 dark:text-gray-200 placeholder:text-gray-400 dark:placeholder:text-gray-500"
-          />
-          )}
-          <button onClick={isStreaming ? handleStop : awaiting ? handleCancelAwaiting : handleSendMessage}
-            disabled={isUploadingAttachment}
-            title={awaiting ? t('chat.cancelWaiting') : undefined}
-            className={`p-2 text-white rounded-xl transition-all active:scale-95 disabled:opacity-50 ${isStreaming || awaiting ? 'bg-red-500 hover:bg-red-600' : 'bg-sigma-600 hover:bg-sigma-700'}`}>
-            {isStreaming || awaiting ? <Square className="w-4 h-4" /> : isUploadingAttachment ? <RotateCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-          </button>
+          {/* Negative margins hang the row into the footer's side padding:
+              the puck 8px into the left, the input box 8px into the right,
+              so both edges sit 8px from the panel edge with a 3px seam
+              between them. The transparent border matches the input
+              container's 1px border and `block` avoids the inline-block
+              baseline gap, keeping tops and bottoms flush. */}
+          <div className="-mr-2 flex items-end gap-[3px]">
+            <div className="group/puck relative -ml-2 flex-shrink-0">
+              <button
+                ref={autoApproveBtnRef}
+                onClick={() => {
+                  const opening = !showAutoApproveMenu
+                  setShowAutoApproveMenu(opening)
+                  if (opening && autoApproveBtnRef.current) {
+                    setSettingsPanel('main')
+                    // Re-read from the backend on every open — the store is only a
+                    // snapshot and other tabs / the dialog checkbox can change it.
+                    if (currentProject) loadAutoApproveSettings(currentProject.id)
+                    const rect = autoApproveBtnRef.current.getBoundingClientRect()
+                    setAutoApproveMenuPos({
+                      bottom: window.innerHeight - rect.top + 4,
+                      left: Math.max(4, rect.left),
+                    })
+                  }
+                }}
+                aria-label={t('chat.autoApproveSettings')}
+                className={`block rounded-2xl border border-transparent transition-colors ${showAutoApproveMenu ? 'bg-sigma-50 dark:bg-sigma-600/20' : 'hover:bg-gray-100 dark:hover:bg-gray-800'}`}
+              >
+                <ContextPuck
+                  ratio={ctxRatio}
+                  over={ctxOver}
+                  categories={APPROVAL_CATEGORIES}
+                  approvals={autoApproveSettings}
+                  pendingKey={approvingCategory}
+                />
+              </button>
+              <div
+                role="tooltip"
+                className="pointer-events-none absolute bottom-full left-0 z-[90] mb-2 hidden w-max max-w-[280px] space-y-1 rounded-lg border border-gray-200 bg-gray-800 px-3 py-2 font-mono text-[11px] leading-relaxed text-gray-100 shadow-2xl group-hover/puck:block group-focus-within/puck:block dark:border-gray-700 dark:bg-gray-900"
+              >
+                {contextStats && (
+                  <>
+                    <div>{t('chat.ctxLength')}{formatTokenCount(ctxCurrent)} / {formatTokenCount(ctxThreshold)} ({ctxPct}%)</div>
+                    <div>{t('chat.threshold')}{formatTokenCount(ctxThreshold)}{t('chat.maxToken')}{formatTokenCount(ctxMax)}</div>
+                    <div className="relative h-1 overflow-hidden rounded-full bg-gray-600 dark:bg-gray-700">
+                      <div className="absolute inset-y-0 left-0 bg-blue-400" style={{ width: `${ctxPctOfMax}%` }} />
+                      <div className="absolute inset-y-0 w-px bg-gray-200 dark:bg-gray-300" style={{ left: `${ctxThresholdPctOfMax}%` }} />
+                    </div>
+                  </>
+                )}
+                <div className="flex flex-wrap gap-x-3 gap-y-0.5 pt-0.5">
+                  {APPROVAL_CATEGORIES.map(({ key, labelKey }) => {
+                    const on = autoApproveSettings[key] === true
+                    return (
+                      <span key={key} className="inline-flex items-center gap-1 whitespace-nowrap">
+                        <span className={on ? 'text-emerald-400' : 'text-gray-500 dark:text-gray-400'}>{on ? '●' : '○'}</span>
+                        {t(labelKey)}
+                      </span>
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+            <div className="flex min-w-0 flex-1 items-end gap-2 bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-2xl pl-4 pr-2 py-1.5 focus-within:ring-2 focus-within:ring-sigma-600/20 focus-within:bg-white dark:focus-within:bg-gray-900 transition-all">
+              <input
+                ref={imageInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                multiple
+                className="hidden"
+                onChange={e => uploadImageFiles(e.target.files)}
+              />
+              {awaiting && dismissedAny && reopenTarget ? (
+                <button type="button"
+                  onClick={() => setInteractionDismissed(false)}
+                  className="flex-1 flex items-center justify-center text-sm font-medium text-sigma-600 dark:text-sigma-400 hover:text-sigma-700 dark:hover:text-sigma-300 cursor-pointer py-1.5 transition-colors">
+                  {t('chat.reopenQuestion')}
+                </button>
+              ) : (
+              <textarea
+                ref={textareaRef}
+                disabled={awaiting}
+                value={chatInput}
+                onChange={e => { setChatInput(e.target.value); setSlashActiveIdx(0); setSkillActiveIdx(0); autoResizeTextarea() }}
+                onPaste={e => {
+                  const images = imageFilesFromList(e.clipboardData?.files?.length ? e.clipboardData.files : e.clipboardData?.items)
+                  if (images.length > 0) {
+                    e.preventDefault()
+                    uploadImageFiles(images)
+                  }
+                }}
+                onDrop={e => {
+                  const images = imageFilesFromList(e.dataTransfer?.files)
+                  if (images.length > 0) {
+                    e.preventDefault()
+                    uploadImageFiles(images)
+                  }
+                }}
+                onDragOver={e => {
+                  if (imageFilesFromList(e.dataTransfer?.items || []).length > 0) e.preventDefault()
+                }}
+                onKeyDown={e => {
+                  if (slashSuggestions.length > 0) {
+                    if (e.key === 'Tab') {
+                      e.preventDefault()
+                      applySlashSuggestion(slashSuggestions[slashActiveSafe].command)
+                      return
+                    }
+                    if (e.key === 'ArrowDown') {
+                      e.preventDefault()
+                      setSlashActiveIdx(i => (i + 1) % slashSuggestions.length)
+                      return
+                    }
+                    if (e.key === 'ArrowUp') {
+                      e.preventDefault()
+                      setSlashActiveIdx(i => (i - 1 + slashSuggestions.length) % slashSuggestions.length)
+                      return
+                    }
+                  }
+                  // Skill submenu navigation (mutually exclusive with the slash popup)
+                  if (skillSuggestions.length > 0) {
+                    if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+                      e.preventDefault()
+                      applySkillSuggestion(skillSuggestions[skillActiveSafe].id)
+                      return
+                    }
+                    if (e.key === 'ArrowDown') {
+                      e.preventDefault()
+                      setSkillActiveIdx(i => (i + 1) % skillSuggestions.length)
+                      return
+                    }
+                    if (e.key === 'ArrowUp') {
+                      e.preventDefault()
+                      setSkillActiveIdx(i => (i - 1 + skillSuggestions.length) % skillSuggestions.length)
+                      return
+                    }
+                  }
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage() }
+                }}
+                onFocus={autoResizeTextarea}
+                placeholder={resolvedPlaceholder}
+                rows={1}
+                className="flex-1 bg-transparent text-sm outline-none py-1.5 resize-none max-h-[200px] overflow-y-auto text-gray-800 dark:text-gray-200 placeholder:text-gray-400 dark:placeholder:text-gray-500"
+              />
+              )}
+              <button onClick={isStreaming ? handleStop : awaiting ? handleCancelAwaiting : handleSendMessage}
+                disabled={isUploadingAttachment}
+                title={awaiting ? t('chat.cancelWaiting') : undefined}
+                className={`p-2 text-white rounded-xl transition-all active:scale-95 disabled:opacity-50 ${isStreaming || awaiting ? 'bg-red-500 hover:bg-red-600' : 'bg-sigma-600 hover:bg-sigma-700'}`}>
+                {isStreaming || awaiting ? <Square className="w-4 h-4" /> : isUploadingAttachment ? <RotateCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+              </button>
+            </div>
           </div>
         </div>
       </div>
 
-      {/* ── Context usage bar (hover for exact numbers) ── */}
-      {contextStats && (() => {
-        const current = Number(contextStats.current_tokens || 0)
-        const threshold = Number(contextStats.compact_threshold || 0)
-        const max = Number(contextStats.max_context_length || 0)
-        const pct = max > 0 ? Math.min(100, (current / max) * 100) : 0
-        const thresholdPct = max > 0 ? Math.min(100, (threshold / max) * 100) : 0
-        return (
-          <div className="group/ctx relative flex-shrink-0 px-4 pb-2 cursor-help">
-            <div
-              role="tooltip"
-              className="pointer-events-none absolute bottom-full left-4 z-50 mb-1.5 hidden w-max max-w-[calc(100%-2rem)] space-y-0.5 group-hover/ctx:block rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-800 dark:bg-gray-900 px-3 py-2 text-[11px] font-mono leading-relaxed text-gray-100 shadow-2xl"
-            >
-              <div>{t('chat.ctxLength')}{formatTokenCount(current)} ({pct.toFixed(1)}%)</div>
-              <div>{t('chat.threshold')}{formatTokenCount(threshold)}{t('chat.maxToken')}{formatTokenCount(max)}</div>
-            </div>
-            <div className="relative h-2 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800">
-              <div className="absolute inset-y-0 left-0 bg-pink-200/70" style={{ width: '100%' }} />
-              <div className="absolute inset-y-0 left-0 bg-green-200/80" style={{ width: `${thresholdPct}%` }} />
-              <div className="absolute inset-y-0 left-0 bg-blue-300/80" style={{ width: `${pct}%` }} />
-            </div>
-          </div>
-        )
-      })()}
-
       {/* ── Auto-approve settings menu ── */}
       {showAutoApproveMenu && (() => {
-        const toolTypes = [
-          { key: 'file_external', label: t('permission.cat.fileExternal'), desc: t('permission.cat.fileExternalDesc') },
-          { key: 'file_internal', label: t('permission.cat.fileInternal'), desc: t('permission.cat.fileInternalDesc') },
-          { key: 'bash', label: t('permission.cat.bash'), desc: t('permission.cat.bashDesc') },
-          { key: 'notebook', label: t('permission.cat.notebook'), desc: t('permission.cat.notebookDesc') },
-        ]
+        const toolTypes = APPROVAL_CATEGORIES.map(({ key, labelKey, descKey }) => ({
+          key, label: t(labelKey), desc: t(descKey),
+        }))
         return (
           <div
             ref={autoApproveMenuRef}

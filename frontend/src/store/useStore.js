@@ -217,18 +217,23 @@ const actions = (set, get) => ({
   }),
   loadAutoApproveSettings: async (projectId) => {
     // Fetch the four-category flags from the backend. Called after project
-    // switch and whenever the ChatPanel settings menu opens. On failure, set
-    // autoApproveLoadFailed so the UI shows an explicit error instead of
-    // silently rendering an all-off display while the backend may be
-    // auto-approving writes.
+    // switch and whenever the ChatPanel settings menu opens. The result
+    // always lands in the per-project cache: on a fresh page load this
+    // fetch can resolve before the project request sets currentProject,
+    // and setCurrentProject seeds the live snapshot from this cache. The
+    // live snapshot itself is only written while projectId is still the
+    // current one, so a late response can never bleed another project's
+    // state into the UI. On failure, set autoApproveLoadFailed so the UI
+    // shows an explicit error instead of silently rendering an all-off
+    // display while the backend may be auto-approving writes.
     try {
       const data = await permissionsAPI.getAutoApprove(projectId)
       const settings = data || {}
-      if (useStore.getState().currentProject?.id !== projectId) return
       set(s => ({
-        autoApproveSettings: settings,
         autoApproveByProject: { ...s.autoApproveByProject, [projectId]: settings },
-        autoApproveLoadFailed: false,
+        ...(useStore.getState().currentProject?.id === projectId
+          ? { autoApproveSettings: settings, autoApproveLoadFailed: false }
+          : {}),
       }))
     } catch (e) {
       if (useStore.getState().currentProject?.id === projectId) {
