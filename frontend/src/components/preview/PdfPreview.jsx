@@ -21,8 +21,7 @@ const SCROLL_MARGIN = 12
  * The three branches are mutually exclusive and exhaustive, so a given state
  * always yields the same delta — callers re-invoke on every forward jump, so
  * the branches MUST be idempotent (a structure flipping between two positions
- * would oscillate forever). Mirrors Preview.jsx's scrollIntoViewMinimal intent
- * but works on a bare offset instead of a DOM element rect.
+ * would oscillate forever).
  */
 function scrollContainerToContainerOffset(container, targetTop) {
   const viewportH = container.clientHeight

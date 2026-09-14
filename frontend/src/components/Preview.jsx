@@ -158,31 +158,52 @@ function foldContainers(tokens) {
   return out
 }
 
-// Scroll `container` by the minimum amount needed to bring `el` fully into
-// view. If `el` is already visible, does nothing. Similar in intent to
-// element.scrollIntoView({ block: 'nearest' }) but operates within a single
-// scroll container (no ancestor scrolling, no horizontal change).
-//
-// The three branches are mutually exclusive and exhaustive, so a given
-// (container, el) state always yields the same delta. Callers re-invoke this
-// on every cursor move, so the branches MUST be idempotent — a structure that
-// flips between two positions across calls would oscillate forever.
-function scrollIntoViewMinimal(container, el) {
+// Write scrollTop synchronously, bypassing the container's scroll-smooth
+// class — with smooth behavior every write becomes an animation: sync
+// scrolling would trail the editor for the whole gesture and only catch up
+// after scrolling stops, and zoom anchoring would slide instead of pinning.
+function setScrollTopInstant(container, top) {
+  container.style.scrollBehavior = 'auto'
+  container.scrollTop = top
+  container.style.scrollBehavior = ''
+}
+
+// The scrollTop that would pin `el`'s top edge to the preview viewport's
+// top edge.
+function topEdgeScrollTop(container, el) {
   const cRect = container.getBoundingClientRect()
   const eRect = el.getBoundingClientRect()
-  const margin = 12  // breathing room so the highlight isn't flush against the edge
-  const targetTop = cRect.top + margin
-  const targetBottom = cRect.bottom - margin
-  if (eRect.top >= targetTop && eRect.bottom <= targetBottom) return  // already visible
-  if (eRect.height >= cRect.height - 2 * margin) {
-    // Taller than the viewport — the bottom constraint is unsatisfiable, so
-    // align the top; any other choice would oscillate on the next call.
-    container.scrollTop += eRect.top - targetTop
-  } else if (eRect.top < targetTop) {
-    container.scrollTop -= targetTop - eRect.top
-  } else {
-    container.scrollTop += eRect.bottom - targetBottom
-  }
+  return eRect.top - cRect.top + container.scrollTop
+}
+
+// Pin `el`'s top edge to the preview viewport's top edge. The editor reports
+// the source line at ITS top edge, so corresponding content then sits at the
+// same relative position in both panes — the property that makes anchor-based
+// sync scrolling feel exact.
+function scrollToTopEdge(container, el) {
+  setScrollTopInstant(container, topEdgeScrollTop(container, el))
+}
+
+// Line-level anchor inside a rendered code block. The renderer emits exactly
+// one gutter <li> per source code line, and the gutter's line metrics match
+// the code's (see index.css), so that <li> is a real element at the right
+// height — no pixel interpolation needed. `block` spans fenced code (its
+// startLine/endLine are the ``` fence lines) or indented code (every line is
+// content); the li count tells the variants apart. The closing fence shares
+// the last code line's anchor (there is no li for the fence itself).
+// Returns null when the block is not a code block or the li count matches
+// none of the shapes (e.g. a DOMPurify rewrite); the caller then falls back
+// to block-level mapping.
+function codeLineAnchor(block, n) {
+  const el = block.el
+  if (!el || el.tagName !== 'PRE' || !el.classList.contains('md-code-block')) return null
+  const lis = el.querySelectorAll(':scope > .md-code-gutter > li')
+  const span = block.endLine - block.startLine
+  const line = n - block.startLine
+  if (lis.length === span - 1 && line >= 1 && line <= span) return lis[Math.min(line, span - 1) - 1] ?? null  // fenced
+  if (lis.length === span + 1 && line >= 0 && line <= span) return lis[line] ?? null         // indented
+  if (lis.length === span && line >= 1 && line <= span) return lis[line - 1] ?? null         // unclosed fence
+  return null
 }
 
 const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine }, ref) => {
@@ -417,7 +438,11 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
     return () => revokePdfUrl()
   }, [revokePdfUrl])
 
-  useEffect(() => {
+  // Typeset math BEFORE paint: the render swaps the prose innerHTML with the
+  // math as raw text, and a passive effect would paint that shorter geometry
+  // first — every keystroke would visibly bounce raw → typeset → raw. Layout
+  // timing keeps each painted frame at the typeset geometry.
+  useLayoutEffect(() => {
     if (type === 'markdown' && containerRef.current) {
         const el = containerRef.current.querySelector('.prose')
         if (el) {
@@ -454,10 +479,12 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
     })
   }, [currentProjectId, previewStorageKey, type, pdf, numPages, mdContent])
 
-  // Build heading map for editor↔preview scroll sync.
-  // Pairs source line numbers with DOM heading elements so scrollToLine
-  // can interpolate positions between headings accurately.
-  useEffect(() => {
+  // Build heading map for editor↔preview scroll sync — the fallback when the
+  // precise block map fails validation. Pairs source line numbers with DOM
+  // heading elements in document order, bounded by el:null sentinels for the
+  // document top and bottom so every line resolves to a section. Layout
+  // effect for the same detached-element reason as the block map above.
+  useLayoutEffect(() => {
     if (type !== 'markdown' || !mdContent || !containerRef.current) {
       headingMapRef.current = []
       return
@@ -508,9 +535,9 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
   }, [type])
 
   // TOC "current section": the last heading above the container's top edge.
-  // Top-edge (not the cursor-sync upper-third anchor) because a just-clicked
-  // heading sits pinned at the top: anything short of the top edge lets the
-  // NEXT heading of a short section claim "current" immediately.
+  // Top-edge because a just-clicked heading sits pinned at the top: anything
+  // short of the top edge lets the NEXT heading of a short section claim
+  // "current" immediately.
   const computeTocCurrent = useCallback(() => {
     const container = containerRef.current
     if (!container) return
@@ -582,7 +609,15 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
   // know `$$`, so a multi-line math block tokenizes differently than the single
   // `<p>` it renders to), which fails the count-validation below and silently
   // disables precise highlight for any document containing math.
-  useEffect(() => {
+  //
+  // Layout-effect timing is load-bearing: the render swaps the prose
+  // innerHTML, and a passive effect would leave blockMapRef holding DETACHED
+  // elements until after paint. scrollToLine reads the map from scroll
+  // events, which can fire inside that window — detached elements measure as
+  // zero rects, so the interpolated target jumps by the container's viewport
+  // offset until the next event corrects it. A layout effect rebuilds the
+  // map in the same commit, before any event can observe it.
+  useLayoutEffect(() => {
     // Clear previous highlight
     for (const el of highlightedElsRef.current) el.classList.remove('md-highlight')
     highlightedElsRef.current = []
@@ -721,9 +756,10 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
     }
 
     // Re-apply the current highlight after the block map was rebuilt. Editing
-    // the document changes mdContent → this effect runs → line 479 clears the
-    // highlight. Without re-applying here, the highlight vanishes on every
-    // keystroke until the user moves the cursor again.
+    // the document changes mdContent → this effect re-runs and its clear step
+    // at the top removes the highlight. Without re-applying here, the
+    // highlight vanishes on every keystroke until the user moves the cursor
+    // again.
     const hl = currentHighlightLineRef.current
     if (hl != null) {
       const n = hl - 1
@@ -772,27 +808,51 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
       if (!container) return
       const n = line - 1  // CodeMirror lines are 1-indexed, source array is 0-indexed
 
-      // Primary: precise block map. Resolves to the exact <li> for list lines,
-      // avoiding the drift the heading-interpolation fallback suffers when one
-      // source line maps to uneven DOM heights (long/wrapping list items).
-      // Within a block we interpolate by source-line ratio, so multi-line
-      // paragraphs scroll continuously while list items snap to their bounds.
+      // Primary: precise block map. The editor reports the source line at
+      // its viewport's top edge; the preview maps it to a scrollTop that
+      // keeps corresponding content at the same relative position:
+      //  - Code blocks resolve to their line-number gutter <li> (one per
+      //    source line) — an exact anchor no matter how the lines render.
+      //  - Every other position interpolates by source line between the
+      //    tops of the surrounding blocks. Pinning only block tops would
+      //    make the mapping discontinuous: a top line sitting just above a
+      //    heading still belongs to the preceding block, and a top line
+      //    wobbling across a boundary (line-height churn while typing,
+      //    one-line scroll jitter) would teleport the preview by a whole
+      //    block. Line-proportional interpolation keeps the mapping
+      //    continuous; its error is bounded by one block and vanishes at
+      //    the anchors.
+      //  - Lists are pre-expanded per <li> in the map, so interpolation
+      //    within them spans a single item, not the whole list.
       const blocks = blockMapRef.current
       if (blocks.length > 0) {
-        for (const block of blocks) {
-          if (n >= block.startLine && n <= block.endLine) {
-            const cRect = container.getBoundingClientRect()
-            const eRect = block.el.getBoundingClientRect()
-            const elTop = eRect.top - cRect.top + container.scrollTop
-            const elH = eRect.height
-            const span = block.endLine - block.startLine
-            const within = span > 0 ? (n - block.startLine) / span : 0
-            const targetTop = elTop + within * elH
-            const anchor = cRect.height / 3  // rest the target near the upper third
-            container.scrollTop = Math.max(0, targetTop - anchor)
+        let ci = -1
+        while (ci + 1 < blocks.length && blocks[ci + 1].startLine <= n) ci++
+        const cur = ci >= 0 ? blocks[ci] : null
+        const next = blocks[ci + 1] ?? null
+        if (cur) {
+          const anchor = codeLineAnchor(cur, n)
+          if (anchor) {
+            scrollToTopEdge(container, anchor)
             return
           }
         }
+        // Interpolate between the surrounding anchors, with virtual
+        // document-start / document-bottom sentinels at the edges: lines
+        // before the first block sweep down from the top, and lines past
+        // the last block sweep toward the bottom (the very last line pins
+        // it, matching an editor scrolled to its own end).
+        const fromTop = cur ? topEdgeScrollTop(container, cur.el) : 0
+        const fromLine = cur ? cur.startLine : 0
+        const toTop = next
+          ? topEdgeScrollTop(container, next.el)
+          : Math.max(0, container.scrollHeight - container.clientHeight)
+        const toLine = next
+          ? next.startLine
+          : Math.max(fromLine + 1, (mdContent || '').split('\n').length - 1)
+        const t = Math.min(1, (n - fromLine) / (toLine - fromLine))
+        setScrollTopInstant(container, fromTop + t * (toTop - fromTop))
+        return
       }
 
       const map = headingMapRef.current
@@ -800,34 +860,35 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
       if (map.length < 3) {
         const totalLines = (mdContent || '').split('\n').length
         const maxScroll = container.scrollHeight - container.clientHeight
-        container.scrollTop = (n / Math.max(1, totalLines - 1)) * maxScroll
+        setScrollTopInstant(container, (n / Math.max(1, totalLines - 1)) * maxScroll)
         return
       }
-      // Binary search for the enclosing heading range
+      // Binary search for the last heading at-or-above n and pin that heading
+      // to the top edge. The leading sentinel (el: null) maps to the document
+      // top. Reaching the trailing sentinel's line means the editor is at its
+      // own bottom, so pin the preview's bottom — the same policy as the
+      // block-map path above.
+      if (n >= map[map.length - 1].srcLine) {
+        setScrollTopInstant(container, container.scrollHeight - container.clientHeight)
+        return
+      }
       let lo = 0, hi = map.length - 1
       while (lo < hi - 1) {
         const mid = (lo + hi) >> 1
         if (map[mid].srcLine <= n) lo = mid
         else hi = mid
       }
-      const from = map[lo], to = map[hi]
-      // Compute DOM positions on-demand (always correct after zoom/KaTeX changes)
-      const containerRect = container.getBoundingClientRect()
-      const fromTop = from.el
-        ? from.el.getBoundingClientRect().top - containerRect.top + container.scrollTop
-        : 0
-      const toTop = to.el
-        ? to.el.getBoundingClientRect().top - containerRect.top + container.scrollTop
-        : container.scrollHeight
-      // Interpolate
-      const lineRange = to.srcLine - from.srcLine
-      if (lineRange <= 0 || n <= from.srcLine) { container.scrollTop = fromTop; return }
-      if (n >= to.srcLine) { container.scrollTop = toTop; return }
-      container.scrollTop = fromTop + ((n - from.srcLine) / lineRange) * (toTop - fromTop)
+      const from = map[lo]
+      if (from.el) scrollToTopEdge(container, from.el)
+      else setScrollTopInstant(container, 0)
     },
-    // ensureVisible=false (sync scroll off) updates the highlight without the
-    // minimal bring-into-view scroll, so the preview stays where the user left it.
-    highlightLine: (line, { ensureVisible = true } = {}) => {
+    // Mirrors the editor cursor as a highlight. Deliberately never scrolls:
+    // with sync scrolling on, scrollToLine must stay the single writer of
+    // preview position. A second minimal-visibility writer here fought it —
+    // for a block taller than the viewport, reveal aligned the block's top
+    // while the pin tracked the cursor line, oscillating on every keystroke.
+    // With sync off, the preview stays exactly where the user left it.
+    highlightLine: (line) => {
       currentHighlightLineRef.current = line
       // Clear previous highlights
       for (const el of highlightedElsRef.current) el.classList.remove('md-highlight')
@@ -844,7 +905,6 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
           if (n >= block.startLine && n <= block.endLine) {
             block.el.classList.add('md-highlight')
             highlightedElsRef.current = [block.el]
-            if (ensureVisible) scrollIntoViewMinimal(container, block.el)
             return
           }
         }
@@ -888,7 +948,6 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
 
       target.classList.add('md-highlight')
       highlightedElsRef.current = [target]
-      if (ensureVisible) scrollIntoViewMinimal(container, target)
     }
   }))
 
@@ -951,8 +1010,7 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
   // cursor line for wheel). The intra-block offset is scaled by the block's
   // own height change, so a point mid-way through a long paragraph stays
   // mid-way even though wrapping shifted. Runs before paint, so the
-  // reposition is invisible; scrollBehavior is forced to auto because the
-  // container's scroll-smooth class would otherwise animate it.
+  // reposition is invisible.
   const prevZoomRef = useRef(zoomLevel)
   useLayoutEffect(() => {
     const prev = prevZoomRef.current
@@ -967,9 +1025,7 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
     const eRect = el.getBoundingClientRect()
     const elTop = eRect.top - cRect.top + container.scrollTop
     const scale = blockHeight > 0 ? eRect.height / blockHeight : 1
-    container.style.scrollBehavior = 'auto'
-    container.scrollTop = elTop + offsetInBlock * scale - viewportY
-    container.style.scrollBehavior = ''
+    setScrollTopInstant(container, elTop + offsetInBlock * scale - viewportY)
   }, [zoomLevel, type])
 
   useEffect(() => {

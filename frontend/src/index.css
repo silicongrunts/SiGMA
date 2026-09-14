@@ -367,27 +367,34 @@
 
 /* Highlight sync — mirrors editor cursor line in the preview.
    Applied to direct children of .prose (the rendered block elements).
-   `!important` ensures it overrides prose's element backgrounds. */
+   `!important` ensures it overrides prose's element backgrounds.
+   The marker strip is an inset box-shadow, NOT a border: a border narrows
+   the block's content box by 3px, rewraps its text, and flips its height,
+   so toggling the highlight bounced everything below it while typing. */
 .prose > .md-highlight {
   background-color: rgba(219, 234, 254, 0.45) !important;
-  border-left: 3px solid rgba(59, 130, 246, 0.35);
+  box-shadow: inset 3px 0 0 0 rgba(59, 130, 246, 0.35);
   border-radius: 2px;
-  transition: background-color 0.15s, border-color 0.15s;
+  transition: background-color 0.15s;
 }
 
 /* List items: the editor↔preview block map targets individual <li> elements,
    which are descendants of .prose rather than direct children, so the
-   highlight rule must reach them separately from .prose > .md-highlight. */
+   highlight rule must reach them separately from .prose > .md-highlight.
+   Inset strip for the same layout-invariance reason as above. */
 .prose li.md-highlight {
   background-color: rgba(219, 234, 254, 0.45) !important;
-  border-left: 3px solid rgba(59, 130, 246, 0.35);
+  box-shadow: inset 3px 0 0 0 rgba(59, 130, 246, 0.35);
   border-radius: 2px;
-  transition: background-color 0.15s, border-color 0.15s;
+  transition: background-color 0.15s;
 }
 
 /* Code blocks: the generic .md-highlight rule above forces a translucent blue
    background onto <pre>, which washes out the hljs code text. Keep the interior
-   dark (hljs github-dark = #0d1117) and signal the highlight via border only. */
+   dark (hljs github-dark = #0d1117) and signal the highlight via border only.
+   A real border is safe here, unlike in the rules above: code renders
+   white-space: pre, so the 3px never rewraps a line or flips the block's
+   height. */
 .prose > pre.md-highlight {
   background-color: #0d1117 !important;
   border-left: 3px solid rgba(96, 165, 250, 0.7) !important;

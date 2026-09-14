@@ -247,6 +247,11 @@ export default function SynthesisTab({
                   })
                 }}
                 onLineChange={(l) => {
+                  // Line numbers only mean something against the preview's
+                  // own source: opening another text file keeps the old
+                  // markdown preview on screen, and scrolling the editor
+                  // must not teleport that unrelated preview.
+                  if (useStore.getState().previewSource.path !== currentFile) return
                   if (currentFile?.endsWith('.md') && useStore.getState().mdSyncScroll && !mdEchoGuardRef.current) previewRef.current?.scrollToLine(l)
                 }}
                 onCursorChange={(cursor) => {
@@ -256,11 +261,10 @@ export default function SynthesisTab({
                     storage.setEditorCursor(projectId, currentFile, cursor)
                   })
                   if (currentFile.endsWith('.md')) {
-                    // Highlight always follows the cursor; the sync-scroll
-                    // toggle and the echo guard only gate preview scrolling
-                    // (both scrollToLine and the highlight's own
-                    // bring-into-view nudge).
-                    previewRef.current?.highlightLine(cursor.line, { ensureVisible: useStore.getState().mdSyncScroll && !mdEchoGuardRef.current })
+                    // Highlight always follows the cursor and never scrolls
+                    // the preview: with sync scrolling on, scrollToLine is
+                    // the single writer of preview position.
+                    previewRef.current?.highlightLine(cursor.line)
                   }
                 }}
                 onAnnoNavScroll={onAnnoNavScroll}

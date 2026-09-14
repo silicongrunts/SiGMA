@@ -977,7 +977,13 @@ const Editor = forwardRef(({ onContentChange, onScroll, onSave, onAutoSave, onLi
     ]
     const view = new EditorView({ state: EditorState.create({ doc: '', extensions }), parent: containerRef.current })
     view.scrollDOM.addEventListener('scroll', () => {
-        const topPos = view.scrollDOM.scrollTop; const lineBlock = view.lineBlockAtHeight(topPos); const lineNumber = view.state.doc.lineAt(lineBlock.from).number
+        const topPos = view.scrollDOM.scrollTop
+        // lineBlockAtHeight measures from the top of the first line while
+        // scrollTop measures from the scrollport edge, so lift the document's
+        // top padding: otherwise the reported line runs ahead of the one
+        // actually at the viewport's top edge.
+        const lineBlock = view.lineBlockAtHeight(Math.max(0, topPos - view.documentPadding.top))
+        const lineNumber = view.state.doc.lineAt(lineBlock.from).number
         callbacks.current.onLineChange?.(lineNumber); if (view.scrollDOM.scrollHeight > view.scrollDOM.clientHeight) callbacks.current.onScroll?.(topPos / (view.scrollDOM.scrollHeight - view.scrollDOM.clientHeight))
         // Button-driven scrolls set currentIndexRef via pure arithmetic and
         // stamp lastNavScrollAt. During free scrolling (outside the
