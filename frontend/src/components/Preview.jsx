@@ -8,15 +8,17 @@ import 'highlight.js/styles/github-dark.css'
 import DOMPurify from 'dompurify'
 import renderMathInElement from 'katex/dist/contrib/auto-render.mjs'
 import { useStore } from '../store/useStore'
+import i18n from '../i18n'
 import { filesAPI, compileAPI } from '../api'
 import { storage } from '../utils/storage'
 import { formatBytes } from '../utils/formatBytes'
 import { getCompiledPdfName } from '../utils/constants'
-import { toastError } from './Toast'
+import { toastError, toastSuccess } from './Toast'
 import { rewriteProjectImageSrc, decorateMarkdownLinks } from './ChatShared'
 import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
+import { copyToClipboard } from '../utils/clipboard'
 import PdfPreview from './preview/PdfPreview'
-import { ZoomIn, ZoomOut, ArrowUp, Maximize2, FileSearch, FileText, Download, AlertTriangle, ChevronLeft, ChevronRight } from 'lucide-react'
+import { ZoomIn, ZoomOut, ArrowUp, Maximize2, FileSearch, FileText, Download, AlertTriangle, ChevronLeft, ChevronRight, List } from 'lucide-react'
 
 // Dedicated marked instance for the editor preview pipeline, fully isolated
 // from the shared global `marked` singleton that ChatShared.jsx configures.
@@ -38,7 +40,63 @@ const previewMarked = new Marked(
       }
     },
   }),
+  {
+    // Wrap every fenced block with a copy button and a line-number gutter
+    // (both styled by index.css; the <ol> is aria-hidden because the numbers
+    // duplicate the code's own reading order). The gutter is an absolutely-
+    // positioned <ol> whose list numbers come from CSS counters, so emitted
+    // <li> elements carry no text.
+    renderer: {
+      code(code, infoString, escaped) {
+        // The language token lands inside a class attribute, so quote-escape
+        // it (the info string is arbitrary user text).
+        const lang = (infoString || '').match(/\S*/)[0]
+        const safeLang = lang.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+        const cls = lang ? ` class="hljs language-${safeLang}"` : ''
+        // markedHighlight's walkTokens has already swapped `code` for the
+        // highlight HTML (escaped=true), so it must never be treated as
+        // copyable source — the click handler reads the rendered <code>
+        // element's text instead. The trailing-newline strip + append keeps
+        // the emitted text at exactly one final newline, matching
+        // markedHighlight's own renderer.
+        const body = (escaped ? code : code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')).replace(/\n$/, '')
+        const lineCount = code.replace(/\n$/, '').split('\n').length
+        const items = Array.from({ length: lineCount }, () => '<li></li>').join('')
+        return (
+          `<pre class="md-code-block">` +
+          `<button type="button" class="pre-copy"></button>` +
+          `<code${cls}>${body}\n</code>` +
+          `<ol aria-hidden="true" class="md-code-gutter">${items}</ol>` +
+          `</pre>`
+        )
+      },
+    },
+  },
 )
+
+// Delegated handler for the copy buttons the renderer emits. Document-level
+// delegation keeps it working across re-renders without per-<pre> wiring.
+// Copy prefers a selection that starts and ends inside this block (partial
+// copy), and falls back to the block's rendered code text — the DOM strips
+// the highlight markup and decodes entities back to the exact source — when
+// nothing is selected.
+const mdCodeBlockActions = (e) => {
+  const copyBtn = e.target.closest?.('.pre-copy')
+  if (!copyBtn) return
+  const block = copyBtn.closest('.md-code-block')
+  const sel = document.getSelection()
+  let selected = ''
+  if (sel && sel.rangeCount > 0 && block) {
+    const range = sel.getRangeAt(0)
+    if (block.contains(range.startContainer) && block.contains(range.endContainer)) {
+      selected = sel.toString()
+    }
+  }
+  const codeText = block?.querySelector('code')?.textContent || ''
+  copyToClipboard(selected || codeText)
+    .then(() => toastSuccess(i18n.t('preview.copySuccess')))
+    .catch(() => toastError(i18n.t('preview.copyFailed')))
+}
 
 // Block-level HTML containers whose marked output NESTS inner blocks instead
 // of emitting them as siblings. E.g. `<details><summary>..</summary> <p>..</p>
@@ -151,6 +209,19 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
   const [editingPage, setEditingPage] = useState(false)
   const pageInputRef = useRef(null)
   const [containerWidth, setContainerWidth] = useState(0)
+  // Outline entries: [{ level, text, el }] in document order — same element
+  // list the heading map already consumes, plus level/text for the TOC UI.
+  const [outline, setOutline] = useState([])
+  const [tocOpen, setTocOpen] = useState(false)
+  // Index of the outline entry currently in view (-1 = none), live-updated
+  // while the popup is open so its row stays highlighted.
+  const [tocCurrent, setTocCurrent] = useState(-1)
+  const tocBtnRef = useRef(null)
+  const tocPopupRef = useRef(null)
+  const tocListRef = useRef(null)
+  // True while a TOC jump's smooth scroll is in flight; scroll events during
+  // it must not recompute the highlight (the clicked entry stays current).
+  const tocJumpingRef = useRef(false)
 
   // Derived view model — title and render branch both flow from previewSource.
   const previewKind = previewSource.kind
@@ -398,7 +469,7 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
       if (line.trimStart().startsWith('```')) { inCode = !inCode; return }
       if (!inCode && /^#{1,6}\s/.test(line)) srcLines.push(i)
     })
-    const domHeadings = containerRef.current.querySelectorAll('.prose h1,h2,h3,h4,h5,h6')
+    const domHeadings = containerRef.current.querySelectorAll('.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6')
     const count = Math.min(srcLines.length, domHeadings.length)
     const map = [{ srcLine: 0, el: null }]  // sentinel: top of document
     for (let i = 0; i < count; i++) {
@@ -407,6 +478,97 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
     map.push({ srcLine: lines.length - 1, el: null })  // sentinel: bottom
     headingMapRef.current = map
   }, [mdContent, type])
+
+  // Outline for the TOC sidebar: [{ level, text, el }] in document order.
+  // Same heading set the scroll-sync heading map above builds — one pass
+  // over the already-parsed DOM (no re-parsing of the markdown source).
+  useEffect(() => {
+    if (type !== 'markdown' || !mdContent || !containerRef.current) {
+      setOutline([])
+      // A popover left open would reappear when a later markdown file
+      // renders its outline — close it whenever the outline goes away.
+      setTocOpen(false)
+      return
+    }
+    const headings = containerRef.current.querySelectorAll('.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6')
+    setOutline(Array.from(headings, h => ({
+      level: Number(h.tagName[1]),
+      text: h.textContent,
+      el: h,
+    })))
+  }, [mdContent, type])
+
+  // Code-block extras (copy button, line-number gutter) are emitted by the
+  // renderer; its copy buttons run through one document-level listener. Only
+  // mounted while a markdown preview exists — the renderer is exclusive to it.
+  useEffect(() => {
+    if (type !== 'markdown') return
+    document.addEventListener('click', mdCodeBlockActions)
+    return () => document.removeEventListener('click', mdCodeBlockActions)
+  }, [type])
+
+  // TOC "current section": the last heading above the container's top edge.
+  // Top-edge (not the cursor-sync upper-third anchor) because a just-clicked
+  // heading sits pinned at the top: anything short of the top edge lets the
+  // NEXT heading of a short section claim "current" immediately.
+  const computeTocCurrent = useCallback(() => {
+    const container = containerRef.current
+    if (!container) return
+    const anchor = container.getBoundingClientRect().top + 2
+    let current = -1
+    for (let i = 0; i < outline.length; i++) {
+      const el = outline[i].el
+      if (!el || !el.isConnected) continue
+      if (el.getBoundingClientRect().top > anchor) break
+      current = i
+    }
+    setTocCurrent(current)
+  }, [outline])
+
+  useEffect(() => {
+    if (!tocOpen) return
+    computeTocCurrent()
+    const el = containerRef.current
+    if (!el) return
+    const onScroll = () => {
+      // A jump's smooth scroll passes through intermediate headings; without
+      // this gate the highlight flickers through them before settling.
+      if (tocJumpingRef.current) return
+      computeTocCurrent()
+    }
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [tocOpen, computeTocCurrent])
+
+  // One-shot: reveal the current entry when the list opens. Computed by hand
+  // and applied only to the popup's own list — native scrollIntoView() would
+  // also scroll every programmatic-scrollable ancestor and shift the preview.
+  useEffect(() => {
+    if (!tocOpen || tocCurrent < 0) return
+    const list = tocListRef.current
+    const row = list?.children[tocCurrent]
+    if (!list || !row) return
+    list.scrollTop = row.offsetTop - list.offsetTop + row.offsetHeight / 2 - list.clientHeight / 2
+  }, [tocOpen, tocCurrent])
+
+  // TOC popup dismissal. Escape closes; outside mousedown closes unless the
+  // press landed inside the popup or on the toggle button itself (which owns
+  // its own toggle, so treating it as "outside" here would close-then-reopen).
+  useEffect(() => {
+    if (!tocOpen) return
+    const onKey = (e) => { if (e.key === 'Escape') setTocOpen(false) }
+    window.addEventListener('keydown', onKey)
+    const onMouseDown = (e) => {
+      const target = e.target
+      if (tocPopupRef.current?.contains(target) || tocBtnRef.current?.contains(target)) return
+      setTocOpen(false)
+    }
+    document.addEventListener('mousedown', onMouseDown)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      document.removeEventListener('mousedown', onMouseDown)
+    }
+  }, [tocOpen])
 
   // Build precise block map using marked.lexer() + indexOf character tracking.
   // Each token's raw text is located in the placeholder text via indexOf, then
@@ -907,6 +1069,62 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
               </button>
             </div>
           )}
+          {type === 'markdown' && (
+            <div className="relative">
+              <button
+                ref={tocBtnRef}
+                onClick={() => setTocOpen(o => !o)}
+                disabled={outline.length === 0}
+                title={t('preview.toggleToc')}
+                aria-label={t('preview.toggleToc')}
+                aria-expanded={tocOpen}
+                className={`p-0.5 rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent ${
+                  tocOpen
+                    ? 'text-sigma-600 dark:text-sigma-200 bg-sigma-50 dark:bg-sigma-600/20'
+                    : 'text-gray-400 dark:text-gray-500 hover:text-sigma-600 hover:bg-sigma-50 dark:hover:bg-sigma-600/20'
+                }`}
+              >
+                <List className="w-3.5 h-3.5" />
+              </button>
+              {tocOpen && outline.length > 0 && (
+                <div
+                  ref={tocPopupRef}
+                  className="absolute right-0 top-6 z-30 w-64 max-w-[calc(100vw_-_80px)] animate-in fade-in zoom-in duration-150"
+                >
+                  <div ref={tocListRef} className="max-h-[min(320px,50vh)] overflow-y-auto rounded-2xl bg-white/95 dark:bg-gray-900/95 shadow-[0_8px_30px_rgba(0,0,0,0.12)] border border-gray-100 dark:border-gray-800 p-1.5 flex flex-col gap-0.5">
+                    {outline.map((item, i) => (
+                      <button
+                        key={i}
+                        title={item.text}
+                        style={{ paddingLeft: `${0.625 + (item.level - 1) * 0.75}rem` }}
+                        onClick={() => {
+                          const container = containerRef.current
+                          if (!item.el || !container) return
+                          // Optimistically highlight the destination, then
+                          // hold the live-recompute gate through the smooth
+                          // scroll so intermediate sections don't flash by.
+                          setTocCurrent(i)
+                          tocJumpingRef.current = true
+                          const cRect = container.getBoundingClientRect()
+                          const eRect = item.el.getBoundingClientRect()
+                          container.scrollTo({ top: container.scrollTop + eRect.top - cRect.top - 12, behavior: 'smooth' })
+                          clearTimeout(tocJumpingRef.timer)
+                          tocJumpingRef.timer = setTimeout(() => { tocJumpingRef.current = false }, 600)
+                        }}
+                        className={`w-full pr-2.5 py-1.5 rounded-lg text-left transition-colors ${
+                          i === tocCurrent
+                            ? 'bg-sigma-100 dark:bg-sigma-600/20 text-sigma-700 dark:text-sigma-200'
+                            : 'text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800'
+                        }`}
+                      >
+                        <span className="block truncate text-xs">{item.text}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           <div className="bg-blue-50 dark:bg-sigma-600/20 text-blue-600 dark:text-sigma-400 px-2 py-0.5 rounded font-mono text-[9px] border border-blue-100 dark:border-sigma-600/30">{Math.round(zoomLevel * 100)}%</div>
         </div>
       </div>
@@ -956,10 +1174,10 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
             </div>
           ) : null
         ) : type === 'markdown' ? (
-            <div className="flex flex-col items-center w-full m-auto py-12 px-8">
+            <div className="w-full grow bg-white dark:bg-gray-900 flex flex-col items-center py-8 px-6">
                 <div
-                    className="prose dark:prose-invert max-w-none prose-pre:font-mono prose-code:font-mono prose-code:before:hidden prose-code:after:hidden bg-white dark:bg-gray-800 p-12 mx-auto shadow-2xl border border-gray-200 dark:border-gray-700 mb-12"
-                    style={{ maxWidth: '48rem', width: '100%', fontSize: `${zoomLevel}rem` }}
+                    className="prose dark:prose-invert max-w-none prose-pre:font-mono prose-code:font-mono prose-code:before:hidden prose-code:after:hidden"
+                    style={{ maxWidth: '60rem', width: '100%', fontSize: `${zoomLevel}rem` }}
                     onClick={(e) => {
                         // Project-relative markdown links (marked by
                         // decorateMarkdownLinks with data-sigma-path) open

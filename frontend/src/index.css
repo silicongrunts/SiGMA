@@ -45,17 +45,25 @@
 /* Markdown preview base is now provided by Tailwind Typography (`.prose`).
    Only project-specific overrides (highlight sync, KaTeX scroll) live here. */
 
-/* ───────────────── Markdown table tokens (shared by chat + preview) ─────────────────
+/* ───────────────── Markdown preview tokens (shared by chat + preview) ─────────────────
    Both .sigma-content (chat/annotation/diff) and .prose (editor preview) render
    the same full-grid, shaded-header table look. Variables live on :root so the
    two systems never drift; .dark overrides flip the palette. */
 :root {
   --sigma-table-border: #e5e7eb;
   --sigma-table-header-bg: #f9fafb;
+  /* Editor-preview palette (scoped to .prose only — chat bubbles keep their
+     own compact look). Dark flips mirror Tailwind's gray-800 page surface. */
+  --sigma-prose-rule: #e5e7eb;
+  --sigma-code-gutter-bg: #010409;
+  --sigma-code-gutter-num: #6e7681;
 }
 .dark {
   --sigma-table-border: #374151;
   --sigma-table-header-bg: #1f2937;
+  --sigma-prose-rule: #374151;
+  --sigma-code-gutter-bg: #161b22;
+  --sigma-code-gutter-num: #8b949e;
 }
 
 /* Chat bubble markdown content.
@@ -147,6 +155,49 @@
 /* All markdown element typography (headings, lists, code, tables, etc.) is now
    handled by Tailwind Typography (`.prose`). The rules below are project-specific
    overrides that prose does not cover. */
+
+/* ───────────────── Editor-preview heading scale ─────────────────
+   Typography's default scale jumps h1 (2.25em) → h2 (1.5em) → h3 (1.25em)
+   and flattens h4 to 1em (indistinguishable from body text). Documents here
+   use deep nesting (`####` and below), so the preview overrides with a full
+   six-level monotonic scale. In em (not px) so the zoomLevel font-size on
+   .prose scales every level proportionally. H1 keeps a full-width rule as a
+   chapter anchor; :first-child avoids a stray rule above the title. */
+.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
+  font-weight: 700;
+}
+.prose h1 {
+  font-size: 1.75em;
+  line-height: 1.3;
+  margin-top: 2.4em;
+  padding-bottom: 0.4em;
+  border-bottom: 1px solid var(--sigma-prose-rule);
+}
+.prose h1:first-child { margin-top: 0; }
+.prose h2 {
+  font-size: 1.45em;
+  line-height: 1.3;
+  margin-top: 1.8em;
+}
+.prose h3 {
+  font-size: 1.2em;
+  line-height: 1.35;
+  margin-top: 1.6em;
+}
+.prose h4 {
+  font-size: 1.05em;
+  margin-top: 1.4em;
+}
+.prose h5 {
+  font-size: 0.95em;
+  margin-top: 1.4em;
+}
+.prose h6 {
+  font-size: 0.85em;
+  margin-top: 1.4em;
+  color: #6b7280;
+}
+.dark .prose h6 { color: #9ca3af; }
 
 /* Display math ($$...$$): horizontal scroll for long equations.
    KaTeX already sets display:block; we only add overflow control.
@@ -242,6 +293,76 @@
 .prose :where(thead th) {
   background-color: var(--sigma-table-header-bg);
   font-weight: 600;
+}
+
+/* ───────────────── Code-block chrome (preview renderer only) ─────────────────
+   The preview's marked renderer wraps every fenced block as
+   .md-code-block > (button.pre-copy + code + ol.md-code-gutter). The gutter
+   <ol> is absolutely positioned on the left; its <li> elements are empty and
+   numbered via CSS counters (the gutter also carries user-select:none, so
+   the numbers never leak into a manual selection copy). The gutter's line
+   metrics must match the code's exactly: this pre inherits root 0.875em and
+   typography computes its line-height as 24/14 (≈1.714), so the gutter
+   inherits the same value from the same source and stays aligned at any
+   zoom. Its vertical padding mirrors typography's computed pre block padding
+   (12px at the 14px root ≈ 0.857em). */
+.prose .md-code-block {
+  position: relative;
+  padding-left: 3.7em; /* gutter slot; typography's default is 1em */
+}
+.prose .md-code-block .pre-copy {
+  position: absolute;
+  top: 0.35em;
+  right: 0.4em;
+  z-index: 10;
+  width: 1.6em;
+  height: 1.6em;
+  border-radius: 4px;
+  color: #9da7b3;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  background-color: transparent;
+}
+/* Draw the glyph in CSS — a plain page icon, no icon-font dependency. */
+.prose .md-code-block .pre-copy::before {
+  content: '';
+  display: block;
+  width: 0.9em;
+  height: 0.9em;
+  margin: 0.35em auto;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+}
+.prose .md-code-block:hover .pre-copy {
+  opacity: 1;
+}
+.prose .md-code-block .pre-copy:hover {
+  background-color: rgba(177, 186, 196, 0.12);
+  color: #e6edf3;
+}
+.prose .md-code-block .md-code-gutter {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  counter-reset: md-line 0;
+  list-style: none;
+  margin: 0;
+  padding: 0.8571429em 0;
+  min-width: 2.9em;
+  border-right: 1px solid rgba(240, 246, 252, 0.1);
+  background-color: var(--sigma-code-gutter-bg);
+  user-select: none;
+}
+.prose .md-code-block .md-code-gutter li {
+  counter-increment: md-line 1;
+  padding-right: 0.9em;
+  text-align: right;
+}
+.prose .md-code-block .md-code-gutter li::before {
+  content: counter(md-line);
+  color: var(--sigma-code-gutter-num);
 }
 
 /* Highlight sync — mirrors editor cursor line in the preview.
