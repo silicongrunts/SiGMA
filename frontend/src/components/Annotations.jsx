@@ -70,9 +70,10 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   }, [annotation.id, isDeleting, onDelete])
   const wrapperRef = useRef(null)
   const isDraggingRef = useRef(false)
-  // True only while the resize grip is held. Guards card/thread inline styles
-  // so a concurrent re-render can't snap them back to the pre-resize size while
-  // the DOM holds live values. Separate from isDraggingRef (drag moves the
+  // True only while the resize grip is held. Gates the layout effect that
+  // re-asserts the live card/row/thread sizes after each re-render (React
+  // re-applies stale inline styles on re-render, which would otherwise snap
+  // them back mid-gesture). Separate from isDraggingRef (drag moves the
   // wrapper, never resizes the card).
   const isResizingRef = useRef(false)
   const dragOffsetRef = useRef({ x: 0, y: 0 })
@@ -82,6 +83,16 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   // The annotation card element; resize writes its width/height directly during
   // the gesture for responsiveness, then commits to `size` state on release.
   const cardRef = useRef(null)
+  // The flex row holding the card and the side diff panel. It carries the
+  // card's height so the panel's self-stretch resolves against a definite
+  // cross size — with an auto-height row a long diff would inflate the row
+  // itself and push the panel's apply buttons below the viewport. Written
+  // directly during resize like the card size, committed to `size` on release.
+  const rowRef = useRef(null)
+  // Live card size while a resize gesture is held, so the re-assert effect
+  // can restore the DOM values a re-render overwrites mid-gesture (e.g. an
+  // SSE thread update).
+  const liveSizeRef = useRef(null)
   // The annotation id the live stream belongs to, captured when the stream
   // starts. The stream's store updates target this captured id — never the
   // currently selected annotation — so switching the popup to another
@@ -272,35 +283,37 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
 
   // ── Resize handle ──
   // Resizes the card live by writing width/height straight to the DOM. The
-  // thread area's maxHeight is a React-derived value (size.height - 112), so we
-  // must update it in lockstep via the DOM too — otherwise the card grows but
-  // the thread area keeps its old cap and a blank gap opens at the bottom until
-  // release. The final size is committed to `size` state on mouseup.
+  // row's height (the cross size the diff panel stretches to) and the thread
+  // area's maxHeight are React-derived from size.height too, so both are
+  // updated in lockstep via the DOM — otherwise the card grows but they keep
+  // their old caps until release. The final size is committed to `size` state
+  // on mouseup; the layout effect below re-asserts the live values if a
+  // re-render lands mid-gesture.
+  const applyLiveSize = (next) => {
+    liveSizeRef.current = next
+    const card = cardRef.current
+    if (card) {
+      card.style.width = `${next.width}px`
+      card.style.height = `${next.height}px`
+    }
+    if (rowRef.current) {
+      rowRef.current.style.height = `${next.height}px`
+    }
+    if (scrollRef.current) {
+      scrollRef.current.style.maxHeight = `${threadMaxHeightFor(next.height)}px`
+    }
+  }
+
   const handleResizeStart = (e) => {
     e.preventDefault()
     e.stopPropagation()
-    // Flag the gesture so concurrent re-renders (e.g. an SSE thread update
-    // arriving mid-resize) don't re-apply the stale `size` to the card/thread
-    // inline styles and snap them back. The card/thread styles read this flag
-    // (see the JSX below) and defer to the DOM values while a resize is live.
     isResizingRef.current = true
     const startX = e.clientX
     const startY = e.clientY
     const startSize = { ...size }
-    const card = cardRef.current
-    const thread = scrollRef.current
 
-    const apply = (next) => {
-      if (card) {
-        card.style.width = `${next.width}px`
-        card.style.height = `${next.height}px`
-      }
-      if (thread) {
-        thread.style.maxHeight = `${threadMaxHeightFor(next.height)}px`
-      }
-    }
     const handleMouseMove = (ev) => {
-      apply({
+      applyLiveSize({
         width: Math.max(MIN_WIDTH, startSize.width + (ev.clientX - startX)),
         height: Math.max(MIN_HEIGHT, startSize.height + (ev.clientY - startY)),
       })
@@ -312,6 +325,7 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
       }
       setSize(finalSize)
       isResizingRef.current = false
+      liveSizeRef.current = null
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
       activeDragRef.current = null
@@ -320,6 +334,16 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     document.addEventListener('mouseup', handleMouseUp)
     activeDragRef.current = { move: handleMouseMove, up: handleMouseUp }
   }
+
+  // While a resize gesture is held, re-assert the live sizes after every
+  // render: a re-render (e.g. an SSE thread update) re-applies the stale
+  // inline `size` styles, which would snap the card, row, and thread back
+  // mid-gesture. Runs on each render (no dep array) but writes only while
+  // the gesture is live.
+  useLayoutEffect(() => {
+    if (!isResizingRef.current) return
+    if (liveSizeRef.current) applyLiveSize(liveSizeRef.current)
+  })
 
   // ── Functional store updates (avoid stale closures) ──
 
@@ -908,16 +932,22 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     >
       {/* Inner layer carries the dim opacity (kept off the animated wrapper so
           the entrance keyframe's `forwards` end-state can't pin it) and lays out
-          the annotation card next to its optional diff panel. */}
-      <div className="flex gap-0" style={dimStyle}>
+          the annotation card next to its optional diff panel. Its height is the
+          card's height: the definite cross size is what keeps the diff panel's
+          self-stretch capped at the card instead of growing with a long diff. */}
+      <div
+        ref={rowRef}
+        className="flex gap-0"
+        style={{ ...dimStyle, height: size.height }}
+      >
       {/* Main annotation popup. Height is driven by `size.height` so the side
-          diff panel (a flex sibling) stretches to match it. During a live resize
-          we omit width/height here so React re-renders can't snap the card back
-          to its pre-resize size (the DOM holds the live values until mouseup). */}
+          diff panel (a flex sibling) stretches to match it. During a live
+          resize the layout effect above re-asserts the DOM values after every
+          re-render — React would otherwise re-apply the stale `size`. */}
       <div
         ref={cardRef}
         className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 shadow-[0_10px_40px_rgba(0,0,0,0.15)] rounded-2xl overflow-hidden flex flex-col relative"
-        style={isResizingRef.current ? undefined : { width: size.width, height: size.height }}
+        style={{ width: size.width, height: size.height }}
       >
         {/* Header - Draggable */}
         <div
@@ -973,10 +1003,10 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
           </div>
         )}
 
-        {/* Thread. maxHeight is omitted during a live resize for the same
-            reason the card size is: the resize path writes it to the DOM
-            directly and a re-render here would snap it back to the old cap. */}
-        <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4 bg-white dark:bg-gray-900" style={isResizingRef.current ? undefined : { maxHeight: threadMaxH }}>
+        {/* Thread. maxHeight follows the card's height; during a live resize
+            the layout effect above re-asserts it in lockstep, same as the
+            card/row sizes. */}
+        <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4 bg-white dark:bg-gray-900" style={{ maxHeight: threadMaxH }}>
           {annotation.thread.map((msg, i) => (
             <div key={i} className={`flex flex-col ${msg.role === 'SiGMA' ? 'items-start' : 'items-end'}`}>
               <div className={`flex items-center gap-1.5 mb-1 text-[10px] font-bold uppercase tracking-wider ${msg.role === 'SiGMA' ? 'text-sigma-600 dark:text-sigma-400' : 'text-gray-400 dark:text-gray-500'}`}>
