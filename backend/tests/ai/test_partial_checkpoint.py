@@ -310,10 +310,14 @@ async def test_compaction_after_checkpointed_round_keeps_history_consistent(
     from app.services.compaction_service import CompactionResult, ContextStats
 
     async def fake_compact(messages, **kwargs):
+        # Mirror _build_compacted_messages: the rebuilt list keeps the outer
+        # system prompt at index 0 and presents the boundary as a user
+        # message (provider contract), never as system.
+        system_prompt = next(m for m in messages if m["role"] == "system")
         return CompactionResult(
             summary="summarized",
             boundary_content="[passive] summarized",
-            messages=[{"role": "system", "content": "[passive] summarized"}],
+            messages=[system_prompt, {"role": "user", "content": "[passive] summarized"}],
             stats=ContextStats(current_tokens=30, compact_threshold=100, max_context_length=200),
             usage=None,
         )
@@ -342,8 +346,15 @@ async def test_compaction_after_checkpointed_round_keeps_history_consistent(
     assert "call_cp" in (rows[1].tool_calls or "")
     assert rows[2].tool_call_id == "call_cp"
     assert rows[4].content == "final after compaction"
-    # The second round's LLM call saw only the compacted context.
-    assert calls["llm_history"][1] == [{"role": "system", "content": "[passive] summarized"}]
+    # The second round's LLM call saw the outer system prompt and only the
+    # compacted context, with the boundary as the user message the provider
+    # contract requires.
+    assert [
+        (m["role"], m["content"]) for m in calls["llm_history"][1]
+    ] == [
+        ("system", calls["llm_history"][0][0]["content"]),
+        ("user", "[passive] summarized"),
+    ]
 
 
 @pytest.mark.asyncio

@@ -280,8 +280,14 @@ class AnnotationLoop:
         """
         async def _operation(uow):
             history = await uow.messages.get_messages_for_annotation_llm(self.annotation_id)
+            # Boundary rows count even though they are staged as system:
+            # entry_from_history presents them to the LLM list as user, and
+            # this count must use the same role view or the slice runs one
+            # short and re-persists the newest history row.
             history_count = sum(
-                1 for msg in history if getattr(msg, "role", "") != "system"
+                1 for msg in history
+                if getattr(msg, "is_boundary", False)
+                or getattr(msg, "role", "") != "system"
             )
             candidates = [
                 msg for msg in messages[1:]

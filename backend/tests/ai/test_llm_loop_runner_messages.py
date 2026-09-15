@@ -1,8 +1,8 @@
 """LLM loop runner message building and persistence.
 
 _build_messages rehydration (input-token baseline, tool image refs) and the
-query/agent _save_messages contracts: what reaches the provider, what lands
-in history, and which rows carry per-message usage.
+query/agent/annotation _save_messages contracts: what reaches the provider,
+what lands in history, and which rows carry per-message usage.
 """
 
 from importlib import import_module
@@ -12,10 +12,12 @@ import pytest
 
 import_module("app.agents.tools")
 import app.services.agent_service as agent_service_module
+import app.services.annotation_loop as annotation_loop_module
 import app.services.query_loop as query_loop_module
 from app.core.chat_attachments import render_image_refs_tag
 from app.core.config import ModelSettings, settings
 from app.services.agent_service import AgentService
+from app.services.annotation_loop import AnnotationLoop
 from app.services.llm_loop_runner import LLMLoopRunner
 from app.services.query_loop import QueryLoop
 from tests.ai.conftest import (
@@ -168,6 +170,97 @@ async def test_query_persist_writes_zero_for_messages_without_real_usage(monkeyp
     assert fake_messages.created[1]["input_tokens"] == 0
     assert fake_messages.created[1]["cached_tokens"] == 0
     assert fake_messages.updated == []
+
+
+def _boundary_row(content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        role="system", content=content, tool_calls=None,
+        tool_call_id=None, reasoning_content=None, input_tokens=0,
+        is_boundary=True,
+    )
+
+
+def _plain_row(role: str, content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        role=role, content=content, tool_calls=None,
+        tool_call_id=None, reasoning_content=None, input_tokens=0,
+        is_boundary=False,
+    )
+
+
+def _llm_list(history_rows, new_messages):
+    """The in-memory list as the loops build it: outer system prompt, then
+    every history row mapped through entry_from_history, then the new tail."""
+    messages = [{"role": "system", "content": "system"}]
+    messages.extend(LLMLoopRunner.entry_from_history(m, m.content) for m in history_rows)
+    messages.extend(new_messages)
+    return messages
+
+
+@pytest.mark.asyncio
+async def test_query_persist_after_compaction_boundary_keeps_history_rows(monkeypatch):
+    # The boundary row is staged as system but enters the LLM list as user
+    # (entry_from_history); the history-count slice must count it the same
+    # way or it runs one short and the newest persisted row — here the
+    # turn's user message — is inserted a second time.
+    history = [_boundary_row("handoff summary"), _plain_row("user", "newest question")]
+    fake_messages = RecordingMessagesRepo(history=history)
+    fake_sessions = RecordingSessionsRepo()
+    monkeypatch.setattr(
+        query_loop_module, "UnitOfWork",
+        make_fake_uow(messages=fake_messages, sessions=fake_sessions),
+    )
+
+    loop = QueryLoop(project_id="project-1", session_id="session-1")
+    await loop._save_messages(_llm_list(history, [{"role": "assistant", "content": "new reply"}]))
+
+    assert [m["content"] for m in fake_messages.created] == ["new reply"]
+    assert fake_messages.updated == []
+    assert fake_sessions.touched == ["session-1"]
+
+
+@pytest.mark.asyncio
+async def test_query_persist_with_boundary_only_history_inserts_only_new_round(monkeypatch):
+    # Passive-compaction shape: the replaced LLM list holds the boundary as
+    # the only history entry; the boundary row itself must not be re-persisted.
+    history = [_boundary_row("handoff summary")]
+    fake_messages = RecordingMessagesRepo(history=history)
+    fake_sessions = RecordingSessionsRepo()
+    monkeypatch.setattr(
+        query_loop_module, "UnitOfWork",
+        make_fake_uow(messages=fake_messages, sessions=fake_sessions),
+    )
+
+    loop = QueryLoop(project_id="project-1", session_id="session-1")
+    await loop._save_messages(_llm_list(history, [{"role": "assistant", "content": "first reply"}]))
+
+    assert [m["content"] for m in fake_messages.created] == ["first reply"]
+    assert fake_messages.updated == []
+
+
+class _AnnotationRecordingMessagesRepo(RecordingMessagesRepo):
+    """RecordingMessagesRepo under the annotation repo's method names."""
+
+    async def get_messages_for_annotation_llm(self, annotation_id):
+        return await self.get_messages_for_llm(annotation_id)
+
+    async def stage_create_for_annotation(self, **kwargs):
+        return await self.create(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_annotation_persist_after_compaction_boundary_keeps_history_rows(monkeypatch):
+    history = [_boundary_row("handoff summary"), _plain_row("user", "annotation prompt")]
+    fake_messages = _AnnotationRecordingMessagesRepo(history=history)
+    monkeypatch.setattr(
+        annotation_loop_module, "UnitOfWork",
+        make_fake_uow(messages=fake_messages),
+    )
+
+    loop = AnnotationLoop(project_id="project-1", file_path="notes.md", annotation_id="ann-1")
+    await loop._save_messages(_llm_list(history, [{"role": "assistant", "content": "new diff"}]))
+
+    assert [m["content"] for m in fake_messages.created] == ["new diff"]
 
 
 @pytest.mark.asyncio
