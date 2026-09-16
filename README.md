@@ -160,14 +160,12 @@ configure three model roles before SiGMA can work:
 
 - **Supervisor**: the main orchestration model. It plans, coordinates tools,
   writes final answers, and handles hard reasoning. Use a strong model here.
-  Recommended: `GPT-5.5`, `Gemini-3.5`, `Claude Opus-4.8`, `DeepSeek V4 Pro`,
-  `Qwen3.7 Max`.
+  Recommended: `GPT-6 Astra`, `Claude Opus-4.6`, `Claude Opus-5`, `Claude Fable-5.1`.
 - **RA**: the research assistant model. It handles explore, searching, and
   drafting tasks, so it can be cheaper and faster than Supervisor. Recommended:
-  `GPT-5.4 Mini`, `Gemini 3.1 Flash Lite`, `Claude Haiku-4.5`, `DeepSeek V4 Flash`,
-  `Qwen3.6 Flash`.
+  `GPT-5.6 Luna`, `Gemini-3.8 Flash`, `DeepSeek-4.1 Flash`.
 - **Embedding**: the model used to index and search your Library. For local
-  deployment, we recommend `microsoft/harrier-oss-v1-270m`.
+  deployment, we recommend `Qwen3 Embedding-0.6B`.
 
 For cloud models, fill in:
 
@@ -198,7 +196,7 @@ Other settings:
   SiGMA to understand images or screenshots. It can reuse Supervisor or RA 
   if that model is multimodal.
 - **Draw**: optional image generation model, 
-  recommend `gemini-3.1-flash-image`, `gpt-image-2` .
+  recommend `gemini-3.1-flash-image`, `gpt-image-2.5` .
 - **Browser**: controls browser automation limits, timeouts, and the default
   search engine. The defaults are fine for most users.
 - **Library**: controls retrieval size, chunking, metadata extraction, and
