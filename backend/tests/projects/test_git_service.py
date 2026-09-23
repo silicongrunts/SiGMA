@@ -254,8 +254,8 @@ def test_create_tag_rejects_invalid_names_before_running_git():
 
     service._run_git = fail_run_git
     invalid_names = [
-        "", "  ", "spa ce", "-option", "--force", "a..b", "v1.lock",
-        "a/b", "x" * 65, "尾部空白 ",
+        "", "  ", "spa ce", "-option", "--force", "a..b", "v1.lock", "v1.",
+        "a/b", "x" * 65, "中文 空格",
     ]
     for name in invalid_names:
         with pytest.raises((ValidationError, FileSystemError)):
@@ -291,6 +291,13 @@ def test_tag_crud_on_real_repo(tmp_path):
     with pytest.raises(FileSystemError) as exc_info:
         service.delete_tag(project_id, "milestone-1")
     assert exc_info.value.code == "TAG_NOT_FOUND"
+
+    # Non-ASCII names are valid git refnames and must round-trip untouched.
+    created = service.create_tag(project_id, "初稿", head)
+    assert created == {"success": True, "name": "初稿", "commit": head}
+    assert [t["name"] for t in service.list_tags(project_id)] == ["初稿"]
+    assert service.delete_tag(project_id, "初稿") == {"success": True, "name": "初稿"}
+    assert service.list_tags(project_id) == []
 
 
 @pytest.mark.timeout(30)

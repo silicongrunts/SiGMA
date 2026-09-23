@@ -62,10 +62,13 @@ SNAPSHOT_LOCK_WAIT_SEC = GIT_WRITE_TIMEOUT_SEC + 60
 GITIGNORE_LATEX_OUTPUTS = ("output.pdf", "output.synctex.gz")
 
 # Tag names become positional git arguments, so a leading dash or option-like
-# value must be impossible. The whitelist (alphanumerics plus . _ -, no
-# slashes) also stays inside git's own refname rules; the extra checks reject
-# the remaining git-forbidden forms that the charset alone still allows.
-TAG_NAME_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$")
+# value must be impossible. The whitelist (Unicode letters/digits plus
+# _ . -, no slashes) also stays inside git's own refname rules; the extra
+# checks reject the remaining git-forbidden forms that the charset alone
+# still allows. [^\W_] matches alphanumerics in any script (underscore
+# excluded) so names like "初稿" are valid, while spaces, control characters,
+# and git-forbidden punctuation are not.
+TAG_NAME_PATTERN = re.compile(r"^[^\W_][\w.\-]{0,63}$")
 
 # Default per-project cap for files that have never appeared in repository
 # history. Existing versioned paths remain protected even after growing past
@@ -112,7 +115,8 @@ _EXCLUDE_PATHSPEC_PREFIX = ":(exclude,literal)"
 def _validate_tag_name(name: str) -> str:
     """Return the stripped tag name, or raise if git would reject it."""
     name = name.strip()
-    if not TAG_NAME_PATTERN.match(name) or ".." in name or name.endswith(".lock"):
+    if (not TAG_NAME_PATTERN.match(name) or ".." in name
+            or name.endswith((".lock", "."))):
         raise ValidationError(f"Invalid tag name: {name!r}")
     return name
 
