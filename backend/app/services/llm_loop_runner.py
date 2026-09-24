@@ -758,6 +758,16 @@ class LLMLoopRunner:
 
             # agent tool — run via queue-based event forwarding
             if tool_def and getattr(tool_def, 'is_agent_tool', False):
+                # Flush the anchor round before the subagent starts. This
+                # round otherwise persists only when it completes, so a page
+                # refresh mid-subagent rebuilds history without the agent
+                # step — leaving every forwarded agent_event without its
+                # attach point. The persister's history-count slice keeps
+                # this idempotent with the round-boundary save, and the
+                # interactive-tool pause site below already persists this
+                # same unanswered-call state.
+                if ctx.persist_messages:
+                    await ctx.persist_messages(messages)
                 try:
                     async for evt in self._run_agent_tool(
                         ctx, tool_name, tool_args, tool_call_id, messages

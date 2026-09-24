@@ -863,7 +863,16 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               preserved.unshift(...popped.process)
             }
           }
-          const cleanProcess = preserved.filter(s => !s.transient)
+          // The agent anchor row is persisted at spawn time, so a mid-run
+          // refresh rebuilds its step as "interrupted" — no result row
+          // exists while the subagent runs. The task is live; restore the
+          // state the step is actually in so replayed agent_events attach
+          // to a running step instead of an "interrupted" label.
+          const cleanProcess = preserved.filter(s => !s.transient).map(s =>
+            (s.type === 'tool' && s.status === 'interrupted' && isAgentToolName(s.tool))
+              ? { ...s, status: 'running' }
+              : s
+          )
           history.push({
             role: 'SiGMA', content: '', process: cleanProcess,
             localId: nextLiveTurnId(),
@@ -2180,8 +2189,27 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               && (s.status === 'running' || s.status === 'awaiting_input')
           )
         }
+        if (agentStepIdx < 0 && parentTcId) {
+          // The parent agent step exists nowhere: neither in rebuilt history
+          // (the anchor row was not yet persisted when this page was served)
+          // nor in the replay buffer (evicted past the catch-up cap).
+          // Synthesize the running step so live subagent progress keeps
+          // rendering after a refresh instead of being silently dropped. A
+          // replayed tool_start for the same id replaces it; tool_end closes
+          // it in place via the stored _toolCallId.
+          currentProcess.push({
+            type: 'tool', tool: 'agent', params: {},
+            status: 'running', toolCallId: parentTcId, _toolCallId: parentTcId,
+          })
+          agentStepIdx = currentProcess.length - 1
+        }
         if (agentStepIdx >= 0) {
           const agentStep = { ...currentProcess[agentStepIdx] }
+          // A live agent_event is proof the subagent is running: a step
+          // rebuilt from history mid-run ("interrupted" — its result row
+          // does not exist until the round completes) flips to running on
+          // first contact, on every rebuild path uniformly.
+          if (agentStep.status === 'interrupted') agentStep.status = 'running'
           const subSteps = [...(agentStep.subSteps || [])]
           const innerType = data.inner_type
           const innerData = data.inner_data || {}

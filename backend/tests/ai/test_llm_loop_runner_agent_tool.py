@@ -230,6 +230,76 @@ async def test_fork_extracts_final_response_after_compaction_replaces_context(mo
     assert result == "final after compaction"
 
 
+@pytest.mark.asyncio
+async def test_agent_tool_spawn_persists_anchor_round_before_subagent(monkeypatch):
+    """The agent anchor round (assistant message carrying the agent
+    tool_call) must be persisted BEFORE the subagent starts. The round
+    otherwise flushes only when it completes, so a page refresh mid-subagent
+    rebuilds history without the agent step — leaving every forwarded
+    agent_event without its attach point (the refresh freeze bug)."""
+    calls = 0
+
+    async def fake_stream_llm(ctx, messages, delta_queue):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (
+                "",
+                "",
+                [{"id": "call_agent", "name": "agent", "params": {}}],
+                {"prompt_tokens": 10, "completion_tokens": 2},
+            )
+        return ("done", "", [], {"prompt_tokens": 5, "completion_tokens": 1})
+
+    monkeypatch.setattr(
+        LLMLoopRunner, "_stream_llm", staticmethod(fake_stream_llm)
+    )
+
+    persisted_snapshots = []
+    observed_at_spawn = {}
+
+    async def persist_messages(messages):
+        persisted_snapshots.append([
+            m for m in messages
+            if not m.get("_ephemeral") and m.get("role") != "system"
+        ])
+
+    async def execute_tool(tool_name, tool_args):
+        # Runs inside the agent tool: the anchor flush must already have
+        # happened by the time subagent execution begins.
+        observed_at_spawn["snapshots"] = list(persisted_snapshots)
+        return "agent result"
+
+    ctx = LoopContext(
+        project_id="project-1",
+        session_id="session-1",
+        persist_messages=persist_messages,
+        execute_tool=execute_tool,
+    )
+    messages = [{"role": "system", "content": "system"}]
+
+    events = [event async for event in LLMLoopRunner().run(ctx, messages)]
+
+    assert any(event["type"] == "done" for event in events)
+    spawn_snapshots = observed_at_spawn["snapshots"]
+    assert spawn_snapshots, "anchor round must be persisted before the subagent runs"
+    anchor_round = spawn_snapshots[-1]
+    assert anchor_round and anchor_round[-1]["role"] == "assistant"
+    assert anchor_round[-1]["tool_calls"][0]["function"]["name"] == "agent"
+    assert all(m.get("role") != "tool" for m in anchor_round), (
+        "no result row can exist at spawn time — the anchor round is persisted "
+        "with the tool_call unanswered"
+    )
+    # The round-boundary save still completes the round: the final flush
+    # carries the agent tool result after the subagent returns.
+    final_round = persisted_snapshots[-1]
+    result_rows = [
+        m for m in final_round
+        if m.get("role") == "tool" and m.get("tool_call_id") == "call_agent"
+    ]
+    assert result_rows and result_rows[-1]["content"] == "agent result"
+
+
 def test_token_usage_total_does_not_double_count_cached_tokens():
     usage = TokenUsage(input=100, output=20, cached=80)
 
