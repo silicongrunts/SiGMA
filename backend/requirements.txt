@@ -39,7 +39,7 @@ numpy==2.4.4
 onnxruntime==1.25.1
 
 # LLM proxy
-litellm==1.84.10
+litellm==1.93.2
 
 # PDF processing
 docling==2.94.0
