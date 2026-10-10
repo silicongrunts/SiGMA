@@ -377,7 +377,9 @@ class SettingsCheckService:
         Only the supervisor model is required. Optional roles (ra, vision,
         draw, embedding, rerank) are never hard requirements: ``_should_skip``
         reports them as "Not configured" when their model name is empty, even
-        if a provider was selected but left half-configured.
+        if a provider was selected but left half-configured. The exception is
+        rerank with the reranker toggle enabled — that misconfiguration fails
+        its role check (see ``_run_model_check``) instead of skipping.
         """
         missing = []
         supervisor = cfg.model_settings_for_role("supervisor")
@@ -392,8 +394,13 @@ class SettingsCheckService:
         if not ms:
             return "Not configured"
 
-        # No model name and not reusing → skip (optional feature)
-        if not ms.model and not ms.reuse:
+        # Disabled rerank is intentionally off → skip. Enabled rerank must
+        # not take the generic skip path below: with no model configured the
+        # check runs and fails loudly (see _run_model_check).
+        if role == "rerank":
+            if not cfg.library.reranker_enabled:
+                return "Reranker disabled"
+        elif not ms.model and not ms.reuse:
             return "Not configured"
 
         # RA reuses supervisor → skip text check (same endpoint)
@@ -401,10 +408,6 @@ class SettingsCheckService:
             return f"Reuses {ms.reuse}"
 
         # Vision always runs (multimodal test), even when reusing
-
-        # Rerank disabled → skip
-        if role == "rerank" and not cfg.library.reranker_enabled:
-            return "Reranker disabled"
 
         return None
 
@@ -435,6 +438,16 @@ class SettingsCheckService:
             }
 
         label = dict(_CHECK_ITEMS).get(role, role)
+
+        # Enabled rerank with no model is a configuration error, not a skip:
+        # the reranker toggle promises reranking that no endpoint can deliver.
+        if role == "rerank" and not endpoint.model:
+            return {
+                "role": role, "label": label,
+                "status": "fail", "error_type": "config_error",
+                "message": "Rerank is enabled but no rerank model is configured",
+            }
+
         start = time.monotonic()
 
         try:

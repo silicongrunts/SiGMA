@@ -353,144 +353,12 @@ class Settings(BaseModel):
         return JUPYTER_BIN
 
     @property
-    def SUPERVISOR_MODEL(self) -> str:
-        return self.model_settings_for_role("supervisor").model
-
-    @property
-    def SUPERVISOR_PROVIDER(self) -> str:
-        return self.model_settings_for_role("supervisor").provider
-
-    @property
-    def SUPERVISOR_BASE_URL(self) -> str:
-        return self.model_settings_for_role("supervisor").base_url
-
-    @property
-    def SUPERVISOR_API_KEY(self) -> str:
-        return self.model_settings_for_role("supervisor").api_key
-
-    @property
-    def SUPERVISOR_EXTRA_JSON(self) -> dict[str, Any]:
-        return self.model_settings_for_role("supervisor").extra
-
-    @property
-    def RA_MODEL(self) -> str:
-        return self.model_settings_for_role("ra").model
-
-    @property
-    def RA_PROVIDER(self) -> str:
-        return self.model_settings_for_role("ra").provider
-
-    @property
-    def RA_BASE_URL(self) -> str:
-        return self.model_settings_for_role("ra").base_url
-
-    @property
-    def RA_API_KEY(self) -> str:
-        return self.model_settings_for_role("ra").api_key
-
-    @property
-    def RA_EXTRA_JSON(self) -> dict[str, Any]:
-        return self.model_settings_for_role("ra").extra
-
-    @property
     def DRAW_MODEL(self) -> str:
         return self.model_settings_for_role("draw").model
 
     @property
-    def DRAW_PROVIDER(self) -> str:
-        return self.model_settings_for_role("draw").provider
-
-    @property
-    def DRAW_BASE_URL(self) -> str:
-        return self.model_settings_for_role("draw").base_url
-
-    @property
-    def DRAW_API_KEY(self) -> str:
-        return self.model_settings_for_role("draw").api_key
-
-    @property
-    def DRAW_EXTRA_JSON(self) -> dict[str, Any]:
-        return self.model_settings_for_role("draw").extra
-
-    @property
     def VISION_MODEL(self) -> str:
         return self.model_settings_for_role("vision").model
-
-    @property
-    def VISION_PROVIDER(self) -> str:
-        return self.model_settings_for_role("vision").provider
-
-    @property
-    def VISION_BASE_URL(self) -> str:
-        return self.model_settings_for_role("vision").base_url
-
-    @property
-    def VISION_API_KEY(self) -> str:
-        return self.model_settings_for_role("vision").api_key
-
-    @property
-    def VISION_EXTRA_JSON(self) -> dict[str, Any]:
-        return self.model_settings_for_role("vision").extra
-
-    @property
-    def EMBEDDING_MODEL(self) -> str:
-        return self.models.embedding.model
-
-    @property
-    def EMBEDDING_PROVIDER(self) -> str:
-        return self.models.embedding.provider
-
-    @property
-    def EMBEDDING_BASE_URL(self) -> str:
-        return self.models.embedding.base_url
-
-    @property
-    def EMBEDDING_API_KEY(self) -> str:
-        return self.models.embedding.api_key
-
-    @property
-    def EMBEDDING_EXTRA_JSON(self) -> dict[str, Any]:
-        return self.models.embedding.extra
-
-    @property
-    def RERANKER_MODEL(self) -> str:
-        return self.models.rerank.model
-
-    @property
-    def RERANKER_PROVIDER(self) -> str:
-        return self.models.rerank.provider
-
-    @property
-    def RERANKER_BASE_URL(self) -> str:
-        return self.models.rerank.base_url
-
-    @property
-    def RERANKER_API_KEY(self) -> str:
-        return self.models.rerank.api_key
-
-    @property
-    def RERANKER_EXTRA_JSON(self) -> dict[str, Any]:
-        return self.models.rerank.extra
-
-    @property
-    def EMBEDDING_SOURCE(self) -> str:
-        return self.models.embedding.source
-
-    @property
-    def EMBEDDING_HF_ENDPOINT(self) -> str:
-        return self.models.embedding.hf_endpoint
-
-    @property
-    def RERANKER_SOURCE(self) -> str:
-        return self.models.rerank.source
-
-    @property
-    def RERANKER_HF_ENDPOINT(self) -> str:
-        return self.models.rerank.hf_endpoint
-
-    @property
-    def COMPRESSION_THRESHOLD(self) -> int:
-        return self.compact_threshold_for_role("supervisor")
 
     def model_settings_for_role(self, role: str, seen: set[str] | None = None) -> ModelSettings:
         seen = seen or set()
@@ -779,8 +647,8 @@ def dump_settings_yaml(config: Settings) -> str:
 
 
 def settings_to_dict(config: Settings) -> dict[str, Any]:
-    # model_dump emits pydantic fields only; derived @property values such as
-    # COMPRESSION_THRESHOLD are never included, so no exclude set is needed.
+    # model_dump emits pydantic fields only; derived @property values are
+    # never included, so no exclude set is needed.
     return config.model_dump(mode="json")
 
 

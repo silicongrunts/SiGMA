@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from app.core.config import ModelSettings, ModelRoleSettings, Settings
+from app.core.config import LibrarySettings, ModelSettings, ModelRoleSettings, Settings
 from app.services.settings_check_service import SettingsCheckService
 
 
@@ -98,3 +98,77 @@ async def test_check_stream_fails_structure_without_supervisor():
     assert "supervisor model" in by_role["structure"]["message"]
     done = [data for event, data in events if event == "check_done"][0]
     assert done["failed"] == 1
+
+
+def _settings_with_rerank(*, reranker_enabled: bool, model: str = "") -> Settings:
+    return Settings(
+        models=ModelRoleSettings(
+            supervisor=ModelSettings(
+                model="gpt-4o", provider="openai", api_key="sk-test",
+            ),
+            rerank=ModelSettings(model=model),
+        ),
+        library=LibrarySettings(reranker_enabled=reranker_enabled),
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.regression
+def test_enabled_rerank_without_model_is_not_skipped():
+    """Enabled rerank with no model must run its check (and fail) instead of
+    being silently skipped as 'Not configured'."""
+    service = SettingsCheckService()
+    cfg = _settings_with_rerank(reranker_enabled=True)
+    assert service._should_skip(cfg, "rerank") is None
+
+
+@pytest.mark.unit
+@pytest.mark.regression
+async def test_enabled_rerank_without_model_fails_check():
+    service = SettingsCheckService()
+    cfg = _settings_with_rerank(reranker_enabled=True)
+    result = await service._run_model_check(cfg, "rerank")
+    assert result["status"] == "fail"
+    assert result["error_type"] == "config_error"
+    assert "no rerank model" in result["message"]
+
+
+@pytest.mark.unit
+@pytest.mark.regression
+async def test_enabled_rerank_without_model_fails_check_stream(monkeypatch):
+    """The check stream reports enabled-but-unconfigured rerank as a failure."""
+    real_check = SettingsCheckService._run_model_check
+
+    async def only_rerank_is_real(self, cfg, role):
+        if role == "rerank":
+            return await real_check(self, cfg, role)
+        return {"role": role, "label": role, "status": "pass"}
+    monkeypatch.setattr(SettingsCheckService, "_run_model_check", only_rerank_is_real)
+
+    config = {
+        "models": {
+            "supervisor": {
+                "model": "gpt-4o", "provider": "openai", "api_key": "sk-test",
+            },
+            "rerank": {"model": "", "provider": ""},
+        },
+    }
+    frames = [frame async for frame in SettingsCheckService().check(config=config)]
+    events = _parse_events(frames)
+
+    by_role = {
+        data["role"]: data for event, data in events if event == "check_result"
+    }
+    assert by_role["rerank"]["status"] == "fail"
+    assert by_role["rerank"]["error_type"] == "config_error"
+    done = [data for event, data in events if event == "check_done"][0]
+    assert done["failed"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.regression
+def test_disabled_rerank_without_model_is_skipped():
+    """A disabled reranker is intentionally off — skipped, not failed."""
+    service = SettingsCheckService()
+    cfg = _settings_with_rerank(reranker_enabled=False)
+    assert service._should_skip(cfg, "rerank") == "Reranker disabled"

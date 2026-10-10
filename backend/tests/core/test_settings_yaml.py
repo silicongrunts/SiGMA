@@ -17,9 +17,9 @@ def test_settings_yaml_round_trip(tmp_path: Path):
 
     loaded = load_settings_file(path)
 
-    assert loaded.SUPERVISOR_MODEL == "gpt-test"
-    assert loaded.SUPERVISOR_PROVIDER == "openai"
-    assert loaded.SUPERVISOR_API_KEY == "sk-test"
+    assert loaded.models.supervisor.model == "gpt-test"
+    assert loaded.models.supervisor.provider == "openai"
+    assert loaded.models.supervisor.api_key == "sk-test"
     # Two representative defaults prove unrelated sections survive the
     # round trip. Not every default constant gets its own pin: plain scalar
     # fields with no serialization or migration subtleties (e.g.
@@ -56,8 +56,10 @@ def test_settings_yaml_allows_supported_model_reuse():
         },
     })
 
-    assert config.RA_MODEL == "claude-sonnet"
-    assert config.VISION_PROVIDER == "anthropic"
+    # The assertions read through model_settings_for_role: the test's point
+    # is that reuse resolves to the supervisor endpoint's values.
+    assert config.model_settings_for_role("ra").model == "claude-sonnet"
+    assert config.model_settings_for_role("vision").provider == "anthropic"
 
 
 def test_settings_yaml_rejects_unsupported_model_reuse():

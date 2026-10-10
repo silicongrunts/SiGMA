@@ -476,22 +476,35 @@ function ModelRoleForm({
   const updateRole = (key, value) => onChange(['models', role, key], value)
   const isLocal = !roleConfig.provider
   const canLocal = LOCAL_CAPABLE_ROLES.has(role)
+  // rerank's empty selection means "not configured" (rerank is optional and
+  // gated by the reranker toggle); local weights stay reachable by filling
+  // the model/source fields while the provider is left empty.
+  const emptyOptionKey = canLocal && role !== 'rerank' ? 'system.providerLocal' : 'system.providerNone'
   const reuseOptions = ROLE_REUSE_OPTIONS[role] || []
   const reuseTarget = roleConfig.reuse || ''
   const isReused = !!reuseTarget
   const effectiveConfig = resolveModelRoleConfig(config, role)
   const roleProviders = providerRoles?.[role] || providers
+  // A provider saved outside the current dropdown list (e.g. hand-edited YAML)
+  // must stay visible so the real value is never silently masked by the first
+  // option.
+  const providerOptions = roleConfig.provider && !roleProviders.includes(roleConfig.provider)
+    ? [...roleProviders, roleConfig.provider]
+    : roleProviders
 
   const handleProviderChange = (nextProvider) => {
     if (nextProvider === '') {
-      // Empty option is Local for embedding/rerank and Not configured for
-      // other roles; either way the cloud-only fields are cleared.
+      // Empty option clears the cloud-only fields. For non-local roles and
+      // for rerank ("not configured") it also clears the model name and the
+      // local-weights fields so the role is skipped; embedding keeps them.
       onChange(['models', role, 'provider'], '')
       onChange(['models', role, 'api_key'], '')
       onChange(['models', role, 'base_url'], '')
-      // Roles without local weights have no valid provider-less config;
-      // "not configured" also clears the model name so the role is skipped.
-      if (!canLocal) onChange(['models', role, 'model'], '')
+      if (!canLocal || role === 'rerank') {
+        onChange(['models', role, 'model'], '')
+        onChange(['models', role, 'source'], '')
+        onChange(['models', role, 'hf_endpoint'], '')
+      }
       return
     }
     if (!roleConfig.provider) {
@@ -568,9 +581,8 @@ function ModelRoleForm({
               onChange={e => handleProviderChange(e.target.value)}
               className="w-full appearance-none px-3 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg outline-none focus:ring-4 focus:ring-sigma-600/10 focus:border-sigma-600 text-sm"
             >
-              {canLocal && <option value="">{t('system.providerLocal')}</option>}
-              {!canLocal && <option value="">{t('system.providerNone')}</option>}
-              {roleProviders.map(provider => <option key={provider} value={provider}>{provider}</option>)}
+              <option value="">{t(emptyOptionKey)}</option>
+              {providerOptions.map(provider => <option key={provider} value={provider}>{provider}</option>)}
             </select>
             <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
           </div>

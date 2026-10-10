@@ -32,8 +32,26 @@ from app.models.requests import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/system", tags=["system"])
 
-# Matched to the providers accepted by litellm.rerank() in litellm==1.81.16.
-# Keep this list narrow: it drives the Rerank provider dropdown only.
+# Product-level provider curation: the settings UI offers only these
+# providers, a subset of litellm's LlmProviders enum. Values must exist in the
+# installed litellm enum — list_litellm_providers intersects with the enum, so
+# a litellm rename or removal only drops the entry, never breaks the route.
+ALLOWED_PROVIDERS = [
+    "openai",
+    "anthropic",
+    "gemini",
+    "deepseek",
+    "openrouter",
+    "moonshot",
+    "dashscope",
+    "xai",
+    "zai",
+    "hosted_vllm",
+]
+
+# Matched to the providers each litellm call type accepts in the installed
+# litellm (re-verify on litellm upgrades). Each list is further intersected
+# with ALLOWED_PROVIDERS and drives one role's provider dropdown only.
 RERANK_SUPPORTED_PROVIDERS = [
     "azure_ai",
     "bedrock",
@@ -50,6 +68,22 @@ RERANK_SUPPORTED_PROVIDERS = [
     "vertex_ai",
     "voyage",
     "watsonx",
+]
+
+DRAW_SUPPORTED_PROVIDERS = [
+    "openai",
+    "gemini",
+    "openrouter",
+    "dashscope",
+    "xai",
+    "zai",
+]
+
+EMBEDDING_SUPPORTED_PROVIDERS = [
+    "openai",
+    "gemini",
+    "openrouter",
+    "hosted_vllm",
 ]
 
 
@@ -218,12 +252,16 @@ async def run_tex_operation(data: TeXOperationRequest):
 
 @router.get("/litellm/providers")
 async def list_litellm_providers():
-    providers = sorted({provider.value for provider in litellm.LlmProviders})
+    enum_values = {provider.value for provider in litellm.LlmProviders}
+    allowed = set(ALLOWED_PROVIDERS) & enum_values
+    provider_roles = {
+        "rerank": [p for p in RERANK_SUPPORTED_PROVIDERS if p in allowed],
+        "draw": [p for p in DRAW_SUPPORTED_PROVIDERS if p in allowed],
+        "embedding": [p for p in EMBEDDING_SUPPORTED_PROVIDERS if p in allowed],
+    }
     return ok({
-        "providers": providers,
-        "provider_roles": {
-            "rerank": RERANK_SUPPORTED_PROVIDERS,
-        },
+        "providers": sorted(allowed),
+        "provider_roles": provider_roles,
     })
 
 

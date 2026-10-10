@@ -17,15 +17,34 @@ from app.routes import system
 
 @pytest.mark.asyncio
 async def test_litellm_provider_and_static_model_metadata():
-    """The routes surface the installed litellm's provider/model data. The
-    expected values are derived from the installed litellm itself so a
-    litellm version bump cannot break the tests; the contract under test is
-    SiGMA's wiring, not litellm's data."""
-    providers = await system.list_litellm_providers()
-    assert providers["data"]["providers"]  # non-empty provider list
+    """The routes surface the curated provider list and litellm's model data.
 
-    models = await system.list_litellm_models(system.ModelListRequest(provider="openrouter"))
-    assert any(model.startswith("openrouter/") for model in models["data"]["models"])
+    The provider dropdown is the ALLOWED_PROVIDERS whitelist intersected with
+    the installed litellm enum, so a litellm version bump cannot introduce
+    unexpected entries; the rerank dropdown is further narrowed by the
+    providers litellm.rerank() actually supports."""
+    import litellm
+
+    providers = await system.list_litellm_providers()
+    enum_values = {provider.value for provider in litellm.LlmProviders}
+    expected = sorted(set(system.ALLOWED_PROVIDERS) & enum_values)
+    assert providers["data"]["providers"] == expected
+    for role, supported in {
+        "rerank": system.RERANK_SUPPORTED_PROVIDERS,
+        "draw": system.DRAW_SUPPORTED_PROVIDERS,
+        "embedding": system.EMBEDDING_SUPPORTED_PROVIDERS,
+    }.items():
+        assert providers["data"]["provider_roles"][role] == [
+            p for p in supported if p in set(expected)
+        ]
+
+    static_provider = next(
+        (p for p in system.ALLOWED_PROVIDERS if system._static_models_for_provider(p)),
+        None,
+    )
+    assert static_provider, "no whitelisted provider has static litellm model data"
+    models = await system.list_litellm_models(system.ModelListRequest(provider=static_provider))
+    assert models["data"]["models"]
 
 
 @pytest.mark.asyncio

@@ -340,7 +340,7 @@ class RAGService:
                 logger.info("RAG: Local embedding model loaded")
             else:
                 if not embedding_endpoint.model:
-                    raise ValueError("EMBEDDING_MODEL is required for cloud embedding")
+                    raise ValueError("Embedding model is required for cloud embedding")
                 logger.info(
                     f"RAG: Loading cloud embedding model {embedding_endpoint.litellm_model}"
                 )
@@ -381,8 +381,12 @@ class RAGService:
                     logger.info(f"RAG: Cloud reranker ready ({reranker_endpoint.litellm_model})")
             else:
                 self._reranker = None
-                if not reranker_endpoint.model:
-                    logger.info("RAG: Reranker disabled — RERANKER_MODEL not configured")
+                if settings.RAG_RERANKER_ENABLED:
+                    # The settings check flags this as a failure; retrieval
+                    # still works without rerank, so only warn here.
+                    logger.warning(
+                        "RAG: Reranker enabled but no rerank model is configured — running without rerank"
+                    )
 
             self._initialized = True
             logger.info("RAG service fully initialized")
