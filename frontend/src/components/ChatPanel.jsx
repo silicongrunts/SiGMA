@@ -271,6 +271,11 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   const [sessionId, setSessionId] = useState(null)
   const [sessionTitle, setSessionTitle] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
+  // Submit-in-flight window (click → stream established). The composer button
+  // shows a disabled spinner here; the red stop only takes over once the
+  // backend has claimed the session and launched the task — before that there
+  // is nothing to stop.
+  const [isSubmitting, setIsSubmitting] = useState(false)
   // Mirror isStreaming/awaiting into refs so the pendingAutoMessage effect and
   // handleDirectSend read the latest values without being closed over a stale
   // render (their effects would otherwise re-fire on every streaming token if
@@ -760,6 +765,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     const load = async () => {
       // Always reset — new session starts clean
       setIsStreaming(false)
+      setIsSubmitting(false)
       resetHistoryPaging()
       useStore.getState().setTaskList([])
       useStore.getState().setExpandedTasks(false)
@@ -2569,7 +2575,9 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   }
 
   function startEditMessage(message) {
-    if (isStreaming || !message.can_edit) return
+    // isSubmitting covers the submit window before isStreaming flips: opening
+    // a second editor then would share editingMessageId with the in-flight one.
+    if (isStreaming || isSubmitting || !message.can_edit) return
     setEditingMessageId(message.id)
     setEditingText(message.content || '')
   }
@@ -2581,13 +2589,17 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
   async function submitEditMessage() {
     const text = editingText.trim()
-    if (!text || !editingMessageId || isStreaming || awaiting || !projectId || !sessionId) return
+    // Guards read the refs, not the state: state lags until re-render, so a
+    // double-click during the awaited save below would pass a state guard
+    // twice and submit the edit twice.
+    if (!text || !editingMessageId || isStreamingRef.current || awaitingRef.current || !projectId || !sessionId) return
     const messageId = editingMessageId
     const originalMessage = messages.find(m => m.id === messageId)
     const attachments = originalMessage?.attachments || []
     // Claim the streaming slot before the awaited save: a second submit while
     // onSaveBeforeChat runs must not pass the guard above.
     isStreamingRef.current = true
+    setIsSubmitting(true)
     if (onSaveBeforeChat) {
       try { await onSaveBeforeChat() } catch { /* don't block chat on save failure */ }
     }
@@ -2606,7 +2618,10 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         ...(getUserState ? { user_state: getUserState() } : {}),
         ...(tokenBudget ? { token_budget: tokenBudget } : {}),
       }, handle.controller.signal)
-      if (handle.controller.signal.aborted) return
+      if (handle.controller.signal.aborted) { setIsSubmitting(false); return }
+      // Stream established: the backend accepted the edit (same submit_chat
+      // contract as the composer path) — swap the spinner for the stop state.
+      setIsSubmitting(false)
       streamStarted = true
       setMessages(prev => {
         const idx = prev.findIndex(m => m.id === messageId)
@@ -2622,6 +2637,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       const decoder = new TextDecoder()
       await processSSEStream(reader, decoder, handle)
     } catch (err) {
+      setIsSubmitting(false)
       if (err.name !== 'AbortError') {
         toastError(t('chat.toast.editFailed', { message: err.message || '' }))
         if (editIndex >= 0) {
@@ -2710,6 +2726,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     // Claim the streaming slot before the awaited save: a second Enter during
     // onSaveBeforeChat must not pass the guard above (which reads the ref).
     isStreamingRef.current = true
+    setIsSubmitting(true)
 
     // Save editor content before sending so AI sees the latest file
     if (onSaveBeforeChat) {
@@ -2717,10 +2734,12 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         const saved = await onSaveBeforeChat()
         if (!saved) {
           isStreamingRef.current = false
+          setIsSubmitting(false)
           return
         }
       } catch {
         isStreamingRef.current = false
+        setIsSubmitting(false)
         return
       }
     }
@@ -2752,7 +2771,11 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       if (!isCompactCommand && tokenBudget) streamBody.token_budget = tokenBudget
 
       const body = await chatAPI.stream(projectId, streamBody, handle.controller.signal)
-      if (handle.controller.signal.aborted) return
+      if (handle.controller.signal.aborted) { setIsSubmitting(false); return }
+      // Fetch resolved ⇒ submit_chat finished server-side: the session is
+      // claimed, the user message persisted, the task launched. Only now is
+      // there something to stop — hand the button over from the spinner.
+      setIsSubmitting(false)
       streamStarted = true
       // Clear the citation strip only once the stream is actually
       // established: a failed establish restores input and attachments, and
@@ -2765,6 +2788,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       // replaced messages.
       processSSEStream(reader, decoder, handle).finally(() => finalizeStreamTurn(handle, { refreshHistory: !isCompactCommand }))
     } catch (err) {
+      setIsSubmitting(false)
       if (err.name === 'AbortError') return
       if (!streamStarted) {
         setMessages(prev => {
@@ -3076,7 +3100,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                     <textarea
                       value={editingText}
                       onChange={e => setEditingText(e.target.value)}
-                      disabled={isStreaming}
+                      disabled={isStreaming || isSubmitting}
                       autoFocus
                       className="w-full min-h-24 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 px-3 py-2 text-sm text-gray-800 dark:text-gray-200 outline-none placeholder:text-gray-400 focus:ring-2 focus:ring-sigma-300 focus:border-sigma-300 disabled:opacity-60"
                     />
@@ -3084,8 +3108,11 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                       {t('chat.editWarning')}
                     </div>
                     <div className="flex justify-end gap-2 mt-2">
-                      <button disabled={isStreaming} onClick={cancelEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">{t('common.cancel')}</button>
-                      <button disabled={isStreaming} onClick={submitEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sigma-600 text-white hover:bg-sigma-700 disabled:opacity-50">{t('common.send')}</button>
+                      <button disabled={isStreaming || isSubmitting} onClick={cancelEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">{t('common.cancel')}</button>
+                      <button disabled={isStreaming || isSubmitting} onClick={submitEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sigma-600 text-white hover:bg-sigma-700 disabled:opacity-50 inline-flex items-center gap-1.5">
+                        {isSubmitting && <Loader2 className="w-3 h-3 animate-spin" />}
+                        {t('common.send')}
+                      </button>
                     </div>
                   </div>
                 )}
@@ -3366,7 +3393,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               ) : (
               <textarea
                 ref={textareaRef}
-                disabled={awaiting}
+                disabled={awaiting || isSubmitting}
                 value={chatInput}
                 onChange={e => { setChatInput(e.target.value); setSlashActiveIdx(0); setSkillActiveIdx(0); autoResizeTextarea() }}
                 onPaste={e => {
@@ -3431,10 +3458,16 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               />
               )}
               <button onClick={isStreaming ? handleStop : awaiting ? handleCancelAwaiting : handleSendMessage}
-                disabled={isUploadingAttachment}
+                disabled={isSubmitting || isUploadingAttachment}
                 title={awaiting ? t('chat.cancelWaiting') : undefined}
-                className={`p-2 text-white rounded-xl transition-all active:scale-95 disabled:opacity-50 ${isStreaming || awaiting ? 'bg-red-500 hover:bg-red-600' : 'bg-sigma-600 hover:bg-sigma-700'}`}>
-                {isStreaming || awaiting ? <Square className="w-4 h-4" /> : isUploadingAttachment ? <RotateCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                className={`p-2 text-white rounded-xl transition-all active:scale-95 disabled:opacity-50 ${!isSubmitting && (isStreaming || awaiting) ? 'bg-red-500 hover:bg-red-600' : 'bg-sigma-600 hover:bg-sigma-700'}`}>
+                {isSubmitting
+                  ? <Loader2 className="w-4 h-4 animate-spin" />
+                  : isStreaming || awaiting
+                    ? <Square className="w-4 h-4" />
+                    : isUploadingAttachment
+                      ? <RotateCw className="w-4 h-4 animate-spin" />
+                      : <Send className="w-4 h-4" />}
               </button>
             </div>
           </div>
