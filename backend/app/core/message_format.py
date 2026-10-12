@@ -174,6 +174,7 @@ def build_assistant_turn(
             "cached_tokens": int,
             "input_tokens": int,
             "last_had_tool_calls": bool,  # True → turn interrupted mid-flight
+            "last_created_at": datetime | None,  # last assistant row's stamp
         }
     """
     msg = messages[start_index]
@@ -186,6 +187,7 @@ def build_assistant_turn(
     assistant_texts: List[str] = []
     full_content = ""
     last_had_tool_calls = bool(getattr(msg, "tool_calls", None))
+    last_created_at: Any = None
 
     def _add_usage(m):
         nonlocal total_token_count, total_cached_tokens, total_input_tokens
@@ -194,10 +196,12 @@ def build_assistant_turn(
         total_input_tokens += getattr(m, "input_tokens", 0) or 0
 
     def _process_assistant(m):
-        nonlocal full_content, last_had_tool_calls
+        nonlocal full_content, last_had_tool_calls, last_created_at
 
         _add_usage(m)
         last_had_tool_calls = bool(getattr(m, "tool_calls", None))
+        if getattr(m, "created_at", None):
+            last_created_at = m.created_at
 
         text = (getattr(m, "content", None) or "").strip()
         if text:
@@ -288,6 +292,7 @@ def build_assistant_turn(
         "cached_tokens": total_cached_tokens,
         "input_tokens": total_input_tokens,
         "last_had_tool_calls": last_had_tool_calls,
+        "last_created_at": last_created_at,
         "assistant_texts": assistant_texts,
     }, j
 
@@ -391,6 +396,10 @@ def shape_messages_for_ui(
     applies to the final assistant turn only — the park always lives
     there. An unpaired call in an earlier turn is a genuinely interrupted
     one.
+
+    An assistant turn's ``created_at`` is its last assistant row's — the
+    moment the AI finished responding, not when the turn opened. Rows
+    without a stamp fall back to the previous assistant row's.
     """
     tool_results = build_tool_results_index(messages)
     result: List[Dict[str, Any]] = []
@@ -498,6 +507,7 @@ def shape_messages_for_ui(
             entry["token_count"] = turn["token_count"]
             entry["cached_tokens"] = turn["cached_tokens"]
             entry["input_tokens"] = turn["input_tokens"]
+            entry["created_at"] = to_iso(turn["last_created_at"]) or entry["created_at"]
             if pending_compacts:
                 # Compaction fired while this turn was being prepared: lead
                 # its timeline with the summary step, matching where the

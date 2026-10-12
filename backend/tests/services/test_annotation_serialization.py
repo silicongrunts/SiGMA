@@ -1,6 +1,7 @@
 """serialize_annotation: UI-facing annotation thread serialization."""
 
 import json
+from datetime import datetime, timedelta
 
 from app.services.annotation_service import serialize_annotation
 
@@ -94,6 +95,25 @@ class TestSerializeAnnotation:
         tools = [p for p in turn.get("process", []) if p["type"] == "tool"]
         assert len(tools) == 1
         assert tools[0]["tool"] == "search"
+
+    def test_merged_turn_created_at_is_last_assistant_row(self):
+        """A merged turn's timestamp is when the AI finished responding,
+        matching the chat-history semantics for the same builder."""
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        tc_json = json.dumps([{
+            "id": "tc1",
+            "function": {"name": "search", "arguments": "query"},
+        }])
+        messages = [
+            MockMsg("assistant", "Let me look...", tool_calls=tc_json,
+                    created_at=t0 + timedelta(seconds=5)),
+            MockMsg("tool", "found it", tool_call_id="tc1"),
+            MockMsg("assistant", "Here is the answer",
+                    created_at=t0 + timedelta(seconds=45)),
+        ]
+        anno = MockAnnotation(messages=messages)
+        result = serialize_annotation(anno)
+        assert result["thread"][0]["created_at"] == "2026-01-01T12:00:45+00:00"
 
     def test_interrupted_turn_empty_bubble(self):
         """Turn ending with tool_calls (no final text) → empty bubble."""

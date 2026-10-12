@@ -67,7 +67,7 @@ def serialize_annotation(annotation) -> Dict[str, Any]:
             entry: Dict[str, Any] = {
                 "role": "SiGMA",
                 "content": finalized["text"],
-                "created_at": to_iso(m.created_at),
+                "created_at": to_iso(turn["last_created_at"]) or to_iso(m.created_at),
             }
             if "process" in finalized:
                 entry["process"] = finalized["process"]

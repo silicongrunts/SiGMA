@@ -1,6 +1,7 @@
 """Message shaping: turning raw message rows into UI chat-history entries."""
 
 import json
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from app.core.compaction_text import (
@@ -13,7 +14,7 @@ from app.core.text_diff import DIFF_LINE_SOFT_LIMIT
 
 
 def _row(seq, role, content="", *, boundary=False, tool_calls=None, tool_call_id=None,
-         token_count=0, cached_tokens=0, input_tokens=0):
+         token_count=0, cached_tokens=0, input_tokens=0, created_at=None):
     return SimpleNamespace(
         id=f"m{seq}",
         role=role,
@@ -25,7 +26,7 @@ def _row(seq, role, content="", *, boundary=False, tool_calls=None, tool_call_id
         input_tokens=input_tokens,
         is_boundary=boundary,
         seq=seq,
-        created_at=None,
+        created_at=created_at,
     )
 
 
@@ -253,6 +254,39 @@ def test_history_tool_step_carries_file_edit_only_for_successful_calls():
             *_tool_turn(2, "edit", args, failure),
         ], None)
         assert "fileEdit" not in entries[-1]["process"][0]
+
+
+def test_assistant_turn_created_at_is_last_assistant_row():
+    """A merged turn's bubble time is when the AI finished, not when the
+    turn opened: the last assistant row's stamp wins, the user row keeps
+    its own."""
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    call = '[{"id": "t1", "function": {"name": "read", "arguments": "{}"}}]'
+    entries = shape_messages_for_ui([
+        _row(1, "user", "go", created_at=t0),
+        _row(2, "assistant", "checking", tool_calls=call,
+             created_at=t0 + timedelta(seconds=5)),
+        _row(3, "tool", "file body", tool_call_id="t1"),
+        _row(4, "assistant", "final answer",
+             created_at=t0 + timedelta(seconds=45)),
+    ], None)
+
+    assert entries[0]["created_at"] == "2026-01-01T12:00:00+00:00"
+    assert entries[1]["created_at"] == "2026-01-01T12:00:45+00:00"
+    assert entries[1]["content"] == "final answer"
+
+
+def test_assistant_turn_created_at_falls_back_to_previous_row():
+    """A last assistant row without a stamp keeps the previous assistant
+    row's time instead of regressing to the turn-opening row."""
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    entries = shape_messages_for_ui([
+        _row(1, "user", "go"),
+        _row(2, "assistant", "part one", created_at=t0 + timedelta(seconds=5)),
+        _row(3, "assistant", "final answer"),
+    ], None)
+
+    assert entries[-1]["created_at"] == "2026-01-01T12:00:05+00:00"
 
 
 def test_parked_session_marks_unpaired_final_call_as_awaiting_input():
