@@ -118,6 +118,10 @@
 .sigma-content svg {
   max-width: 100%;
 }
+/* Markdown images open the fullscreen viewer on click; images inside links
+   keep the pointer cursor because the click follows the link instead. */
+.sigma-content img { cursor: zoom-in; }
+.sigma-content a img { cursor: pointer; }
 .sigma-content table {
   border-collapse: collapse;
   width: auto;
@@ -241,6 +245,8 @@
 .prose svg {
   max-width: 100%;
 }
+.prose img { cursor: zoom-in; }
+.prose a img { cursor: pointer; }
 
 /* Overflow containment — nothing rendered inside the preview may cross the
    column boundary. Each wide element type owns its own scrollbar instead. */

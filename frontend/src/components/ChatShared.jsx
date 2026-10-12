@@ -14,6 +14,7 @@ import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
 import { ChevronDown, Cpu, CheckCircle2, Loader2, AlertCircle, AlertTriangle, FoldVertical, PauseCircle, Search, FileText, X } from 'lucide-react'
 import TaskList from './TaskList'
 import DiffView from './DiffView'
+import ImageLightbox from './ImageLightbox'
 
 marked.setOptions({ gfm: true, breaks: true })
 
@@ -261,6 +262,10 @@ const citationUriRegexp = /^(?:sigma:|(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|
 
 export const MarkdownContent = ({ content, projectId = null, onCitation = null, compact = false }) => {
     const containerRef = useRef(null)
+    // Currently open image viewer: { src, alt } from the clicked <img>, or
+    // null. Mounted per MarkdownContent instance (one chat message = one
+    // potential viewer), rendered through ImageLightbox's body portal.
+    const [lightbox, setLightbox] = useState(null)
 
     // Memoize parsing+sanitizing: in streaming chat the parent re-renders on
     // every token delta, and without this every prior message re-parses its
@@ -302,39 +307,63 @@ export const MarkdownContent = ({ content, projectId = null, onCitation = null, 
         }
     }, [html])
 
-    // Links that are never real navigation are intercepted via a single
-    // delegated handler instead of per-anchor binding: sigma: citations, and
-    // project-relative markdown links (marked by decorateMarkdownLinks with
-    // data-sigma-path). The latter dispatch through the citation channel as a
-    // synthesized sigma://synthesis URL, so validation, tab switching,
-    // autosave-before-switch, and error toasts all live in one place
-    // (EditorView's handleCitation / openProjectPath). Only active when
-    // onCitation is set, so other MarkdownContent callers are unaffected.
+    // Links and images are intercepted via a single delegated handler instead
+    // of per-element binding. Links: sigma: citations, and project-relative
+    // markdown links (marked by decorateMarkdownLinks with data-sigma-path)
+    // dispatch through the citation channel as a synthesized sigma://synthesis
+    // URL, so validation, tab switching, autosave-before-switch, and error
+    // toasts all live in one place (EditorView's handleCitation /
+    // openProjectPath). Without onCitation, anchors keep their native
+    // behavior. Plain images (not wrapped in an <a> — a linked image keeps
+    // its link semantics) open the fullscreen ImageLightbox.
     const handleClick = useMemo(() => {
-        if (!onCitation) return undefined
         return (e) => {
             const anchor = e.target.closest?.('a')
-            if (!anchor) return
-            const sigmaPath = anchor.getAttribute('data-sigma-path')
-            if (sigmaPath) {
+            if (anchor) {
+                if (!onCitation) return
+                const sigmaPath = anchor.getAttribute('data-sigma-path')
+                if (sigmaPath) {
+                    e.preventDefault()
+                    onCitation(`sigma://synthesis/file?path=${encodeURIComponent(sigmaPath)}`)
+                    return
+                }
+                const href = anchor.getAttribute('href') || ''
+                if (!href.startsWith(SIGMA_CITATION_SCHEME + ':')) return
                 e.preventDefault()
-                onCitation(`sigma://synthesis/file?path=${encodeURIComponent(sigmaPath)}`)
+                onCitation(href)
                 return
             }
-            const href = anchor.getAttribute('href') || ''
-            if (!href.startsWith(SIGMA_CITATION_SCHEME + ':')) return
+            const img = e.target.closest?.('img')
+            if (!img) return
+            // A drag-selection that starts or ends on an image is text
+            // selection, not an open request.
+            const sel = document.getSelection()
+            if (sel && sel.type === 'Range') return
             e.preventDefault()
-            onCitation(href)
+            e.stopPropagation()
+            setLightbox({
+                src: img.getAttribute('src') || img.src || '',
+                alt: img.getAttribute('alt') || '',
+            })
         }
     }, [onCitation])
 
     return (
-        <div
-            ref={containerRef}
-            className={`${compact ? 'sigma-content sigma-content-compact' : 'sigma-content'} text-sm leading-relaxed break-words overflow-hidden`}
-            dangerouslySetInnerHTML={{ __html: html }}
-            onClick={handleClick}
-        />
+        <>
+            <div
+                ref={containerRef}
+                className={`${compact ? 'sigma-content sigma-content-compact' : 'sigma-content'} text-sm leading-relaxed break-words overflow-hidden`}
+                dangerouslySetInnerHTML={{ __html: html }}
+                onClick={handleClick}
+            />
+            {lightbox && (
+                <ImageLightbox
+                    src={lightbox.src}
+                    alt={lightbox.alt}
+                    onClose={() => setLightbox(null)}
+                />
+            )}
+        </>
     )
 }
 

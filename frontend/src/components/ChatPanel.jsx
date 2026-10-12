@@ -9,6 +9,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { MarkdownContent, ThinkingProcess, CompactSummaryNote, STREAM_RECOVERY_MAX_ATTEMPTS, STREAM_RECOVERY_DELAY_MS, isAgentToolName, streamStatusText, withTransientHint } from './ChatShared'
+import ImageLightbox from './ImageLightbox'
 import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, ChevronRight, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Loader2, GitBranch, Search, AlertTriangle } from 'lucide-react'
 import ContextPuck from './ContextPuck'
 import { toastError, toastSuccess } from './Toast'
@@ -219,24 +220,30 @@ function imageFilesFromList(files) {
 
 function AttachmentStrip({ projectId, attachments, onRemove = null, compact = false }) {
   const { t } = useTranslation()
+  // Fullscreen image viewer: { src, alt } of the clicked thumbnail, or null.
+  const [viewer, setViewer] = useState(null)
   if (!attachments?.length) return null
   return (
     <div className={`flex flex-wrap gap-2 ${compact ? 'mt-2' : ''}`}>
       {attachments.map(item => (
         <div key={item.path} className="relative group/attachment">
-          <a
-            href={attachmentSrc(projectId, item)}
-            target="_blank"
-            rel="noreferrer"
-            className="block overflow-hidden rounded-lg border border-white/20 bg-white/10"
+          <button
+            type="button"
+            onClick={() => setViewer({
+              src: attachmentSrc(projectId, item),
+              alt: item.name || t('chat.attachedImage'),
+            })}
+            className="block overflow-hidden rounded-lg border border-white/20 bg-white/10 cursor-zoom-in"
             title={item.name || item.path}
+            aria-label={t('chat.viewImage')}
           >
             <img
               src={attachmentSrc(projectId, item)}
               alt={item.name || t('chat.attachedImage')}
               className={`${compact ? 'h-20 w-20' : 'h-16 w-16'} object-cover`}
+              draggable={false}
             />
-          </a>
+          </button>
           {onRemove && (
             <button
               type="button"
@@ -249,6 +256,13 @@ function AttachmentStrip({ projectId, attachments, onRemove = null, compact = fa
           )}
         </div>
       ))}
+      {viewer && (
+        <ImageLightbox
+          src={viewer.src}
+          alt={viewer.alt}
+          onClose={() => setViewer(null)}
+        />
+      )}
     </div>
   )
 }

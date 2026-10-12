@@ -18,6 +18,7 @@ import { rewriteProjectImageSrc, decorateMarkdownLinks } from './ChatShared'
 import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
 import { copyToClipboard } from '../utils/clipboard'
 import PdfPreview from './preview/PdfPreview'
+import ImageLightbox from './ImageLightbox'
 import { ZoomIn, ZoomOut, ArrowUp, Maximize2, FileSearch, FileText, Download, AlertTriangle, ChevronLeft, ChevronRight, List } from 'lucide-react'
 
 // Dedicated marked instance for the editor preview pipeline, fully isolated
@@ -230,6 +231,8 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
   const [editingPage, setEditingPage] = useState(false)
   const pageInputRef = useRef(null)
   const [containerWidth, setContainerWidth] = useState(0)
+  // Open image viewer: { src, alt } from a clicked prose <img>, or null.
+  const [lightbox, setLightbox] = useState(null)
   // Outline entries: [{ level, text, el }] in document order — same element
   // list the heading map already consumes, plus level/text for the TOC UI.
   const [outline, setOutline] = useState([])
@@ -1038,13 +1041,14 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
   // produced it — the reverse of scrollToLine. The block map records list
   // blocks per <li> (a descendant of the top-level <ul>), so the entry is
   // located by containment from the click target rather than by identity with
-  // the top-level element. Links are excluded: their click already navigates
-  // (in-app for data-sigma-path, new tab for external), so a double click must
-  // not also move the editor. Documents whose block map failed validation
-  // simply get no jump.
+  // the top-level element. Links and images are excluded: a link's click
+  // already navigates (in-app for data-sigma-path, new tab for external), and
+  // an image's click opens the ImageLightbox, so a double click must not also
+  // move the editor. Documents whose block map failed validation simply get
+  // no jump.
   const handleProseDoubleClick = useCallback((e) => {
     if (!onJumpToLine) return
-    if (e.target.closest?.('a')) return
+    if (e.target.closest?.('a, img')) return
     const block = blockMapRef.current.find(b => b.el.contains(e.target))
     if (block) onJumpToLine(block.startLine + 1)  // block map lines are 0-indexed, gotoLine is 1-indexed
   }, [onJumpToLine])
@@ -1235,16 +1239,34 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
                     className="prose dark:prose-invert max-w-none prose-pre:font-mono prose-code:font-mono prose-code:before:hidden prose-code:after:hidden"
                     style={{ maxWidth: '60rem', width: '100%', fontSize: `${zoomLevel}rem` }}
                     onClick={(e) => {
-                        // Project-relative markdown links (marked by
-                        // decorateMarkdownLinks with data-sigma-path) open
+                        // Links first: project-relative markdown links (marked
+                        // by decorateMarkdownLinks with data-sigma-path) open
                         // in-app via openProjectPath — never a navigation that
                         // would unload the editor. External links need no
-                        // interception: they carry target="_blank".
-                        if (!onOpenPath) return
-                        const anchor = e.target.closest?.('a[data-sigma-path]')
-                        if (!anchor) return
+                        // interception: they carry target="_blank". An image
+                        // wrapped in a link keeps its link semantics.
+                        const anchor = e.target.closest?.('a')
+                        if (anchor) {
+                            if (!onOpenPath) return
+                            const sigmaPath = anchor.getAttribute('data-sigma-path')
+                            if (!sigmaPath) return
+                            e.preventDefault()
+                            onOpenPath(sigmaPath)
+                            return
+                        }
+                        // A plain image opens the fullscreen viewer. A
+                        // drag-selection ending on an image is text selection,
+                        // not an open request.
+                        const img = e.target.closest?.('img')
+                        if (!img) return
+                        const sel = document.getSelection()
+                        if (sel && sel.type === 'Range') return
                         e.preventDefault()
-                        onOpenPath(anchor.getAttribute('data-sigma-path'))
+                        e.stopPropagation()
+                        setLightbox({
+                            src: img.getAttribute('src') || img.src || '',
+                            alt: img.getAttribute('alt') || '',
+                        })
                     }}
                     onDoubleClick={handleProseDoubleClick}
                     dangerouslySetInnerHTML={{ __html: (() => {
@@ -1283,6 +1305,14 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
           </div>
         ))}
       </div>
+
+      {lightbox && (
+        <ImageLightbox
+          src={lightbox.src}
+          alt={lightbox.alt}
+          onClose={() => setLightbox(null)}
+        />
+      )}
     </div>
   )
 })
