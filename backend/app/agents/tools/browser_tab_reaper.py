@@ -29,7 +29,16 @@ _SCAN_INTERVAL = 60  # seconds between scans (hardcoded, not user-facing)
 
 
 class TabReaper:
-    """Daemon thread that closes idle Chrome tabs."""
+    """Daemon thread that closes idle Chrome tabs.
+
+    Scans can be suspended for a bounded window (refcounted via
+    ``suspend``/``resume``) while a flow owns the browser interactively —
+    e.g. the ChatGPT OAuth login, where the auth tab legitimately sits
+    unchanged far longer than the idle timeout. While suspended the idle
+    baseline (``_state``) is dropped, so every tab gets a fresh idle window
+    after resumption instead of being closed immediately for idleness that
+    accrued during the suspension.
+    """
 
     def __init__(self, cdp_port: int, idle_timeout: int):
         self._cdp_port = cdp_port
@@ -39,6 +48,8 @@ class TabReaper:
         self._state: dict[str, dict] = {}
         self._running = False
         self._thread: threading.Thread | None = None
+        self._suspend_lock = threading.Lock()
+        self._suspend_count = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -65,6 +76,22 @@ class TabReaper:
         logger.info("TabReaper stopped")
 
     # ------------------------------------------------------------------
+    # Suspension (refcounted)
+    # ------------------------------------------------------------------
+
+    def suspend(self) -> None:
+        """Pause idle-tab closing for one owner. Every call must be paired
+        with exactly one ``resume`` (owners use try/finally)."""
+        with self._suspend_lock:
+            self._suspend_count += 1
+        logger.info("TabReaper suspended (count=%d)", self._suspend_count)
+
+    def resume(self) -> None:
+        with self._suspend_lock:
+            self._suspend_count = max(0, self._suspend_count - 1)
+        logger.info("TabReaper resumed (count=%d)", self._suspend_count)
+
+    # ------------------------------------------------------------------
     # Core loop
     # ------------------------------------------------------------------
 
@@ -80,6 +107,13 @@ class TabReaper:
 
     def _scan(self) -> None:
         """One scan cycle: list targets, detect idle, close."""
+        with self._suspend_lock:
+            suspended = self._suspend_count > 0
+        if suspended:
+            # Restart every tab's idle clock: time spent inside the
+            # suspension window must not count toward idleness.
+            self._state.clear()
+            return
         try:
             resp = httpx.get(f"{self._base_url}/json/list", timeout=5)
             resp.raise_for_status()

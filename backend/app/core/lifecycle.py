@@ -137,6 +137,19 @@ async def startup_event():
     except Exception as e:
         logger.warning("Failed to start terminal reaper: %s", e, exc_info=True)
 
+    # ---- ChatGPT subscription provider ----
+    # Installs the instructions-passthrough policy (fail-loud on litellm
+    # drift), verifies the token mirror wiring, and keeps the refresh chain
+    # alive across idle periods.
+    from app.core.chatgpt_provider import apply_chatgpt_provider_policy
+    apply_chatgpt_provider_policy()
+    from app.services.chatgpt_auth_service import chatgpt_auth_service
+    try:
+        await chatgpt_auth_service.startup_check()
+    except Exception as e:
+        logger.warning("ChatGPT startup token check failed: %s", e, exc_info=True)
+    chatgpt_auth_service.start_maintenance()
+
     # ---- Library background runner and maintenance loop ----
     # Started last: the library task handlers register themselves at the
     # document-processing / index-builder imports above.
@@ -230,5 +243,13 @@ async def shutdown_event():
         await terminal_service.kill_all()
     except Exception as e:
         logger.warning("Failed to kill terminal sessions: %s", e, exc_info=True)
+
+    # ---- ChatGPT subscription ----
+    from app.services.chatgpt_auth_service import chatgpt_auth_service
+    try:
+        await chatgpt_auth_service.stop_maintenance()
+        await chatgpt_auth_service.cancel_login()
+    except Exception as e:
+        logger.warning("Failed to stop ChatGPT subscription service: %s", e, exc_info=True)
 
     logger.info("SiGMA shutdown complete")

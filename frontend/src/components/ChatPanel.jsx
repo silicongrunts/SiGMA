@@ -9,7 +9,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { MarkdownContent, ThinkingProcess, CompactSummaryNote, STREAM_RECOVERY_MAX_ATTEMPTS, STREAM_RECOVERY_DELAY_MS, isAgentToolName, streamStatusText, withTransientHint } from './ChatShared'
-import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Loader2, GitBranch, Search, AlertTriangle } from 'lucide-react'
+import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, ChevronRight, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Loader2, GitBranch, Search, AlertTriangle } from 'lucide-react'
 import ContextPuck from './ContextPuck'
 import { toastError, toastSuccess } from './Toast'
 import { ModalOverlay, ConfirmModal } from './Modal'
@@ -22,6 +22,8 @@ import { copyToClipboard } from '../utils/clipboard'
 import { formatTimestamp } from '../utils/formatTimestamp'
 import { joinCitationTexts } from '../utils/citations'
 import { useStore } from '../store/useStore'
+import { chatgptAPI } from '../api'
+import { fetchChatGPTStatus, formatChatGPTWindowReset, ChatGPTQuotaModal } from './ChatGPTSubscriptionSection'
 import { useTranslation } from 'react-i18next'
 
 function formatTokenCount(value) {
@@ -386,6 +388,12 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   // Per-turn token budget
   const [tokenBudget, setTokenBudget] = useState(null)
   const [contextStats, setContextStats] = useState(null)
+  // ChatGPT subscription rate-limit display for the context-puck panel:
+  // shown while any role resolves to the chatgpt provider, refetched on
+  // every panel open with a loading state.
+  const [puckPanelOpen, setPuckPanelOpen] = useState(false)
+  const [chatgptUsage, setChatgptUsage] = useState(null) // null | 'loading' | 'error' | {data}
+  const [quotaModalOpen, setQuotaModalOpen] = useState(false)
   const [budgetDraft, setBudgetDraft] = useState('')
   const [budgetError, setBudgetError] = useState('')
 
@@ -2844,6 +2852,26 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   const ctxPctOfMax = ctxMax > 0 ? Math.min(100, (ctxCurrent / ctxMax) * 100) : 0
   const ctxThresholdPctOfMax = ctxMax > 0 ? Math.min(100, (ctxThreshold / ctxMax) * 100) : 0
 
+  // Refresh subscription rate limits whenever the puck panel opens. The
+  // shared status snapshot is refreshed too, so switching a role to/from the
+  // chatgpt provider in the settings is picked up without reopening the view.
+  useEffect(() => {
+    if (!puckPanelOpen) return
+    let cancelled = false
+    setChatgptUsage('loading')
+    fetchChatGPTStatus().then((status) => {
+      if (cancelled) return
+      if (!status?.in_use) {
+        setChatgptUsage(null)
+        return
+      }
+      chatgptAPI.usage()
+        .then(data => { if (!cancelled) setChatgptUsage({ data }) })
+        .catch(() => { if (!cancelled) setChatgptUsage('error') })
+    })
+    return () => { cancelled = true }
+  }, [puckPanelOpen])
+
   function applySlashSuggestion(command) {
     // Suggestions are only shown when the input is exactly `/` or `/word` with
     // nothing after, so we can replace the whole input.
@@ -3319,7 +3347,13 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               container's 1px border and `block` avoids the inline-block
               baseline gap, keeping tops and bottoms flush. */}
           <div className="-mr-2 flex items-end gap-[3px]">
-            <div className="group/puck relative -ml-2 flex-shrink-0">
+            <div
+              className="group/puck relative -ml-2 flex-shrink-0"
+              onMouseEnter={() => setPuckPanelOpen(true)}
+              onMouseLeave={() => setPuckPanelOpen(false)}
+              onFocusCapture={() => setPuckPanelOpen(true)}
+              onBlurCapture={() => setPuckPanelOpen(false)}
+            >
               <button
                 ref={autoApproveBtnRef}
                 onClick={() => {
@@ -3350,8 +3384,12 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               </button>
               <div
                 role="tooltip"
-                className="pointer-events-none absolute bottom-full left-0 z-[90] mb-2 hidden w-max max-w-[280px] space-y-1 rounded-lg border border-gray-200 bg-gray-800 px-3 py-2 font-mono text-[11px] leading-relaxed text-gray-100 shadow-2xl group-hover/puck:block group-focus-within/puck:block dark:border-gray-700 dark:bg-gray-900"
+                className="invisible absolute bottom-full left-0 z-[90] mb-2 w-max max-w-[280px] space-y-1 rounded-lg border border-gray-200 bg-gray-800 px-3 py-2 font-mono text-[11px] leading-relaxed text-gray-100 shadow-2xl group-hover/puck:visible group-focus-within/puck:visible after:absolute after:-bottom-2 after:left-0 after:h-2 after:right-0 after:visible after:content-[''] dark:border-gray-700 dark:bg-gray-900"
               >
+                {/* Hoverable tooltip (no pointer-events-none): the mouse may
+                    move in — the invisible after-bridge spans the mb-2 gap so
+                    crossing it never closes the panel. visibility-based
+                    hiding keeps the bridge present while hidden. */}
                 {contextStats && (
                   <>
                     <div>{t('chat.ctxLength')}{formatTokenCount(ctxCurrent)} / {formatTokenCount(ctxThreshold)} ({ctxPct}%)</div>
@@ -3361,6 +3399,56 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                       <div className="absolute inset-y-0 w-px bg-gray-200 dark:bg-gray-300" style={{ left: `${ctxThresholdPctOfMax}%` }} />
                     </div>
                   </>
+                )}
+                {chatgptUsage && chatgptUsage !== 'error' && (
+                  chatgptUsage === 'loading' ? (
+                    <div className="border-t border-gray-700 pt-1">
+                      <div className="flex items-center gap-1.5 text-gray-300">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        {t('chatgpt.usage.title')}
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      title={t('chatgpt.quota.viewHint')}
+                      onClick={() => setQuotaModalOpen(true)}
+                      className="block w-full border-t border-gray-700 pt-1 text-left cursor-pointer rounded-md hover:bg-gray-700/40 transition-colors"
+                    >
+                      <div className="grid grid-cols-2 gap-x-3">
+                        {[
+                          ['primary_window', 'chatgpt.usage.fiveHourWindow'],
+                          ['secondary_window', 'chatgpt.usage.weeklyWindow'],
+                        ].map(([winKey, labelKey]) => {
+                          const win = chatgptUsage.data?.rate_limit?.[winKey]
+                          if (!win) return <div key={winKey} />
+                          const used = Number(win.used_percent) || 0
+                          const reset = formatChatGPTWindowReset(win.reset_after_seconds, t)
+                          return (
+                            <div key={winKey} className="min-w-0">
+                              <div className="flex items-baseline justify-between gap-2">
+                                <span className="truncate">{t(labelKey)}</span>
+                                <span>{used.toFixed(0)}%</span>
+                              </div>
+                              <div className="relative mt-0.5 h-1 overflow-hidden rounded-full bg-gray-600 dark:bg-gray-700">
+                                <div
+                                  className={`absolute inset-y-0 left-0 rounded-full ${used >= 100 ? 'bg-red-500' : used >= 80 ? 'bg-amber-400' : 'bg-blue-400'}`}
+                                  style={{ width: `${Math.min(Math.max(used, 0), 100)}%` }}
+                                />
+                              </div>
+                              {reset && (
+                                <div className="mt-0.5 text-[10px] text-gray-400">{t('chatgpt.usage.resets')} {reset}</div>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                      <div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-gray-400">
+                        {t('chatgpt.quota.viewHint')}
+                        <ChevronRight className="w-3 h-3" />
+                      </div>
+                    </button>
+                  )
                 )}
                 <div className="flex flex-wrap gap-x-3 gap-y-0.5 pt-0.5">
                   {APPROVAL_CATEGORIES.map(({ key, labelKey }) => {
@@ -3766,6 +3854,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         message={t('chat.deleteArchivedConfirm')}
         danger
       />
+
+      <ChatGPTQuotaModal isOpen={quotaModalOpen} onClose={() => setQuotaModalOpen(false)} />
     </div>
   )
 }

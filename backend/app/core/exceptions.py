@@ -189,6 +189,12 @@ class ConfigurationError(SiGMAException):
         super().__init__(message, "CONFIGURATION_ERROR", 500)
 
 
+class CodexCatalogError(SiGMAException):
+    """The remote Codex model catalog could not be fetched from any source."""
+    def __init__(self, message: str = "Codex model catalog error"):
+        super().__init__(message, "CODEX_CATALOG_ERROR", 502)
+
+
 class RAGIndexModelMismatchError(ServiceException):
     """The on-disk RAG index was built with a different embedding model."""
     def __init__(self, current_model: str = "", indexed_model: str = ""):
@@ -321,6 +327,18 @@ class AuthenticationError(SiGMAException):
     """Authentication is required or the provided credentials are invalid."""
     def __init__(self, detail: str = "Authentication required"):
         super().__init__(detail, "AUTHENTICATION_ERROR", status_code=401)
+
+
+class ChatGPTAuthError(ServiceException):
+    """ChatGPT subscription (Codex OAuth) authentication failure.
+
+    Covers the whole lifecycle: a login flow that never received a callback,
+    a code/token exchange rejection, an import of a malformed auth file, and
+    refresh-chain terminal states (``invalid_grant`` /
+    ``refresh_token_reused``) where only a fresh interactive login helps.
+    """
+    def __init__(self, detail: str = "ChatGPT subscription authentication error"):
+        super().__init__(detail, code="CHATGPT_AUTH_ERROR", status_code=400)
 
 
 # ---------------------------------------------------------------------------

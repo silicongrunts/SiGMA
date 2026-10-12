@@ -451,6 +451,13 @@ class SettingsCheckService:
         start = time.monotonic()
 
         try:
+            if endpoint.provider == "chatgpt":
+                # Fail fast with a clear config error instead of letting the
+                # chatgpt transport fall back to an interactive device-code
+                # login inside the check.
+                from app.services.chatgpt_auth_service import chatgpt_auth_service
+                await chatgpt_auth_service.ensure_ready()
+
             if role in ("supervisor", "ra"):
                 await asyncio.wait_for(
                     _check_chat_model(endpoint, "Who are you? Reply in under 10 words."),
@@ -465,10 +472,19 @@ class SettingsCheckService:
                     timeout=60,
                 )
             elif role == "draw":
-                await asyncio.wait_for(
-                    _check_draw_model(endpoint, "A simple landscape painting"),
-                    timeout=60,
-                )
+                if endpoint.provider == "chatgpt":
+                    # LiteLLM has no chatgpt image transport; use the same
+                    # Codex-images branch the draw role uses at runtime.
+                    from app.services.llm_service import codex_generate_image
+                    await asyncio.wait_for(
+                        codex_generate_image(endpoint, "A simple landscape painting"),
+                        timeout=60,
+                    )
+                else:
+                    await asyncio.wait_for(
+                        _check_draw_model(endpoint, "A simple landscape painting"),
+                        timeout=60,
+                    )
             elif role == "embedding":
                 await asyncio.wait_for(
                     _check_embedding_model(endpoint),

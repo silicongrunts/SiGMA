@@ -160,10 +160,10 @@ configure three model roles before SiGMA can work:
 
 - **Supervisor**: the main orchestration model. It plans, coordinates tools,
   writes final answers, and handles hard reasoning. Use a strong model here.
-  Recommended: `GPT-6 Astra`, `Claude Opus-4.6`, `Claude Opus-5`, `Claude Fable-5.1`.
+  Recommended: `GPT-6 Astra`, `GPT-6.1 Sol`, `Claude Opus-5.5`, `Claude Fable-5.1`.
 - **RA**: the research assistant model. It handles explore, searching, and
   drafting tasks, so it can be cheaper and faster than Supervisor. Recommended:
-  `GPT-5.6 Luna`, `Gemini-3.8 Flash`, `DeepSeek-4.1 Flash`.
+  `GPT-6 Luna`, `Gemini-3.8 Flash`, `DeepSeek-4.1 Flash`.
 - **Embedding**: the model used to index and search your Library. For local
   deployment, we recommend `Qwen3 Embedding-0.6B`.
 
@@ -173,6 +173,8 @@ For cloud models, fill in:
 - **Base URL**: only needed for custom or OpenAI-compatible endpoints.
 - **API Key**: your provider key.
 - **Model**: the exact model name.
+
+SiGMA also supports ChatGPT subscription (Codex OAuth, experimental).
 
 For local embedding, choose **Local / model prefix**, select HuggingFace or
 ModelScope, then enter the model name.

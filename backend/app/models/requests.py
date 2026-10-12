@@ -408,3 +408,37 @@ class TeXOperationRequest(BaseModel):
     package: Optional[str] = None
     query: Optional[str] = None
     target_year: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# ChatGPT subscription (Codex OAuth)
+# ---------------------------------------------------------------------------
+
+class ChatGPTLoginRequest(BaseModel):
+    """Request body for POST /chatgpt/login.
+
+    ``open_browser`` selects the login surface: true opens the authorize page
+    in the embedded Chrome (and streams its picture to the login overlay);
+    false leaves the browser to the user, who opens the authorize URL in
+    their own browser and pastes the callback.
+    """
+    open_browser: StrictBool = True
+
+
+class ChatGPTCallbackRequest(BaseModel):
+    """The full OAuth redirect URL pasted by the user."""
+    url: str = Field(..., min_length=1, max_length=4096)
+
+
+class ChatGPTImportRequest(BaseModel):
+    """Raw contents of an exported Codex CLI auth.json (or a flat record)."""
+    content: str = Field(..., min_length=1, max_length=200_000)
+
+
+class ChatGPTResetCreditRequest(BaseModel):
+    """Request body for POST /chatgpt/reset-credits/consume.
+
+    ``credit_id`` targets one specific reset card; omitted means let the
+    backend pick an eligible one (same as the official CLI's default).
+    """
+    credit_id: str | None = Field(default=None, min_length=1, max_length=256)

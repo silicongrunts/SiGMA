@@ -5,6 +5,7 @@ import { systemAPI, authAPI } from '../api'
 import { createSSEStreamParser } from '../utils/sse'
 import { resolveModelRoleConfig } from '../utils/modelRoles'
 import { toastError } from './Toast'
+import { ChatGPTProviderField } from './ChatGPTSubscriptionSection'
 
 const MODEL_ROLES = [
   ['supervisor', 'system.role.supervisor'],
@@ -13,6 +14,22 @@ const MODEL_ROLES = [
   ['draw', 'system.role.draw'],
   ['embedding', 'system.role.embedding'],
   ['rerank', 'system.role.rerank'],
+]
+
+// Transport roles the subscription can serve with chat models. embedding and
+// rerank have no chatgpt entry in their provider lists, so a chatgpt value
+// there can only come from a hand-edited config.
+const CHATGPT_CHAT_ROLES = ['supervisor', 'ra', 'vision']
+
+// Image-generation suggestions for the draw role on the ChatGPT subscription.
+// No remote catalog publishes these names (Codex clients pin them in code,
+// and so does this list); the field stays free-text either way.
+const CHATGPT_DRAW_IMAGE_MODELS = [
+  'gpt-image-1.5',
+  'gpt-image-2',
+  'gpt-image-2.5',
+  'gpt-image-2.5-flare',
+  'gpt-image-2.5-sunburst',
 ]
 
 const MODEL_ROLE_DETAILS = {
@@ -456,6 +473,7 @@ function ModelRoleForm({
   onFetchModels,
   onFetchContext,
   onApplyContext,
+  onRefreshChatgptModels,
 }) {
   const { t } = useTranslation()
   const roleConfig = config.models?.[role] || {}
@@ -511,6 +529,12 @@ function ModelRoleForm({
       // Switching from Local to Cloud: clear local-only fields
       onChange(['models', role, 'source'], '')
       onChange(['models', role, 'hf_endpoint'], '')
+    }
+    if (nextProvider === 'chatgpt') {
+      // The subscription authenticates via its own OAuth login; stale
+      // key/URL values from a previous provider would only linger hidden.
+      onChange(['models', role, 'api_key'], '')
+      onChange(['models', role, 'base_url'], '')
     }
     updateRole('provider', nextProvider)
   }
@@ -582,13 +606,21 @@ function ModelRoleForm({
               className="w-full appearance-none px-3 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg outline-none focus:ring-4 focus:ring-sigma-600/10 focus:border-sigma-600 text-sm"
             >
               <option value="">{t(emptyOptionKey)}</option>
-              {providerOptions.map(provider => <option key={provider} value={provider}>{provider}</option>)}
+              {providerOptions.map(provider => (
+                <option key={provider} value={provider}>
+                  {provider === 'chatgpt' ? t('chatgpt.title') : provider}
+                </option>
+              ))}
             </select>
             <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
           </div>
         </label>
 
-        {!isLocal && (
+        {!isLocal && roleConfig.provider === 'chatgpt' ? (
+          // The subscription needs no Base URL / API key — show the login
+          // status button that opens the ChatGPT subscription panel instead.
+          <ChatGPTProviderField />
+        ) : !isLocal && (
           <>
             <TextField
               label={t('system.baseUrl')}
@@ -605,23 +637,49 @@ function ModelRoleForm({
           </>
         )}
 
-        <label className="block">
-          <span className="block text-xs font-bold text-gray-500 dark:text-gray-400 mb-1.5">{t('system.modelLabel')}</span>
-          <div className="relative">
-            <input
-              value={roleConfig.model || ''}
-              list={datalistId}
-              onFocus={() => onFetchModels(role)}
-              onBlur={() => hasContextBudget && onFetchContext(role)}
-              onChange={e => updateRole('model', e.target.value)}
-              className="w-full px-3 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg outline-none focus:ring-4 focus:ring-sigma-600/10 focus:border-sigma-600 text-sm"
-            />
-            {loadingModels && <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 animate-spin" />}
+        {/* One grid cell: the header row (label + optional catalog refresh)
+            must wrap the input's label, or the 4-column form grid splits the
+            field across two rows. */}
+        <div>
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-xs font-bold text-gray-500 dark:text-gray-400">{t('system.modelLabel')}</span>
+            {roleConfig.provider === 'chatgpt' && CHATGPT_CHAT_ROLES.includes(role) && (
+              <button
+                type="button"
+                onClick={() => onRefreshChatgptModels(role)}
+                disabled={loadingModels}
+                title={t('system.chatgptModelRefresh')}
+                className="flex items-center gap-1 shrink-0 whitespace-nowrap text-xs font-bold text-sigma-600 dark:text-sigma-400 hover:underline disabled:opacity-50 disabled:hover:no-underline"
+              >
+                <RotateCcw className={`w-3 h-3 ${loadingModels ? 'animate-spin' : ''}`} />
+                {t('system.chatgptModelRefresh')}
+              </button>
+            )}
           </div>
-          <datalist id={datalistId}>
-            {(modelSuggestions[role] || []).map(model => <option key={model} value={model} />)}
-          </datalist>
-        </label>
+          <label className="block">
+            <div className="relative">
+              <input
+                value={roleConfig.model || ''}
+                list={datalistId}
+                onFocus={() => onFetchModels(role)}
+                onBlur={() => hasContextBudget && onFetchContext(role)}
+                onChange={e => updateRole('model', e.target.value)}
+                className="w-full px-3 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg outline-none focus:ring-4 focus:ring-sigma-600/10 focus:border-sigma-600 text-sm"
+              />
+              {/* Positioning and rotation must live on separate elements:
+                  animate-spin's keyframes override the transform property,
+                  which would discard the -translate-y-1/2 centering. */}
+              {loadingModels && (
+                <span className="absolute right-3 top-1/2 -translate-y-1/2 flex">
+                  <Loader2 className="w-4 h-4 text-gray-400 animate-spin" />
+                </span>
+              )}
+            </div>
+            <datalist id={datalistId}>
+              {(modelSuggestions[role] || []).map(model => <option key={model} value={model} />)}
+            </datalist>
+          </label>
+        </div>
       </div>}
 
       {!isReused && isLocal && canLocal && (
@@ -884,6 +942,33 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
   const fetchModels = async (role) => {
     const roleConfig = config?.models?.[role]
     if (!roleConfig) return
+    if (roleConfig.provider === 'chatgpt') {
+      // The subscription has no discovery endpoint: chat roles suggest from
+      // the cached remote catalog (fallback: litellm's static list), the
+      // draw role from the built-in image names, and any other role (only
+      // reachable via a hand-edited config) gets no suggestions.
+      if (role === 'draw') {
+        setModelSuggestions(current => ({ ...current, [role]: CHATGPT_DRAW_IMAGE_MODELS }))
+        return
+      }
+      if (!CHATGPT_CHAT_ROLES.includes(role)) {
+        setModelSuggestions(current => ({ ...current, [role]: [] }))
+        return
+      }
+      setLoadingModels(current => ({ ...current, [role]: true }))
+      try {
+        const catalog = await systemAPI.getChatgptModels()
+        const models = catalog.models?.length
+          ? catalog.models
+          : (await systemAPI.listModels({ provider: 'chatgpt' })).models || []
+        setModelSuggestions(current => ({ ...current, [role]: models }))
+      } catch {
+        setModelSuggestions(current => ({ ...current, [role]: [] }))
+      } finally {
+        setLoadingModels(current => ({ ...current, [role]: false }))
+      }
+      return
+    }
     setLoadingModels(current => ({ ...current, [role]: true }))
     try {
       const data = await systemAPI.listModels({
@@ -894,6 +979,18 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
       setModelSuggestions(current => ({ ...current, [role]: data.models || [] }))
     } catch {
       setModelSuggestions(current => ({ ...current, [role]: [] }))
+    } finally {
+      setLoadingModels(current => ({ ...current, [role]: false }))
+    }
+  }
+
+  const refreshChatgptModels = async (role) => {
+    setLoadingModels(current => ({ ...current, [role]: true }))
+    try {
+      const data = await systemAPI.refreshChatgptModels()
+      setModelSuggestions(current => ({ ...current, [role]: data.models || [] }))
+    } catch (error) {
+      toastError(error?.message || t('system.chatgptModelRefreshFailed'))
     } finally {
       setLoadingModels(current => ({ ...current, [role]: false }))
     }
@@ -1207,6 +1304,7 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
                       onFetchModels={fetchModels}
                       onFetchContext={fetchContext}
                       onApplyContext={applyContextSuggestion}
+                      onRefreshChatgptModels={refreshChatgptModels}
                     />
                   ))}
                 </div>

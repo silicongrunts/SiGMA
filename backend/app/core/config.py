@@ -34,6 +34,29 @@ _env_userdata = Path(os.getenv("SIGMA_USERDATA_DIR", str(ROOT_DIR / "userdata"))
 USERDATA_DIR = _env_userdata if _env_userdata.is_absolute() else (ROOT_DIR / _env_userdata).resolve()
 SIGMA_DIR = USERDATA_DIR / ".SiGMA"
 SETTINGS_FILE = USERDATA_DIR / "settings.yaml"
+# ChatGPT subscription (Codex OAuth) storage. Everything subscription-related
+# lives under .SiGMA/chatgpt: the canonical token file (SiGMA-owned and human-
+# inspectable), the mirror auth.json that litellm's chatgpt Authenticator reads
+# (the filename is fixed by litellm), and the Codex model catalog cache. The
+# env var MUST be set before litellm is first imported — the Authenticator
+# captures CHATGPT_TOKEN_DIR in its constructor at litellm import time, and
+# routes/system.py imports litellm at module scope — hence the assignment here
+# rather than in the lifecycle or the auth service. Direct assignment (not
+# setdefault): a stray operator override would silently strand the mirror.
+CHATGPT_TOKEN_DIR = SIGMA_DIR / "chatgpt"
+CHATGPT_AUTH_FILE = CHATGPT_TOKEN_DIR / "chatgpt.auth.json"
+os.environ["CHATGPT_TOKEN_DIR"] = str(CHATGPT_TOKEN_DIR)
+# Client identity for ChatGPT subscription traffic. litellm's chatgpt
+# transport reads these env vars per request; its default User-Agent embeds
+# the litellm version, which the subscription backend can tell apart from
+# any official client. The pinned values mirror the official CLI exactly;
+# setdefault so an explicit operator override wins.
+CHATGPT_ORIGINATOR = "codex-tui"
+CHATGPT_USER_AGENT = (
+    "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
+)
+os.environ.setdefault("CHATGPT_ORIGINATOR", CHATGPT_ORIGINATOR)
+os.environ.setdefault("CHATGPT_USER_AGENT", CHATGPT_USER_AGENT)
 PROJECT_NAME = "SiGMA"
 # Override the Jupyter executable path (e.g. for venv/conda installs).
 JUPYTER_BIN = os.getenv("SIGMA_JUPYTER_BIN", "jupyter")

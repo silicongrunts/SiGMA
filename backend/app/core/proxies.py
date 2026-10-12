@@ -253,3 +253,14 @@ async def browser_vnc_ws_proxy(websocket: WebSocket, project_id: str):
             await websocket.close()
         except Exception:
             logger.debug("Failed to close browser VNC client websocket", exc_info=True)
+
+
+async def chatgpt_login_vnc_ws_proxy(websocket: WebSocket):
+    """noVNC surface for the ChatGPT subscription login.
+
+    Same shared-browser picture as ``browser_vnc_ws_proxy`` but reachable
+    without a project context, so the login overlay works from pages that
+    have no Explore tab (e.g. the project list). The OAuth tab itself is
+    owned and cleaned up by the auth service, not by this route.
+    """
+    await browser_vnc_ws_proxy(websocket, "chatgpt-login")

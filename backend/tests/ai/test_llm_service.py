@@ -1,17 +1,22 @@
 """Unit tests for llm_service with a fake litellm backend: stream delta
 parsing, retry/timeout and iterator-cleanup contracts, litellm error
-classification, and outbound payload shaping (message normalization,
-tool-result pairing)."""
+classification, outbound payload shaping (message normalization,
+tool-result pairing), and the chatgpt provider entries (subscription
+guard, session-affinity metadata, Codex images transport)."""
 
 import asyncio
 
 import pytest
 
+from app.core.config import CHATGPT_ORIGINATOR
+from app.core.config import CHATGPT_USER_AGENT
 from app.core.config import settings
 from app.core.config import ModelSettings
+from app.core.exceptions import ConfigurationError
 from app.core.exceptions import LLMException
 from app.core.exceptions import LLMTimeoutError
 from app.services.llm_service import LLMService
+from app.services.llm_service import CHATGPT_API_BASE
 from app.services.llm_service import FALLBACK_USER_MESSAGE
 from app.services.llm_service import INTERRUPTED_TOOL_RESULT
 from app.services.llm_service import normalize_request_messages
@@ -591,6 +596,246 @@ async def test_call_chat_text_omits_tools_when_none(monkeypatch):
     assert usage is None
     assert "tools" not in captured
     assert "tool_choice" not in captured
+
+
+# ---------------------------------------------------------------------------
+# ChatGPT provider entries: subscription fail-fast guard, session-affinity
+# metadata, and the direct Codex images transport for the draw role.
+# ---------------------------------------------------------------------------
+
+class _StubChatGPTAuth:
+    """chatgpt_auth_service stand-in with a configurable guard outcome."""
+
+    def __init__(self, error=None):
+        self.error = error
+
+    async def ensure_ready(self):
+        if self.error is not None:
+            raise self.error
+
+    async def get_access_token(self):
+        if self.error is not None:
+            raise self.error
+        return "tok-test"
+
+    def status(self):
+        return {"account_id": "acct-test"}
+
+
+async def test_call_chat_text_chatgpt_requires_active_subscription(monkeypatch):
+    """A signed-out subscription fails fast as a non-retryable configuration
+    error instead of reaching litellm, whose own fallback would start an
+    interactive login inside the request."""
+    monkeypatch.setattr(settings.models, "ra", ModelSettings(
+        model="gpt-5.3-codex",
+        provider="chatgpt",
+    ))
+    monkeypatch.setattr("app.services.llm_service.chatgpt_auth_service", _StubChatGPTAuth(
+        error=ConfigurationError("ChatGPT subscription is not signed in."),
+    ))
+
+    class NoCallLiteLLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def acompletion(self, **kwargs):
+            self.calls += 1
+            return {}
+
+    fake = NoCallLiteLLM()
+    monkeypatch.setattr(LLMService, "_litellm", staticmethod(lambda: fake))
+
+    service = LLMService()
+    with pytest.raises(ConfigurationError):
+        await service.call_chat_text(
+            messages=[{"role": "user", "content": "hi"}],
+            model_role="ra",
+        )
+    assert fake.calls == 0
+
+
+async def test_call_vision_chatgpt_requires_active_subscription(monkeypatch):
+    monkeypatch.setattr(settings.models, "vision", ModelSettings(
+        model="gpt-5.3-codex",
+        provider="chatgpt",
+    ))
+    monkeypatch.setattr("app.services.llm_service.chatgpt_auth_service", _StubChatGPTAuth(
+        error=ConfigurationError("ChatGPT subscription is not signed in."),
+    ))
+
+    class NoCallLiteLLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def acompletion(self, **kwargs):
+            self.calls += 1
+            return {}
+
+    fake = NoCallLiteLLM()
+    monkeypatch.setattr(LLMService, "_litellm", staticmethod(lambda: fake))
+
+    service = LLMService()
+    with pytest.raises(ConfigurationError):
+        await service.call_vision(prompt="describe", image_base64="aGk=")
+    assert fake.calls == 0
+
+
+async def test_call_chat_text_chatgpt_session_rides_in_metadata(monkeypatch):
+    """The chatgpt transport derives its cache-affinity session header from
+    litellm_params, so the session id must travel in metadata."""
+    captured = {}
+
+    class CaptureLiteLLM:
+        async def acompletion(self, **kwargs):
+            captured.update(kwargs)
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(settings.models, "ra", ModelSettings(
+        model="gpt-5.3-codex",
+        provider="chatgpt",
+    ))
+    monkeypatch.setattr("app.services.llm_service.chatgpt_auth_service", _StubChatGPTAuth())
+    monkeypatch.setattr(LLMService, "_litellm", staticmethod(lambda: CaptureLiteLLM()))
+
+    service = LLMService()
+    await service.call_chat_text(
+        messages=[{"role": "user", "content": "hi"}],
+        model_role="ra",
+        session_id="sess-123",
+    )
+
+    assert captured["metadata"] == {"session_id": "sess-123"}
+
+
+async def test_stream_chat_chatgpt_session_rides_in_metadata(monkeypatch):
+    captured = {}
+
+    class CaptureStreamLiteLLM:
+        async def acompletion(self, **kwargs):
+            captured.update(kwargs)
+
+            async def _stream():
+                yield {"choices": [{"delta": {"content": "ok"}}]}
+
+            return _stream()
+
+    monkeypatch.setattr(settings.models, "supervisor", ModelSettings(
+        model="gpt-5.3-codex",
+        provider="chatgpt",
+    ))
+    monkeypatch.setattr("app.services.llm_service.chatgpt_auth_service", _StubChatGPTAuth())
+    monkeypatch.setattr(LLMService, "_litellm", staticmethod(lambda: CaptureStreamLiteLLM()))
+
+    service = LLMService()
+    await service.stream_chat(
+        messages=[{"role": "user", "content": "hi"}],
+        model_role="supervisor",
+        session_id="sess-abc",
+    )
+
+    assert captured["metadata"] == {"session_id": "sess-abc"}
+
+
+async def test_call_chat_text_chatgpt_without_session_gets_stable_role_key(monkeypatch):
+    """One-shot calls carry no session id; a stable per-role key keeps them
+    cache-affine instead of routing every request cache-cold."""
+    captured = {}
+
+    class CaptureLiteLLM:
+        async def acompletion(self, **kwargs):
+            captured.update(kwargs)
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(settings.models, "ra", ModelSettings(
+        model="gpt-5.3-codex",
+        provider="chatgpt",
+    ))
+    monkeypatch.setattr("app.services.llm_service.chatgpt_auth_service", _StubChatGPTAuth())
+    monkeypatch.setattr(LLMService, "_litellm", staticmethod(lambda: CaptureLiteLLM()))
+
+    service = LLMService()
+    await service.call_chat_text(messages=[{"role": "user", "content": "hi"}], model_role="ra")
+    assert captured["metadata"] == {"session_id": "sigma:ra"}
+
+    await service.call_chat_text(messages=[{"role": "user", "content": "again"}], model_role="ra")
+    assert captured["metadata"] == {"session_id": "sigma:ra"}
+
+
+async def test_stream_chat_chatgpt_without_session_gets_stable_role_key(monkeypatch):
+    captured = {}
+
+    class CaptureStreamLiteLLM:
+        async def acompletion(self, **kwargs):
+            captured.update(kwargs)
+
+            async def _stream():
+                yield {"choices": [{"delta": {"content": "ok"}}]}
+
+            return _stream()
+
+    monkeypatch.setattr(settings.models, "supervisor", ModelSettings(
+        model="gpt-5.3-codex",
+        provider="chatgpt",
+    ))
+    monkeypatch.setattr("app.services.llm_service.chatgpt_auth_service", _StubChatGPTAuth())
+    monkeypatch.setattr(LLMService, "_litellm", staticmethod(lambda: CaptureStreamLiteLLM()))
+
+    service = LLMService()
+    await service.stream_chat(
+        messages=[{"role": "user", "content": "hi"}],
+        model_role="supervisor",
+    )
+
+    assert captured["metadata"] == {"session_id": "sigma:supervisor"}
+
+
+async def test_generate_image_chatgpt_posts_to_codex_images_endpoint(monkeypatch):
+    """LiteLLM has no chatgpt image transport, so the draw role posts to the
+    Codex images endpoint directly with the subscription bearer/account
+    headers."""
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"b64_json": "aW1n", "mime_type": "image/png"}]}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            captured.update(url=url, headers=headers, json=json)
+            return _FakeResponse()
+
+    monkeypatch.setattr(settings.models, "draw", ModelSettings(
+        model="gpt-image-1",
+        provider="chatgpt",
+    ))
+    monkeypatch.setattr("app.services.llm_service.chatgpt_auth_service", _StubChatGPTAuth())
+    monkeypatch.setattr("app.services.llm_service.httpx.AsyncClient", _FakeClient)
+
+    service = LLMService()
+    image = await service.generate_image("a landscape", size="1024x1024")
+
+    assert captured["url"] == f"{CHATGPT_API_BASE}/codex/images/generations"
+    assert captured["headers"]["Authorization"] == "Bearer tok-test"
+    assert captured["headers"]["chatgpt-account-id"] == "acct-test"
+    assert captured["headers"]["User-Agent"] == CHATGPT_USER_AGENT
+    assert captured["headers"]["originator"] == CHATGPT_ORIGINATOR
+    # Extra generate_image kwargs ride in the request body like on every
+    # other provider instead of being dropped.
+    assert captured["json"] == {"model": "gpt-image-1", "prompt": "a landscape", "size": "1024x1024"}
+    assert image.b64_json == "aW1n"
+    assert image.mime_type == "image/png"
 
 
 # ---------------------------------------------------------------------------

@@ -9,9 +9,11 @@ touched.
 """
 
 import pytest
+from fastapi import HTTPException
 
 from app.core.auth import SESSION_COOKIE_NAME, session_token
 from app.core.config import settings, settings_to_dict
+from app.core.exceptions import CodexCatalogError
 from app.routes import system
 
 
@@ -175,3 +177,39 @@ async def test_check_endpoint_tolerates_security_block(client, password_set):
     assert "password_enabled" not in body
     assert "Extra inputs are not permitted" not in body
     assert "extra_forbidden" not in body
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_model_catalog_routes(monkeypatch):
+    """The catalog GET surfaces the cached payload and the refresh POST
+    translates a total fetch failure into a 502. Slugs reach the client
+    provider-prefixed, matching the static litellm suggestions the field
+    already uses."""
+
+    class _StubService:
+        def __init__(self):
+            self.refresh_calls = 0
+
+        def cached_models(self):
+            return {"models": ["gpt-5.5"], "source": "s", "fetched_at": 1.0}
+
+        async def refresh(self):
+            self.refresh_calls += 1
+            if self.refresh_calls == 1:
+                return {"models": ["gpt-5.5", "gpt-5.6-sol"], "source": "s", "fetched_at": 2.0}
+            raise CodexCatalogError("Could not fetch the Codex model catalog from any source: boom")
+
+    stub = _StubService()
+    monkeypatch.setattr(system, "codex_model_catalog_service", stub)
+
+    cached = await system.get_chatgpt_model_catalog()
+    assert cached["data"]["models"] == ["chatgpt/gpt-5.5"]
+    assert cached["data"]["source"] == "s"
+
+    refreshed = await system.refresh_chatgpt_model_catalog()
+    assert refreshed["data"]["models"] == ["chatgpt/gpt-5.5", "chatgpt/gpt-5.6-sol"]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await system.refresh_chatgpt_model_catalog()
+    assert exc_info.value.status_code == 502
+    assert "any source" in exc_info.value.detail

@@ -99,6 +99,19 @@ def get_model_endpoint(role: ModelRole) -> ModelEndpoint:
     )
 
 
+def chatgpt_subscription_in_use() -> bool:
+    """Whether any transport-capable role resolves to the chatgpt provider.
+
+    Drives UI affordances that only make sense with a subscription (e.g. the
+    rate-limit display in the chat panel). embedding/rerank are excluded —
+    the subscription offers neither.
+    """
+    return any(
+        get_model_endpoint(role).provider == "chatgpt"
+        for role in ("supervisor", "ra", "vision", "draw")
+    )
+
+
 def model_role_accepts_images(role: str) -> bool:
     """Return whether a logical role can receive image parts directly.
 

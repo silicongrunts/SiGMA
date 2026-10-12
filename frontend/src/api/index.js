@@ -230,6 +230,8 @@ export const systemAPI = {
       method: 'POST',
       body: JSON.stringify({ provider, base_url: baseUrl, api_key: apiKey }),
     }),
+  getChatgptModels: () => request('/system/chatgpt/models'),
+  refreshChatgptModels: () => request('/system/chatgpt/models/refresh', { method: 'POST' }),
   getModelContext: ({ provider = '', model = '' }) => {
     const qs = new URLSearchParams({ provider, model })
     return request(`/system/litellm/context?${qs.toString()}`)
@@ -640,6 +642,40 @@ export const skillsAPI = {
       method: 'POST',
       body: JSON.stringify({ url }),
     }),
+}
+
+// ---------------------------------------------------------------------------
+// ChatGPT subscription (Codex OAuth)
+// ---------------------------------------------------------------------------
+export const chatgptAPI = {
+  status: () => request('/chatgpt/status'),
+  /** Start an interactive login — returns ReadableStream for SSE progress */
+  login: (payload, signal) => fetchEventStream(`${API_BASE_URL}/chatgpt/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+    signal,
+  }, i18n.t('chatgpt.toast.loginFailed')),
+  /** Complete a pending login with a pasted OAuth redirect URL */
+  deliverCallback: (url) => request('/chatgpt/login/callback', {
+    method: 'POST',
+    body: JSON.stringify({ url }),
+  }),
+  cancelLogin: () => request('/chatgpt/login/cancel', { method: 'POST' }),
+  /** Import the auth.json exported by the official Codex CLI */
+  importAuth: (content) => request('/chatgpt/login/import', {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  }),
+  logout: () => request('/chatgpt/logout', { method: 'POST' }),
+  usage: () => request('/chatgpt/usage'),
+  /** Available rate-limit reset credits ("reset cards") */
+  resetCredits: () => request('/chatgpt/reset-credits'),
+  /** Redeem one reset credit to clear the current rate-limit windows */
+  consumeResetCredit: (creditId) => request('/chatgpt/reset-credits/consume', {
+    method: 'POST',
+    body: JSON.stringify(creditId ? { credit_id: creditId } : {}),
+  }),
 }
 
 // ---------------------------------------------------------------------------

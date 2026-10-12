@@ -12,7 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.logging import RequestIDMiddleware, LoggingMiddleware, setup_logging
 from app.core.middleware import AuthMiddleware, register_exception_handlers
 from app.core.lifecycle import startup_event, shutdown_event
-from app.core.proxies import jupyter_ws_proxy, jupyter_proxy, browser_vnc_ws_proxy
+from app.core.proxies import (
+    jupyter_ws_proxy, jupyter_proxy, browser_vnc_ws_proxy,
+    chatgpt_login_vnc_ws_proxy,
+)
 from app.core.terminal_ws import terminal_ws_handler
 from app.core.static_files import mount_frontend, mount_static
 from app.core.config import settings
@@ -26,7 +29,7 @@ from app.routes import (
     library as library_routes, browser as browser_routes,
     permissions as permissions_routes, terminal as terminal_routes,
     skills as skills_routes, system as system_routes,
-    auth as auth_routes,
+    auth as auth_routes, chatgpt as chatgpt_routes,
 )
 
 # ---------------------------------------------------------------------------
@@ -70,6 +73,7 @@ app.include_router(terminal_routes.router, prefix=settings.API_PREFIX)
 app.include_router(skills_routes.router, prefix=settings.API_PREFIX)
 app.include_router(system_routes.router, prefix=settings.API_PREFIX)
 app.include_router(auth_routes.router, prefix=settings.API_PREFIX)
+app.include_router(chatgpt_routes.router, prefix=settings.API_PREFIX)
 
 # Proxy routes (WebSocket + HTTP)
 app.websocket("/api/v1/jupyter/{path:path}")(jupyter_ws_proxy)
@@ -78,6 +82,8 @@ app.api_route(
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
 )(jupyter_proxy)
 app.websocket("/api/v1/browser/{project_id}/vnc")(browser_vnc_ws_proxy)
+# Project-free VNC surface for the ChatGPT subscription login overlay.
+app.websocket("/api/v1/chatgpt/login/vnc")(chatgpt_login_vnc_ws_proxy)
 app.websocket("/api/v1/terminal/{project_id}")(terminal_ws_handler)
 
 # Static files & frontend

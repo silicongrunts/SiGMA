@@ -10,8 +10,11 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from app.core.config import settings
+import httpx
+
+from app.core.config import CHATGPT_ORIGINATOR, CHATGPT_USER_AGENT, settings
 from app.core.exceptions import (
+    ChatGPTAuthError,
     ConfigurationError,
     LLMException,
     LLMRateLimitError,
@@ -20,6 +23,7 @@ from app.core.exceptions import (
 )
 from app.core.logging import get_logger
 from app.core.model_config import ModelEndpoint, get_model_endpoint
+from app.services.chatgpt_auth_service import CHATGPT_API_BASE, chatgpt_auth_service
 
 logger = get_logger(__name__)
 
@@ -27,6 +31,43 @@ STREAM_FIRST_CHUNK_TIMEOUT_SECONDS = 900.0
 STREAM_IDLE_TIMEOUT_SECONDS = 300.0
 STREAM_ABSOLUTE_TIMEOUT_SECONDS = 3600.0
 PROVIDER_CLOSE_TIMEOUT_SECONDS = 5.0
+
+
+async def codex_generate_image(
+    endpoint: ModelEndpoint, prompt: str, *, timeout: float = 300.0, **kwargs: Any,
+) -> dict:
+    """Generate one image through the Codex subscription images endpoint.
+
+    LiteLLM does not cover image generation on the chatgpt provider, so the
+    draw role calls ``/backend-api/codex/images/generations`` directly with
+    the same bearer/account headers the chat transport uses. Extra keyword
+    arguments are forwarded as image-request fields; the endpoint rejects
+    unsupported ones. Returns the raw response payload (``{"data": [...]}``).
+    """
+    try:
+        token = await chatgpt_auth_service.get_access_token()
+    except ChatGPTAuthError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    account_id = chatgpt_auth_service.status().get("account_id") or ""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": CHATGPT_USER_AGENT,
+        "originator": CHATGPT_ORIGINATOR,
+    }
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            f"{CHATGPT_API_BASE}/codex/images/generations",
+            headers=headers,
+            json={"model": endpoint.model, "prompt": prompt, **kwargs},
+        )
+    if resp.status_code != 200:
+        raise LLMResponseError(
+            f"Codex image generation failed (HTTP {resp.status_code}): {resp.text[:200]}"
+        )
+    return resp.json()
 
 
 class _StreamAttemptError(Exception):
@@ -264,6 +305,7 @@ class LLMService:
         """
         if max_tokens is None:
             max_tokens = settings.NORMAL_RESPONSE_MAX_TOKENS
+        await self._ensure_provider_ready(self._require_endpoint(model_role))
         response = await self._completion_with_retries(
             role=model_role,
             messages=messages,
@@ -286,6 +328,7 @@ class LLMService:
         timeout: float = 120.0,
     ) -> str:
         """Analyze an image using the configured vision role."""
+        await self._ensure_provider_ready(self._require_endpoint("vision"))
         messages = [{
             "role": "user",
             "content": [
@@ -317,20 +360,27 @@ class LLMService:
     ) -> GeneratedImage:
         """Generate an image using the configured draw role."""
         endpoint = self._require_endpoint("draw")
+        await self._ensure_provider_ready(endpoint)
 
-        async def _call():
-            litellm = self._litellm()
-            call_kwargs = {
-                "model": endpoint.litellm_model,
-                "prompt": prompt,
-                **endpoint.litellm_kwargs(),
-                **kwargs,
-            }
-            if hasattr(litellm, "aimage_generation"):
-                return await litellm.aimage_generation(**call_kwargs)
-            return await asyncio.to_thread(litellm.image_generation, **call_kwargs)
+        if endpoint.provider == "chatgpt":
+            response = await self._retry_role_call(
+                "draw", timeout,
+                lambda: codex_generate_image(endpoint, prompt, timeout=timeout, **kwargs),
+            )
+        else:
+            async def _call():
+                litellm = self._litellm()
+                call_kwargs = {
+                    "model": endpoint.litellm_model,
+                    "prompt": prompt,
+                    **endpoint.litellm_kwargs(),
+                    **kwargs,
+                }
+                if hasattr(litellm, "aimage_generation"):
+                    return await litellm.aimage_generation(**call_kwargs)
+                return await asyncio.to_thread(litellm.image_generation, **call_kwargs)
 
-        response = await self._retry_role_call("draw", timeout, _call)
+            response = await self._retry_role_call("draw", timeout, _call)
         payload = self._to_dict(response)
         data = payload.get("data") or []
         if not data:
@@ -367,6 +417,7 @@ class LLMService:
         absolute deadline while retaining separate first-chunk and idle limits.
         """
         endpoint = self._require_endpoint(model_role)
+        await self._ensure_provider_ready(endpoint)
         litellm = self._litellm()
         if max_tokens is None:
             max_tokens = settings.NORMAL_RESPONSE_MAX_TOKENS
@@ -382,6 +433,12 @@ class LLMService:
             **endpoint.litellm_kwargs(),
             **_session_headers(session_id),
         }
+        if endpoint.provider == "chatgpt":
+            # The chatgpt transport derives its cache-affinity session header
+            # from litellm_params instead of extra_headers. Calls without a
+            # session fall back to a stable per-role key so one-shot roles
+            # still route to a single cache machine.
+            payload["metadata"] = {"session_id": session_id or f"sigma:{model_role}"}
         if max_tokens:
             payload["max_tokens"] = max_tokens
         if tools:
@@ -564,6 +621,12 @@ class LLMService:
                 **endpoint.litellm_kwargs(),
                 **_session_headers(session_id),
             }
+            if endpoint.provider == "chatgpt":
+                # The chatgpt transport derives its cache-affinity session
+                # header from litellm_params instead of extra_headers. Calls
+                # without a session fall back to a stable per-role key so
+                # one-shot roles still route to a single cache machine.
+                payload["metadata"] = {"session_id": session_id or f"sigma:{role}"}
             if max_tokens:
                 payload["max_tokens"] = max_tokens
             if tools:
@@ -609,6 +672,18 @@ class LLMService:
                 )
                 await asyncio.sleep(self._retry_delay(attempt))
         raise LLMException("LLM call failed after retries")
+
+    async def _ensure_provider_ready(self, endpoint: ModelEndpoint) -> None:
+        """Provider-specific pre-flight checks on the resolved endpoint.
+
+        For the chatgpt provider this fails fast (as a non-retryable
+        ``ConfigurationError``) when the subscription is not signed in —
+        litellm's own fallback for a missing or expired token would otherwise
+        silently start an interactive device-code login inside the request.
+        It also drives the proactive token refresh inside the 24h margin.
+        """
+        if endpoint.provider == "chatgpt":
+            await chatgpt_auth_service.ensure_ready()
 
     def _require_endpoint(self, role: str) -> ModelEndpoint:
         try:

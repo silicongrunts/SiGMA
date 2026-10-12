@@ -20,6 +20,7 @@ from app.core.config import (
     validate_settings_yaml,
 )
 from app.core.response import ok
+from app.core.exceptions import CodexCatalogError
 from app.models.requests import (
     ModelListRequest,
     SettingsDataUpdate,
@@ -27,6 +28,7 @@ from app.models.requests import (
     SettingsYamlUpdate,
     TeXOperationRequest,
 )
+from app.services.codex_model_catalog_service import codex_model_catalog_service
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,7 @@ router = APIRouter(prefix="/system", tags=["system"])
 ALLOWED_PROVIDERS = [
     "openai",
     "anthropic",
+    "chatgpt",
     "gemini",
     "deepseek",
     "openrouter",
@@ -77,6 +80,7 @@ DRAW_SUPPORTED_PROVIDERS = [
     "dashscope",
     "xai",
     "zai",
+    "chatgpt",
 ]
 
 EMBEDDING_SUPPORTED_PROVIDERS = [
@@ -288,6 +292,26 @@ async def list_litellm_models(data: ModelListRequest):
     if not models:
         models = _static_models_for_provider(provider)
     return ok({"models": models[:1000]})
+
+
+@router.get("/chatgpt/models")
+async def get_chatgpt_model_catalog():
+    """Cached Codex model suggestions, provider-prefixed like the static
+    list; empty until the first manual refresh."""
+    cached = codex_model_catalog_service.cached_models()
+    cached["models"] = [f"chatgpt/{slug}" for slug in cached["models"]]
+    return ok(cached)
+
+
+@router.post("/chatgpt/models/refresh")
+async def refresh_chatgpt_model_catalog():
+    """Re-fetch the Codex model catalog from its remote sources."""
+    try:
+        data = await codex_model_catalog_service.refresh()
+    except CodexCatalogError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    data["models"] = [f"chatgpt/{slug}" for slug in data["models"]]
+    return ok(data)
 
 
 @router.get("/litellm/context")
