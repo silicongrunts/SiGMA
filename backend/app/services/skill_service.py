@@ -13,6 +13,7 @@ skill file formats.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import re
@@ -20,6 +21,7 @@ import shutil
 import tempfile
 import uuid
 import zipfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -51,6 +53,8 @@ _MAX_EXTRACT_TOTAL = 100_000_000  # 100 MB total extracted
 _MAX_EXTRACT_PER_FILE = 10_000_000  # 10 MB per extracted file
 _MAX_EXTRACT_ENTRIES = 500    # max files in a ZIP
 _CLONE_TIMEOUT = 60          # seconds
+_COLLISION_ATTEMPTS = 5      # retries for store folder-name collisions
+_MAX_CLONE_STDERR = 500      # cap for clone error messages
 
 _FRONTMATTER_RE = re.compile(r"^---\s*$", re.MULTILINE)
 
@@ -543,76 +547,143 @@ class SkillService:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    async def import_git(self, url: str) -> dict:
+    async def preview_git(self, url: str) -> dict:
+        """List the importable skills of a Git repository without importing.
+
+        The repository is shallow-cloned to a temporary directory and
+        scanned with exactly the same logic as :meth:`import_git`, but
+        nothing is copied to the skill store.  Each returned skill carries
+        the repo-relative ``path`` that :meth:`import_git` accepts as a
+        selection key, plus ``already_exists`` — whether the store already
+        holds a skill under the same target folder name (importing would
+        create a renamed copy).
+
+        Returns ``{skills: [...], ignored_count: int}``.
+        """
+        async with self._cloned_repo(url) as clone_dir:
+            candidates, skipped = self._scan_dir(clone_dir)
+            skills = [
+                {
+                    "path": cand["path"],
+                    "name": cand["name"],
+                    "description": cand["description"],
+                    "already_exists": (self._skills_dir / f".{cand['dir_name']}").exists(),
+                }
+                for cand in candidates
+            ]
+            return {"skills": skills, "ignored_count": len(skipped)}
+
+    async def import_git(self, url: str, paths: list[str] | None = None) -> dict:
         """Import skills from a Git repository.
 
         The repository is shallow-cloned to a temporary directory, scanned
         for valid skill directories, and imported in disabled state.
 
+        When *paths* is given it acts as a filter on the scan result: only
+        scanned skills whose repo-relative path is listed are imported,
+        and selections that no longer exist in the repository are reported
+        as skipped.  The paths never select a copy source directly.
+
         Returns ``{imported: [...], skipped: [...]}``.
+        """
+        if paths is not None:
+            self._validate_selected_paths(paths)
+
+        async with self._cloned_repo(url) as clone_dir:
+            candidates, skipped = self._scan_dir(clone_dir)
+            if paths is None:
+                selected = candidates
+            else:
+                wanted = set(paths)
+                selected = [c for c in candidates if c["path"] in wanted]
+                scanned = {c["path"] for c in candidates}
+                skipped = skipped + [
+                    {"path": p, "reason": "Not found in repository"}
+                    for p in sorted(wanted - scanned)
+                ]
+            return self._import_candidates(selected, skipped)
+
+    @asynccontextmanager
+    async def _cloned_repo(self, url: str):
+        """Validate *url*, shallow-clone it into a temp dir, yield the clone.
+
+        The temp dir is always removed afterwards.  Raises ``SkillError``
+        for invalid URLs, clone failures and timeouts.
         """
         self._validate_git_url(url)
 
         tmp_dir = Path(tempfile.mkdtemp(prefix="sigma-skill-import-"))
         try:
             clone_dir = tmp_dir / "repo"
-
-            import asyncio
+            # GIT_TERMINAL_PROMPT=0 and an empty credential helper make git
+            # fail fast instead of hanging on credential prompts for
+            # private repositories; stdin is /dev/null for the same reason.
+            env = os.environ.copy()
+            env["GIT_TERMINAL_PROMPT"] = "0"
             proc = await asyncio.create_subprocess_exec(
-                "git", "clone", "--depth", "1", url, str(clone_dir),
+                "git", "-c", "credential.helper=", "clone", "--depth", "1",
+                url, str(clone_dir),
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             try:
-                stdout, stderr = await asyncio.wait_for(
+                _, stderr = await asyncio.wait_for(
                     proc.communicate(), timeout=_CLONE_TIMEOUT
                 )
             except asyncio.TimeoutError:
                 proc.kill()
+                await proc.wait()  # reap the killed process
                 raise SkillError(
                     f"Git clone timed out after {_CLONE_TIMEOUT}s"
                 )
 
             if proc.returncode != 0:
                 err_msg = stderr.decode(errors="replace").strip()
+                if len(err_msg) > _MAX_CLONE_STDERR:
+                    err_msg = err_msg[:_MAX_CLONE_STDERR] + "…"
                 raise SkillError(f"Git clone failed: {err_msg}")
 
-            return self._import_from_dir(clone_dir)
+            yield clone_dir
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _import_from_dir(self, source_dir: Path) -> dict:
-        """Scan a directory for valid skills and import them.
+    def _scan_dir(self, source_dir: Path) -> tuple[list[dict], list[dict]]:
+        """Scan a directory tree for importable skills.
 
         Finds every ``SKILL.md`` in the tree, validates its frontmatter,
-        and copies the containing directory into the skill store in
-        disabled state (dot-prefix).  Name collisions are resolved by
-        appending an 8-char random suffix.
+        and returns ``(candidates, skipped)``.  Each candidate is
+        ``{path, dir_name, skill_dir, name, description}`` where ``path``
+        is the repo-relative directory (the selection key used by
+        :meth:`import_git`), ``dir_name`` the folder name the skill will
+        get in the store, and ``skill_dir`` the absolute source directory.
+        Skipped entries are ``{path, reason}``.
 
-        Returns ``{imported: [...], skipped: [...]}``.
+        Preview and import share this method, so the list a user confirms
+        is exactly what gets imported.  Results are sorted by path for
+        deterministic ordering.
         """
-        imported: list[dict] = []
+        candidates: list[dict] = []
         skipped: list[dict] = []
-        seen_dirs: set[Path] = set()  # avoid importing the same dir twice
 
-        for skill_md in source_dir.rglob(_SKILL_MD):
+        for skill_md in sorted(source_dir.rglob(_SKILL_MD)):
             skill_dir = skill_md.parent
-
-            # Skip if we already imported this directory (nested SKILL.md)
-            if skill_dir in seen_dirs:
-                continue
-
             rel = skill_dir.relative_to(source_dir)
 
-            # Skip hidden paths
+            # Skip hidden paths (e.g. .git, .github)
             if any(p.startswith(".") for p in rel.parts):
                 continue
 
-            # Read and validate SKILL.md
+            rel_path = rel.as_posix()  # "." for a repo-root skill
+
             try:
+                if skill_md.stat().st_size > _MAX_FILE_BYTES:
+                    skipped.append({"path": rel_path, "reason": "SKILL.md too large"})
+                    continue
                 text = skill_md.read_text(encoding="utf-8", errors="replace")
             except OSError:
-                skipped.append({"path": str(rel), "reason": "Cannot read SKILL.md"})
+                skipped.append({"path": rel_path, "reason": "Cannot read SKILL.md"})
                 continue
 
             parsed = _parse_frontmatter(text)
@@ -620,40 +691,76 @@ class SkillService:
             desc = parsed.get("description", "").strip()
             if not name or not desc:
                 skipped.append({
-                    "path": str(rel),
+                    "path": rel_path,
                     "reason": "SKILL.md missing required 'name' or 'description'",
                 })
                 continue
 
-            # Determine target directory name
-            dir_name = rel.name if str(rel) != "." else _slugify(name)
-            target_name = f".{dir_name}"  # disabled
-
-            # Resolve name collision with 8-char random suffix
-            target = self._skills_dir / target_name
-            if target.exists():
-                target_name = f".{dir_name}-{_short_id()}"
-                target = self._skills_dir / target_name
-
-            # Copy directory
-            try:
-                shutil.copytree(skill_dir, target)
-            except OSError as exc:
-                skipped.append({
-                    "path": str(rel),
-                    "reason": f"Failed to copy: {exc}",
-                })
-                continue
-
-            seen_dirs.add(skill_dir)
-            imported.append({
-                "id": target_name,
+            candidates.append({
+                "path": rel_path,
+                # A repo-root skill has no directory name to keep, so the
+                # store folder name is derived from the frontmatter name.
+                "dir_name": rel.name if rel_path != "." else _slugify(name),
+                "skill_dir": skill_dir,
                 "name": name,
                 "description": desc,
             })
 
+        return candidates, skipped
+
+    def _import_candidates(self, candidates: list[dict], skipped: list[dict]) -> dict:
+        """Copy scanned candidates into the skill store in disabled state.
+
+        Folder-name collisions are resolved by appending an 8-char random
+        suffix.  Returns ``{imported: [...], skipped: [...]}``.
+        """
+        imported: list[dict] = []
+
+        for cand in candidates:
+            target_name = f".{cand['dir_name']}"
+            target = self._skills_dir / target_name
+            # The store dir is shared state; re-check existence for every
+            # attempt instead of assuming the earlier check still holds.
+            for _ in range(_COLLISION_ATTEMPTS):
+                if not target.exists():
+                    break
+                target_name = f".{cand['dir_name']}-{_short_id()}"
+                target = self._skills_dir / target_name
+            if target.exists():
+                skipped.append({
+                    "path": cand["path"],
+                    "reason": "Could not find a free folder name",
+                })
+                continue
+
+            try:
+                # Only the repo-root layout can carry the clone's .git;
+                # subdirectory skills never contain one, so this is a no-op
+                # for them and for ZIP imports.
+                shutil.copytree(
+                    cand["skill_dir"], target,
+                    ignore=shutil.ignore_patterns(".git"),
+                )
+            except OSError as exc:
+                skipped.append({
+                    "path": cand["path"],
+                    "reason": f"Failed to copy: {exc}",
+                })
+                continue
+
+            imported.append({
+                "id": target_name,
+                "name": cand["name"],
+                "description": cand["description"],
+            })
+
         self._invalidate()
         return {"imported": imported, "skipped": skipped}
+
+    def _import_from_dir(self, source_dir: Path) -> dict:
+        """Scan a directory and import everything found (ZIP entry point)."""
+        candidates, skipped = self._scan_dir(source_dir)
+        return self._import_candidates(candidates, skipped)
 
     # ------------------------------------------------------------------
     # Import helpers
@@ -724,6 +831,25 @@ class SkillService:
         # Reject obvious injection patterns
         if any(c in url for c in (";", "|", "`", "$", "(", ")")):
             raise SkillError("Invalid characters in URL")
+
+    @staticmethod
+    def _validate_selected_paths(paths: list[str]) -> None:
+        """Reject selection keys that could never come from ``_scan_dir``.
+
+        Valid keys are POSIX-style relative paths without ``..`` or hidden
+        components; the repo root itself is the single ``"."``.  Scan
+        results can never contain anything else, so a malformed value
+        means a broken client and fails fast instead of being silently
+        dropped.
+        """
+        for path in paths:
+            if path == ".":
+                continue
+            if not path or path.startswith("/") or "\\" in path:
+                raise SkillError(f"Invalid skill path: {path!r}")
+            for part in path.split("/"):
+                if not part or part.startswith("."):
+                    raise SkillError(f"Invalid skill path: {path!r}")
 
     # ------------------------------------------------------------------
     # File-management helpers (path & content validation)

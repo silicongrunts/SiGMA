@@ -992,5 +992,18 @@
   "chatgpt.quota.detailsTitle": "Cuota y tarjetas de reinicio",
   "chatgpt.quota.viewHint": "Saldo de crédito y tarjetas de reinicio",
   "chatgpt.login.openAuthorize": "Abrir página de inicio de sesión",
-  "chatgpt.login.copyLink": "Copiar enlace"
+  "chatgpt.login.copyLink": "Copiar enlace",
+  "skills.gitScan": "Obtener lista",
+  "skills.gitScanning": "Obteniendo…",
+  "skills.gitImport": "Importar",
+  "skills.gitImporting": "Importando…",
+  "skills.gitNoSkills": "No se encontraron skills importables en este repositorio.",
+  "skills.gitScanFailed": "No se pudo obtener la lista de skills.",
+  "skills.gitImportFailed": "No se pudieron importar las skills.",
+  "skills.gitAlreadyExists": "Instalado",
+  "skills.gitAlreadyExistsTitle": "Ya existe una skill con el mismo nombre de carpeta; al importar se creará una copia desactivada con un sufijo aleatorio.",
+  "skills.gitSelectAll": "Seleccionar todo",
+  "skills.gitChangeUrl": "Cambiar URL",
+  "skills.gitIgnoredHint": "Se ignoraron {{count}} carpeta(s) del repositorio (SKILL.md ausente o no válido).",
+  "skills.gitSelectedCount": "{{count}} seleccionadas"
 }

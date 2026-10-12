@@ -365,8 +365,14 @@ class SkillFileRenameRequest(BaseModel):
 
 
 class SkillImportGitRequest(BaseModel):
-    """Request body for POST /skills/import/git."""
+    """Request body for POST /skills/import/git and /skills/import/git/preview.
+
+    ``paths`` is optional; when given it filters the import to the scanned
+    skills whose repo-relative path is listed (omitted means import all).
+    The preview endpoint ignores it.
+    """
     url: str = Field(..., min_length=1, max_length=2000)
+    paths: list[str] | None = Field(default=None, max_length=500)
 
 
 class SkillLoadRequest(BaseModel):

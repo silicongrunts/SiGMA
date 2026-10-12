@@ -63,15 +63,28 @@ async def import_skill_zip(file: UploadFile = File(...)):
     return ok(data)
 
 
+@router.post("/import/git/preview")
+async def preview_skill_git(body: SkillImportGitRequest):
+    """List the importable skills of a Git repository without importing.
+
+    Shallow-clones the repository to a temporary directory and scans it
+    with the same logic as the import endpoint.  Each returned skill
+    carries the repo-relative ``path`` used to select it for import.
+    """
+    data = await skill_service.preview_git(body.url)
+    return ok(data)
+
+
 @router.post("/import/git")
 async def import_skill_git(body: SkillImportGitRequest):
     """Import skills from a Git repository.
 
     The repository is shallow-cloned, scanned for directories containing
     a valid ``SKILL.md``, and matching directories are imported in
-    disabled state.
+    disabled state.  When ``body.paths`` is given, only the scanned
+    skills whose repo-relative path is listed are imported.
     """
-    data = await skill_service.import_git(body.url)
+    data = await skill_service.import_git(body.url, body.paths)
     return ok(data)
 
 

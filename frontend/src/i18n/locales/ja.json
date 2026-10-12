@@ -992,5 +992,18 @@
   "chatgpt.quota.detailsTitle": "使用量とリセットカード",
   "chatgpt.quota.viewHint": "クレジット残高とリセットカード",
   "chatgpt.login.openAuthorize": "サインインページを開く",
-  "chatgpt.login.copyLink": "リンクをコピー"
+  "chatgpt.login.copyLink": "リンクをコピー",
+  "skills.gitScan": "リストを取得",
+  "skills.gitScanning": "取得中…",
+  "skills.gitImport": "インポート",
+  "skills.gitImporting": "インポート中…",
+  "skills.gitNoSkills": "このリポジトリにインポート可能なスキルが見つかりません。",
+  "skills.gitScanFailed": "スキルリストの取得に失敗しました。",
+  "skills.gitImportFailed": "スキルのインポートに失敗しました。",
+  "skills.gitAlreadyExists": "インストール済み",
+  "skills.gitAlreadyExistsTitle": "同じフォルダ名のスキルが既に存在します。インポートするとランダムな接尾辞付きのコピーとして追加されます（無効状態）。",
+  "skills.gitSelectAll": "すべて選択",
+  "skills.gitChangeUrl": "URL を変更",
+  "skills.gitIgnoredHint": "リポジトリ内の {{count}} 個のフォルダは無視されました（SKILL.md がないか無効）。",
+  "skills.gitSelectedCount": "{{count}} 件選択中"
 }

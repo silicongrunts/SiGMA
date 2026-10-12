@@ -992,5 +992,18 @@
   "chatgpt.quota.detailsTitle": "額度與重置卡",
   "chatgpt.quota.viewHint": "Credit 餘額與重置卡",
   "chatgpt.login.openAuthorize": "開啟登入頁面",
-  "chatgpt.login.copyLink": "複製連結"
+  "chatgpt.login.copyLink": "複製連結",
+  "skills.gitScan": "取得清單",
+  "skills.gitScanning": "正在取得…",
+  "skills.gitImport": "匯入",
+  "skills.gitImporting": "正在匯入…",
+  "skills.gitNoSkills": "未在此儲存庫中找到可匯入的技能。",
+  "skills.gitScanFailed": "取得技能清單失敗。",
+  "skills.gitImportFailed": "匯入技能失敗。",
+  "skills.gitAlreadyExists": "已安裝",
+  "skills.gitAlreadyExistsTitle": "已存在同名技能，匯入後會以帶隨機後綴的副本形式加入（預設停用）。",
+  "skills.gitSelectAll": "全選",
+  "skills.gitChangeUrl": "更換網址",
+  "skills.gitIgnoredHint": "儲存庫中另有 {{count}} 個目錄被忽略（SKILL.md 缺失或無效）。",
+  "skills.gitSelectedCount": "已選 {{count}} 項"
 }

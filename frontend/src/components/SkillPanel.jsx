@@ -8,6 +8,7 @@ import { oneDarkHighlightStyle } from '@codemirror/theme-one-dark'
 // Language recognition and loading go through @codemirror/language-data (see utils/editorLanguages.js).
 import { getLanguageDescription, loadLanguage } from '../utils/editorLanguages'
 import { ModalOverlay, InputModal, ConfirmModal } from './Modal'
+import SkillGitImportModal from './SkillGitImportModal'
 import { skillsAPI } from '../api'
 import { toastError, toastSuccess } from './Toast'
 import { useTheme } from '../hooks/useTheme'
@@ -216,6 +217,7 @@ export default function SkillPanel({ isOpen, onClose }) {
   const [errorModal, setErrorModal] = useState({ open: false, message: '' })
   const [importMenuOpen, setImportMenuOpen] = useState(false)
   const [importing, setImporting] = useState(false)
+  const [gitModalOpen, setGitModalOpen] = useState(false)
   const zipInputRef = useRef(null)
   const confirmResolverRef = useRef(null)
 
@@ -304,7 +306,7 @@ export default function SkillPanel({ isOpen, onClose }) {
   })
 
   const handleClose = () => {
-    if (discardModal.open || confirmModal.open || inputModal.open || errorModal.open) return
+    if (discardModal.open || confirmModal.open || inputModal.open || errorModal.open || gitModalOpen) return
     if (!dirty) { onClose(); return }
     confirmResolverRef.current = (ok) => { if (ok) onClose() }
     setDiscardModal({ open: true, message: t('skills.discardCloseConfirm') })
@@ -316,7 +318,7 @@ export default function SkillPanel({ isOpen, onClose }) {
     const handler = (e) => { if (e.key === 'Escape') handleClose() }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [isOpen, dirty, discardModal.open, confirmModal.open, inputModal.open, errorModal.open])
+  }, [isOpen, dirty, discardModal.open, confirmModal.open, inputModal.open, errorModal.open, gitModalOpen])
 
   // -----------------------------------------------------------------------
   // Skill list actions
@@ -532,26 +534,17 @@ export default function SkillPanel({ isOpen, onClose }) {
 
   const handleGitImport = () => {
     setImportMenuOpen(false)
-    setInputModal({
-      open: true,
-      title: t('skills.importGit'),
-      placeholder: t('skills.gitPlaceholder'),
-      initial: '',
-      isNewFile: false,
-      onConfirm: async (url) => {
-        setImporting(true)
-        try {
-          const result = await skillsAPI.importGit(url)
-          showImportResult(result)
-          await fetchSkills(true)
-          if (result?.imported?.length > 0) {
-            useStore.getState().bumpSkillsVersion()
-          }
-        } finally {
-          setImporting(false)
-        }
-      },
-    })
+    setGitModalOpen(true)
+  }
+
+  // Called after the git import modal finished an import (success only —
+  // failures keep the modal open so the user can retry).
+  const handleGitImported = async (result) => {
+    showImportResult(result)
+    await fetchSkills(true)
+    if (result?.imported?.length > 0) {
+      useStore.getState().bumpSkillsVersion()
+    }
   }
 
   // Close dropdown when clicking outside
@@ -769,6 +762,13 @@ export default function SkillPanel({ isOpen, onClose }) {
         title={confirmModal.title}
         message={confirmModal.message}
         danger
+      />
+
+      {/* Git import — scan & select skills */}
+      <SkillGitImportModal
+        isOpen={gitModalOpen}
+        onClose={() => setGitModalOpen(false)}
+        onImported={handleGitImported}
       />
 
       {/* Unsaved-changes confirmation */}

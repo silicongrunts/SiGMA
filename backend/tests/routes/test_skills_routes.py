@@ -21,18 +21,47 @@ async def test_import_skill_zip_rejects_non_zip_filename():
 
 @pytest.mark.route
 @pytest.mark.asyncio
-async def test_import_skill_git_passes_url(monkeypatch):
+async def test_import_skill_git_passes_url_and_paths(monkeypatch):
     calls = {}
 
-    async def import_git(url):
-        calls["url"] = url
-        return {"imported": 1}
+    async def import_git(url, paths=None):
+        calls["args"] = (url, paths)
+        return {"imported": [], "skipped": []}
 
     monkeypatch.setattr(skills, "skill_service", SimpleNamespace(import_git=import_git))
 
-    result = await skills.import_skill_git(SkillImportGitRequest(url="https://example.test/repo.git"))
+    result = await skills.import_skill_git(
+        SkillImportGitRequest(url="https://example.test/repo.git", paths=["a", "b"])
+    )
 
-    assert result["data"] == {"imported": 1}
+    assert result["data"] == {"imported": [], "skipped": []}
+    assert calls["args"] == ("https://example.test/repo.git", ["a", "b"])
+
+
+@pytest.mark.route
+@pytest.mark.asyncio
+async def test_preview_skill_git_passes_url(monkeypatch):
+    calls = {}
+
+    async def preview_git(url):
+        calls["url"] = url
+        return {
+            "skills": [{
+                "path": ".",
+                "name": "demo",
+                "description": "a demo",
+                "already_exists": False,
+            }],
+            "ignored_count": 0,
+        }
+
+    monkeypatch.setattr(skills, "skill_service", SimpleNamespace(preview_git=preview_git))
+
+    result = await skills.preview_skill_git(
+        SkillImportGitRequest(url="https://example.test/repo.git")
+    )
+
+    assert result["data"]["skills"][0]["name"] == "demo"
     assert calls["url"] == "https://example.test/repo.git"
 
 

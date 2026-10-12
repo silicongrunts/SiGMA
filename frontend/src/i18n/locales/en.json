@@ -992,5 +992,18 @@
   "chatgpt.quota.detailsTitle": "Quota & reset credits",
   "chatgpt.quota.viewHint": "Credit balance & reset credits",
   "chatgpt.login.openAuthorize": "Open sign-in page",
-  "chatgpt.login.copyLink": "Copy link"
+  "chatgpt.login.copyLink": "Copy link",
+  "skills.gitScan": "Fetch List",
+  "skills.gitScanning": "Fetching…",
+  "skills.gitImport": "Import",
+  "skills.gitImporting": "Importing…",
+  "skills.gitNoSkills": "No importable skills found in this repository.",
+  "skills.gitScanFailed": "Failed to fetch the skill list.",
+  "skills.gitImportFailed": "Failed to import skills.",
+  "skills.gitAlreadyExists": "Installed",
+  "skills.gitAlreadyExistsTitle": "A skill with the same folder name already exists — importing creates a disabled copy with a random suffix.",
+  "skills.gitSelectAll": "Select all",
+  "skills.gitChangeUrl": "Change URL",
+  "skills.gitIgnoredHint": "{{count}} folder(s) in the repository were ignored (missing or invalid SKILL.md).",
+  "skills.gitSelectedCount": "{{count}} selected"
 }

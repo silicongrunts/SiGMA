@@ -637,10 +637,15 @@ export const skillsAPI = {
       return unwrapResponse(d)
     })
   },
-  importGit: (url) =>
-    request('/skills/import/git', {
+  previewGit: (url) =>
+    request('/skills/import/git/preview', {
       method: 'POST',
       body: JSON.stringify({ url }),
+    }),
+  importGit: (url, paths) =>
+    request('/skills/import/git', {
+      method: 'POST',
+      body: JSON.stringify(paths ? { url, paths } : { url }),
     }),
 }
 

@@ -992,5 +992,18 @@
   "chatgpt.quota.detailsTitle": "사용량 및 리셋 카드",
   "chatgpt.quota.viewHint": "크레딧 잔액 및 리셋 카드",
   "chatgpt.login.openAuthorize": "로그인 페이지 열기",
-  "chatgpt.login.copyLink": "링크 복사"
+  "chatgpt.login.copyLink": "링크 복사",
+  "skills.gitScan": "목록 가져오기",
+  "skills.gitScanning": "가져오는 중…",
+  "skills.gitImport": "가져오기",
+  "skills.gitImporting": "가져오는 중…",
+  "skills.gitNoSkills": "이 저장소에서 가져올 수 있는 스킬을 찾지 못했습니다.",
+  "skills.gitScanFailed": "스킬 목록을 가져오지 못했습니다.",
+  "skills.gitImportFailed": "스킬을 가져오지 못했습니다.",
+  "skills.gitAlreadyExists": "설치됨",
+  "skills.gitAlreadyExistsTitle": "같은 폴더 이름의 스킬이 이미 있습니다 — 가져오면 무작위 접미사가 붙은 복사본으로 추가됩니다(비활성 상태).",
+  "skills.gitSelectAll": "모두 선택",
+  "skills.gitChangeUrl": "URL 변경",
+  "skills.gitIgnoredHint": "저장소의 폴더 {{count}}개가 무시되었습니다(SKILL.md 없음 또는 잘못됨).",
+  "skills.gitSelectedCount": "{{count}}개 선택됨"
 }

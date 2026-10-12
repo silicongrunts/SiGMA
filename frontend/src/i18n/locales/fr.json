@@ -992,5 +992,18 @@
   "chatgpt.quota.detailsTitle": "Quota et cartes de réinitialisation",
   "chatgpt.quota.viewHint": "Solde de crédits et cartes de réinitialisation",
   "chatgpt.login.openAuthorize": "Ouvrir la page de connexion",
-  "chatgpt.login.copyLink": "Copier le lien"
+  "chatgpt.login.copyLink": "Copier le lien",
+  "skills.gitScan": "Récupérer la liste",
+  "skills.gitScanning": "Récupération…",
+  "skills.gitImport": "Importer",
+  "skills.gitImporting": "Importation…",
+  "skills.gitNoSkills": "Aucune skill importable trouvée dans ce dépôt.",
+  "skills.gitScanFailed": "Échec de la récupération de la liste des skills.",
+  "skills.gitImportFailed": "Échec de l'import des skills.",
+  "skills.gitAlreadyExists": "Installée",
+  "skills.gitAlreadyExistsTitle": "Une skill du même nom de dossier existe déjà — l'import créera une copie désactivée avec un suffixe aléatoire.",
+  "skills.gitSelectAll": "Tout sélectionner",
+  "skills.gitChangeUrl": "Changer l'URL",
+  "skills.gitIgnoredHint": "{{count}} dossier(s) du dépôt ont été ignorés (SKILL.md absent ou invalide).",
+  "skills.gitSelectedCount": "{{count}} sélectionnée(s)"
 }

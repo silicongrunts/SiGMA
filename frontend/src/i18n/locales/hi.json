@@ -992,5 +992,18 @@
   "chatgpt.quota.detailsTitle": "कोटा और रीसेट कार्ड",
   "chatgpt.quota.viewHint": "क्रेडिट शेष और रीसेट कार्ड",
   "chatgpt.login.openAuthorize": "साइन-इन पेज खोलें",
-  "chatgpt.login.copyLink": "लिंक कॉपी करें"
+  "chatgpt.login.copyLink": "लिंक कॉपी करें",
+  "skills.gitScan": "सूची प्राप्त करें",
+  "skills.gitScanning": "प्राप्त कर रहे हैं…",
+  "skills.gitImport": "इम्पोर्ट करें",
+  "skills.gitImporting": "इम्पोर्ट हो रहा है…",
+  "skills.gitNoSkills": "इस रिपॉजिटरी में कोई इम्पोर्ट करने योग्य स्किल नहीं मिली।",
+  "skills.gitScanFailed": "स्किल सूची प्राप्त करने में विफल।",
+  "skills.gitImportFailed": "स्किल इम्पोर्ट करने में विफल।",
+  "skills.gitAlreadyExists": "इंस्टॉल है",
+  "skills.gitAlreadyExistsTitle": "इसी फ़ोल्डर नाम वाली स्किल पहले से मौजूद है — इम्पोर्ट करने पर यादृच्छिक प्रत्यय वाली निष्क्रिय प्रतिलिपि बनेगी।",
+  "skills.gitSelectAll": "सभी चुनें",
+  "skills.gitChangeUrl": "URL बदलें",
+  "skills.gitIgnoredHint": "रिपॉजिटरी के {{count}} फ़ोल्डर नज़रअंदाज़ किए गए (SKILL.md अनुपस्थित या अमान्य)।",
+  "skills.gitSelectedCount": "{{count}} चयनित"
 }
