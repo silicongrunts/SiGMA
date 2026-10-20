@@ -42,7 +42,7 @@ onnxruntime==1.25.1
 litellm==1.84.10
 
 # PDF processing
-docling==2.94.0
+docling==2.132.0
 modelscope==1.35.3
 
 # Database / migrations
