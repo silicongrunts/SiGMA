@@ -24,7 +24,7 @@ llama-index-retrievers-bm25==0.7.1
 llama-index-postprocessor-flag-embedding-reranker==0.5.0
 llama-index-instrumentation==0.5.0
 llama-index-workflows==2.20.0
-sentence-transformers==5.4.1
+sentence-transformers==5.6.0
 FlagEmbedding==1.4.0
 
 # Model runtimes (pinned because they're version-sensitive and pull C libs).
