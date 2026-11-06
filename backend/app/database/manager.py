@@ -13,6 +13,7 @@ from typing import Optional
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import event as sa_event
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from app.core.config import settings
 from app.core.exceptions import DatabaseIncompatibleError, DatabaseException
@@ -86,10 +87,19 @@ class DatabaseManager:
                 _configure_sqlite_file(db_path)
             db_url = f"sqlite+aiosqlite:///{db_path}"
 
+            # The aiosqlite dialect defaults to NullPool for file databases,
+            # which opens and closes a fresh libsqlite3 connection on every
+            # checkout. Pooling keeps connections open, so steady-state
+            # traffic performs no sqlite3_close calls at all — the WAL
+            # close/open interleaving that wedges old libsqlite3 (and the
+            # leaked-thread churn under cancelled sweeps) disappears.
             engine = create_async_engine(
                 db_url,
                 echo=False,
                 pool_pre_ping=True,
+                poolclass=AsyncAdaptedQueuePool,
+                pool_size=10,
+                max_overflow=20,
                 connect_args={"timeout": SQLITE_BUSY_TIMEOUT_MS / 1000},
             )
             _configure_sqlite_connection(engine)
