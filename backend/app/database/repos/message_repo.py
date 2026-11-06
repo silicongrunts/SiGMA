@@ -294,6 +294,16 @@ class MessageRepository:
         )
         return result.scalar_one()
 
+    async def count_before(self, session_id: str, seq: int) -> int:
+        """Count messages with ``seq < seq`` — rows that survive a truncate."""
+        result = await self._session.execute(
+            select(func.count()).select_from(Message).where(
+                Message.session_id == session_id,
+                Message.seq < seq,
+            )
+        )
+        return result.scalar_one()
+
     async def get_total_tokens(self, session_id: str) -> int:
         """Return cumulative real input+output usage, not context length."""
         result = await self._session.execute(

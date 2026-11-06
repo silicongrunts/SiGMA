@@ -39,6 +39,13 @@ class ToolDefinition:
     # old==new invariant, notebook cell lookups. Receives the same kwargs the
     # permission executor sees (project_id/session_id injected by the runner).
     preflight: Callable[..., Awaitable[Optional[str]]] | None = None
+    # Not part of any default toolset: excluded from every role's schema list
+    # unless the caller explicitly allows it by name, and refused by the
+    # generic dispatch paths (permission gate, default tool execution) — only
+    # a loop that explicitly allow-lists the tool by name can run it. Used
+    # for tools whose audience is one narrow loop (e.g. ``rm`` for the
+    # memory consolidation agent).
+    internal: bool = False
 
     def to_openai_schema(self) -> dict:
         """Convert to OpenAI function-calling format.

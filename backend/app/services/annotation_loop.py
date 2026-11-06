@@ -198,6 +198,23 @@ class AnnotationLoop:
         )
         content = f"{system_prompt}\n\n{status_block}"
 
+        # Memory is read+usage for annotation loops (pull-based: the tools
+        # can read .SiGMA/memory on demand; the section only states the
+        # policy and the usage-tag contract). Static text + a stable path
+        # keeps the rendered system prompt byte-stable across turns.
+        from app.services.memory_service import (
+            MEMORY_USAGE_MAX_PER_TURN,
+            memory_root,
+            memory_service,
+        )
+
+        if memory_service.memory_enabled():
+            content += "\n\n" + prompt_service.render(
+                "tools/memory_annotation_note",
+                memory_dir=str(memory_root(self.project_id)),
+                max_usage_per_turn=MEMORY_USAGE_MAX_PER_TURN,
+            )
+
         async with UnitOfWork(self.project_id) as uow:
             tips = await uow.config.get("tips", "")
             history = await uow.messages.get_messages_for_annotation_llm(self.annotation_id)

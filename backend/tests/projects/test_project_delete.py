@@ -59,7 +59,7 @@ async def test_delete_project_calls_all_steps(seeded_ps):
 
     mock_mark_deleting = _tracked(MagicMock(), "mark_project_deleting")
     mock_mark_deleted = _tracked(MagicMock(), "mark_project_deleted")
-    mock_cancel = _tracked(AsyncMock(), "_cancel_library_tasks")
+    mock_cancel = _tracked(AsyncMock(), "_cancel_background_tasks")
     mock_wait_rebuild = _tracked(AsyncMock(), "_wait_for_library_rebuild")
     mock_kill = _tracked(AsyncMock(), "_kill_project_kernels")
     mock_db.wait_for_project_sessions = _tracked(
@@ -73,7 +73,7 @@ async def test_delete_project_calls_all_steps(seeded_ps):
     with (
         patch.object(svc, 'mark_project_deleting', mock_mark_deleting),
         patch.object(svc, 'mark_project_deleted', mock_mark_deleted),
-        patch.object(svc, '_cancel_library_tasks', mock_cancel),
+        patch.object(svc, '_cancel_background_tasks', mock_cancel),
         patch.object(svc, '_wait_for_library_rebuild', mock_wait_rebuild),
         patch("app.services.task_runtime.cancel_project", mock_cancel_tasks),
         patch.object(svc, '_evict_project_caches', mock_evict),
@@ -87,7 +87,7 @@ async def test_delete_project_calls_all_steps(seeded_ps):
     # resource cleanup, DB tombstone, caches, directory, and barrier release.
     assert [call[0] for call in recorder.mock_calls] == [
         "mark_project_deleting",
-        "_cancel_library_tasks",
+        "_cancel_background_tasks",
         "_wait_for_library_rebuild",
         "cancel_project",             # via _cleanup_worker_state
         "_kill_project_kernels",      # via _cleanup_project_resources
@@ -117,7 +117,7 @@ async def test_delete_project_waits_for_active_index_rebuild(seeded_ps):
     mock_db.mark_deleted = MagicMock()
     with (
         patch.object(library_service, '_rebuild_index_claimed', blocked_rebuild),
-        patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock),
+        patch.object(svc, '_cancel_background_tasks', new_callable=AsyncMock),
         patch.object(svc, '_cleanup_worker_state', new_callable=AsyncMock, return_value=True),
         patch.object(svc, '_cleanup_project_resources', new_callable=AsyncMock),
         patch.object(svc, '_evict_project_caches', new_callable=AsyncMock),
@@ -147,7 +147,7 @@ async def test_delete_project_marks_metadata_deleted(seeded_ps):
     mock_db = _mock_db_manager()
     mock_db.mark_deleted = MagicMock()
     with (
-        patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock),
+        patch.object(svc, '_cancel_background_tasks', new_callable=AsyncMock),
         patch.object(svc, '_evict_project_caches', new_callable=AsyncMock),
         patch.object(svc, '_kill_project_kernels', new_callable=AsyncMock),
         patch("app.database.manager.get_db_manager", new_callable=AsyncMock, return_value=mock_db),
@@ -165,7 +165,7 @@ async def test_delete_project_stops_when_worker_drain_times_out(seeded_ps):
     mock_db = _mock_db_manager()
     mock_db.mark_deleted = MagicMock()
     with (
-        patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock) as cancel,
+        patch.object(svc, '_cancel_background_tasks', new_callable=AsyncMock) as cancel,
         patch.object(svc, '_cleanup_worker_state', new_callable=AsyncMock, return_value=False),
         patch.object(svc, '_delete_project_directory') as rmdir,
         patch("app.database.manager.get_db_manager", new_callable=AsyncMock, return_value=mock_db),
@@ -184,7 +184,7 @@ async def test_delete_project_waits_for_open_database_work(seeded_ps):
     mock_db = _mock_db_manager()
     mock_db.wait_for_project_sessions.return_value = False
     with (
-        patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock),
+        patch.object(svc, '_cancel_background_tasks', new_callable=AsyncMock),
         patch.object(svc, '_cleanup_project_resources', new_callable=AsyncMock),
         patch.object(svc, '_delete_project_directory') as rmdir,
         patch("app.database.manager.get_db_manager", new_callable=AsyncMock, return_value=mock_db),
@@ -203,7 +203,7 @@ async def test_delete_project_keeps_barrier_when_kernel_cleanup_fails(seeded_ps)
     svc, project_id = seeded_ps
     with patch.object(svc, '_kill_project_kernels', new_callable=AsyncMock,
                       side_effect=RuntimeError("kernel still running")), \
-         patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock), \
+         patch.object(svc, '_cancel_background_tasks', new_callable=AsyncMock), \
          patch.object(svc, '_delete_project_directory') as rmdir, \
          patch("app.database.manager.get_db_manager", new_callable=AsyncMock):
         with pytest.raises(RuntimeError, match="kernel still running"):
@@ -220,7 +220,7 @@ async def test_reset_database_keeps_barrier_when_kernel_cleanup_fails(seeded_ps)
     mock_db.reset_project_database = AsyncMock()
     with patch.object(svc, '_kill_project_kernels', new_callable=AsyncMock,
                       side_effect=RuntimeError("kernel still running")), \
-         patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock), \
+         patch.object(svc, '_cancel_background_tasks', new_callable=AsyncMock), \
          patch("app.database.manager.get_db_manager", new_callable=AsyncMock,
                return_value=mock_db):
         with pytest.raises(RuntimeError, match="kernel still running"):
@@ -258,7 +258,7 @@ async def test_lifecycle_reconcile_converges_crashed_barriers(seeded_ps):
 
     db_manager = _mock_db_manager()
     db_manager.reset_project_database = AsyncMock()
-    with patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock) as cancel_library, \
+    with patch.object(svc, '_cancel_background_tasks', new_callable=AsyncMock) as cancel_library, \
          patch.object(svc, '_cleanup_project_resources', new_callable=AsyncMock) as cleanup, \
          patch.object(svc, '_cleanup_worker_state', new_callable=AsyncMock, return_value=True) as cleanup_worker, \
          patch.object(svc, '_evict_project_caches', new_callable=AsyncMock), \
@@ -291,7 +291,7 @@ async def test_reconcile_keeps_barrier_when_resource_cleanup_fails(seeded_ps):
 
     db_manager = _mock_db_manager()
     db_manager.reset_project_database = AsyncMock()
-    with patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock), \
+    with patch.object(svc, '_cancel_background_tasks', new_callable=AsyncMock), \
          patch.object(svc, '_cleanup_project_resources', new_callable=AsyncMock,
                       side_effect=fail_cleanup), \
          patch("app.database.manager.get_db_manager", new_callable=AsyncMock,
@@ -316,7 +316,7 @@ async def test_delete_project_removes_directory(seeded_ps):
     mock_db = _mock_db_manager()
     mock_db.mark_deleted = MagicMock()
     with (
-        patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock),
+        patch.object(svc, '_cancel_background_tasks', new_callable=AsyncMock),
         patch.object(svc, '_evict_project_caches', new_callable=AsyncMock),
         patch.object(svc, '_kill_project_kernels', new_callable=AsyncMock),
         patch("app.database.manager.get_db_manager", new_callable=AsyncMock, return_value=mock_db),
@@ -344,7 +344,7 @@ async def test_reset_database_uses_barrier_and_restores_active(seeded_ps):
     mock_db.reset_project_database.side_effect = _assert_resetting
 
     with (
-        patch.object(svc, '_cancel_library_tasks', new_callable=AsyncMock) as mock_cancel,
+        patch.object(svc, '_cancel_background_tasks', new_callable=AsyncMock) as mock_cancel,
         patch.object(svc, '_evict_project_caches', new_callable=AsyncMock) as mock_evict,
         patch("app.services.task_runtime.cancel_project") as mock_cancel_tasks,
         patch("app.database.manager.get_db_manager", new_callable=AsyncMock, return_value=mock_db),
@@ -368,7 +368,7 @@ async def test_reset_library_drain_failure_keeps_resetting_barrier(seeded_ps):
     mock_db.reset_project_database = AsyncMock()
     with (
         patch.object(
-            svc, '_cancel_library_tasks', new_callable=AsyncMock,
+            svc, '_cancel_background_tasks', new_callable=AsyncMock,
             side_effect=RuntimeError("library drain failed"),
         ),
         patch("app.database.manager.get_db_manager", new_callable=AsyncMock, return_value=mock_db),
@@ -402,7 +402,7 @@ async def test_library_cancel_db_failure_still_drains_live_handlers(seeded_ps):
             mock_runner,
         ),
     ):
-        assert await svc._cancel_library_tasks(project_id) is True
+        assert await svc._cancel_background_tasks(project_id) is True
 
     mock_runner.cancel_project.assert_called_once_with(project_id)
     mock_runner.wait_for_project.assert_awaited_once_with(project_id)
@@ -516,7 +516,7 @@ def test_get_session_maker_requires_initialized_project():
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_cancel_library_tasks_cancels_project_level_once():
+async def test_cancel_background_tasks_cancels_project_level_once():
     """The project-level cancel covers every active task row; no per-document
     cancellation runs on top of it."""
     svc = ProjectService()
@@ -524,7 +524,7 @@ async def test_cancel_library_tasks_cancels_project_level_once():
     mock_bg.cancel_project_tasks = AsyncMock()
     mock_bg.cancel_document_tasks = AsyncMock()
     with patch("app.services.background_task_service.background_task_service", mock_bg):
-        assert await svc._cancel_library_tasks("proj1") is True
+        assert await svc._cancel_background_tasks("proj1") is True
     mock_bg.cancel_project_tasks.assert_awaited_once_with("proj1")
     mock_bg.cancel_document_tasks.assert_not_awaited()
 

@@ -22,6 +22,7 @@ from . import library_tools     # noqa: F401 — library_search, library_ls, ...
 from . import annotation_tools  # noqa: F401 — annotation_new, annotation_rm, ...
 from . import skill_tools       # noqa: F401 — skill_load
 from . import draw_tools        # noqa: F401 — draw_image
+from . import memory_file_tools  # noqa: F401 — rm (internal: memory consolidation only)
 
 __all__ = [
     "ToolDefinition", "tool_registry", "ToolRegistry",

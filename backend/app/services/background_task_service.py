@@ -31,8 +31,12 @@ _DOCUMENT_DRAIN_POLL_SECONDS = 0.05
 _PROJECT_CURSOR = 0
 
 
-def _project_allows_persistence(project_id: str) -> bool:
-    """Return true only while the project is registered and active."""
+def project_allows_persistence(project_id: str) -> bool:
+    """Return true only while the project is registered and active.
+
+    Shared by both background runners (library and memory) to decide whether
+    a finalize may still write to the project's database.
+    """
     status = get_project_status(project_id)
     if status is None:
         return not (settings.USERDATA_DIR / project_id).exists()
@@ -72,11 +76,11 @@ class BackgroundTaskService:
 
     @property
     def wake_event(self) -> asyncio.Event:
-        """Event the library runner waits on between claim passes."""
+        """Event the library and memory runners wait on between claim passes."""
         return self._wake_event_for_running_loop()
 
     def wake(self) -> None:
-        """End the library runner's idle wait.
+        """End a background runner's idle wait.
 
         The durable DB row is the source of truth; the event only avoids
         idle waiting. Setting an asyncio.Event coalesces any number of
@@ -167,11 +171,12 @@ class BackgroundTaskService:
         priority: int = 100,
         max_attempts: int = 3,
         wake: bool = True,
+        queue: str = QUEUE_LIBRARY,
     ) -> str:
         async with UnitOfWork(project_id) as uow:
             task = await uow.background_tasks.enqueue(
                 kind=kind,
-                queue=QUEUE_LIBRARY,
+                queue=queue,
                 payload_json=json.dumps(payload),
                 priority=priority,
                 max_attempts=max_attempts,
@@ -756,7 +761,7 @@ class LibraryTaskRunner:
                 raise RuntimeError(f"Unknown background task kind: {task.kind}")
             heartbeat_task = asyncio.create_task(self._heartbeat_while_running(ctx))
             await handler(ctx, payload)
-            if not _project_allows_persistence(project_id):
+            if not project_allows_persistence(project_id):
                 return
             # allow_inactive: these finalizes serve tasks of a project that
             # may already be marked deleting; they must land while the
@@ -773,7 +778,7 @@ class LibraryTaskRunner:
                         "finalize; left to its cancel/reclaim path", task.id,
                     )
         except asyncio.CancelledError:
-            if not _project_allows_persistence(project_id):
+            if not project_allows_persistence(project_id):
                 raise
             async with UnitOfWork(project_id, allow_inactive=True) as uow:
                 # A CANCELLING row means the user already asked to cancel;
@@ -788,7 +793,7 @@ class LibraryTaskRunner:
             raise
         except Exception as exc:
             logger.exception("Background task %s failed", task.id)
-            if not _project_allows_persistence(project_id):
+            if not project_allows_persistence(project_id):
                 raise
             async with UnitOfWork(project_id, allow_inactive=True) as uow:
                 # Same split as the cancellation above: a failing handler

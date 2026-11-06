@@ -243,6 +243,14 @@ class AIService:
             await jupyter.stop_session_executions(project_id, session_ids)
 
         try:
+            from app.services.memory_service import clear_cursor
+
+            for sid in session_ids:
+                await clear_cursor(project_id, sid)
+        except Exception:
+            logger.debug("Memory cursor cleanup failed for %s", session_ids, exc_info=True)
+
+        try:
             for sid in session_ids:
                 session_temp_service.delete_session_dir(project_id, sid)
         except Exception as exc:
@@ -413,6 +421,17 @@ class AIService:
                     )
             raise
 
+        # The fork copied rows up to cutoff_seq with their source seq values.
+        # Seed its memory cursor there: the source conversation up to the
+        # fork point was (very likely) already extracted, and re-extracting
+        # it into the fork would only duplicate memories.
+        try:
+            from app.services.memory_service import set_cursor
+
+            await set_cursor(project_id, new_parent_id, cutoff_seq)
+        except Exception:
+            logger.debug("Memory cursor seed for fork failed", exc_info=True)
+
         async with UnitOfWork(project_id) as uow:
             forked = await uow.sessions.get_by_id(new_parent_id)
             if forked is None:
@@ -435,7 +454,11 @@ class AIService:
             for um in user_msgs[:1]:
                 context_parts.append(f"User: {self._strip_status(um.content)[:200]}")
             for am in assistant_msgs[:1]:
-                context_parts.append(f"Assistant: {am.content[:200]}")
+                from app.core.memory_usage_tags import strip_memory_usage_tags
+
+                context_parts.append(
+                    f"Assistant: {strip_memory_usage_tags(am.content)[:200]}"
+                )
 
             context = "\n".join(context_parts)
 
@@ -973,9 +996,11 @@ class AIService:
                 raise ValidationError("Compressed messages cannot be edited")
 
             target_seq = target.seq
+            edit_is_first = await uow.messages.count_before(session_id, target_seq) == 0
 
         full_content = await self._build_user_message_content(
             message, context, project_id, session_id,
+            is_first=edit_is_first,
         )
 
         # Claim the session BEFORE any side effects (message truncation and
@@ -1008,6 +1033,16 @@ class AIService:
         # (a stranded queued row blocks the session).
         try:
             await UnitOfWork.execute_atomic(project_id, _operation)
+
+            # Rewind deleted rows at and after target_seq; a memory cursor
+            # pointing past them would dangle. Best-effort: a stale cursor
+            # only widens the next extraction window, never loses work.
+            try:
+                from app.services.memory_service import clamp_cursor
+
+                await clamp_cursor(project_id, session_id, target_seq - 1)
+            except Exception:
+                logger.debug("Memory cursor clamp after rewind failed", exc_info=True)
 
             # A chat turn is project activity — refresh the list ordering timestamp.
             project_service.touch_project(project_id)
@@ -1263,6 +1298,7 @@ class AIService:
         context: Dict[str, Any],
         project_id: str,
         session_id: str,
+        is_first: bool | None = None,
     ) -> str:
         """Build hidden status/citation/reminder blocks plus user-visible content.
 
@@ -1270,6 +1306,12 @@ class AIService:
         time so the persisted content is final: message rows are written
         once and never modified afterwards, keeping rebuilt request
         prefixes byte-identical for prompt-cache hits.
+
+        The project memory index rides in the first ``<status>`` block of a
+        session (``is_first``; self-detected as "no prior messages" when
+        None). Like the reminder it is a submit-time snapshot — later memory
+        edits do not rewrite history, and compaction re-injects a fresh
+        snapshot on the boundary.
         """
         cleaned_message, plan_requested = self._strip_slash_command(message)
 
@@ -1299,6 +1341,11 @@ class AIService:
                     citation_text = v if isinstance(v, str) else str(v)
                 else:
                     status_lines.append(f"{k}: {_format_value(v)}")
+        memory_block = await self._memory_block_for_new_message(
+            project_id, session_id, is_first,
+        )
+        if memory_block:
+            status_lines.append(memory_block)
         status_block = "<status>\n" + "\n".join(status_lines) + "\n</status>"
         citation_block = f"\n<citation>{citation_text}</citation>" if citation_text else ""
         attachments_block = render_attachments_tag(attachments)
@@ -1307,6 +1354,45 @@ class AIService:
         if unfinished:
             reminder_block = render_task_reminder_tag(unfinished)
         return f"{status_block}{citation_block}{attachments_block}{reminder_block}\n{cleaned_message}"
+
+    @staticmethod
+    async def _memory_block_for_new_message(
+        project_id: str, session_id: str, is_first: bool | None,
+    ) -> str:
+        """Build the ``<memory>`` block for a session's first message.
+
+        Best-effort by design: any failure logs and returns "" so a broken
+        memory directory can never block submitting a message. When the
+        snapshot is complete (not truncated) it is seeded into read-state so
+        editing MEMORY.md does not bounce on must-read-first; a truncated
+        snapshot is left unseeded deliberately — the model must Read the
+        index before rewriting it, or it would drop the unseen tail.
+        """
+        from app.services.memory_service import (
+            build_memory_injection,
+            build_memory_status_block,
+            memory_service,
+            seed_read_state_for_injection,
+        )
+
+        if is_first is None:
+            try:
+                async with UnitOfWork(project_id) as uow:
+                    is_first = await uow.messages.get_count(session_id) == 0
+            except Exception:
+                logger.debug("Memory injection: message count failed", exc_info=True)
+                return ""
+        if not is_first or not memory_service.memory_enabled():
+            return ""
+        try:
+            injection = await build_memory_injection(project_id)
+            if injection is None:
+                return ""
+            seed_read_state_for_injection(session_id, project_id, injection)
+            return build_memory_status_block(injection)
+        except Exception:
+            logger.debug("Memory injection failed for %s/%s", project_id, session_id, exc_info=True)
+            return ""
 
     @staticmethod
     def _strip_slash_command(message: str) -> tuple[str, bool]:

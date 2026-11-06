@@ -1013,5 +1013,10 @@
   "skills.gitSelectAll": "全选",
   "skills.gitChangeUrl": "更换地址",
   "skills.gitIgnoredHint": "仓库中另有 {{count}} 个目录被忽略（SKILL.md 缺失或无效）。",
-  "skills.gitSelectedCount": "已选 {{count}} 项"
+  "skills.gitSelectedCount": "已选 {{count}} 项",
+  "chat.memoryUsed": "引用记忆 ×{{count}}",
+  "system.memorySection": "项目记忆",
+  "system.memoryEnabled": "启用项目记忆",
+  "system.memoryExtractionInterval": "抽取间隔（主循环 LLM 调用次数）",
+  "system.memoryConsolidationInterval": "整理间隔（记忆写入次数）"
 }

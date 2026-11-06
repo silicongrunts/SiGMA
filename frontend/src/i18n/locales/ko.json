@@ -1013,5 +1013,10 @@
   "skills.gitSelectAll": "모두 선택",
   "skills.gitChangeUrl": "URL 변경",
   "skills.gitIgnoredHint": "저장소의 폴더 {{count}}개가 무시되었습니다(SKILL.md 없음 또는 잘못됨).",
-  "skills.gitSelectedCount": "{{count}}개 선택됨"
+  "skills.gitSelectedCount": "{{count}}개 선택됨",
+  "chat.memoryUsed": "메모리 사용 ×{{count}}",
+  "system.memorySection": "프로젝트 메모리",
+  "system.memoryEnabled": "프로젝트 메모리 사용",
+  "system.memoryExtractionInterval": "추출 간격(메인 루프 LLM 호출 수)",
+  "system.memoryConsolidationInterval": "정리 간격(메모리 쓰기 수)"
 }

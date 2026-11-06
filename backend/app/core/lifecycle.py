@@ -17,6 +17,21 @@ logger = get_logger(__name__)
 jupyter_service: JupyterService = JupyterService(base_dir=str(settings.USERDATA_DIR))
 
 
+def register_background_task_handlers() -> None:
+    """Import every background-task executor module once.
+
+    Executors register their handlers in the ``library_task_protocol``
+    registry at module import time; a missing kind makes the corresponding
+    runner fail its rows, so the imports must happen before any runner
+    starts. Called from ``startup_event``.
+    """
+    from importlib import import_module
+
+    import_module("app.services.document_processing_service")
+    import_module("app.services.index_builder")
+    import_module("app.services.memory_task_handlers")
+
+
 async def startup_event():
     """Run once when the FastAPI application starts."""
     from app.services.notebook_service import init_notebook_service
@@ -121,14 +136,8 @@ async def startup_event():
     except Exception as e:
         logger.warning("Git startup maintenance failed: %s", e, exc_info=True)
 
-    # ---- Library task handler registration ----
-    # These imports register the library background task handlers via their
-    # module-level registries; no service-level start/stop is needed since
-    # the background runner owns the execution lifecycle.
-    from importlib import import_module
-
-    import_module("app.services.document_processing_service")
-    import_module("app.services.index_builder")
+    # ---- Background task handler registration ----
+    register_background_task_handlers()
 
     # ---- Terminal session reaper ----
     from app.services.terminal_service import terminal_service
@@ -160,6 +169,11 @@ async def startup_event():
     library_task_runner.start()
     background_task_service.start_maintenance()
 
+    # Memory background queue runner (last: it depends on the registry above).
+    from app.services.memory_task_runner import memory_task_runner
+
+    memory_task_runner.start()
+
     logger.info("SiGMA startup complete")
 
 
@@ -189,6 +203,12 @@ async def shutdown_event():
         await library_task_runner.stop()
     except Exception as e:
         logger.warning("Failed to stop library background runner: %s", e, exc_info=True)
+    from app.services.memory_task_runner import memory_task_runner
+
+    try:
+        await memory_task_runner.stop()
+    except Exception as e:
+        logger.warning("Failed to stop memory background runner: %s", e, exc_info=True)
 
     # ---- Project databases ----
     from app.database.manager import get_db_manager

@@ -495,6 +495,10 @@ async def _write_file(
     if err:
         return err
 
+    limit_err = _memory_limit_error(project_id, file_path, len(content))
+    if limit_err:
+        return limit_err
+
     if file_path.startswith('/'):
         await file_service.write_file_absolute(project_id, file_path, content)
     else:
@@ -538,6 +542,12 @@ async def _edit_file(
     err = _must_read_first_error_for(project_id, session_id, file_path, op="edit")
     if err:
         return err
+
+    limit_err = _memory_edit_limit_error(
+        project_id, session_id, file_path, old_string, new_string, replace_all,
+    )
+    if limit_err:
+        return limit_err
 
     # Read the raw bytes: matching needs CRLF normalization and the write
     # -back needs the original encoding/BOM. The whole file must fit in
@@ -627,6 +637,14 @@ async def _edit_file(
             # codec would silently flip it to the machine's native order).
             new_content = "\ufeff" + new_content
 
+    # Exact post-edit size check. The pre-load projection above can miss
+    # (no snapshot, normalization drift), so the authoritative limit runs on
+    # the final string about to be written — after the CRLF/BOM restore,
+    # which can itself add characters to what the normalized check saw.
+    final_limit_err = _memory_limit_error(project_id, file_path, len(new_content))
+    if final_limit_err:
+        return final_limit_err
+
     # Write back — permission already checked by permission_executor._check_write
     if file_path.startswith('/'):
         await file_service.write_file_absolute(
@@ -638,6 +656,60 @@ async def _edit_file(
     # Refresh cache so further edits in the same turn pass the staleness check.
     _record_read(project_id, session_id, file_path, new_content, is_partial=False)
     return f"File edited: {file_path} ({count} replacement(s))"
+
+
+def _memory_limit_error(
+    project_id: str, file_path: str, projected_chars: int,
+) -> str | None:
+    """Over-limit error when *file_path* is a memory file exceeding the cap.
+
+    ``None`` for any path outside the project memory root — the limit only
+    exists to keep the model-curated memory directory compact (RULES: one
+    fact per file); regular project files are governed by file_service.
+    """
+    try:
+        from app.services.memory_service import (
+            memory_size_error,
+            resolve_memory_file,
+        )
+
+        resolved = resolve_memory_file(project_id, file_path)
+        if resolved is None:
+            return None
+        return memory_size_error(project_id, resolved, projected_chars)
+    except (OSError, ValueError):
+        return None
+
+
+def _memory_edit_limit_error(
+    project_id: str, session_id: str, file_path: str,
+    old_string: str, new_string: str, replace_all: bool = False,
+) -> str | None:
+    """Projected-size limit check for memory-file edits.
+
+    Projects the post-edit size from the must-read-first snapshot (fresh by
+    the time this runs — the staleness check has already passed). Without a
+    snapshot there is nothing to project from; the tool body re-checks after
+    it loads the real content.
+    """
+    try:
+        from app.services.memory_service import resolve_memory_file
+
+        resolved = resolve_memory_file(project_id, file_path)
+        if resolved is None:
+            return None
+        entry = read_state_cache.get(session_id, path_read_state_key(resolved))
+        if entry is None:
+            return None
+        occurrences = entry.content.count(old_string) if replace_all else 1
+        projected = (
+            len(entry.content)
+            - occurrences * len(old_string)
+            + occurrences * len(new_string)
+        )
+        return _memory_limit_error(project_id, file_path, projected)
+    except (OSError, ValueError):
+        return None
 
 
 def _must_read_first_error_for(
@@ -1519,16 +1591,21 @@ async def _grep_fallback(
 # an error string (fed back to the LLM) or None to proceed to the gate.
 
 async def _write_preflight(
-    project_id: str, session_id: str, file_path: str, **_extra,
+    project_id: str, session_id: str, file_path: str,
+    content: str = "", **_extra,
 ) -> str | None:
-    return _must_read_first_error_for(
+    err = _must_read_first_error_for(
         project_id, session_id, file_path, op="write",
     )
+    if err:
+        return err
+    return _memory_limit_error(project_id, file_path, len(content))
 
 
 async def _edit_preflight(
     project_id: str, session_id: str, file_path: str,
-    old_string: str = "", new_string: str = "", **_extra,
+    old_string: str = "", new_string: str = "",
+    replace_all: bool = False, **_extra,
 ) -> str | None:
     if old_string == new_string:
         return "Error: old_string and new_string are identical. No changes needed."
@@ -1538,8 +1615,13 @@ async def _edit_preflight(
     if not old_string:
         return ("Error: old_string must be non-empty. Use the write tool to "
                 "create a file or replace its whole content.")
-    return _must_read_first_error_for(
+    err = _must_read_first_error_for(
         project_id, session_id, file_path, op="edit",
+    )
+    if err:
+        return err
+    return _memory_edit_limit_error(
+        project_id, session_id, file_path, old_string, new_string, replace_all,
     )
 
 

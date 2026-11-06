@@ -6,9 +6,10 @@ import { InlineDiffViewer } from './DiffViewer'
 import { SideBySideDiffViewer } from './DiffViewer'
 import { computeDiffState } from '../utils/diffState'
 import { formatTimestamp } from '../utils/formatTimestamp'
+import { extractMemoryUsages } from '../utils/memoryUsage'
 import { useStore } from '../store/useStore'
 import { createSSEStreamParser } from '../utils/sse'
-import { STREAM_RECOVERY_MAX_ATTEMPTS, STREAM_RECOVERY_DELAY_MS, ThinkingProcess, streamStatusText, withTransientHint } from './ChatShared'
+import { STREAM_RECOVERY_MAX_ATTEMPTS, STREAM_RECOVERY_DELAY_MS, ThinkingProcess, MemoryUsageChip, streamStatusText, withTransientHint } from './ChatShared'
 import { toastError } from './Toast'
 
 const MIN_WIDTH = 320
@@ -1007,47 +1008,51 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
             the layout effect above re-asserts it in lockstep, same as the
             card/row sizes. */}
         <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4 bg-white dark:bg-gray-900" style={{ maxHeight: threadMaxH }}>
-          {annotation.thread.map((msg, i) => (
-            <div key={i} className={`flex flex-col ${msg.role === 'SiGMA' ? 'items-start' : 'items-end'}`}>
-              <div className={`flex items-center gap-1.5 mb-1 text-[10px] font-bold uppercase tracking-wider ${msg.role === 'SiGMA' ? 'text-sigma-600 dark:text-sigma-400' : 'text-gray-400 dark:text-gray-500'}`}>
-                {msg.role === 'SiGMA' ? <Bot className="w-3 h-3" /> : <User className="w-3 h-3" />}
-                {msg.role === 'SiGMA' ? t('chat.roleSigma') : t('annotations.senderYou')}
-                {msg.isStreaming && <RotateCw className="w-2.5 h-2.5 animate-spin text-blue-400" />}
-                {msg.created_at && !msg.isStreaming && (
-                  <span className="text-[9px] text-gray-300 dark:text-gray-600 select-none font-normal normal-case tracking-normal">{formatTimestamp(msg.created_at)}</span>
-                )}
+          {annotation.thread.map((msg, i) => {
+            const memoryUsages = msg.role === 'SiGMA' ? extractMemoryUsages(msg.content) : []
+            return (
+              <div key={i} className={`flex flex-col ${msg.role === 'SiGMA' ? 'items-start' : 'items-end'}`}>
+                <div className={`flex items-center gap-1.5 mb-1 text-[10px] font-bold uppercase tracking-wider ${msg.role === 'SiGMA' ? 'text-sigma-600 dark:text-sigma-400' : 'text-gray-400 dark:text-gray-500'}`}>
+                  {msg.role === 'SiGMA' ? <Bot className="w-3 h-3" /> : <User className="w-3 h-3" />}
+                  {msg.role === 'SiGMA' ? t('chat.roleSigma') : t('annotations.senderYou')}
+                  {msg.isStreaming && <RotateCw className="w-2.5 h-2.5 animate-spin text-blue-400" />}
+                  {msg.created_at && !msg.isStreaming && (
+                    <span className="text-[9px] text-gray-300 dark:text-gray-600 select-none font-normal normal-case tracking-normal">{formatTimestamp(msg.created_at)}</span>
+                  )}
+                </div>
+                <div className={`max-w-[85%] rounded-2xl text-sm leading-relaxed shadow-sm overflow-hidden break-words ${
+                  msg.role === 'SiGMA' ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-900 dark:text-blue-200 rounded-tl-none border border-blue-100 dark:border-blue-800/50 px-3 py-2' : 'bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200 rounded-tr-none border border-gray-200 dark:border-gray-700 px-3 py-2'
+                }`}>
+                  {msg.process?.length > 0 && (
+                    <ThinkingProcess steps={msg.process} isStreaming={msg.isStreaming} />
+                  )}
+                  {msg.role === 'SiGMA' ? (
+                    msg.content ? (
+                      <InlineDiffViewer
+                        annotation={annotation}
+                        message={msg}
+                        messageIndex={i}
+                        onExpandDiff={setExpandedDiff}
+                        expandedDiff={expandedDiff}
+                        editorContent={editorContent}
+                        projectId={projectId}
+                      />
+                    ) : !msg.process?.length && msg.isStreaming ? (
+                      <div className="flex items-center gap-2">
+                        <span className="inline-block w-1.5 h-1.5 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                        <span className="inline-block w-1.5 h-1.5 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                        <span className="inline-block w-1.5 h-1.5 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                        <span className="text-xs text-blue-600">{t('chat.thinking')}</span>
+                      </div>
+                    ) : null
+                  ) : (
+                    <div className="whitespace-pre-wrap">{msg.content}</div>
+                  )}
+                  {memoryUsages.length > 0 && <MemoryUsageChip usages={memoryUsages} />}
+                </div>
               </div>
-              <div className={`max-w-[85%] rounded-2xl text-sm leading-relaxed shadow-sm overflow-hidden break-words ${
-                msg.role === 'SiGMA' ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-900 dark:text-blue-200 rounded-tl-none border border-blue-100 dark:border-blue-800/50 px-3 py-2' : 'bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200 rounded-tr-none border border-gray-200 dark:border-gray-700 px-3 py-2'
-              }`}>
-                {msg.process?.length > 0 && (
-                  <ThinkingProcess steps={msg.process} isStreaming={msg.isStreaming} />
-                )}
-                {msg.role === 'SiGMA' ? (
-                  msg.content ? (
-                    <InlineDiffViewer
-                      annotation={annotation}
-                      message={msg}
-                      messageIndex={i}
-                      onExpandDiff={setExpandedDiff}
-                      expandedDiff={expandedDiff}
-                      editorContent={editorContent}
-                      projectId={projectId}
-                    />
-                  ) : !msg.process?.length && msg.isStreaming ? (
-                    <div className="flex items-center gap-2">
-                      <span className="inline-block w-1.5 h-1.5 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
-                      <span className="inline-block w-1.5 h-1.5 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
-                      <span className="inline-block w-1.5 h-1.5 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
-                      <span className="text-xs text-blue-600">{t('chat.thinking')}</span>
-                    </div>
-                  ) : null
-                ) : (
-                  <div className="whitespace-pre-wrap">{msg.content}</div>
-                )}
-              </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
 
         {/* Input */}

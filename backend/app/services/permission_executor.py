@@ -27,6 +27,7 @@ source of truth, and the resume path re-reads it from the database.
 """
 
 import hashlib
+from pathlib import Path
 from typing import Any, Optional
 
 from app.agents.tools.bash_permissions import check_bash_permission
@@ -63,6 +64,8 @@ async def execute_with_permission(
     tool_def: Any = None,
     *,
     project_id: str,
+    session_id: str = "",
+    memory_write_mode: str = "deny",
 ) -> str:
     """Dispatch ``tool_name`` after running the appropriate permission gate.
 
@@ -71,6 +74,21 @@ async def execute_with_permission(
     that goes back to the LLM). Raises ``PermissionRequestPause`` when user
     approval is needed — the caller (LLM loop runner) catches it and parks the
     task as ``awaiting_input``.
+
+    ``memory_write_mode``: how filesystem writes inside the project memory
+    root (``.SiGMA/memory``) are gated — ``"allow"`` (foreground main loop:
+    silent auto-approve, the whole point of active memory) or ``"deny"``
+    (subagents: read-only memory, hard denial). The gate runs before the
+    normal category classification, so memory writes never surface an
+    approval dialog and never depend on the file_internal/file_external
+    categories.
+
+    ``session_id``: the calling loop's chat session. When a landed write
+    counts, it is that session's extraction window which resets.
+
+    Internal tools (``ToolDefinition.internal``) are refused outright: they
+    execute only inside the background loop that explicitly allow-lists
+    them.
     """
     if tool_def is None:
         tool_def = tool_registry.get(tool_name)
@@ -78,6 +96,11 @@ async def execute_with_permission(
         return f"Error: Unknown tool '{tool_name}'"
     if tool_def.call is None:
         return f"Error: Tool '{tool_name}' has no call implementation"
+    if tool_def.internal:
+        return (
+            f"Error: tool '{tool_name}' is internal to a background "
+            "subsystem and cannot be called here."
+        )
 
     # Structural pre-check: reject malformed arguments before any approval gate.
     # A doomed call (missing/typo'd param) must never surface a permission
@@ -88,10 +111,47 @@ async def execute_with_permission(
 
     denied = await _check_permission(
         tool_name, tool_args, tool_def, project_id,
+        memory_write_mode=memory_write_mode,
     )
     if denied:
         return denied
-    return await LLMLoopRunner.call_tool(tool_def, tool_args)
+    result = await LLMLoopRunner.call_tool(tool_def, tool_args)
+    memory_target = _foreground_memory_write_path(
+        tool_name, tool_args, tool_def, project_id, memory_write_mode,
+    )
+    if not result.startswith("Error") and memory_target is not None:
+        # Count only writes that actually landed: size-limit and
+        # must-read-first rejections surface as tool errors, and a bounced
+        # write must not reset or deplete the memory counters. The writing
+        # session's extraction window is the one that resets.
+        from app.services.memory_service import memory_service
+
+        await memory_service.note_memory_file_write(
+            project_id, session_id, memory_target,
+        )
+    return result
+
+
+def _foreground_memory_write_path(
+    tool_name: str, tool_args: dict, tool_def: Any,
+    project_id: str, memory_write_mode: str,
+) -> Optional[Path]:
+    """The resolved memory-root target of a foreground main-loop write, or ``None``.
+
+    Mirrors the routing ``_check_permission`` uses to reach ``_check_write``
+    (write-category tools that are not bash/notebook/exempt), so the write
+    counted after execution is exactly the one the gate auto-approved.
+    """
+    if memory_write_mode != "allow" or tool_def.is_read_only:
+        return None
+    if tool_name in ("bash", "notebook_run_cell") or tool_name in _EXEMPT_TOOLS:
+        return None
+    target_path = write_target_arg(tool_args)
+    if not target_path:
+        return None
+    from app.services.memory_service import resolve_memory_file
+
+    return resolve_memory_file(project_id, target_path)
 
 
 async def _check_permission(
@@ -99,6 +159,7 @@ async def _check_permission(
     tool_args: dict,
     tool_def: Any,
     project_id: str,
+    memory_write_mode: str = "deny",
 ) -> Optional[str]:
     """Returns denial string if denied, None to proceed with tool execution.
 
@@ -123,7 +184,10 @@ async def _check_permission(
     if tool_name in _EXEMPT_TOOLS:
         return None
     if not tool_def.is_read_only:
-        return await _check_write(tool_name, tool_args, project_id)
+        return await _check_write(
+            tool_name, tool_args, project_id,
+            memory_write_mode=memory_write_mode,
+        )
     return None
 
 
@@ -395,6 +459,7 @@ async def _check_write(
     tool_name: str,
     tool_args: dict,
     project_id: str,
+    memory_write_mode: str = "deny",
 ) -> Optional[str]:
     """Require approval for filesystem writes, classifying the target into the
     ``file_internal`` (sandbox /tmp) or ``file_external`` category.
@@ -403,10 +468,27 @@ async def _check_write(
     the resume path can detect a target that moved while the task was parked.
 
     For the ``edit`` tool, the before/after strings are composed into the preview.
+
+    Memory-root writes are decided first, without an approval dialog:
+    foreground loops auto-approve, subagents get a hard denial — see
+    ``execute_with_permission``, which counts a landed write toward the
+    memory counters.
     """
     target_path = write_target_arg(tool_args)
     if not target_path:
         return None
+
+    from app.services.memory_service import memory_write_mode_for
+
+    if memory_write_mode_for(project_id, target_path) == "memory":
+        if memory_write_mode == "allow":
+            return None
+        return (
+            f"Error: '{target_path}' is inside the project memory directory "
+            f"(.SiGMA/memory). Subagents cannot modify project memory — "
+            "describe the change in your final result instead so the main "
+            "loop can save it."
+        )
 
     level = file_service.check_write_allowed(project_id, target_path)
 

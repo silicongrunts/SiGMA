@@ -54,6 +54,18 @@ class PromptService:
             "precedence over tips."
         )
 
+    @staticmethod
+    def _memory_max_file_chars() -> int:
+        from app.core.config import settings
+
+        return settings.memory.max_file_chars
+
+    @staticmethod
+    def _memory_max_usage_per_turn() -> int:
+        from app.services.memory_service import MEMORY_USAGE_MAX_PER_TURN
+
+        return MEMORY_USAGE_MAX_PER_TURN
+
     def build_system_prompt(
         self,
         *,
@@ -83,6 +95,22 @@ class PromptService:
                 session_temp_dir=session_temp_dir,
             )
         )
+
+        # Project memory policy (main loop only; subagents get a read-only
+        # note from their own templates). Lazy import: the memory section
+        # must come from the single owner so the main loop and the
+        # background extraction agent render byte-identical prompts.
+        from app.services.memory_service import memory_service, memory_root
+
+        if memory_service.memory_enabled() and project_id:
+            sections.append(
+                self.render(
+                    "agents/memory_policy",
+                    memory_dir=str(memory_root(project_id)),
+                    max_file_chars=self._memory_max_file_chars(),
+                    max_usage_per_turn=self._memory_max_usage_per_turn(),
+                )
+            )
 
         # Project tips (user-defined behavioral guidelines)
         if tips and tips.strip():

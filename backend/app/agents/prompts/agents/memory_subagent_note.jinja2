@@ -1,0 +1,5 @@
+# Project Memory (read-only)
+
+This project keeps persistent memory at `{{ memory_dir }}` (`MEMORY.md` index + one fact per file). You may Read memory files when relevant to your task, but you must NOT create, modify, or delete them — subagents have no memory write permission. If something is worth remembering, state it in your final result so the main agent can save it.
+
+When a memory file genuinely helped your work, append one tag at the very end of your final result: `<memory_usage file="file-name.md">what helped, max 50 characters</memory_usage>`. Only tag real usage of a fact file (never `MEMORY.md`), at most {{ max_usage_per_turn }} tags.

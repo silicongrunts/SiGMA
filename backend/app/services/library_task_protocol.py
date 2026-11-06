@@ -36,6 +36,14 @@ from app.database.unit_of_work import UnitOfWork
 QUEUE_LIBRARY = "library"
 KIND_DOCUMENT_PROCESS = "document_process"
 KIND_RAG_INDEX = "rag_index"
+# Memory background queue: extraction / consolidation for .SiGMA/memory.
+# Handlers register in services.memory_task_handlers, imported at startup
+# next to the library executors (see core/lifecycle); the dedicated
+# MemoryTaskRunner claims only this queue so memory work never waits behind
+# document processing.
+QUEUE_MEMORY = "memory"
+KIND_MEMORY_EXTRACT = "memory_extract"
+KIND_MEMORY_CONSOLIDATE = "memory_consolidate"
 
 
 # ---------------------------------------------------------------------------
@@ -90,10 +98,10 @@ TaskHandler = Callable[[RunningTaskContext, Dict[str, Any]], Awaitable[None]]
 # Handler registry
 # ---------------------------------------------------------------------------
 #
-# Executors (document_processing_service, index_builder) register their
-# handlers at module import time.  Both modules are imported during
-# application startup (see ``core/lifecycle``), so every kind is
-# registered before the first task is dispatched.
+# Executors (document_processing_service, index_builder,
+# memory_task_handlers) register their handlers at module import time. All
+# three are imported during application startup (see ``core/lifecycle``),
+# so every kind is registered before the first task is dispatched.
 
 
 _handlers: Dict[str, TaskHandler] = {}

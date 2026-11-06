@@ -39,6 +39,24 @@ def test_system_boundary_and_tool_roles_never_match():
     assert visible_search_matches(entries, compile_search_pattern("needle")) == []
 
 
+def test_memory_usage_tags_never_match_or_quote():
+    """The bubble hides <memory_usage> markup behind a chip; search must
+    neither match the hidden text nor leak it into a snippet."""
+    entries = [
+        _entry(
+            "m0", "SiGMA",
+            'Prefix <memory_usage file="name.md">cited the memory</memory_usage> suffix',
+        ),
+    ]
+    assert visible_search_matches(entries, compile_search_pattern("memory_usage")) == []
+    assert visible_search_matches(entries, compile_search_pattern("name.md")) == []
+    assert visible_search_matches(entries, compile_search_pattern("cited")) == []
+
+    (match,) = visible_search_matches(entries, compile_search_pattern("Prefix"))
+    assert "Prefix" in match["snippet"]
+    assert "memory_usage" not in match["snippet"]
+
+
 def test_regex_special_characters_in_query_match_literally():
     entries = [_entry("m0", "user", "a.b*c lookup")]
     matches = visible_search_matches(entries, compile_search_pattern("a.b*"))

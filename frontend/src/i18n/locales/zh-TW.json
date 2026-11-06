@@ -1013,5 +1013,10 @@
   "skills.gitSelectAll": "全選",
   "skills.gitChangeUrl": "更換網址",
   "skills.gitIgnoredHint": "儲存庫中另有 {{count}} 個目錄被忽略（SKILL.md 缺失或無效）。",
-  "skills.gitSelectedCount": "已選 {{count}} 項"
+  "skills.gitSelectedCount": "已選 {{count}} 項",
+  "chat.memoryUsed": "引用記憶 ×{{count}}",
+  "system.memorySection": "專案記憶",
+  "system.memoryEnabled": "啟用專案記憶",
+  "system.memoryExtractionInterval": "抽取間隔（主循環 LLM 呼叫次數）",
+  "system.memoryConsolidationInterval": "整理間隔（記憶寫入次數）"
 }

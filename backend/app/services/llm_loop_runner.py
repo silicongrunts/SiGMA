@@ -144,6 +144,64 @@ class ToolRoundState:
     tool_error_stop_message: str = ""
 
 
+def _is_main_loop(ctx: LoopContext) -> bool:
+    """A top-level user-facing loop call (query_loop) tied to a project."""
+    return ctx.context_kind == "main" and not ctx.is_agent_tool and bool(ctx.project_id)
+
+
+def _depletes_memory_counter(ctx: LoopContext) -> bool:
+    """Whether this LLM call depletes the session's memory extraction window.
+
+    Main-loop calls only: a subagent run (fork/explore/general) is one unit
+    accounted to the calling loop no matter how many calls it makes inside,
+    and annotation turns never feed project extraction.
+    """
+    return _is_main_loop(ctx)
+
+
+def _records_memory_usage(ctx: LoopContext) -> bool:
+    """Loops whose final reply carries the memory-usage tag contract.
+
+    Foreground main and annotation replies surface to the user directly;
+    subagent final results are the third reply surface the contract applies
+    to (their tags are recorded at loop end and stripped before the result
+    returns to the calling loop — see AgentService._extract_final_text).
+    """
+    return ctx.is_agent_tool or (
+        ctx.context_kind in ("main", "annotation") and not ctx.is_agent_tool
+    )
+
+
+# Holds references to the fire-and-forget turn-end scheduler tasks so they
+# cannot be garbage-collected mid-flight.
+_memory_scheduler_tasks: set["asyncio.Task"] = set()
+
+
+def _schedule_due_memory_task(project_id: str, session_id: str) -> "asyncio.Task":
+    """Hand the project's due background memory task to the queue, best-effort.
+
+    The only sanctioned trigger is a finished main-loop turn: the final
+    assistant message has been produced and no tool calls are pending.
+    Pause and error paths return before this runs. Fire-and-forget by
+    design: a scheduling failure must never flip a completed turn to failed
+    (the counters stay at zero and the next turn retries).
+    """
+    from app.services.memory_service import memory_service
+
+    async def _start() -> None:
+        try:
+            kind = await memory_service.due_task(project_id, session_id)
+            if kind:
+                await memory_service.start_due_task(project_id, kind, session_id=session_id)
+        except Exception:
+            logger.debug("Memory task scheduling after turn failed", exc_info=True)
+
+    task = asyncio.create_task(_start())
+    _memory_scheduler_tasks.add(task)
+    task.add_done_callback(_memory_scheduler_tasks.discard)
+    return task
+
+
 class LLMLoopRunner:
     """Shared LLM loop kernel.  One instance can be reused for multiple runs."""
 
@@ -403,6 +461,18 @@ class LLMLoopRunner:
             if exit_error:
                 break
 
+            # Project-memory extraction counter: one depletion unit per
+            # main-loop LLM call, against the loop's own session window.
+            if _depletes_memory_counter(ctx):
+                try:
+                    from app.services.memory_service import memory_service
+
+                    await memory_service.note_main_loop_llm_call(
+                        ctx.project_id, ctx.session_id or "",
+                    )
+                except Exception:
+                    logger.debug("Memory counter hook failed", exc_info=True)
+
             # Accumulate usage
             if llm_usage:
                 tu = extract_llm_usage(llm_usage)
@@ -544,6 +614,27 @@ class LLMLoopRunner:
                 error_data["usage"] = self._public_usage(turn_usage)
             yield self.sse(SSE_ERROR, error_data)
             return
+
+        if _records_memory_usage(ctx):
+            # Record <memory_usage> tags from the final reply (main,
+            # annotation, and subagent loops). Fire-and-forget: bookkeeping
+            # must not delay the terminal event.
+            final_text = next(
+                (m.get("content", "") for m in reversed(messages) if m.get("role") == "assistant"),
+                "",
+            )
+            try:
+                from app.services.memory_service import schedule_usage_recording
+
+                schedule_usage_recording(ctx.project_id, final_text)
+            except Exception:
+                logger.debug("Memory usage scheduling failed", exc_info=True)
+
+        if _is_main_loop(ctx):
+            # A completed turn ends with a final assistant message and no
+            # pending tool calls — the single sanctioned moment to hand a
+            # due background memory task to the queue.
+            _schedule_due_memory_task(ctx.project_id, ctx.session_id or "")
 
         yield self.sse(SSE_DONE, done_data)
 
@@ -1377,6 +1468,11 @@ class LLMLoopRunner:
             return f"Error: Unknown tool '{tool_name}'"
         if tool_def.call is None:
             return f"Error: Tool '{tool_name}' has no call implementation"
+        if tool_def.internal:
+            return (
+                f"Error: tool '{tool_name}' is internal to a background "
+                "subsystem and cannot be called here."
+            )
         return await LLMLoopRunner.call_tool(tool_def, tool_args)
 
     @staticmethod

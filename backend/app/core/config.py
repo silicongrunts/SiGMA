@@ -276,6 +276,28 @@ class FilesSettings(BaseModel):
         return value
 
 
+class MemorySettings(BaseModel):
+    """Project-memory feature (.SiGMA/memory) tuning.
+
+    Counters are depletion triggers, not quotas: the background extraction
+    runs once per *extraction_interval* main-loop LLM calls; consolidation
+    runs once per *consolidation_interval* foreground memory-file writes.
+    """
+    enabled: bool = True
+    # Main-loop LLM calls between background memory extractions.
+    extraction_interval: int = Field(default=30, ge=1, le=1000)
+    # Foreground memory-file writes between memory consolidation runs.
+    consolidation_interval: int = Field(default=30, ge=1, le=1000)
+    # Hard cap for a single memory file, including MEMORY.md (characters).
+    max_file_chars: int = Field(default=20_000, ge=1000)
+    # Injection cap for the MEMORY.md snapshot embedded in the first user
+    # message / compaction boundary (characters, before the WARNING suffix).
+    injection_max_chars: int = Field(default=20_000, ge=1000)
+    # Agent-turn budget for one background extraction / consolidation run.
+    extraction_max_turns: int = Field(default=5, ge=1, le=50)
+    consolidation_max_turns: int = Field(default=15, ge=1, le=200)
+
+
 class LibrarySettings(BaseModel):
     top_k: int = 5
     candidate_pool_size: int = 15
@@ -346,6 +368,7 @@ class Settings(BaseModel):
     background: BackgroundSettings = Field(default_factory=BackgroundSettings)
     files: FilesSettings = Field(default_factory=FilesSettings)
     library: LibrarySettings = Field(default_factory=LibrarySettings)
+    memory: MemorySettings = Field(default_factory=MemorySettings)
 
     # NOTE: keep this model side-effect-free. Directories are created by
     # ``lifecycle.startup_event`` and by ``write_settings_file``; validating

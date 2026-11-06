@@ -4,14 +4,16 @@
  * shared by the sidebar ChatPanel, DiffViewer, LibraryBrowser, and
  * PlanApprovalDialog.
  */
-import { useEffect, useState, useRef, useMemo } from 'react'
+import { useEffect, useState, useRef, useMemo, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import renderMathInElement from 'katex/dist/contrib/auto-render.mjs'
 import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
-import { ChevronDown, Cpu, CheckCircle2, Loader2, AlertCircle, AlertTriangle, FoldVertical, PauseCircle, Search, FileText, X } from 'lucide-react'
+import { stripMemoryUsageTags } from '../utils/memoryUsage'
+import { useClickOutside } from '../hooks/useClickOutside'
+import { ChevronDown, Cpu, CheckCircle2, Loader2, AlertCircle, AlertTriangle, FoldVertical, PauseCircle, Search, FileText, TextQuote, X } from 'lucide-react'
 import TaskList from './TaskList'
 import DiffView from './DiffView'
 import ImageLightbox from './ImageLightbox'
@@ -127,6 +129,88 @@ export function streamStatusText(data, t) {
         })
     }
     return data?.message || ''
+}
+
+// "Used memory" chip under an assistant reply: the label carries the count;
+// clicking toggles a small popover listing each usage as "note + file" —
+// exactly the content of the reply's memory_usage tags. Shared by the chat
+// panel, the annotation thread panel, and the archived-session viewer.
+
+// tailwind max-w-sm, kept in sync for viewport clamping
+const MEMORY_POPOVER_MAX_WIDTH = 384
+
+export function MemoryUsageChip({ usages }) {
+    const { t } = useTranslation()
+    const [open, setOpen] = useState(false)
+    const [pos, setPos] = useState(null)
+    const rootRef = useRef(null)
+    const buttonRef = useRef(null)
+    const popoverRef = useRef(null)
+
+    // Single outside-click region = popover ∪ toggle button, so clicking the
+    // button while open reaches the toggle instead of being eaten by a close.
+    useClickOutside(rootRef, () => setOpen(false), open)
+
+    useEffect(() => {
+        if (!open) return
+        const onKey = (e) => { if (e.key === 'Escape') setOpen(false) }
+        // The popover is viewport-anchored: close instead of letting it float
+        // detached when any scroller (chat list, panels) moves under it.
+        const onScroll = () => setOpen(false)
+        window.addEventListener('keydown', onKey)
+        window.addEventListener('scroll', onScroll, true)
+        return () => {
+            window.removeEventListener('keydown', onKey)
+            window.removeEventListener('scroll', onScroll, true)
+        }
+    }, [open])
+
+    // Chat bubbles clip (overflow-hidden), so the popover anchors to the
+    // viewport above the chip — flipping below it when there is no room —
+    // instead of being placed inside the bubble. Placed in a layout effect
+    // before paint; re-runs when more tags complete while the reply is
+    // still streaming and the popover grows.
+    useLayoutEffect(() => {
+        if (!open || !buttonRef.current) return
+        const rect = buttonRef.current.getBoundingClientRect()
+        const width = popoverRef.current?.offsetWidth || MEMORY_POPOVER_MAX_WIDTH
+        const height = popoverRef.current?.offsetHeight || 0
+        const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))
+        if (rect.top - height - 12 >= 8) {
+            setPos({ left, bottom: window.innerHeight - rect.top + 4 })
+        } else {
+            setPos({ left, top: rect.bottom + 4 })
+        }
+    }, [open, usages.length])
+
+    return (
+        <span ref={rootRef} className="relative mt-2 inline-flex">
+            <button
+                ref={buttonRef}
+                type="button"
+                aria-expanded={open}
+                onClick={() => setOpen(v => !v)}
+                className="flex cursor-pointer items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300"
+            >
+                <TextQuote className="w-3 h-3" />
+                {t('chat.memoryUsed', { count: usages.length })}
+            </button>
+            {open && (
+                <span
+                    ref={popoverRef}
+                    style={pos}
+                    className="fixed z-[90] block w-max max-w-sm space-y-1 rounded-lg border border-gray-200 bg-white px-3 py-2 text-[11px] font-normal normal-case tracking-normal shadow-lg dark:border-gray-700 dark:bg-gray-800 animate-in fade-in zoom-in duration-150"
+                >
+                    {usages.map((u, i) => (
+                        <span key={`${u.file}:${i}`} className="block">
+                            <span className="block whitespace-pre-wrap break-words text-gray-600 dark:text-gray-300">{u.note}</span>
+                            <span className="mt-0.5 block text-right text-gray-400 dark:text-gray-500">{u.file}</span>
+                        </span>
+                    ))}
+                </span>
+            )}
+        </span>
+    )
 }
 
 // Drop-reconnect budget shared by the chat and annotation stream consumers:
@@ -274,7 +358,9 @@ export const MarkdownContent = ({ content, projectId = null, onCitation = null, 
         // Protect math from marked (breaks:true <br> insertion, emphasis eating,
         // entity escaping) by lifting it out before parse and stitching it back
         // after. See utils/mathGuard.js for the full rationale.
-        const { text, map } = extractMath(content || '')
+        // Memory-usage citations live in stored content but never render as
+        // text (the chat bubble surfaces them as a chip instead).
+        const { text, map } = extractMath(stripMemoryUsageTags(content || ''))
         const parsed = marked.parse(text)
         const restored = restoreMath(parsed, map)
         const rewritten = rewriteProjectImageSrc(restored, projectId)

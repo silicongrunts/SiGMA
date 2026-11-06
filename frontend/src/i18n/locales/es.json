@@ -1013,5 +1013,10 @@
   "skills.gitSelectAll": "Seleccionar todo",
   "skills.gitChangeUrl": "Cambiar URL",
   "skills.gitIgnoredHint": "Se ignoraron {{count}} carpeta(s) del repositorio (SKILL.md ausente o no válido).",
-  "skills.gitSelectedCount": "{{count}} seleccionadas"
+  "skills.gitSelectedCount": "{{count}} seleccionadas",
+  "chat.memoryUsed": "Memoria usada ×{{count}}",
+  "system.memorySection": "Memoria del proyecto",
+  "system.memoryEnabled": "Habilitar memoria del proyecto",
+  "system.memoryExtractionInterval": "Intervalo de extracción (llamadas LLM del bucle principal)",
+  "system.memoryConsolidationInterval": "Intervalo de consolidación (escrituras de memoria)"
 }

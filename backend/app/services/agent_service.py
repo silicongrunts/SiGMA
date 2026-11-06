@@ -55,7 +55,7 @@ class AgentService:
         ``extra``.
         """
         meta = project_service.get_project_meta(project_id)
-        return prompt_service.render(
+        prompt = prompt_service.render(
             template,
             project_id=project_id,
             working_dir=str(settings.get_project_path(project_id)),
@@ -63,6 +63,23 @@ class AgentService:
             project_description=meta["description"],
             **extra,
         )
+        # Subagents are memory read-only: a short note appended here covers
+        # general/explore/plan uniformly; the permission executor enforces it
+        # at the tool boundary. The note also carries the usage-tag contract
+        # — subagent results are recorded like any other reply.
+        from app.services.memory_service import (
+            MEMORY_USAGE_MAX_PER_TURN,
+            memory_root,
+            memory_service,
+        )
+
+        if memory_service.memory_enabled() and project_id:
+            prompt += "\n\n" + prompt_service.render(
+                "agents/memory_subagent_note",
+                memory_dir=str(memory_root(project_id)),
+                max_usage_per_turn=MEMORY_USAGE_MAX_PER_TURN,
+            )
+        return prompt
 
     def _general_system_prompt(self, project_id: str) -> str:
         """Render the general-agent template plus the <skills> list.
@@ -348,6 +365,7 @@ class AgentService:
             return await execute_with_permission(
                 tool_name, tool_args, tool_def,
                 project_id=tool_args.get("project_id", ""),
+                memory_write_mode="deny",
             )
 
         return _execute
@@ -600,7 +618,7 @@ class AgentService:
         """Fork: inherit parent loop messages without persisting child context."""
         messages = list(inherited_messages)
         start_index = len(messages)
-        messages.extend(self._fork_task_messages(prompt))
+        messages.append(self._fork_brief(prompt))
 
         active_tool_schemas = (
             tool_schemas
@@ -744,30 +762,31 @@ class AgentService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _fork_task_messages(prompt: str) -> list[dict]:
+    def _fork_brief(prompt: str) -> dict:
+        """One user message carrying fork framing plus the injected task."""
         forbidden_tools = ", ".join(sorted(FORK_FORBIDDEN_TOOLS))
-        mode_message = prompt_service.render(
-            "agents/fork_mode",
+        brief = prompt_service.render(
+            "agents/fork_run",
             forbidden_tools=forbidden_tools,
-        )
-        task_message = prompt_service.render(
-            "agents/fork_task",
             prompt=prompt.strip(),
         )
-        return [
-            {"role": "user", "content": mode_message},
-            {"role": "user", "content": task_message},
-        ]
+        return {"role": "user", "content": brief}
 
     @staticmethod
     def _extract_final_text(messages: list[dict], *, start_index: int = 0) -> str:
+        from app.core.memory_usage_tags import strip_memory_usage_tags
+
         for msg in reversed(messages[start_index:]):
             if (
                 msg.get("role") == "assistant"
                 and msg.get("content")
                 and not msg.get("tool_calls")
             ):
-                return msg["content"]
+                # A subagent reply may end with <memory_usage> tags (the
+                # loop runner records them at loop end). What returns here
+                # feeds the calling loop's tool result and the tool-activity
+                # UI — protocol markup must not leak into either.
+                return strip_memory_usage_tags(msg["content"])
         return ""
 
     @staticmethod

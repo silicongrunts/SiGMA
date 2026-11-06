@@ -203,6 +203,12 @@ class QueryLoop:
                 **stats.to_dict(),
             })
             self._require_not_cancelled()
+            from app.services.memory_service import (
+                build_memory_status_block,
+                clamp_cursor_to_boundary,
+                seed_read_state_for_injection,
+            )
+            memory_injection = await self._memory_compaction_injection()
             result = await compaction_service.compact_messages(
                 messages,
                 model_role=self.model_role,
@@ -211,6 +217,10 @@ class QueryLoop:
                 token_budget_tracker=self._token_budget_tracker,
                 session_id=self.session_id,
                 cancel_event=self._cancel_event,
+                memory_block=(
+                    build_memory_status_block(memory_injection)
+                    if memory_injection is not None else None
+                ),
             )
             async def _operation(uow):
                 await compaction_service.stage_session_boundary(
@@ -224,6 +234,9 @@ class QueryLoop:
             # Compaction collapses the conversation — must-read-first cache must
             # reset so the LLM is forced to re-read files before further edits.
             read_state_cache.clear(self.session_id)
+            if memory_injection is not None:
+                seed_read_state_for_injection(self.session_id, self.project_id, memory_injection)
+            await clamp_cursor_to_boundary(self.project_id, self.session_id)
 
             done_data = {}
             if result.usage:
@@ -543,7 +556,13 @@ class QueryLoop:
         # Boundary check: a turn the user already cancelled must not start a
         # new compaction.
         self._require_not_cancelled()
+        from app.services.memory_service import (
+            build_memory_status_block,
+            clamp_cursor_to_boundary,
+            seed_read_state_for_injection,
+        )
         try:
+            memory_injection = await self._memory_compaction_injection()
             result = await compaction_service.compact_messages(
                 messages,
                 model_role=self.model_role,
@@ -552,6 +571,10 @@ class QueryLoop:
                 token_budget_tracker=self._token_budget_tracker,
                 session_id=self.session_id,
                 cancel_event=self._cancel_event,
+                memory_block=(
+                    build_memory_status_block(memory_injection)
+                    if memory_injection is not None else None
+                ),
             )
         except Exception as exc:
             raise RuntimeError(
@@ -570,6 +593,12 @@ class QueryLoop:
         # Compaction collapses the conversation — must-read-first cache must
         # reset so the LLM is forced to re-read files before further edits.
         read_state_cache.clear(self.session_id)
+        if memory_injection is not None:
+            # The boundary carries a fresh <memory> snapshot — re-seed the
+            # index as "read" so the first MEMORY.md edit after compaction
+            # does not bounce on must-read-first.
+            seed_read_state_for_injection(self.session_id, self.project_id, memory_injection)
+        await clamp_cursor_to_boundary(self.project_id, self.session_id)
 
         # Compaction replaced the message list — invalidate cached real tokens.
         if loop_ctx:
@@ -585,6 +614,26 @@ class QueryLoop:
         events.append(LLMLoopRunner.sse(SSE_CONTEXT_STATS, result.stats.to_dict()))
         LLMLoopRunner.apply_cache_control(result.messages, target_offset=0)
         return result.messages, events
+
+    async def _memory_compaction_injection(self):
+        """Fresh MEMORY.md snapshot for the compaction boundary, or None.
+
+        Main loop only. ``None`` when memory is disabled or the index is
+        missing/empty — the boundary then carries no memory block, matching
+        a session that never had one.
+        """
+        from app.services.memory_service import (
+            build_memory_injection,
+            memory_service,
+        )
+
+        if not memory_service.memory_enabled():
+            return None
+        try:
+            return await build_memory_injection(self.project_id)
+        except Exception:
+            logger.debug("Memory compaction injection failed", exc_info=True)
+            return None
 
     async def _get_active_tasks(self, session_id: str) -> list:
         async with UnitOfWork(self.project_id) as uow:
@@ -623,6 +672,9 @@ class QueryLoop:
         return await execute_with_permission(
             tool_name, tool_args, tool_def,
             project_id=self.project_id,
+            session_id=self.session_id,
+            # Foreground main loop: memory-root writes are auto-approved.
+            memory_write_mode="allow",
         )
 
     # ------------------------------------------------------------------

@@ -8,7 +8,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import { useClickOutside } from '../hooks/useClickOutside'
-import { MarkdownContent, ThinkingProcess, CompactSummaryNote, STREAM_RECOVERY_MAX_ATTEMPTS, STREAM_RECOVERY_DELAY_MS, isAgentToolName, streamStatusText, withTransientHint } from './ChatShared'
+import { MarkdownContent, ThinkingProcess, CompactSummaryNote, MemoryUsageChip, STREAM_RECOVERY_MAX_ATTEMPTS, STREAM_RECOVERY_DELAY_MS, isAgentToolName, streamStatusText, withTransientHint } from './ChatShared'
 import ImageLightbox from './ImageLightbox'
 import { Send, RotateCw, Bot, User, Zap, Square, Quote, X, Pencil, Check, ChevronUp, ChevronDown, ChevronRight, List, Archive, Trash2, Plus, TextQuote, Shield, Copy, Gauge, ArrowLeft, Image as ImageIcon, Loader2, GitBranch, Search, AlertTriangle } from 'lucide-react'
 import ContextPuck from './ContextPuck'
@@ -18,6 +18,7 @@ import ChatSearchModal from './ChatSearchModal'
 import Toggle from './Toggle'
 import { chatAPI, skillsAPI, permissionsAPI } from '../api'
 import { createSSEStreamParser } from '../utils/sse'
+import { extractMemoryUsages, stripMemoryUsageTags } from '../utils/memoryUsage'
 import { storage, STORAGE_KEYS } from '../utils/storage'
 import { copyToClipboard } from '../utils/clipboard'
 import { formatTimestamp } from '../utils/formatTimestamp'
@@ -2555,7 +2556,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
   async function copyMessage(message) {
     try {
-      await copyToClipboard(message.content || '')
+      await copyToClipboard(stripMemoryUsageTags(message.content || ''))
       setCopiedMessageId(message.id)
       if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
       copiedTimerRef.current = setTimeout(() => setCopiedMessageId(cur => (cur === message.id ? null : cur)), 1500)
@@ -3051,6 +3052,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
           {messages.map((m, i) => {
             const isLastMessage = i === messages.length - 1
             const isCurrentlyStreaming = isLastMessage && isStreaming
+            const memoryUsages = m.role === 'SiGMA' ? extractMemoryUsages(m.content) : []
             // Compaction boundaries render as a collapsed card, not a bubble.
             if (m.is_boundary) {
               return (
@@ -3094,6 +3096,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                       {t('chat.viewCitation')}
                     </button>
                   )}
+                  {memoryUsages.length > 0 && <MemoryUsageChip usages={memoryUsages} />}
                   {isStreaming && i === messages.length - 1 && !m.content && streamPhase && (
                     <div className="mt-1 min-w-0">
                       <div className="flex items-center gap-2 text-gray-400 dark:text-gray-500">
@@ -3797,6 +3800,10 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                                   ? <MarkdownContent content={m.content} projectId={projectId} onCitation={onCitation} />
                                   : <div className="whitespace-pre-wrap">{m.content}</div>)
                               : (m.process?.length > 0 ? t('chat.toolCalls') : t('chat.emptyMsg'))}
+                            {m.role === 'SiGMA' && (() => {
+                              const usages = extractMemoryUsages(m.content)
+                              return usages.length > 0 ? <MemoryUsageChip usages={usages} /> : null
+                            })()}
                             {m.role === 'user' && (
                               <AttachmentStrip projectId={projectId} attachments={m.attachments} compact />
                             )}

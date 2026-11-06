@@ -925,17 +925,19 @@ class ProjectService:
     # Delete project — helpers + orchestration
     # ------------------------------------------------------------------
 
-    async def _cancel_library_tasks(self, project_id: str) -> bool:
-        """Cancel the project's queued/running durable library background tasks.
+    async def _cancel_background_tasks(self, project_id: str) -> bool:
+        """Cancel the project's queued/running durable background tasks.
 
-        ``cancel_project_tasks`` covers every active task row in the project
-        database — there is no per-document work left to do on top of it.
+        ``cancel_project_tasks`` covers every active task row (library and
+        memory queues) in the project database; each runner then drains its
+        live handlers so no write lands after deletion.
         """
         try:
             from app.services.background_task_service import (
                 background_task_service,
                 library_task_runner,
             )
+            from app.services.memory_task_runner import memory_task_runner
         except ImportError:
             raise FileSystemError(
                 "Background task runtime is unavailable; lifecycle remains blocked.",
@@ -949,18 +951,30 @@ class ProjectService:
             # that already exist in this process; reset/delete removes the
             # unreadable files only after that drain completes.
             logger.warning(
-                "Could not persist library cancellation for project %s; "
+                "Could not persist background task cancellation for project %s; "
                 "draining live handlers instead",
                 project_id,
                 exc_info=True,
             )
-        library_task_runner.cancel_project(project_id)
-        drained = await library_task_runner.wait_for_project(project_id)
-        if not drained:
-            raise FileSystemError(
-                f"Project {project_id} still has running library work; retry later.",
-                code="PROJECT_DRAIN_TIMEOUT",
-            )
+        for runner, label in (
+            (library_task_runner, "library"),
+            (memory_task_runner, "memory"),
+        ):
+            runner.cancel_project(project_id)
+            drained = await runner.wait_for_project(project_id)
+            if not drained:
+                raise FileSystemError(
+                    f"Project {project_id} still has running {label} work; "
+                    "retry later.",
+                    code="PROJECT_DRAIN_TIMEOUT",
+                )
+        # A memory task queued but never claimed was written off above
+        # without the runner seeing it, so no finalize callback fired —
+        # release its single-flight slot here or the project's memory work
+        # silently stalls until the process restarts.
+        from app.services.memory_service import memory_service
+
+        await memory_service.clear_pending_slot(project_id)
         return True
 
     async def _evict_project_caches(self, project_id: str, db_manager) -> None:
@@ -1046,7 +1060,7 @@ class ProjectService:
 
         self.mark_project_deleting(project_id)
 
-        await self._cancel_library_tasks(project_id)
+        await self._cancel_background_tasks(project_id)
         await self._wait_for_library_rebuild(project_id)
         if not await self._cleanup_worker_state(project_id):
             raise FileSystemError(
@@ -1074,7 +1088,7 @@ class ProjectService:
         self.mark_project_resetting(project_id)
         reset_succeeded = False
         try:
-            await self._cancel_library_tasks(project_id)
+            await self._cancel_background_tasks(project_id)
             await self._wait_for_library_rebuild(project_id)
             drained = await self._cleanup_worker_state(project_id)
             if not drained:
@@ -1110,7 +1124,7 @@ class ProjectService:
             status = self._status_of(entry)
             if status == PROJECT_STATUS_DELETING:
                 try:
-                    await self._cancel_library_tasks(project_id)
+                    await self._cancel_background_tasks(project_id)
                     await self._wait_for_library_rebuild(project_id)
                     if not await self._cleanup_worker_state(project_id):
                         raise FileSystemError(
@@ -1131,7 +1145,7 @@ class ProjectService:
                     )
             elif status == PROJECT_STATUS_RESETTING:
                 try:
-                    await self._cancel_library_tasks(project_id)
+                    await self._cancel_background_tasks(project_id)
                     await self._wait_for_library_rebuild(project_id)
                     if not await self._cleanup_worker_state(project_id):
                         raise FileSystemError(

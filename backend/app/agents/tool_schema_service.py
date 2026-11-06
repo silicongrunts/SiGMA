@@ -23,6 +23,12 @@ def tool_schemas_for_model_role(
     for tool in tool_registry.list_all():
         if allowed_tools is not None and tool.name not in allowed_tools:
             continue
+        if tool.internal and allowed_tools is None:
+            # Internal tools exist for one narrow loop; never advertised by
+            # a plain role listing. An explicit allowed_tools entry (line
+            # above already filtered non-members) is the only way one shows
+            # up in a catalog.
+            continue
         if tool.name == "vision_analyze" and accepts_images:
             continue
         if tool.name == "read":

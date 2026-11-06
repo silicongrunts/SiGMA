@@ -43,6 +43,9 @@ def _make_tool_def(*, is_read_only=True, has_call=True, preflight=None):
     # Explicitly None unless the test opts in — MagicMock would otherwise expose
     # a truthy `preflight` and short-circuit the preflight check incorrectly.
     tool_def.preflight = preflight
+    # Same for `internal`: a truthy auto-attribute would trip the internal-tool
+    # refusal in the dispatch paths before any gate logic runs.
+    tool_def.internal = False
     tool_def.input_schema = {}
     return tool_def
 

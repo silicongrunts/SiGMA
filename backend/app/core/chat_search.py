@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.core.memory_usage_tags import strip_memory_usage_tags
+
 # UI entry roles whose bubble content is user-visible and searchable.
 # Boundary summaries (``system``) are deliberately excluded.
 SEARCHABLE_UI_ROLES = ("user", "SiGMA")
@@ -71,6 +73,10 @@ def visible_search_matches(
 ) -> List[Dict[str, Any]]:
     """Find *pattern* in user-visible entries from ``shape_messages_for_ui``.
 
+    ``memory_usage`` tags are stripped here: shaping keeps them in assistant
+    content (the chat UI turns them into a chip), but the bubble never shows
+    the raw markup, so search must neither match nor quote it.
+
     Returns one match dict per UI entry whose bubble content contains the
     needle: ``{id, role, seq, created_at, snippet}``.
     """
@@ -78,7 +84,8 @@ def visible_search_matches(
     for entry in entries:
         if entry.get("role") not in SEARCHABLE_UI_ROLES:
             continue
-        span = find_visible_match(entry.get("content") or "", pattern)
+        content = strip_memory_usage_tags(entry.get("content") or "")
+        span = find_visible_match(content, pattern)
         if span is None:
             continue
         matches.append({
@@ -86,6 +93,6 @@ def visible_search_matches(
             "role": entry["role"],
             "seq": entry.get("seq"),
             "created_at": entry.get("created_at"),
-            "snippet": build_snippet(entry["content"], *span),
+            "snippet": build_snippet(content, *span),
         })
     return matches

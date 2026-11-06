@@ -6,7 +6,6 @@ head`` — there is no separate ``Base.metadata.create_all`` path.
 """
 
 import asyncio
-from logging.config import fileConfig
 
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
@@ -18,9 +17,9 @@ from app.database.models import Base
 
 config = context.config
 
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
-
+# No fileConfig() here: SiGMA owns logging via app.core.logging, and
+# applying alembic.ini's template logging section would reset the root
+# logger mid-process and silence all runtime logs.
 target_metadata = Base.metadata
 
 

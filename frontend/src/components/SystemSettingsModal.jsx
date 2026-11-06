@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { AlertTriangle, BookOpen, Check, CheckCircle2, ChevronDown, Circle, Code2, Edit3, Eye, Globe2, Link2, Loader2, Lock, Minus, RotateCcw, Save, ShieldCheck, ShieldOff, Sparkles, XCircle, X } from 'lucide-react'
+import { AlertTriangle, BookOpen, Check, CheckCircle2, ChevronDown, Circle, Code2, Database, Edit3, Eye, Globe2, Link2, Loader2, Lock, Minus, RotateCcw, Save, ShieldCheck, ShieldOff, Sparkles, XCircle, X } from 'lucide-react'
 import { systemAPI, authAPI } from '../api'
 import { createSSEStreamParser } from '../utils/sse'
 import { resolveModelRoleConfig } from '../utils/modelRoles'
@@ -1377,6 +1377,24 @@ export default function SystemSettingsModal({ isOpen, onClose, blockClose = fals
                         className="w-full resize-none rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2 text-sm outline-none focus:border-sigma-600 focus:ring-4 focus:ring-sigma-600/10"
                       />
                     </label>
+                  </div>
+                </SettingsGroup>
+              </Section>
+
+              <Section title={t('system.memorySection')}>
+                <SettingsGroup title={t('system.memorySection')} icon={Database}>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <label className="flex h-[66px] items-center gap-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2">
+                      <input
+                        type="checkbox"
+                        checked={config.memory?.enabled !== false}
+                        onChange={e => updateConfig(['memory', 'enabled'], e.target.checked)}
+                        className="w-4 h-4 rounded border-gray-300 text-sigma-600 focus:ring-sigma-600"
+                      />
+                      <span className="text-sm font-bold text-gray-700 dark:text-gray-300">{t('system.memoryEnabled')}</span>
+                    </label>
+                    <NumberField label={t('system.memoryExtractionInterval')} value={config.memory?.extraction_interval ?? 30} min={1} max={1000} onChange={value => updateConfig(['memory', 'extraction_interval'], value)} />
+                    <NumberField label={t('system.memoryConsolidationInterval')} value={config.memory?.consolidation_interval ?? 30} min={1} max={1000} onChange={value => updateConfig(['memory', 'consolidation_interval'], value)} />
                   </div>
                 </SettingsGroup>
               </Section>

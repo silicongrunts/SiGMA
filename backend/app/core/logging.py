@@ -239,8 +239,13 @@ def setup_logging(
 
     root._sigma_logging_process = process  # type: ignore[attr-defined]
 
-    # Quieten noisy third-party loggers
-    for noisy in ("uvicorn.access", "httpx", "httpcore", "multipart", "chromadb"):
+    # Quieten noisy third-party loggers. LiteLLM and the OpenAI SDK dump
+    # full request/response payloads at DEBUG and aiosqlite logs every SQL
+    # operation — each is megabytes per chat session in the DEBUG file.
+    for noisy in (
+        "uvicorn.access", "httpx", "httpcore", "multipart", "chromadb",
+        "LiteLLM", "openai", "aiosqlite",
+    ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

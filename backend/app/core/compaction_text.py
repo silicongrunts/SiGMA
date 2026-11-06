@@ -9,6 +9,7 @@ apart.
 
 from __future__ import annotations
 
+import re
 from typing import Optional, Tuple
 
 
@@ -31,11 +32,30 @@ def split_boundary_content(content: str) -> Tuple[Optional[str], str]:
 
     *mode* is ``"active"`` or ``"passive"`` when *content* starts with the
     matching instruction prefix; the prefix is stripped from the returned
-    summary. For content without a known prefix (legacy or future rows) the
-    mode is ``None`` and the content is returned unchanged — callers keep
-    treating it as a standalone boundary note.
+    summary. In every mode a trailing ``<memory>`` injection block is
+    dropped from the summary as well. For content without a known prefix
+    (legacy or future rows) the mode is ``None`` and only that block is
+    removed — callers keep treating the rest as a standalone boundary note.
     """
     for mode, prefix in (("active", ACTIVE_SUMMARY_PREFIX), ("passive", PASSIVE_SUMMARY_PREFIX)):
         if content.startswith(prefix):
-            return mode, content[len(prefix):].strip()
-    return None, content
+            return mode, _strip_memory_block(content[len(prefix):]).strip()
+    return None, _strip_memory_block(content)
+
+
+_MEMORY_BLOCK_TAIL_RE = re.compile(
+    r"\s*<memory>(?:(?!<memory>|</memory>).)*</memory>\s*\Z", re.DOTALL,
+)
+
+
+def _strip_memory_block(summary: str) -> str:
+    """Drop a trailing ``<memory>`` injection block for UI display.
+
+    The LLM-facing boundary keeps the block (the model needs the memory
+    index after compaction); the boundary card must not show it. Anchored
+    at the string end and tempered so the block's body cannot itself
+    contain a ``<memory>`` tag — a ``<memory>...</memory>`` pair quoted
+    inside summary prose is left alone, and content sanitation
+    (memory_service) keeps such fragments out of the real injected block.
+    """
+    return _MEMORY_BLOCK_TAIL_RE.sub("", summary)

@@ -6,6 +6,16 @@ The following tools are prohibited in fork mode and will be rejected at runtime 
 
 {{ forbidden_tools }}
 
+Note: writes to the project memory directory (`.SiGMA/memory`) are also rejected at runtime — fork agents are memory read-only. If something should be remembered, say so in your final message instead.
+
 The parent agent will not see your intermediate messages, tool calls, tool results, or reasoning. Only your final assistant message without tool calls will be returned as the `agent` tool result. Make that final message complete, specific, and information-dense enough for the parent agent to continue without seeing your fork context.
 
 In the final message, include the completion status, actions taken, key evidence such as paths or command results, files or state changed if any, blockers, risks, and concrete next steps when relevant. Do not refer to hidden intermediate context with phrases like "as above" or "the previous result".
+
+<fork_task>
+For this fork run, perform only the following task:
+
+{{ prompt }}
+
+IMPORTANT: When this task is complete, stop and return one complete final assistant message for the parent agent. Do not continue any parent task beyond this fork subtask.
+</fork_task>

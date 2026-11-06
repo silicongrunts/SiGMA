@@ -119,10 +119,13 @@ async def test_fork_reuses_parent_request_shape_and_injects_task_messages(monkey
     assert result == "fork complete"
     assert captured["messages"][:2] == inherited
     assert captured["messages"][2]["role"] == "user"
-    assert "fork mode" in captured["messages"][2]["content"]
-    assert "agent" in captured["messages"][2]["content"]
-    assert captured["messages"][3]["role"] == "user"
-    assert "Inspect the agent service." in captured["messages"][3]["content"]
+    assert len(captured["messages"]) == 3
+    content = captured["messages"][2]["content"]
+    assert "fork mode" in content
+    assert "agent" in content
+    assert "Inspect the agent service." in content
+    # Framing precedes the injected task inside the single brief message.
+    assert content.index("fork mode") < content.index("Inspect the agent service.")
     assert captured["ctx"].model_role == "ra"
     assert captured["ctx"].response_max_tokens == 777
     assert captured["ctx"].tool_schemas is parent_tools

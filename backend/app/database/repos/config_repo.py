@@ -34,3 +34,13 @@ class ProjectConfigRepository:
         else:
             self._session.add(ProjectConfig(key=key, value=value))
         await self._session.commit()
+
+    async def delete(self, key: str) -> None:
+        """Remove a config row; missing keys are a no-op (idempotent)."""
+        result = await self._session.execute(
+            select(ProjectConfig).where(ProjectConfig.key == key)
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            await self._session.delete(row)
+            await self._session.commit()

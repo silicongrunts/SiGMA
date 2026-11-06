@@ -580,4 +580,4 @@ async def test_wake_before_runner_start_is_not_lost(monkeypatch):
 async def test_project_barrier_blocks_post_delete_persistence(monkeypatch):
     monkeypatch.setattr(bts, "get_project_status", lambda _project_id: "deleting")
 
-    assert bts._project_allows_persistence("p1") is False
+    assert bts.project_allows_persistence("p1") is False

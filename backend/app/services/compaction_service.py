@@ -270,6 +270,7 @@ class CompactionService:
         token_budget_tracker=None,
         session_id: str | None = None,
         cancel_event: "asyncio.Event | None" = None,
+        memory_block: str | None = None,
     ) -> CompactionResult:
         """Generate a compacted context view.
 
@@ -315,6 +316,13 @@ class CompactionService:
 
         prefix = ACTIVE_SUMMARY_PREFIX if mode == "active" else PASSIVE_SUMMARY_PREFIX
         boundary_content = f"{prefix}{summary.strip()}"
+        if memory_block:
+            # Post-compaction re-injection: the first-message <memory> block
+            # was compacted away, so the boundary itself carries a fresh
+            # snapshot. UI display strips it (compaction_text), the LLM sees
+            # it (entry_from_history). Persisted bytes never change after
+            # this point, preserving the byte-identical prefix contract.
+            boundary_content = f"{boundary_content}\n\n{memory_block}"
         compacted = self._build_compacted_messages(messages, boundary_content)
         stats = self.stats_for_messages(compacted, model_role=model_role, tools=tools)
         logger.info(

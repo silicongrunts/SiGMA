@@ -1013,5 +1013,10 @@
   "skills.gitSelectAll": "सभी चुनें",
   "skills.gitChangeUrl": "URL बदलें",
   "skills.gitIgnoredHint": "रिपॉजिटरी के {{count}} फ़ोल्डर नज़रअंदाज़ किए गए (SKILL.md अनुपस्थित या अमान्य)।",
-  "skills.gitSelectedCount": "{{count}} चयनित"
+  "skills.gitSelectedCount": "{{count}} चयनित",
+  "chat.memoryUsed": "मेमोरी उपयोग ×{{count}}",
+  "system.memorySection": "प्रोजेक्ट मेमोरी",
+  "system.memoryEnabled": "प्रोजेक्ट मेमोरी सक्षम करें",
+  "system.memoryExtractionInterval": "निष्कर्षण अंतराल (मुख्य लूप LLM कॉल)",
+  "system.memoryConsolidationInterval": "समेकन अंतराल (मेमोरी लेखन)"
 }
