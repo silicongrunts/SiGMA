@@ -3265,7 +3265,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                     </div>
                     <div className="flex justify-end gap-2 mt-2">
                       <button disabled={isStreaming || isSubmitting} onClick={cancelEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">{t('common.cancel')}</button>
-                      <button disabled={isStreaming || isSubmitting} onClick={submitEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sigma-600 text-white hover:bg-sigma-700 disabled:opacity-50 inline-flex items-center gap-1.5">
+                      <button disabled={isStreaming || isSubmitting || !editingText.trim()} onClick={submitEditMessage} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-sigma-600 text-white hover:bg-sigma-700 disabled:opacity-50 inline-flex items-center gap-1.5">
                         {isSubmitting && <Loader2 className="w-3 h-3 animate-spin" />}
                         {t('common.send')}
                       </button>
@@ -3674,7 +3674,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               />
               )}
               <button onClick={isStreaming ? handleStop : awaiting ? handleCancelAwaiting : handleSendMessage}
-                disabled={isSubmitting || isUploadingAttachment || stopping || cancellingAwaiting}
+                disabled={isSubmitting || isUploadingAttachment || stopping || cancellingAwaiting
+                  || (!isStreaming && !awaiting && !chatInput.trim() && pendingAttachments.length === 0)}
                 title={awaiting ? t('chat.cancelWaiting') : undefined}
                 className={`p-2 text-white rounded-xl transition-all active:scale-95 disabled:opacity-50 ${!isSubmitting && (isStreaming || awaiting) ? 'bg-red-500 hover:bg-red-600' : 'bg-sigma-600 hover:bg-sigma-700'}`}>
                 {isSubmitting || stopping || cancellingAwaiting
