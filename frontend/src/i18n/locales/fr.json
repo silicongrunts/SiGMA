@@ -1000,6 +1000,7 @@
   "chatgpt.reset.action": "Réinitialiser",
   "chatgpt.reset.confirmTitle": "Réinitialiser l’utilisation ?",
   "chatgpt.reset.confirmMessage": "Consomme 1 carte de réinitialisation pour effacer immédiatement vos fenêtres d’utilisation actuelles. Action irréversible.",
+  "chatgpt.reset.submitting": "Réinitialisation...",
   "chatgpt.reset.success_one": "{{count}} fenêtre d’utilisation réinitialisée",
   "chatgpt.reset.success_other": "{{count}} fenêtres d’utilisation réinitialisées",
   "chatgpt.reset.nothingToReset": "Rien à réinitialiser pour l’instant.",

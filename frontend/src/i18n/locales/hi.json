@@ -1000,6 +1000,7 @@
   "chatgpt.reset.action": "अभी रीसेट करें",
   "chatgpt.reset.confirmTitle": "उपयोग रीसेट करें?",
   "chatgpt.reset.confirmMessage": "1 रीसेट कार्ड का उपयोग करके अपनी वर्तमान उपयोग विंडो तुरंत साफ़ करें। यह क्रिया पूर्ववत नहीं हो सकती।",
+  "chatgpt.reset.submitting": "रीसेट हो रहा है...",
   "chatgpt.reset.success_one": "{{count}} उपयोग विंडो रीसेट हुई",
   "chatgpt.reset.success_other": "{{count}} उपयोग विंडो रीसेट हुईं",
   "chatgpt.reset.nothingToReset": "अभी रीसेट करने के लिए कुछ नहीं है।",

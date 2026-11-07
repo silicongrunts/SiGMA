@@ -1000,6 +1000,7 @@
   "chatgpt.reset.action": "Reset now",
   "chatgpt.reset.confirmTitle": "Reset rate limits?",
   "chatgpt.reset.confirmMessage": "Consume 1 reset credit to clear your current usage windows immediately. This cannot be undone.",
+  "chatgpt.reset.submitting": "Resetting...",
   "chatgpt.reset.success_one": "Reset {{count}} usage window",
   "chatgpt.reset.success_other": "Reset {{count}} usage windows",
   "chatgpt.reset.nothingToReset": "Nothing to reset right now.",

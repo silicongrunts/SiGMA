@@ -1000,6 +1000,7 @@
   "chatgpt.reset.action": "Reiniciar ahora",
   "chatgpt.reset.confirmTitle": "¿Reiniciar el uso?",
   "chatgpt.reset.confirmMessage": "Consume 1 tarjeta de reinicio para vaciar de inmediato tus ventanas de uso actuales. Esta acción no se puede deshacer.",
+  "chatgpt.reset.submitting": "Reiniciando...",
   "chatgpt.reset.success_one": "Se reinició {{count}} ventana de uso",
   "chatgpt.reset.success_other": "Se reiniciaron {{count}} ventanas de uso",
   "chatgpt.reset.nothingToReset": "No hay ventanas que reiniciar ahora mismo.",

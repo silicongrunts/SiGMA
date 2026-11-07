@@ -1000,6 +1000,7 @@
   "chatgpt.reset.action": "立即重置",
   "chatgpt.reset.confirmTitle": "重置用量额度?",
   "chatgpt.reset.confirmMessage": "消耗 1 张重置卡，立即清空当前用量窗口。此操作不可撤销。",
+  "chatgpt.reset.submitting": "重置中...",
   "chatgpt.reset.success_one": "已重置 {{count}} 个用量窗口",
   "chatgpt.reset.success_other": "已重置 {{count}} 个用量窗口",
   "chatgpt.reset.nothingToReset": "当前没有需要重置的窗口。",

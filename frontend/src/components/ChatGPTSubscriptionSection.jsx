@@ -249,6 +249,7 @@ export function ChatGPTCreditsReset({ usage, resetCredits, loading, onRefresh })
         onConfirm={doResetCredit}
         title={t('chatgpt.reset.confirmTitle')}
         message={t('chatgpt.reset.confirmMessage')}
+        processingLabel={t('chatgpt.reset.submitting')}
         danger
       />
     </>

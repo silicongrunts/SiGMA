@@ -1000,6 +1000,7 @@
   "chatgpt.reset.action": "今すぐリセット",
   "chatgpt.reset.confirmTitle": "使用率をリセットしますか?",
   "chatgpt.reset.confirmMessage": "リセットカードを 1 枚消費して、現在の使用量ウィンドウを直ちにリセットします。この操作は取り消せません。",
+  "chatgpt.reset.submitting": "リセット中...",
   "chatgpt.reset.success_one": "{{count}} 個の使用量ウィンドウをリセットしました",
   "chatgpt.reset.success_other": "{{count}} 個の使用量ウィンドウをリセットしました",
   "chatgpt.reset.nothingToReset": "現在リセットが必要なウィンドウはありません。",

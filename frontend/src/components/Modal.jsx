@@ -21,8 +21,10 @@ export function ModalOverlay({ isOpen, onClose, children, isDanger }) {
   )
 }
 
-// --- Confirm Modal (for Deletion) ---
-export function ConfirmModal({ isOpen, onClose, onConfirm, title, message, danger = false }) {
+// --- Confirm Modal (for destructive confirmations) ---
+// processingLabel overrides the submitting-state button text; it defaults to
+// "deleting" for danger modals and "processing" otherwise.
+export function ConfirmModal({ isOpen, onClose, onConfirm, title, message, danger = false, processingLabel }) {
   const { t } = useTranslation()
   const [submitting, setSubmitting] = useState(false)
   const handleClose = () => { if (!submitting) onClose() }
@@ -49,7 +51,7 @@ export function ConfirmModal({ isOpen, onClose, onConfirm, title, message, dange
           <button onClick={handleClose} disabled={submitting} className="flex-1 py-3.5 bg-gray-50 dark:bg-gray-800 text-gray-500 dark:text-gray-400 font-bold rounded-2xl hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors disabled:opacity-50">{t('modal.confirm.cancel')}</button>
           <button onClick={handleConfirm} disabled={submitting} className={`flex-1 py-3.5 text-white font-black rounded-2xl shadow-lg transition-all active:scale-95 disabled:opacity-80 flex items-center justify-center gap-2 ${danger ? 'bg-red-600 hover:bg-red-700 shadow-red-200 dark:shadow-none' : 'bg-sigma-600 hover:bg-sigma-700 shadow-blue-200 dark:shadow-none'}`}>
             {submitting && <Loader className="w-4 h-4 animate-spin" />}
-            {submitting ? (danger ? t('modal.confirm.deleting') : t('modal.confirm.processing')) : t('modal.confirm.confirm')}
+            {submitting ? (processingLabel ?? (danger ? t('modal.confirm.deleting') : t('modal.confirm.processing'))) : t('modal.confirm.confirm')}
           </button>
         </div>
       </div>
