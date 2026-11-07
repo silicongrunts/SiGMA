@@ -37,7 +37,7 @@ function getLibrarySearchErrorMessage(error, t) {
 /* =========================================================================
  * ".." go-up row with drop support (move to parent folder)
  * ========================================================================= */
-function GoUpRow({ onClick, parentFolderId, projectId, onMoved, onUploadToFolder }) {
+function GoUpRow({ onClick, parentFolderId, onUploadToFolder, onMoveToFolder }) {
   const { t } = useTranslation()
   const [isDragOver, setIsDragOver] = useState(false)
   return (
@@ -54,11 +54,11 @@ function GoUpRow({ onClick, parentFolderId, projectId, onMoved, onUploadToFolder
           onUploadToFolder?.(entries, parentFolderId)
           return
         }
-        // Internal library item move
+        // Internal library item move — the parent owns the call, its overlay,
+        // the reload, and the error toast.
         try {
           const data = JSON.parse(e.dataTransfer.getData('text/plain'))
-          await libraryAPI.moveItems(projectId, { ids: [data.id], target_folder_id: parentFolderId })
-          onMoved?.()
+          await onMoveToFolder?.(data.id, parentFolderId)
         } catch (err) { toastError(err.message || t('library.toast.moveFailed')) }
       }}
       className={`px-4 py-3 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400
@@ -225,11 +225,17 @@ export default function LibraryBrowser({ projectId }) {
   const [uploadLoading, setUploadLoading] = useState(false)
   const [reprocessingIds, setReprocessingIds] = useState(() => new Set())
   const [reprocessingAll, setReprocessingAll] = useState(false)
+  // Drag-and-drop move onto a folder: overlay until the move + list reload
+  // settle, so a dropped item never silently vanishes mid-flight.
+  const [movingItems, setMovingItems] = useState(false)
+  // Inline row rename — blocks the confirm button and re-entry while PATCH runs.
+  const [renameSaving, setRenameSaving] = useState(false)
 
   // Processing log state
   const [showLogModal, setShowLogModal] = useState(false)
   const [currentLog, setCurrentLog] = useState(null)
   const [logContent, setLogContent] = useState('')
+  const [logLoading, setLogLoading] = useState(false)
 
   // Sort state
   const [sortBy, setSortBy] = useState(() => getStoredLibraryState().sortBy)  // 'title' | 'updated_at'
@@ -713,15 +719,37 @@ export default function LibraryBrowser({ projectId }) {
     }
   }
 
-  // View processing log
+  // View processing log — open the modal immediately with a spinner; the
+  // fetch fills (or errors and closes) it.
   const handleViewLog = async (doc) => {
+    setShowLogModal(true)
+    setCurrentLog(doc)
+    setLogContent('')
+    setLogLoading(true)
     try {
       const data = await libraryAPI.getProcessingLog(projectId, doc.id)
-      setCurrentLog(doc)
       setLogContent(data.processing_log || '')
-      setShowLogModal(true)
     } catch (e) {
       toastError(t('library.toast.logFailed'))
+      setShowLogModal(false)
+      setCurrentLog(null)
+    } finally {
+      setLogLoading(false)
+    }
+  }
+
+  // Drag-and-drop move of one item into a folder. Shared by the folder-row
+  // drop and the ".." go-up row; the overlay stays up through the reload.
+  const moveItemsToFolder = async (itemId, targetFolderId) => {
+    if (!projectId || movingItems) return
+    setMovingItems(true)
+    try {
+      await libraryAPI.moveItems(projectId, { ids: [itemId], target_folder_id: targetFolderId })
+      await loadDocuments()
+    } catch (err) {
+      toastError(err.message || t('library.toast.moveFailed'))
+    } finally {
+      setMovingItems(false)
     }
   }
 
@@ -848,8 +876,7 @@ export default function LibraryBrowser({ projectId }) {
     try {
       const data = JSON.parse(e.dataTransfer.getData('text/plain'))
       if (data.id === targetFolderId) return // Can't drop onto self
-      await libraryAPI.moveItems(projectId, { ids: [data.id], target_folder_id: targetFolderId })
-      loadDocuments()
+      await moveItemsToFolder(data.id, targetFolderId)
     } catch (err) {
       toastError(err.message || t('library.toast.moveFailed'))
     }
@@ -1073,7 +1100,8 @@ export default function LibraryBrowser({ projectId }) {
   }
 
   const handleRenameConfirm = async () => {
-    if (!renameValue.trim()) return
+    if (!renameValue.trim() || renameSaving) return
+    setRenameSaving(true)
     try {
       await libraryAPI.update(projectId, renamingItemId, { title: renameValue.trim() })
       setRenamingItemId(null)
@@ -1081,6 +1109,8 @@ export default function LibraryBrowser({ projectId }) {
       loadDocuments()
     } catch (e) {
       toastError(e.message || t('library.toast.renameFailed'))
+    } finally {
+      setRenameSaving(false)
     }
   }
 
@@ -1247,16 +1277,18 @@ export default function LibraryBrowser({ projectId }) {
           }}
           onContextMenu={handleListEmptyAreaContextMenu}
         >
-          {/* Upload overlay — covers the document list while files are uploading */}
-          {uploadLoading && <LoadingOverlay label={t('library.uploading')} />}
+          {/* Upload/move overlay — covers the document list while files are
+              uploading or a drag move is in flight */}
+          {(uploadLoading || movingItems) && (
+            <LoadingOverlay label={uploadLoading ? t('library.uploading') : t('library.moving')} />
+          )}
           {/* ".." go-up row when inside a folder — always show, even when empty */}
           {!isSearchResult && currentFolderId && (
             <GoUpRow
               onClick={() => navigateToBreadcrumb(breadcrumbs.length - 2)}
               parentFolderId={breadcrumbs.length >= 2 ? breadcrumbs[breadcrumbs.length - 2].id : null}
-              projectId={projectId}
-              onMoved={loadDocuments}
               onUploadToFolder={handleUpload}
+              onMoveToFolder={moveItemsToFolder}
             />
           )}
           {loading ? (
@@ -1314,6 +1346,7 @@ export default function LibraryBrowser({ projectId }) {
                   onRenameChange={(e) => setRenameValue(e.target.value)}
                   onRenameConfirm={handleRenameConfirm}
                   onRenameCancel={handleRenameCancel}
+                  renameSaving={renameSaving}
                   renameInputRef={renameInputRef}
                 />
               ))}
@@ -1323,39 +1356,47 @@ export default function LibraryBrowser({ projectId }) {
       </div>
 
       {/* ===== Draggable divider + Right Panel ===== */}
-      {selectedDoc && (
+      {(selectedDoc || detailLoading) && selectedDocId && (
         <>
           <div
             onMouseDown={handleDragStart}
             className="w-1 flex-shrink-0 cursor-col-resize hover:bg-sigma-300 active:bg-sigma-400 transition-colors bg-gray-100 dark:bg-gray-800"
           />
-          <DetailPanel
-            key={selectedDoc.id}
-            doc={selectedDoc}
-            projectId={projectId}
-            onClose={() => selectDocument(null)}
-            getStatusBadge={getStatusBadge}
-            onFieldSave={handleFieldSave}
-            onReprocess={handleReprocess}
-            isReprocessing={reprocessingIds.has(selectedDoc.id) || reprocessingAll}
-            onViewLog={handleViewLog}
-            onDelete={handleDelete}
-            onRefresh={async () => {
-              await loadDocuments();
-              if (selectedDocId) {
-                const targetId = selectedDocId
-                try {
-                  const doc = await libraryAPI.get(projectId, targetId, { include_content: false })
-                  // Guard against the selection changing during the await.
-                  if (targetId !== selectedDocIdRef.current) return
-                  setSelectedDoc(doc)
-                } catch (e) { console.warn('Failed to refresh selected document:', e) }
-              }
-            }}
-            onKeywordSearch={handleKeywordSearch}
-            onEditKeywords={(docId, keywords) => setKeywordEdit({ docId, keywords })}
-            width={panelWidth}
-          />
+          {selectedDoc ? (
+            <DetailPanel
+              key={selectedDoc.id}
+              doc={selectedDoc}
+              projectId={projectId}
+              onClose={() => selectDocument(null)}
+              getStatusBadge={getStatusBadge}
+              onFieldSave={handleFieldSave}
+              onReprocess={handleReprocess}
+              isReprocessing={reprocessingIds.has(selectedDoc.id) || reprocessingAll}
+              onViewLog={handleViewLog}
+              onDelete={handleDelete}
+              onRefresh={async () => {
+                await loadDocuments();
+                if (selectedDocId) {
+                  const targetId = selectedDocId
+                  try {
+                    const doc = await libraryAPI.get(projectId, targetId, { include_content: false })
+                    // Guard against the selection changing during the await.
+                    if (targetId !== selectedDocIdRef.current) return
+                    setSelectedDoc(doc)
+                  } catch (e) { console.warn('Failed to refresh selected document:', e) }
+                }
+              }}
+              onKeywordSearch={handleKeywordSearch}
+              onEditKeywords={(docId, keywords) => setKeywordEdit({ docId, keywords })}
+              width={panelWidth}
+            />
+          ) : (
+            /* Detail fetch in flight: show the panel shell with a spinner so
+               a slow response doesn't look like a dead click. */
+            <div className="min-w-0 bg-gray-50/30 dark:bg-gray-900/30 flex-shrink-0 h-full flex items-center justify-center" style={{ width: panelWidth }}>
+              <Spinner size="md" className="text-sigma-600/50" />
+            </div>
+          )}
         </>
       )}
 
@@ -1373,6 +1414,7 @@ export default function LibraryBrowser({ projectId }) {
         <LogModal
           doc={currentLog}
           logContent={logContent}
+          loading={logLoading}
           onClose={() => { setShowLogModal(false); setCurrentLog(null) }}
         />
       )}
@@ -1520,7 +1562,7 @@ function PathBadge({ path }) {
 function LibraryItem({ doc, idx, selectedDocId, isSelected, isSearchResult, searchMode, searchQuery,
   onSelectDoc, onToggleSelect, onContextMenu, onDragStart, onDropOnFolder, onNavigateFolder,
   onReprocess, reprocessingIds, onViewLog, onDelete, getStatusBadge, projectId, onKeywordSearch,
-  renamingItemId, renameValue, onRenameChange, onRenameConfirm, onRenameCancel, renameInputRef }) {
+  renamingItemId, renameValue, onRenameChange, onRenameConfirm, onRenameCancel, renameSaving, renameInputRef }) {
   const { t } = useTranslation()
   const [isDragOver, setIsDragOver] = useState(false)
 
@@ -1588,11 +1630,13 @@ function LibraryItem({ doc, idx, selectedDocId, isSelected, isSearchResult, sear
                   <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
                     <button
                       onClick={() => onRenameConfirm(doc.id)}
-                      className="p-0.5 text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30 rounded transition-colors"
-                    ><Check className="w-3 h-3" /></button>
+                      disabled={renameSaving}
+                      className="p-0.5 text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30 rounded transition-colors disabled:opacity-50 disabled:cursor-wait"
+                    >{renameSaving ? <Spinner size="xs" /> : <Check className="w-3 h-3" />}</button>
                     <button
                       onClick={() => onRenameCancel()}
-                      className="p-0.5 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 rounded transition-colors"
+                      disabled={renameSaving}
+                      className="p-0.5 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 rounded transition-colors disabled:opacity-50"
                     ><X className="w-3 h-3" /></button>
                   </div>
                 )}
@@ -1993,7 +2037,7 @@ function UploadModal({ onClose, onUpload, uploadLoading }) {
 /* =========================================================================
  * Processing Log Modal
  * ========================================================================= */
-function LogModal({ doc, logContent, onClose }) {
+function LogModal({ doc, logContent, loading, onClose }) {
   const { t } = useTranslation()
   return (
     <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50 animate-in fade-in duration-300" onClick={onClose}>
@@ -2007,7 +2051,9 @@ function LogModal({ doc, logContent, onClose }) {
         </div>
         <div className="flex-1 overflow-y-auto p-6">
           <div className="bg-gray-900 text-green-400 rounded-xl p-4 font-mono text-xs whitespace-pre-wrap leading-relaxed max-h-[50vh] overflow-y-auto">
-            {logContent || <span className="text-gray-500">{t('library.noLog')}</span>}
+            {loading ? (
+              <span className="flex justify-center py-4"><Spinner size="sm" className="text-green-400" /></span>
+            ) : (logContent || <span className="text-gray-500">{t('library.noLog')}</span>)}
           </div>
         </div>
         <div className="px-6 py-4 border-t border-gray-100 dark:border-gray-800 flex justify-end">

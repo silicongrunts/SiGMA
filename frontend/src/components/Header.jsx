@@ -223,7 +223,7 @@ function TipsEditModal({ isOpen, onClose, initialValue, onSave }) {
 }
 
 
-export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLogs, onSave }) {
+export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLogs, onSave, saving, downloadingPdf }) {
   const currentProject = useStore(state => state.currentProject)
   const setCurrentProject = useStore(state => state.setCurrentProject)
   const activeTab = useStore(state => state.activeTab)
@@ -282,6 +282,14 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
   const [showSnapshotDisableWarning, setShowSnapshotDisableWarning] = useState(false)
   const [tabSwitching, setTabSwitching] = useState(false)
   const [settingUpdating, setSettingUpdating] = useState(false)
+  // Project title rename — the ref blocks the Enter-then-blur double fire.
+  const [titleSaving, setTitleSaving] = useState(false)
+  const titleSavingRef = useRef(false)
+  // Kernel kill row feedback.
+  const [killingKernelId, setKillingKernelId] = useState(null)
+  // Snapshot-interval PATCH in flight — the select locks so the optimistic
+  // value cannot be changed again before the server confirms or reverts it.
+  const [intervalUpdating, setIntervalUpdating] = useState(false)
 
   // Tips settings
   const [tips, setTips] = useState("")
@@ -327,12 +335,18 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
       return
     }
     if (trimmed && trimmed !== currentProject?.name) {
+      if (titleSavingRef.current) { setIsEditingTitle(false); return }
+      titleSavingRef.current = true
+      setTitleSaving(true)
       try {
         const updated = await projectsAPI.update(currentProject.id, { name: trimmed })
         setCurrentProject(updated)
       } catch (e) {
         toastError(e.message || t('editor.toast.updateNameFailed'))
         return // Don't exit edit mode on failure
+      } finally {
+        titleSavingRef.current = false
+        setTitleSaving(false)
       }
     }
     setIsEditingTitle(false)
@@ -460,11 +474,15 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
   }, [showSettings, showKernelModal, fetchKernels])
 
   const handleKillKernel = async (kernelId) => {
+    if (killingKernelId) return
+    setKillingKernelId(kernelId)
     try {
       await notebooksAPI.killKernel(kernelId)
       setActiveKernels(prev => prev.filter(k => (k.id || k.name) !== kernelId))
     } catch (e) {
       toastError(e.message || t('editor.toast.killKernelFailed'))
+    } finally {
+      setKillingKernelId(null)
     }
   }
 
@@ -505,8 +523,10 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
       setShowSnapshotDisableWarning(true)
       return
     }
+    if (intervalUpdating) return
     const prev = snapshotInterval
     setSnapshotInterval(value)
+    setIntervalUpdating(true)
     try {
       await projectsAPI.updateConfig(currentProject.id, {
         snapshot_enabled: true,
@@ -515,6 +535,8 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
     } catch (e) {
       setSnapshotInterval(prev)
       toastError(t('editor.toast.updateIntervalFailed'))
+    } finally {
+      setIntervalUpdating(false)
     }
   }
 
@@ -684,7 +706,8 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
             <select
               value={snapshotInterval}
               onChange={(e) => handleSnapshotIntervalChange(parseInt(e.target.value))}
-              className="w-full px-3 py-2.5 bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-700 rounded-xl text-xs font-bold text-gray-700 dark:text-gray-300 outline-none focus:ring-2 focus:ring-sigma-600/20"
+              disabled={intervalUpdating}
+              className="w-full px-3 py-2.5 bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-700 rounded-xl text-xs font-bold text-gray-700 dark:text-gray-300 outline-none focus:ring-2 focus:ring-sigma-600/20 disabled:opacity-60 disabled:cursor-wait"
             >
               <option value={0}>{t('editor.settings.snapshot.disabled')}</option>
               <option value={1}>{t('editor.settings.snapshot.minutes', { count: 1 })}</option>
@@ -857,10 +880,11 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
                 <button
                   type="button"
                   onClick={() => handleKillKernel(kernel.id)}
-                  className="ml-2 p-1.5 text-red-400 dark:text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-md transition-colors"
+                  disabled={killingKernelId === kernel.id}
+                  className="ml-2 p-1.5 text-red-400 dark:text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-md transition-colors disabled:opacity-50 disabled:cursor-wait"
                   title={t('editor.kernels.kill')}
                 >
-                  <X className="w-3.5 h-3.5" />
+                  {killingKernelId === kernel.id ? <Spinner size="xs" /> : <X className="w-3.5 h-3.5" />}
                 </button>
               </div>
             ))
@@ -1017,8 +1041,8 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
                 onKeyDown={handleTitleKeyDown}
                 className="font-bold text-gray-900 dark:text-gray-100 leading-tight border-b-2 border-sigma-600 outline-none bg-transparent text-sm w-44"
               />
-              <button data-edit-btn onClick={handleTitleSubmit} className="p-0.5 text-green-600 hover:bg-green-50 rounded transition-colors" title={t('common.save')}>
-                <Check className="w-3.5 h-3.5" />
+              <button data-edit-btn onClick={handleTitleSubmit} disabled={titleSaving} className="p-0.5 text-green-600 hover:bg-green-50 rounded transition-colors disabled:opacity-50 disabled:cursor-wait" title={t('common.save')}>
+                {titleSaving ? <Spinner size="xs" /> : <Check className="w-4 h-4" />}
               </button>
               <button data-edit-btn onClick={() => setIsEditingTitle(false)} className="p-0.5 text-red-500 hover:bg-red-50 rounded transition-colors" title={t('common.cancel')}>
                 <X className="w-3.5 h-3.5" />
@@ -1048,6 +1072,8 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
           <div className="flex items-center gap-1.5 mt-0.5">
             {!currentFile ? (
               <span className="text-[10px] font-medium text-gray-300 uppercase tracking-wider">{t('editor.title.noFileOpen')}</span>
+            ) : saving ? (
+              <><Loader2 className="w-2.5 h-2.5 animate-spin text-sigma-500" /><span className="text-[10px] font-bold text-sigma-500 uppercase tracking-wider">{t('common.saving')}</span></>
             ) : hasUnsavedChanges ? (
               <><div className="w-1.5 h-1.5 rounded-full bg-orange-400 animate-pulse" /><span className="text-[10px] font-bold text-orange-500 uppercase tracking-wider">{t('editor.title.unsaved')}</span></>
             ) : (
@@ -1178,18 +1204,18 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
             <div className="relative flex items-stretch" ref={compileMenuRef}>
               <button
                 type="button"
-                onClick={() => { if (!compiling) onCompile?.(); }}
-                disabled={compiling}
+                onClick={() => { if (!compiling && !downloadingPdf) onCompile?.(); }}
+                disabled={compiling || downloadingPdf}
                 className="bg-sigma-600 hover:bg-sigma-700 disabled:bg-gray-300 text-white px-4 py-1.5 rounded-l-lg flex items-center shadow-lg shadow-blue-100 dark:shadow-none text-sm font-bold transition-all active:scale-95 disabled:cursor-not-allowed"
               >
-                {compiling ? <RefreshCw className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
-                {compiling ? t('editor.actions.compiling') : t('editor.actions.compile')}
+                {compiling ? <RefreshCw className="w-4 h-4 mr-2 animate-spin" /> : downloadingPdf ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
+                {compiling ? t('editor.actions.compiling') : downloadingPdf ? t('editor.actions.downloadingPdf') : t('editor.actions.compile')}
               </button>
               {/* Caret — visually attached to the compile button, opens the menu */}
               <button
                 type="button"
-                onClick={() => { if (!compiling) setShowCompileMenu(v => !v) }}
-                disabled={compiling}
+                onClick={() => { if (!compiling && !downloadingPdf) setShowCompileMenu(v => !v) }}
+                disabled={compiling || downloadingPdf}
                 title={t('editor.actions.compileAndDownload')}
                 className="bg-sigma-600 hover:bg-sigma-700 disabled:bg-gray-300 text-white px-2 py-1.5 rounded-r-lg flex items-center border-l border-sigma-700/40 shadow-lg shadow-blue-100 dark:shadow-none text-sm font-bold transition-all active:scale-95 disabled:cursor-not-allowed"
               >
@@ -1198,7 +1224,7 @@ export function EditorHeader({ onBack, onCompile, onCompileAndDownload, onShowLo
               {showCompileMenu && (
                 <div className="absolute right-0 top-full mt-1 bg-white/95 dark:bg-gray-800/95 backdrop-blur-xl border border-gray-200 dark:border-gray-700 shadow-2xl rounded-xl py-1.5 min-w-[200px] z-50 animate-in fade-in zoom-in duration-150">
                   <button
-                    onClick={() => { setShowCompileMenu(false); if (!compiling) onCompileAndDownload?.() }}
+                    onClick={() => { setShowCompileMenu(false); if (!compiling && !downloadingPdf) onCompileAndDownload?.() }}
                     className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-sigma-600/20 hover:text-blue-600 dark:hover:text-sigma-400 transition-colors"
                   >
                     <Download className="w-4 h-4" /><span>{t('editor.actions.compileAndDownload')}</span>

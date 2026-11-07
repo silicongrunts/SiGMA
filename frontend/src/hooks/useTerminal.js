@@ -13,6 +13,7 @@
  * - Taken over (code 4001): another browser tab claimed this slot — do NOT reconnect.
  */
 import { useEffect, useRef, useCallback } from 'react'
+import { useTranslation } from 'react-i18next'
 
 const WS_BASE = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/v1/terminal`
 const PING_INTERVAL = 30_000
@@ -27,12 +28,16 @@ export function markSlotForKill(slot) {
 }
 
 export default function useTerminal({ slot, projectId, terminalRef, onExit }) {
+  const { t } = useTranslation()
   const wsRef = useRef(null)
   const pingTimerRef = useRef(null)
   const reconnectTimerRef = useRef(null)
   const reconnectDelayRef = useRef(RECONNECT_BASE_DELAY)
   const disposedRef = useRef(false)
   const replayRef = useRef(false)
+  // False until the first successful open — reconnects write status lines
+  // into the terminal so a dead connection is visible to the user.
+  const everConnectedRef = useRef(false)
   const onExitRef = useRef(onExit)
 
   // Keep onExitRef current so WebSocket handlers never capture a stale callback
@@ -78,6 +83,7 @@ export default function useTerminal({ slot, projectId, terminalRef, onExit }) {
         return
       }
       // Any other code (1006 network, etc.) → reconnect
+      try { terminal.write(`\r\n\x1b[31m${t('terminal.connectionLost')}\x1b[0m\r\n`) } catch { /* terminal disposed */ }
       scheduleReconnect()
     }
 
@@ -102,6 +108,13 @@ export default function useTerminal({ slot, projectId, terminalRef, onExit }) {
     function connect() {
       if (disposedRef.current) return
 
+      // Reconnection attempts announce themselves in the terminal — without
+      // this the pane looks frozen while the backoff loop retries. The first
+      // attempt stays silent: the shell prompt appearing is the feedback.
+      if (everConnectedRef.current) {
+        try { terminal.write(`\r\n\x1b[33m${t('terminal.reconnecting')}\x1b[0m\r\n`) } catch { /* terminal disposed */ }
+      }
+
       // Pass cols/rows in URL so server can size the PTY before replay snapshot
       const ws = new WebSocket(`${WS_BASE}/${projectId}?slot=${slot}&cols=${terminal.cols}&rows=${terminal.rows}`)
       ws.binaryType = 'arraybuffer'
@@ -110,6 +123,7 @@ export default function useTerminal({ slot, projectId, terminalRef, onExit }) {
       ws.addEventListener('error', onWsError)
 
       ws.addEventListener('open', () => {
+        everConnectedRef.current = true
         replayRef.current = true // first binary data will be buffer replay
         reconnectDelayRef.current = RECONNECT_BASE_DELAY
         sendJson({ type: 'resize', cols: terminal.cols, rows: terminal.rows })

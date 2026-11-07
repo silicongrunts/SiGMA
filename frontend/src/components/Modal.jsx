@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { X, Edit3, AlertTriangle, FileText, FileCode, TerminalSquare, Loader, Bot, UploadCloud, FileArchive } from 'lucide-react'
 import { projectsAPI } from '../api'
+import { Spinner } from './ui'
 
 export function ModalOverlay({ isOpen, onClose, children, isDanger }) {
   useEffect(() => {
@@ -193,39 +194,51 @@ export function CreateProjectModal({ isOpen, onClose, onCreate }) {
   const { t } = useTranslation()
   const [name, setName] = useState(''); const [desc, setDesc] = useState(''); const [template, setTemplate] = useState('latex'); const inputRef = useRef(null)
   const [templates, setTemplates] = useState([])
+  const [templatesLoading, setTemplatesLoading] = useState(false)
+  // Project creation scaffolds directories and copies the template — seconds
+  // at least. The submit button spins and disables, and closing is blocked,
+  // so a double click cannot create two projects.
+  const [submitting, setSubmitting] = useState(false)
   useEffect(() => {
     if (isOpen) {
+      setTemplatesLoading(true)
       projectsAPI.listTemplates().then(list => {
         if (list.length > 0) {
           setTemplates(list)
           setTemplate(list[0].id)
         }
       }).catch(e => console.warn('Failed to load project templates:', e))
+        .finally(() => setTemplatesLoading(false))
     }
   }, [isOpen])
   useEffect(() => { if (isOpen) inputRef.current?.focus() }, [isOpen])
+  const handleClose = () => { if (!submitting) onClose() }
   const handleSubmit = async () => {
     const trimmedName = name.trim()
     const trimmedDesc = desc || ''
     if (!trimmedName) return
     if (trimmedName.length > 100) return
     if (trimmedDesc.length > 500) return
+    if (submitting) return
+    setSubmitting(true)
     try {
       await onCreate({ name: trimmedName, description: trimmedDesc, template })
       onClose()
       setName('')
       setDesc('')
     } catch {
-      // Don't close modal on failure
+      // Don't close modal on failure — the caller toasts the reason
+    } finally {
+      setSubmitting(false)
     }
   }
   const canCreate = name.trim().length > 0 && name.trim().length <= 100 && (desc || '').length <= 500
   return (
-    <ModalOverlay isOpen={isOpen} onClose={onClose}>
+    <ModalOverlay isOpen={isOpen} onClose={handleClose}>
       <div className="p-8">
         <header className="flex justify-between items-center mb-8">
           <h2 className="text-2xl font-black text-gray-900 dark:text-gray-100 tracking-tight">{t('modal.createProject.title')}</h2>
-          <button onClick={onClose} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl transition-colors"><X className="w-5 h-5 text-gray-400 dark:text-gray-500" /></button>
+          <button onClick={handleClose} disabled={submitting} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl transition-colors disabled:opacity-50"><X className="w-5 h-5 text-gray-400 dark:text-gray-500" /></button>
         </header>
         <div className="space-y-5 mb-8">
           <div>
@@ -250,7 +263,9 @@ export function CreateProjectModal({ isOpen, onClose, onCreate }) {
           <div>
             <label className="block text-xs font-black uppercase tracking-widest text-gray-400 dark:text-gray-500 mb-2">{t('modal.createProject.templateLabel')}</label>
             <div className={templates.length <= 3 ? 'grid grid-cols-3 gap-2' : 'grid grid-cols-3 gap-2 max-h-48 overflow-y-auto'}>
-              {templates.map(t => (
+              {templatesLoading && templates.length === 0 ? (
+                <div className="col-span-3 py-6 flex justify-center"><Spinner size="sm" className="text-gray-400" /></div>
+              ) : templates.map(t => (
                 <button key={t.id} type="button" onClick={() => setTemplate(t.id)}
                   className={`p-3 rounded-2xl border-2 text-left transition-all flex flex-col ${template === t.id ? 'border-sigma-600 bg-sigma-50 dark:bg-sigma-600/20' : 'border-gray-100 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 hover:border-gray-200 dark:hover:border-gray-600'}`}>
                   <div className="flex items-center gap-2 mb-1">
@@ -263,7 +278,10 @@ export function CreateProjectModal({ isOpen, onClose, onCreate }) {
             </div>
           </div>
         </div>
-        <button onClick={handleSubmit} disabled={!canCreate} className="w-full py-4 bg-sigma-600 text-white font-black rounded-2xl shadow-[0_15px_35px_rgba(37,99,235,0.3)] hover:bg-sigma-700 active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none">{t('modal.createProject.submit')}</button>
+        <button onClick={handleSubmit} disabled={!canCreate || submitting} className="w-full py-4 bg-sigma-600 text-white font-black rounded-2xl shadow-[0_15px_35px_rgba(37,99,235,0.3)] hover:bg-sigma-700 active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none flex items-center justify-center gap-2">
+          {submitting && <Spinner size="sm" />}
+          {submitting ? t('modal.createProject.creating') : t('modal.createProject.submit')}
+        </button>
       </div>
     </ModalOverlay>
   )
@@ -277,6 +295,7 @@ export function UploadProjectModal({ isOpen, onClose, onImportedProject }) {
   const [submitting, setSubmitting] = useState(false)
   const [showRegisterPanel, setShowRegisterPanel] = useState(false)
   const [unregistered, setUnregistered] = useState([])
+  const [unregisteredLoading, setUnregisteredLoading] = useState(false)
   const [registeringName, setRegisteringName] = useState('')
   const inputRef = useRef(null)
 
@@ -285,7 +304,7 @@ export function UploadProjectModal({ isOpen, onClose, onImportedProject }) {
   useEffect(() => {
     if (!isOpen) {
       setFile(null); setError(''); setSubmitting(false); setDragging(false)
-      setShowRegisterPanel(false); setUnregistered([]); setRegisteringName('')
+      setShowRegisterPanel(false); setUnregistered([]); setUnregisteredLoading(false); setRegisteringName('')
     }
   }, [isOpen])
 
@@ -332,11 +351,16 @@ export function UploadProjectModal({ isOpen, onClose, onImportedProject }) {
   const openRegisterPanel = async () => {
     setShowRegisterPanel(true)
     setError('')
+    // Spinner until the scan resolves — otherwise the panel's "nothing found"
+    // empty state flashes while the request is still in flight.
+    setUnregisteredLoading(true)
     try {
       const list = await projectsAPI.listUnregistered()
       setUnregistered(Array.isArray(list) ? list : [])
     } catch (e) {
       setError(e.message || t('modal.uploadProject.errors.loadFailed'))
+    } finally {
+      setUnregisteredLoading(false)
     }
   }
 
@@ -420,9 +444,13 @@ export function UploadProjectModal({ isOpen, onClose, onImportedProject }) {
               </span>
             </div>
             {unregistered.length === 0 ? (
-              <div className="px-4 py-6 text-center text-xs text-gray-400 dark:text-gray-500">
-                {t('modal.uploadProject.noUnregistered')}
-              </div>
+              unregisteredLoading ? (
+                <div className="px-4 py-6 flex justify-center"><Spinner size="sm" className="text-gray-400" /></div>
+              ) : (
+                <div className="px-4 py-6 text-center text-xs text-gray-400 dark:text-gray-500">
+                  {t('modal.uploadProject.noUnregistered')}
+                </div>
+              )
             ) : (
               <ul className="max-h-44 overflow-y-auto divide-y divide-gray-100 dark:divide-gray-800">
                 {unregistered.map((d) => (

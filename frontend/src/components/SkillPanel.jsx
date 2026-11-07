@@ -8,6 +8,7 @@ import { oneDarkHighlightStyle } from '@codemirror/theme-one-dark'
 // Language recognition and loading go through @codemirror/language-data (see utils/editorLanguages.js).
 import { getLanguageDescription, loadLanguage } from '../utils/editorLanguages'
 import { ModalOverlay, InputModal, ConfirmModal } from './Modal'
+import { LoadingOverlay } from './ui'
 import SkillGitImportModal from './SkillGitImportModal'
 import { skillsAPI } from '../api'
 import { toastError, toastSuccess } from './Toast'
@@ -210,6 +211,9 @@ export default function SkillPanel({ isOpen, onClose }) {
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [filesLoading, setFilesLoading] = useState(false)
+  // True while a selected file's content is being fetched; overlays the editor
+  // so stale content from the previously open file is not interactable.
+  const [fileContentLoading, setFileContentLoading] = useState(false)
   // ── Modal state ──
   const [inputModal, setInputModal] = useState({ open: false })
   const [confirmModal, setConfirmModal] = useState({ open: false })
@@ -277,6 +281,7 @@ export default function SkillPanel({ isOpen, onClose }) {
   }, [])
 
   const loadFile = useCallback(async (skillId, filePath) => {
+    setFileContentLoading(true)
     try {
       const data = await skillsAPI.readFile(skillId, filePath)
       isInternalUpdate.current = true
@@ -286,6 +291,8 @@ export default function SkillPanel({ isOpen, onClose }) {
       setDirty(false)
     } catch (e) {
       toastError(e.message || t('skills.toast.readFailed'))
+    } finally {
+      setFileContentLoading(false)
     }
   }, [])
 
@@ -876,7 +883,10 @@ export default function SkillPanel({ isOpen, onClose }) {
                   </button>
                 </div>
               </div>
-              <div className="flex-1 min-h-0 overflow-hidden" ref={editorRef} />
+              <div className="flex-1 min-h-0 overflow-hidden relative">
+                <div className="absolute inset-0" ref={editorRef} />
+                {fileContentLoading && <LoadingOverlay label={t('common.loading')} />}
+              </div>
             </>
           ) : (
             <div className="flex-1 flex items-center justify-center text-gray-400 dark:text-gray-500">

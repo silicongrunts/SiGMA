@@ -212,7 +212,7 @@ function FileIcon({ filename, isOpen }) {
 // TreeNode
 // ---------------------------------------------------------------------------
 
-function TreeNode({ node, projectId, level = 0, onFileClick, currentFile, onRefresh, onContextMenu, onUploadFiles, childrenCache, loadingPaths, onExpand, isSelected, selectedPaths, onSelectionClick, onClearSelection }) {
+function TreeNode({ node, projectId, level = 0, onFileClick, currentFile, onRefresh, onContextMenu, onUploadDrop, childrenCache, loadingPaths, onExpand, isSelected, selectedPaths, onSelectionClick, onClearSelection }) {
   const { t } = useTranslation()
   const [isExpanded, setIsExpanded] = useState(false)
   const isFolder = node.type === 'directory'
@@ -240,14 +240,11 @@ function TreeNode({ node, projectId, level = 0, onFileClick, currentFile, onRefr
   const handleDrop = async (e) => {
     e.preventDefault(); e.stopPropagation(); setIsDragOver(false)
     if (!isFolder) return
-    // OS file/folder drop → upload into this folder
-    if (e.dataTransfer.items?.length > 0) {
-      const entries = await collectEntries(e.dataTransfer.items)
-      if (entries.length > 0) { onUploadFiles(entries, node.path); return }
-    }
-    if (e.dataTransfer.files?.length > 0) {
-      const flat = Array.from(e.dataTransfer.files).map(f => ({ file: f, relativePath: f.name }))
-      if (flat.length > 0) { onUploadFiles(flat, node.path); return }
+    // OS file/folder drop → upload into this folder. The parent owns the busy
+    // overlay for the whole window: traversal, conflict check, transfers.
+    if (e.dataTransfer.items?.length > 0 || e.dataTransfer.files?.length > 0) {
+      await onUploadDrop?.(e, node.path)
+      return
     }
     // Multi-file drag → move all selected paths
     const jsonPaths = e.dataTransfer.getData('application/json')
@@ -344,7 +341,7 @@ function TreeNode({ node, projectId, level = 0, onFileClick, currentFile, onRefr
                 currentFile={currentFile}
                 onRefresh={onRefresh}
                 onContextMenu={onContextMenu}
-                onUploadFiles={onUploadFiles}
+                onUploadDrop={onUploadDrop}
                 childrenCache={childrenCache}
                 loadingPaths={loadingPaths}
                 onExpand={onExpand}
@@ -799,6 +796,10 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
 
   // --- Upload ---
   const uploadEntries = useCallback(async (entries, targetDir = '') => {
+    // Keep the busy overlay up through the conflict-check round trip (it may
+    // already be up from the drop traversal); doUploadEntries continues from
+    // here for the actual transfers.
+    setUploading(true)
     const uploadPaths = new Set()
     for (const { relativePath } of entries) {
       uploadPaths.add(targetDir ? `${targetDir}/${relativePath}` : relativePath)
@@ -832,6 +833,8 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
       return
     }
 
+    // Conflict resolution must not sit under the busy overlay.
+    setUploading(false)
     setConflictModal({ open: true, conflicts, entries, nonConflicts, targetDir, mode: 'upload' })
   }, [currentProjectId])
 
@@ -850,23 +853,44 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
         if (overwrite) fd.append('overwrite', 'true')
         try { await filesAPI.upload(currentProjectId, fd); ok++ } catch (err) { toastError(`${relativePath}: ${err.message}`) }
       }
-      if (ok > 0) { loadRootNodes(); toastSuccess(t('filetree.uploadedCount', { count: ok })) }
+      if (ok > 0) {
+        await loadRootNodes()
+        toastSuccess(t('filetree.uploadedCount', { count: ok }))
+      }
     } finally {
       setUploading(false)
     }
   }, [currentProjectId, loadRootNodes])
 
+  // Shared upload drop path for the root zone and folder nodes. Raises the
+  // busy overlay to cover the browser-side directory traversal, then hands
+  // flag ownership to uploadEntries. Returns true when the drop was an upload.
+  const handleUploadDrop = useCallback(async (e, targetDir) => {
+    let ownedByUpload = false
+    try {
+      if (e.dataTransfer.items?.length > 0) {
+        // Snapshot the item list synchronously (the DataTransfer goes into
+        // protected mode once the drop event yields); collectEntries resolves
+        // per-item entries before its first await.
+        const items = Array.from(e.dataTransfer.items)
+        setUploading(true)
+        const entries = await collectEntries(items)
+        if (entries.length > 0) { ownedByUpload = true; await uploadEntries(entries, targetDir); return true }
+      }
+      if (e.dataTransfer.files?.length > 0) {
+        const flat = Array.from(e.dataTransfer.files).map(f => ({ file: f, relativePath: f.name }))
+        if (flat.length > 0) { ownedByUpload = true; await uploadEntries(flat, targetDir); return true }
+      }
+    } finally {
+      if (!ownedByUpload) setUploading(false)
+    }
+    return false
+  }, [uploadEntries])
+
   // --- Root drop handler ---
   const handleRootDrop = useCallback(async (e) => {
     e.preventDefault()
-    if (e.dataTransfer.items?.length > 0) {
-      const entries = await collectEntries(e.dataTransfer.items)
-      if (entries.length > 0) { uploadEntries(entries, ''); return }
-    }
-    if (e.dataTransfer.files?.length > 0) {
-      const flat = Array.from(e.dataTransfer.files).map(f => ({ file: f, relativePath: f.name }))
-      if (flat.length > 0) { uploadEntries(flat, ''); return }
-    }
+    if (await handleUploadDrop(e, '')) return
     // Multi-file drag → move all to root
     const jsonPaths = e.dataTransfer.getData('application/json')
     if (jsonPaths) {
@@ -878,7 +902,7 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
     // Single drag → move to root
     const src = e.dataTransfer.getData('sourcePath')
     if (src) { await performMove([src], '.') }
-  }, [uploadEntries, performMove])
+  }, [handleUploadDrop, performMove])
 
   // --- Determine context menu options ---
   const getNodeMenuOptions = useCallback((node) => {
@@ -970,7 +994,7 @@ export const FileTree = forwardRef(({ onFileSelect, onSaveCurrentFile }, ref) =>
             onFileClick={onFileSelect}
             onRefresh={onRefresh}
             currentFile={currentFile}
-            onUploadFiles={uploadEntries}
+            onUploadDrop={handleUploadDrop}
             onContextMenu={handleNodeContextMenu}
             childrenCache={childrenCache}
             loadingPaths={loadingPaths}

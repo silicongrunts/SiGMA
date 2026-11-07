@@ -1,33 +1,92 @@
 <!DOCTYPE html>
 <html>
 <head><title>SiGMA Browser</title>
-<style>*{margin:0;padding:0}body{overflow:hidden;background:#000}#screen{width:100vw;height:100vh}</style>
+<style>
+*{margin:0;padding:0}body{overflow:hidden;background:#000}#screen{width:100vw;height:100vh}
+#overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:#000;color:#9ca3af;font:14px sans-serif;z-index:10}
+#overlay .spin{width:36px;height:36px;border:3px solid #374151;border-top-color:#6fa8dc;border-radius:50%;animation:vncspin .8s linear infinite}
+#overlay .err{display:none;color:#f87171;max-width:80vw;text-align:center;line-height:1.5}
+#overlay a{display:none;color:#6fa8dc;cursor:pointer;text-decoration:underline}
+@keyframes vncspin{to{transform:rotate(360deg)}}
+</style>
 </head>
 <body><div id="screen"></div>
+<div id="overlay">
+  <div class="spin"></div>
+  <div id="overlay-text">Connecting&hellip;</div>
+  <div id="overlay-err" class="err"></div>
+  <a id="overlay-retry">Reconnect</a>
+</div>
 <script type="module">
 const params = new URLSearchParams(location.search);
 const wsPath = params.get('ws') || '/api/v1/browser/default/vnc';
 const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsUrl = wsProto + '//' + location.host + wsPath;
+// If the VNC stream is not established within this window, treat it as dead.
+const CONNECT_TIMEOUT_MS = 30000;
 
 import RFB from './novnc/core/rfb.js';
 let rfb;
+let connectTimer = null;
+
+const overlay = document.getElementById('overlay');
+const spinEl = overlay.querySelector('.spin');
+const textEl = document.getElementById('overlay-text');
+const errEl = document.getElementById('overlay-err');
+const retryEl = document.getElementById('overlay-retry');
+
+// The embedding React app listens for these to sync its status dot and
+// overlays; same-origin in both dev (vite proxy) and prod (uvicorn).
+function notifyParent(status, message) {
+  if (window.parent !== window) {
+    try { window.parent.postMessage({ source: 'sigma-vnc', status, message }, window.location.origin); } catch { /* parent gone */ }
+  }
+}
+
+function showConnecting() {
+  clearTimeout(connectTimer);
+  spinEl.style.display = 'block';
+  errEl.style.display = 'none';
+  retryEl.style.display = 'none';
+  textEl.innerHTML = 'Connecting&hellip;';
+  overlay.style.display = 'flex';
+}
+
+function fail(message) {
+  clearTimeout(connectTimer);
+  spinEl.style.display = 'none';
+  textEl.textContent = '';
+  errEl.textContent = message;
+  errEl.style.display = 'block';
+  retryEl.style.display = 'inline';
+  overlay.style.display = 'flex';
+  notifyParent('error', message);
+}
 
 function connect() {
   const div = document.getElementById('screen');
   div.innerHTML = '';
+  showConnecting();
+  notifyParent('connecting');
+
   rfb = new RFB(div, wsUrl);
   rfb.scaleViewport = true;
   rfb.resizeSession = true;
   rfb.background = '#000';
+  rfb.addEventListener('connect', () => {
+    clearTimeout(connectTimer);
+    overlay.style.display = 'none';
+    notifyParent('connected');
+  });
   rfb.addEventListener('disconnect', (e) => {
     if (!e.detail.clean) {
-      div.innerHTML =
-        '<div style="color:#fff;padding:40px;font:14px sans-serif">Connection lost. <a href="" style="color:#6fa8dc">Reconnect</a></div>';
+      fail(e.detail.detail || 'Connection lost.');
     }
   });
+  connectTimer = setTimeout(() => fail('Connection timed out. The browser may not be ready.'), CONNECT_TIMEOUT_MS);
 }
 
+retryEl.addEventListener('click', (e) => { e.preventDefault(); connect(); });
 connect();
 </script>
 </body>

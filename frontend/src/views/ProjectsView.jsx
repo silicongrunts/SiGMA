@@ -111,6 +111,13 @@ export default function ProjectsView() {
   const [descEditValue, setDescEditValue] = useState('')
   const [exportingProject, setExportingProject] = useState(null)
   const [backendError, setBackendError] = useState(false)
+  // First list fetch: show a spinner instead of the "no projects" empty state,
+  // which would flash misleadingly until the list arrives.
+  const [projectsLoading, setProjectsLoading] = useState(false)
+  // Inline name/description saves. The ref guards the Enter-then-click double
+  // fire that two state reads in one tick cannot catch.
+  const [metaSaving, setMetaSaving] = useState(false)
+  const metaSavingRef = useRef(false)
   const nameEditRef = useRef(null)
   const descEditRef = useRef(null)
   // Mirror the edit values into refs so finishEditing (called from the
@@ -126,6 +133,7 @@ export default function ProjectsView() {
   useEffect(() => { forceSettingsRef.current = forceSettings }, [forceSettings])
 
   const loadProjects = async () => {
+    setProjectsLoading(true)
     try {
       const data = await projectsAPI.list()
       const list = Array.isArray(data) ? data : (data.projects || [])
@@ -146,6 +154,7 @@ export default function ProjectsView() {
       // full-screen mask with retry / log commands.
       setBackendError(true)
     }
+    finally { setProjectsLoading(false) }
   }
   useEffect(() => { loadProjects() }, [])
 
@@ -336,6 +345,9 @@ export default function ProjectsView() {
     if (!originalProject) { setEditingField({ projectId: null, field: null }); return }
     const originalVal = isName ? (originalProject.name || '') : (originalProject.description || '')
     if (trimmed !== originalVal) {
+      if (metaSavingRef.current) { setEditingField({ projectId: null, field: null }); return }
+      metaSavingRef.current = true
+      setMetaSaving(true)
       try {
         const updates = {}
         if (isName) updates.name = trimmed || originalProject.name
@@ -345,6 +357,9 @@ export default function ProjectsView() {
       } catch (err) {
         toastError(err.message || t('projects.toast.updateFailed'))
         return
+      } finally {
+        metaSavingRef.current = false
+        setMetaSaving(false)
       }
     }
     setEditingField({ projectId: null, field: null })
@@ -475,7 +490,13 @@ export default function ProjectsView() {
             </div>
           </div>
 
-          {filteredProjects.length === 0 && (
+          {filteredProjects.length === 0 && projectsLoading && (
+            <div className="bg-white dark:bg-gray-800/60 rounded-2xl border border-dashed border-gray-200 dark:border-gray-700 py-16 flex justify-center">
+              <Spinner size="md" className="text-sigma-600/60" />
+            </div>
+          )}
+
+          {filteredProjects.length === 0 && !projectsLoading && (
             <div className="bg-white dark:bg-gray-800/60 rounded-2xl border border-dashed border-gray-200 dark:border-gray-700 py-16 text-center">
               <div className="p-4 bg-blue-50 dark:bg-sigma-600/20 rounded-2xl text-sigma-600 w-fit mx-auto mb-4">
                 <Folder className="w-8 h-8" />
@@ -535,10 +556,10 @@ export default function ProjectsView() {
                           onFocus={e => e.target.select()}
                           className="w-64 px-3 py-1 border-2 border-sigma-600 rounded-lg outline-none text-sm font-bold bg-white dark:bg-gray-900"
                         />
-                        <button data-edit-btn onClick={() => finishEditing(editingField)} className="p-0.5 text-green-600 hover:bg-green-50 rounded transition-colors" title={t('common.save')}>
-                          <Check className="w-4 h-4" />
+                        <button data-edit-btn onClick={() => finishEditing(editingField)} disabled={metaSaving} className="p-0.5 text-green-600 hover:bg-green-50 rounded transition-colors disabled:opacity-50 disabled:cursor-wait" title={t('common.save')}>
+                          {metaSaving ? <Spinner size="xs" /> : <Check className="w-4 h-4" />}
                         </button>
-                        <button data-edit-btn onClick={() => setEditingField({ projectId: null, field: null })} className="p-0.5 text-red-500 hover:bg-red-50 rounded transition-colors" title={t('common.cancel')}>
+                        <button data-edit-btn onClick={() => setEditingField({ projectId: null, field: null })} disabled={metaSaving} className="p-0.5 text-red-500 hover:bg-red-50 rounded transition-colors disabled:opacity-50" title={t('common.cancel')}>
                           <X className="w-4 h-4" />
                         </button>
                         <span className={`text-[10px] ${nameEditValue.length > 80 ? (nameEditValue.length >= 100 ? 'text-red-500' : 'text-orange-500') : 'text-gray-400'}`}>
@@ -584,10 +605,10 @@ export default function ProjectsView() {
                             placeholder={t('projects.descriptionPlaceholder')}
                             className="w-80 px-3 py-1.5 border-2 border-sigma-600 rounded-lg outline-none text-xs bg-white dark:bg-gray-900"
                           />
-                          <button data-edit-btn onClick={() => finishEditing(editingField)} className="p-0.5 text-green-600 hover:bg-green-50 rounded transition-colors" title={t('common.save')}>
-                            <Check className="w-4 h-4" />
+                          <button data-edit-btn onClick={() => finishEditing(editingField)} disabled={metaSaving} className="p-0.5 text-green-600 hover:bg-green-50 rounded transition-colors disabled:opacity-50 disabled:cursor-wait" title={t('common.save')}>
+                            {metaSaving ? <Spinner size="xs" /> : <Check className="w-4 h-4" />}
                           </button>
-                          <button data-edit-btn onClick={() => setEditingField({ projectId: null, field: null })} className="p-0.5 text-red-500 hover:bg-red-50 rounded transition-colors" title={t('common.cancel')}>
+                          <button data-edit-btn onClick={() => setEditingField({ projectId: null, field: null })} disabled={metaSaving} className="p-0.5 text-red-500 hover:bg-red-50 rounded transition-colors disabled:opacity-50" title={t('common.cancel')}>
                             <X className="w-4 h-4" />
                           </button>
                           <span className={`text-[10px] ${descEditValue.length > 400 ? (descEditValue.length >= 500 ? 'text-red-500' : 'text-orange-500') : 'text-gray-400'}`}>

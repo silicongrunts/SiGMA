@@ -139,7 +139,7 @@ export default function EditorView() {
 
   // ── Shared hooks ──
   const handleCompileRef = useRef(null)
-  const { handleSave, conflictState, dismissConflict } = useSave({ projectId, editorRef, handleCompileRef })
+  const { handleSave, saving, conflictState, dismissConflict } = useSave({ projectId, editorRef, handleCompileRef })
   const handleConflictReload = useCallback(async () => {
     await reloadConflict({
       reload: () => editorRef.current?.reloadFromDisk?.(),
@@ -160,12 +160,17 @@ export default function EditorView() {
 
   // Compile, then immediately download the produced PDF. Compile failures
   // (no usable PDF) are surfaced by handleCompile via toast/log modal, so we
-  // only attempt the download when a pdfPath comes back.
+  // only attempt the download when a pdfPath comes back. downloadingPdf covers
+  // the whole sequence — handleCompile flips the store's compiling flag for
+  // its own network phase, but the getPDF blob download after it would
+  // otherwise run with no feedback.
+  const [downloadingPdf, setDownloadingPdf] = useState(false)
   const handleCompileAndDownload = useCallback(async () => {
-    if (!projectId) return
-    const result = await handleCompile(false, false)
-    if (!result?.pdfPath) return
+    if (!projectId || downloadingPdf) return
+    setDownloadingPdf(true)
     try {
+      const result = await handleCompile(false, false)
+      if (!result?.pdfPath) return
       const blob = await compileAPI.getPDF(projectId, result.pdfPath)
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -180,8 +185,10 @@ export default function EditorView() {
       URL.revokeObjectURL(url)
     } catch (e) {
       toastError(t('api.downloadFailed') + ': ' + (e.message || String(e)))
+    } finally {
+      setDownloadingPdf(false)
     }
-  }, [projectId, handleCompile, t])
+  }, [projectId, downloadingPdf, handleCompile, t])
 
   // ── Build user_state for LLM status context ──
   // Pending citations ride along on every tab: they are global pre-send
@@ -635,6 +642,8 @@ export default function EditorView() {
           onCompileAndDownload={handleCompileAndDownload}
           onShowLogs={() => setShowLogModal(true)}
           onSave={handleSave}
+          saving={saving}
+          downloadingPdf={downloadingPdf}
         />
 
         <SnapshotHealthBanner projectId={projectId} />

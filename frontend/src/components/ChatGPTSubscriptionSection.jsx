@@ -274,6 +274,9 @@ export default function ChatGPTSubscriptionSection() {
   // (fresh mount), the mode comes from the status snapshot, so the view
   // survives page refreshes — the backend flow does.
   const [loginRunning, setLoginRunning] = useState(false)
+  // True while the cancel-login round trip is in flight; disables the cancel
+  // button so double clicks can't fire redundant cancels.
+  const [cancellingLogin, setCancellingLogin] = useState(false)
   const [loginMode, setLoginMode] = useState(null) // 'embedded' | 'manual'
   const [authUrl, setAuthUrl] = useState('')
   const [embeddedFailed, setEmbeddedFailed] = useState(false)
@@ -383,9 +386,12 @@ export default function ChatGPTSubscriptionSection() {
   const loggedIn = !!status && (status.state === 'active' || status.state === 'expired')
 
   const cancelLogin = async () => {
+    if (cancellingLogin) return
+    setCancellingLogin(true)
     try {
       await chatgptAPI.cancelLogin()
     } catch { /* the flow may have just finished on its own */ }
+    setCancellingLogin(false)
     fetchChatGPTStatus()
   }
 
@@ -581,9 +587,10 @@ export default function ChatGPTSubscriptionSection() {
           <button
             type="button"
             onClick={cancelLogin}
-            className="self-start flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-md transition-colors"
+            disabled={cancellingLogin}
+            className="self-start flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold text-gray-700 dark:text-gray-200 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-md transition-colors disabled:opacity-60 disabled:cursor-wait"
           >
-            <X className="w-3.5 h-3.5" />
+            {cancellingLogin ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}
             {t('chatgpt.action.cancelLogin')}
           </button>
         </div>

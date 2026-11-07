@@ -17,6 +17,9 @@ import { toastError } from '../components/Toast'
 export function useSave({ projectId, editorRef, handleCompileRef }) {
   const { t } = useTranslation()
   const savingRef = useRef(false)
+  // UI mirror of savingRef: lets consumers render a saving indicator and
+  // disable save triggers while the round trip is in flight.
+  const [saving, setSaving] = useState(false)
   const [conflictState, setConflictState] = useState(null)
   const dismissConflict = useCallback(() => {
     setConflictState(null)
@@ -29,6 +32,7 @@ export function useSave({ projectId, editorRef, handleCompileRef }) {
     if (!projectId || !state.currentFile || !editorRef.current) return false
 
     savingRef.current = true
+    setSaving(true)
     try {
       const content = editorRef.current.getContent()
       if (content === null) return false
@@ -55,8 +59,9 @@ export function useSave({ projectId, editorRef, handleCompileRef }) {
       return false
     } finally {
       savingRef.current = false
+      setSaving(false)
     }
   }, [projectId, editorRef, t])
 
-  return { handleSave, conflictState, dismissConflict }
+  return { handleSave, saving, conflictState, dismissConflict }
 }

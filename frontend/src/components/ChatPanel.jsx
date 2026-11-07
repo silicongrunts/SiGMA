@@ -17,6 +17,7 @@ import { ModalOverlay, ConfirmModal } from './Modal'
 import ChatSearchModal from './ChatSearchModal'
 import Toggle from './Toggle'
 import { chatAPI, skillsAPI, permissionsAPI } from '../api'
+import { Spinner } from './ui'
 import { createSSEStreamParser } from '../utils/sse'
 import { extractMemoryUsages, stripMemoryUsageTags } from '../utils/memoryUsage'
 import { storage, STORAGE_KEYS } from '../utils/storage'
@@ -293,6 +294,24 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   // backend has claimed the session and launched the task — before that there
   // is nothing to stop.
   const [isSubmitting, setIsSubmitting] = useState(false)
+  // Per-action busy markers for session management: each trigger shows
+  // immediate feedback on itself and stays disabled until its awaits settle,
+  // so double clicks cannot fork/create/archive twice.
+  const [forkingMessageId, setForkingMessageId] = useState(null)
+  const [creatingSession, setCreatingSession] = useState(false)
+  const [sessionsLoading, setSessionsLoading] = useState(false)
+  // Archive/unarchive row buttons — one at a time panel-wide.
+  const [archivalBusyId, setArchivalBusyId] = useState(null)
+  // Title rename submits. The ref blocks the blur-after-Enter double fire,
+  // which a state guard alone cannot catch within the same tick.
+  const [renamingSession, setRenamingSession] = useState(false)
+  const renameInFlightRef = useRef(false)
+  const [archivedListLoading, setArchivedListLoading] = useState(false)
+  // Expanded-archived-session message fetch, per row.
+  const [archivedMsgsBusyId, setArchivedMsgsBusyId] = useState(null)
+  // Stop / cancel-awaiting requests (getActive + cancel round trips).
+  const [stopping, setStopping] = useState(false)
+  const [cancellingAwaiting, setCancellingAwaiting] = useState(false)
   // Mirror isStreaming/awaiting into refs so the pendingAutoMessage effect and
   // handleDirectSend read the latest values without being closed over a stale
   // render (their effects would otherwise re-fire on every streaming token if
@@ -467,6 +486,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   // token budgets of archived sessions.
   const loadSessions = useCallback(async () => {
     if (!projectId) return
+    setSessionsLoading(true)
     try {
       const list = await chatAPI.listSessions(projectId, { include_archived: true })
       storage.pruneSessionState(projectId, list.map(s => s.id))
@@ -476,6 +496,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         if (cur) setSessionTitle(cur.title || '')
       }
     } catch { /* ignore */ }
+    finally { setSessionsLoading(false) }
   }, [projectId, sessionId])
 
   useEffect(() => {
@@ -759,7 +780,10 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   // ---- Effect 2: Load data + reconnect SSE (reacts to sessionId changes) ----
   useEffect(() => {
     historyGenerationRef.current += 1
-    if (!projectId || !sessionId) return
+    if (!projectId || !sessionId) {
+      setIsLoadingHistory(false)
+      return
+    }
     // Session switch: drop every session-scoped interaction/global synchronously —
     // the async load below restores the new session's own state (e.g. a parked
     // interaction checkpoint); stale dialogs from the previous session must not
@@ -785,7 +809,20 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     genRef.current += 1
     let cancelled = false
 
+    // The switch indicator: the header row (or the empty-state spinner) shows
+    // while history + sessions + tasks + active-task all resolve, so switching
+    // into a large session never looks like a dead panel. `cancelled` belongs
+    // to this effect run — a superseded load must not clear a newer one's flag.
     const load = async () => {
+      setIsLoadingHistory(true)
+      try {
+        await loadHistory()
+      } finally {
+        if (!cancelled) setIsLoadingHistory(false)
+      }
+    }
+
+    const loadHistory = async () => {
       // Always reset — new session starts clean
       setIsStreaming(false)
       setIsSubmitting(false)
@@ -1540,11 +1577,20 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   async function submitTitle() {
     const trimmed = editTitle.trim()
     if (trimmed && trimmed !== sessionTitle && sessionId) {
+      // Enter-then-blur (or click-then-blur) fires submit twice in one tick —
+      // the ref is the only guard that sees the first call's in-flight marker.
+      if (renameInFlightRef.current) { setIsEditingTitle(false); return }
+      renameInFlightRef.current = true
+      setRenamingSession(true)
       try {
         await chatAPI.updateSession(projectId, sessionId, { title: trimmed })
         setSessionTitle(trimmed)
         setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title: trimmed } : s))
       } catch { /* ignore */ }
+      finally {
+        renameInFlightRef.current = false
+        setRenamingSession(false)
+      }
     }
     setIsEditingTitle(false)
   }
@@ -1583,6 +1629,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
   async function archiveSession(sid, e) {
     e.stopPropagation()
+    if (archivalBusyId) return
+    setArchivalBusyId(sid)
     try {
       await chatAPI.updateSession(projectId, sid, { is_archived: true })
       storage.removeSession(projectId, sid)
@@ -1599,6 +1647,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         await loadSessions()
       }
     } catch (e) { toastError(t('chat.toast.archiveFailed')) }
+    finally { setArchivalBusyId(null) }
   }
 
   async function deleteSessionAction(sid, e) {
@@ -1629,42 +1678,57 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   }
 
   async function createNewSession() {
+    if (creatingSession) return
+    setCreatingSession(true)
     try {
       const s = await chatAPI.createSession(projectId)
       setShowDropdown(false)
       switchToSession(s.id)
     } catch (e) { toastError(t('chat.toast.createFailed')) }
+    finally { setCreatingSession(false) }
   }
 
   // Fork the session starting from message m: the new session receives m and
-  // everything before it, then becomes the active session.
+  // everything before it, then becomes the active session. Copying a large
+  // session takes seconds, so the fork button spins and blocks re-entry —
+  // a second click would fork an identical second copy.
   async function forkFromMessage(m) {
+    if (forkingMessageId) return
+    setForkingMessageId(m.id)
     const forkTitle = sessionTitle ? t('chat.forkTitlePrefix') + sessionTitle : ''
     try {
       const s = await chatAPI.forkSession(projectId, sessionId, m.id, forkTitle)
       setShowDropdown(false)
       switchToSession(s.id)
     } catch (e) { toastError(t('chat.toast.forkFailed')) }
+    finally { setForkingMessageId(null) }
   }
 
   // /clear: delete the current session and create a fresh one in its place.
   // Unlike confirmDeleteSession (which prefers a remaining sibling), clear
-  // always starts a blank session.
+  // always starts a blank session. Borrows the isSubmitting slot so the
+  // composer disables and the send button spins for the delete+create window.
   async function clearCurrentSession() {
-    if (!sessionId) return
+    if (!sessionId || isSubmitting) return
+    setIsSubmitting(true)
     try {
       await chatAPI.deleteSession(projectId, sessionId)
       storage.removeSession(projectId, sessionId)
       const s = await chatAPI.createSession(projectId)
       switchToSession(s.id)
     } catch (e) { toastError(t('chat.toast.clearFailed')) }
+    finally { setIsSubmitting(false) }
   }
 
   // /skill <id>: inject a completed skill_load turn into the session (no LLM call).
   // Backend validates the id and enabled state; on success we reload history so
   // the injected user/assistant/tool/assistant turn renders via existing paths.
   async function handleLoadSkill(skillId) {
-    if (isStreaming || !projectId || !sessionId || !skillId) return
+    // Claim the submit slot: the composer disables and the send button spins
+    // while the turn is injected and history refreshes, so a message cannot
+    // race the skill-load's history rewrite.
+    if (isStreaming || isSubmitting || !projectId || !sessionId || !skillId) return
+    setIsSubmitting(true)
     try {
       const res = await chatAPI.loadSkill(projectId, sessionId, skillId)
       await refreshLatestHistory()
@@ -1672,6 +1736,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
     } catch (e) {
       toastError(t('chat.toast.skillLoadFailed'))
     }
+    finally { setIsSubmitting(false) }
   }
 
   // ---- Archived sessions ----
@@ -1679,11 +1744,14 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   // the archivedFocus effect scrolls to the message once it renders.
   async function openArchived(focus = null) {
     setShowDropdown(false)
+    // Open the modal immediately with a spinner — the list fetch below fills
+    // it in; a slow fetch must not look like a dead click.
+    setShowArchived(true)
+    setArchivedListLoading(true)
     try {
       const list = await chatAPI.listSessions(projectId, { include_archived: true })
       const archived = list.filter(s => s.is_archived)
       setArchivedSessions(archived)
-      setShowArchived(true)
       if (focus) {
         // Only row-level hits need staging; session-level jumps land on the
         // expanded session itself. Staged refs are consumed once rendered —
@@ -1701,6 +1769,7 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
         }
       }
     } catch { /* ignore */ }
+    finally { setArchivedListLoading(false) }
   }
 
   // Scroll the archive modal to a search hit once its messages render.
@@ -1759,20 +1828,26 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
       setArchivedMessages([])
       return
     }
+    if (archivedMsgsBusyId) return
+    setArchivedMsgsBusyId(sid)
     try {
       const msgs = await chatAPI.getSessionMessages(projectId, sid)
       setArchivedMessages(msgs)
       setExpandedArchivedId(sid)
     } catch { toastError(t('chat.toast.loadMessagesFailed')) }
+    finally { setArchivedMsgsBusyId(null) }
   }
 
   async function unarchiveSession(sid) {
+    if (archivalBusyId) return
+    setArchivalBusyId(sid)
     try {
       await chatAPI.updateSession(projectId, sid, { is_archived: false })
       setArchivedSessions(prev => prev.filter(s => s.id !== sid))
       setExpandedArchivedId(null)
       await loadSessions()
     } catch { toastError(t('chat.toast.unarchiveFailed')) }
+    finally { setArchivalBusyId(null) }
   }
 
   async function deleteArchivedSession(sid) {
@@ -1799,10 +1874,17 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
   async function submitArchivedTitle(sid) {
     const trimmed = editArchivedTitle.trim()
     if (trimmed) {
+      if (renameInFlightRef.current) { setEditingArchivedId(null); return }
+      renameInFlightRef.current = true
+      setRenamingSession(true)
       try {
         await chatAPI.updateSession(projectId, sid, { title: trimmed })
         setArchivedSessions(prev => prev.map(s => s.id === sid ? { ...s, title: trimmed } : s))
       } catch { /* ignore */ }
+      finally {
+        renameInFlightRef.current = false
+        setRenamingSession(false)
+      }
     }
     setEditingArchivedId(null)
   }
@@ -2410,8 +2492,16 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
   // ---- Stop an ongoing stream ----
   async function handleStop() {
-    if (stopRequestedRef.current) return
+    if (stopRequestedRef.current || stopping) return
+    // Spin the stop button while the getActive/cancel round trips run —
+    // a stop that "does nothing" for seconds looks broken otherwise.
+    setStopping(true)
+    try {
+      await runStop()
+    } finally { setStopping(false) }
+  }
 
+  async function runStop() {
     let taskId = taskIdRef.current
     const handle = streamHandleRef.current
     if (!projectId) {
@@ -2523,7 +2613,14 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
    *  away. The backend turns awaiting_input into cancelled and clears the
    *  checkpoint, so the history refresh below settles the turn as idle. */
   async function handleCancelAwaiting() {
-    if (!projectId || !sessionId) return
+    if (!projectId || !sessionId || cancellingAwaiting) return
+    setCancellingAwaiting(true)
+    try {
+      await runCancelAwaiting()
+    } finally { setCancellingAwaiting(false) }
+  }
+
+  async function runCancelAwaiting() {
     let taskId = taskIdRef.current
     if (!taskId) {
       try {
@@ -2924,8 +3021,10 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                 onBlur={submitTitle}
                 className="flex-1 min-w-0 text-sm font-semibold bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-2 py-1 outline-none focus:ring-2 focus:ring-sigma-600/20 focus:border-sigma-600"
               />
-              <button data-edit-btn onClick={submitTitle} className="p-1 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 rounded"><Check className="w-3.5 h-3.5" /></button>
-              <button data-edit-btn onClick={cancelEditTitle} className="p-1 text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"><X className="w-3.5 h-3.5" /></button>
+              <button data-edit-btn onClick={submitTitle} disabled={renamingSession} className="p-1 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 rounded disabled:opacity-50 disabled:cursor-wait">
+                {renamingSession ? <Spinner size="xs" /> : <Check className="w-3.5 h-3.5" />}
+              </button>
+              <button data-edit-btn onClick={cancelEditTitle} disabled={renamingSession} className="p-1 text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 rounded disabled:opacity-50"><X className="w-3.5 h-3.5" /></button>
               <span className="text-[9px] text-gray-300 font-mono">{editTitle.length}/100</span>
             </div>
           ) : (
@@ -2974,7 +3073,11 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
               <div className="max-h-64 overflow-y-auto">
                 {activeSessions.length === 0 && (
-                  <div className="px-3 py-6 text-center text-xs text-gray-400">{t('chat.noSessions')}</div>
+                  sessionsLoading ? (
+                    <div className="px-3 py-6 flex justify-center"><Spinner size="sm" className="text-gray-400" /></div>
+                  ) : (
+                    <div className="px-3 py-6 text-center text-xs text-gray-400">{t('chat.noSessions')}</div>
+                  )
                 )}
                 {activeSessions.map(s => (
                   <div
@@ -2994,10 +3097,11 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                     <div className="flex items-center gap-0.5 flex-shrink-0">
                       <button
                         onClick={(e) => archiveSession(s.id, e)}
-                        className="p-1 text-gray-300 dark:text-gray-500 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/30 rounded transition-colors"
+                        disabled={archivalBusyId === s.id}
+                        className="p-1 text-gray-300 dark:text-gray-500 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/30 rounded transition-colors disabled:opacity-50 disabled:cursor-wait"
                         title={t('chat.archive')}
                       >
-                        <Archive className="w-3.5 h-3.5" />
+                        {archivalBusyId === s.id ? <Spinner size="xs" /> : <Archive className="w-3.5 h-3.5" />}
                       </button>
                       <button
                         onClick={(e) => deleteSessionAction(s.id, e)}
@@ -3014,9 +3118,10 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               <div className="border-t border-gray-100 dark:border-gray-800 p-1.5 space-y-0.5">
                 <button
                   onClick={createNewSession}
-                  className="w-full flex items-center gap-2 px-2 py-1.5 text-[10px] font-medium text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+                  disabled={creatingSession}
+                  className="w-full flex items-center gap-2 px-2 py-1.5 text-[10px] font-medium text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-wait"
                 >
-                  <Plus className="w-3.5 h-3.5" />
+                  {creatingSession ? <Spinner size="xs" /> : <Plus className="w-3.5 h-3.5" />}
                   {t('chat.newSession')}
                 </button>
                 <button
@@ -3040,10 +3145,16 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
             overflow — room that programmatic scrolling must never have. */}
         <div ref={chatScrollRef} onScroll={handleChatScroll} className="relative h-full overflow-y-auto p-4">
           <div ref={chatContentRef} className="space-y-6">
-          {isLoadingHistory && (
+          {isLoadingHistory && messages.length === 0 && (
+            <div className="flex flex-col items-center justify-center py-16 gap-3">
+              <Spinner size="md" className="text-sigma-600/60" />
+              <div className="text-xs text-gray-400 dark:text-gray-500 font-medium">{t('chat.loadingHistory')}</div>
+            </div>
+          )}
+          {isLoadingHistory && messages.length > 0 && (
             <div className="text-center text-[10px] text-gray-400 dark:text-gray-500 font-medium">{t('chat.loadingHistory')}</div>
           )}
-          {messages.length === 0 && (
+          {messages.length === 0 && !isLoadingHistory && (
             <div className="bg-white dark:bg-gray-900 p-6 rounded-3xl shadow-sm border border-gray-100 dark:border-gray-800 text-sm text-gray-500 dark:text-gray-400 italic leading-relaxed text-center mt-10">
               <Bot className="w-8 h-8 mx-auto mb-3 text-sigma-600/30" />
               {t('chat.welcome')}
@@ -3167,8 +3278,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                       {copiedMessageId === m.id ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3" />}
                     </button>
                     {m.id && m.role === 'SiGMA' && !isStreaming && !awaiting && (
-                      <button onClick={() => forkFromMessage(m)} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800" title={t('chat.fork')}>
-                        <GitBranch className="w-3 h-3" />
+                      <button onClick={() => forkFromMessage(m)} disabled={forkingMessageId === m.id} className="p-1 text-gray-300 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-white dark:hover:bg-gray-900 rounded-md border border-transparent hover:border-gray-100 dark:hover:border-gray-800 disabled:opacity-50 disabled:cursor-wait" title={t('chat.fork')}>
+                        {forkingMessageId === m.id ? <Spinner size="xs" /> : <GitBranch className="w-3 h-3" />}
                       </button>
                     )}
                     {m.role === 'user' && m.can_edit && !isStreaming && !awaiting && (
@@ -3563,10 +3674,10 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
               />
               )}
               <button onClick={isStreaming ? handleStop : awaiting ? handleCancelAwaiting : handleSendMessage}
-                disabled={isSubmitting || isUploadingAttachment}
+                disabled={isSubmitting || isUploadingAttachment || stopping || cancellingAwaiting}
                 title={awaiting ? t('chat.cancelWaiting') : undefined}
                 className={`p-2 text-white rounded-xl transition-all active:scale-95 disabled:opacity-50 ${!isSubmitting && (isStreaming || awaiting) ? 'bg-red-500 hover:bg-red-600' : 'bg-sigma-600 hover:bg-sigma-700'}`}>
-                {isSubmitting
+                {isSubmitting || stopping || cancellingAwaiting
                   ? <Loader2 className="w-4 h-4 animate-spin" />
                   : isStreaming || awaiting
                     ? <Square className="w-4 h-4" />
@@ -3732,7 +3843,11 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
             <div className="flex-1 overflow-y-auto">
               {archivedSessions.length === 0 && (
-                <div className="px-5 py-12 text-center text-sm text-gray-400 dark:text-gray-500">{t('chat.noArchived')}</div>
+                archivedListLoading ? (
+                  <div className="px-5 py-12 flex justify-center"><Spinner size="md" className="text-gray-400" /></div>
+                ) : (
+                  <div className="px-5 py-12 text-center text-sm text-gray-400 dark:text-gray-500">{t('chat.noArchived')}</div>
+                )
               )}
               {archivedSessions.map(s => (
                 <div key={s.id} className="border-b border-gray-50 dark:border-gray-800">
@@ -3749,8 +3864,10 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                               onBlur={() => submitArchivedTitle(s.id)}
                               className="flex-1 min-w-0 text-sm font-medium bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-2 py-1 outline-none focus:ring-2 focus:ring-sigma-600/20"
                             />
-                            <button data-edit-btn onClick={() => submitArchivedTitle(s.id)} className="p-0.5 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 rounded"><Check className="w-3 h-3" /></button>
-                            <button data-edit-btn onClick={() => setEditingArchivedId(null)} className="p-0.5 text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"><X className="w-3 h-3" /></button>
+                            <button data-edit-btn onClick={() => submitArchivedTitle(s.id)} disabled={renamingSession} className="p-0.5 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 rounded disabled:opacity-50 disabled:cursor-wait">
+                              {renamingSession ? <Spinner size="xs" /> : <Check className="w-3 h-3" />}
+                            </button>
+                            <button data-edit-btn onClick={() => setEditingArchivedId(null)} disabled={renamingSession} className="p-0.5 text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 rounded disabled:opacity-50"><X className="w-3 h-3" /></button>
                           </div>
                         ) : (
                           <button
@@ -3768,8 +3885,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                         <button onClick={() => startEditArchived(s)} className="p-1 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors" title={t('common.rename')}>
                           <Pencil className="w-3.5 h-3.5" />
                         </button>
-                        <button onClick={() => unarchiveSession(s.id)} className="p-1 text-gray-400 dark:text-gray-500 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/30 rounded-lg transition-colors" title={t('chat.unarchive')}>
-                          <Archive className="w-3.5 h-3.5" />
+                        <button onClick={() => unarchiveSession(s.id)} disabled={archivalBusyId === s.id} className="p-1 text-gray-400 dark:text-gray-500 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/30 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-wait" title={t('chat.unarchive')}>
+                          {archivalBusyId === s.id ? <Spinner size="xs" /> : <Archive className="w-3.5 h-3.5" />}
                         </button>
                         <button onClick={() => deleteArchivedSession(s.id)} className="p-1 text-gray-400 dark:text-gray-500 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-colors" title={t('common.delete')}>
                           <Trash2 className="w-3.5 h-3.5" />
@@ -3780,10 +3897,14 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
 
                   {expandedArchivedId === s.id && (
                     <div className="px-5 pb-4 space-y-3 max-h-64 overflow-y-auto border-t border-gray-50 dark:border-gray-800 pt-3 bg-gray-50/30 dark:bg-gray-900/30">
-                      {archivedMessages.length === 0 && (
-                        <div className="text-xs text-gray-400 dark:text-gray-500 text-center py-4">{t('chat.noMessages')}</div>
-                      )}
-                      {archivedMessages.map((m, mi) => (
+                      {archivedMsgsBusyId === s.id ? (
+                        <div className="flex justify-center py-4"><Spinner size="sm" className="text-gray-400" /></div>
+                      ) : (
+                        <>
+                          {archivedMessages.length === 0 && (
+                            <div className="text-xs text-gray-400 dark:text-gray-500 text-center py-4">{t('chat.noMessages')}</div>
+                          )}
+                          {archivedMessages.map((m, mi) => (
                         m.is_boundary ? (
                           <div key={mi} data-archived-msg-id={m.id} className="w-full my-1">
                             <CompactSummaryNote summary={m.content} />
@@ -3811,6 +3932,8 @@ export default function ChatPanel({ projectId, placeholder, citations = [], onCl
                         </div>
                         )
                       ))}
+                        </>
+                      )}
                     </div>
                   )}
                 </div>

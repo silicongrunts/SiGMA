@@ -167,8 +167,10 @@ function CommitModal({ isOpen, onClose, commit, parentHash, projectId, onDownloa
       if (blobObj && blobObj.content !== null && blobObj.content !== undefined) {
         downloadText(blobObj.content, file.name || file.path)
       } else {
+        // Await the fetch so the spinner covers the real network round trip
         const downloadUrl = gitsAPI.snapshot(projectId, commit.hash)
-        downloadFromUrl(downloadUrl, file.name || file.path)
+        const blob = await fetchBlob(downloadUrl)
+        triggerDownload(blob, file.name || file.path)
       }
     } catch (err) {
       toastError(t('history.toast.downloadFailed') + ': ' + (err.message || String(err)))
@@ -180,11 +182,6 @@ function CommitModal({ isOpen, onClose, commit, parentHash, projectId, onDownloa
   const downloadText = (text, filename) => {
     const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
     triggerDownload(blob, filename)
-  }
-
-  const downloadFromUrl = (url, filename) => {
-    fetchBlob(url).then(blob => triggerDownload(blob, filename))
-      .catch(err => { toastError(t('history.toast.downloadFailed') + ': ' + (err.message || String(err))) })
   }
 
   const triggerDownload = (blobObj, filename) => {

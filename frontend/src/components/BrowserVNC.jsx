@@ -10,6 +10,10 @@ import { useStore } from '../store/useStore'
 
 const POLL_INTERVAL_MS = 500
 const POLL_MAX_ATTEMPTS = 20
+// vnc.html reports the real stream state via postMessage and owns its own
+// 30s connect timeout; this parent fallback only fires if that message is
+// somehow lost (blocked scripts, ancient iframe cache).
+const VNC_LIVE_FALLBACK_MS = 40_000
 
 export default function BrowserVNC({ projectId }) {
   const { t } = useTranslation()
@@ -22,10 +26,21 @@ export default function BrowserVNC({ projectId }) {
   const browserDataClearedAt = useStore(state => state.browserDataClearedAt)
   const [status, setStatus] = useState('starting') // starting | connected | error
   const [error, setError] = useState(null)
+  // Real VNC stream state, reported by vnc.html via postMessage. 'pending'
+  // shows a connecting overlay above the (black) iframe; 'live' means pixels
+  // are actually flowing; 'failed' means the stream died or timed out.
+  const [vncLive, setVncLive] = useState('pending') // pending | live | failed
+  const [vncError, setVncError] = useState(null)
   // Bumped on every start attempt; stale async chains bail out so they cannot
   // call setStatus/setError after the component unmounts, projectId changes,
   // or the user presses Retry while an earlier attempt is still in flight.
   const activeTokenRef = useRef(0)
+  // Bumped by Retry when the stream itself failed; re-keys the iframe so
+  // vnc.html remounts and reconnects.
+  const [reloadToken, setReloadToken] = useState(0)
+  const iframeRef = useRef(null)
+  const vncLiveRef = useRef(vncLive)
+  vncLiveRef.current = vncLive
 
   const startBrowser = useCallback(async () => {
     const myToken = ++activeTokenRef.current
@@ -76,6 +91,53 @@ export default function BrowserVNC({ projectId }) {
     return () => { activeTokenRef.current++ }  // invalidate the in-flight chain on unmount/projectId change
   }, [projectId, startBrowser, browserDataClearedAt])
 
+  // Stream state resets to 'pending' whenever a fresh iframe mounts (start
+  // success, data clear, or retry) — the backend being 'running' says nothing
+  // about the noVNC WebSocket itself.
+  useEffect(() => {
+    if (status === 'connected') {
+      setVncLive('pending')
+      setVncError(null)
+    }
+  }, [status, browserDataClearedAt, reloadToken])
+
+  // vnc.html owns the connection lifecycle and reports it via postMessage;
+  // this listener mirrors it into the toolbar dot and overlays.
+  useEffect(() => {
+    const onMessage = (e) => {
+      if (e.source !== iframeRef.current?.contentWindow) return
+      if (e.origin !== window.location.origin) return
+      const data = e.data
+      if (!data || data.source !== 'sigma-vnc') return
+      if (data.status === 'connected') setVncLive('live')
+      else if (data.status === 'connecting') setVncLive('pending')
+      else if (data.status === 'error') {
+        setVncLive('failed')
+        setVncError(data.message || t('browser.connectionFailed'))
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [t])
+
+  // Fallback: if the iframe never reports in, fail visibly instead of leaving
+  // a black pane under a forever-spinning overlay.
+  useEffect(() => {
+    if (status !== 'connected') return
+    const timer = setTimeout(() => {
+      if (vncLiveRef.current === 'pending') {
+        setVncLive('failed')
+        setVncError(t('browser.vncTimeout'))
+      }
+    }, VNC_LIVE_FALLBACK_MS)
+    return () => clearTimeout(timer)
+  }, [status, browserDataClearedAt, reloadToken, t])
+
+  const retryStream = useCallback(() => {
+    setVncError(null)
+    setReloadToken(v => v + 1)  // re-keys iframe → effect resets vncLive to 'pending'
+  }, [])
+
   if (status === 'error') {
     return (
       <div className="h-full flex flex-col items-center justify-center bg-gray-50 dark:bg-gray-900 text-gray-500 dark:text-gray-400 gap-4">
@@ -105,15 +167,36 @@ export default function BrowserVNC({ projectId }) {
       <div className="flex items-center gap-2 px-3 py-1.5 bg-gray-900 text-gray-400 text-xs flex-shrink-0">
         <Monitor className="w-3.5 h-3.5" />
         <span className="font-medium">{t('browser.chromeBrowser')}</span>
-        <div className="w-2 h-2 rounded-full bg-green-400" />
+        {/* Stream state, not backend state: green only when pixels flow */}
+        <div className={`w-2 h-2 rounded-full ${vncLive === 'live' ? 'bg-green-400' : vncLive === 'failed' ? 'bg-red-500' : 'bg-amber-400 animate-pulse'}`} />
       </div>
-      <iframe
-        key={browserDataClearedAt}
-        src={iframeSrc}
-        className="flex-1 border-0"
-        style={{ minHeight: 0 }}
-        title={t('browser.iframeTitle')}
-      />
+      <div className="flex-1 min-h-0 relative">
+        {vncLive === 'failed' ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-950 text-gray-400 gap-3">
+            <AlertTriangle className="w-10 h-10 text-amber-400" />
+            <div className="text-sm max-w-md text-center">{vncError || t('browser.connectionFailed')}</div>
+            <button onClick={retryStream} className="flex items-center gap-2 px-4 py-2 bg-sigma-600 text-white rounded-xl hover:bg-sigma-700 transition-all text-sm">
+              <RefreshCw className="w-4 h-4" /> {t('common.retry')}
+            </button>
+          </div>
+        ) : (
+          <>
+            <iframe
+              key={`${browserDataClearedAt}-${reloadToken}`}
+              ref={iframeRef}
+              src={iframeSrc}
+              className="absolute inset-0 w-full h-full border-0"
+              title={t('browser.iframeTitle')}
+            />
+            {vncLive === 'pending' && (
+              <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black text-gray-400">
+                <Loader2 className="w-10 h-10 animate-spin text-sigma-600/50" />
+                <div className="text-sm">{t('browser.vncConnecting')}</div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </div>
   )
 }

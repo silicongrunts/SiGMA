@@ -13,6 +13,7 @@ const REPOSITORY_OPTIONS = [
 export default function TeXManagerPanel({ isOpen, onClose }) {
   const { t } = useTranslation()
   const [status, setStatus] = useState(null)
+  const [statusLoading, setStatusLoading] = useState(false)
   const [repository, setRepository] = useState('official')
   const [customRepository, setCustomRepository] = useState('')
   const [targetYear, setTargetYear] = useState(String(new Date().getFullYear()))
@@ -27,6 +28,7 @@ export default function TeXManagerPanel({ isOpen, onClose }) {
 
   const loadStatus = useCallback(async () => {
     if (!isOpen) return
+    setStatusLoading(true)
     try {
       const nextStatus = await systemAPI.getTeXStatus()
       setStatus(nextStatus)
@@ -36,6 +38,8 @@ export default function TeXManagerPanel({ isOpen, onClose }) {
       })
     } catch (err) {
       toastError(err.message || t('tex.toast.statusFailed'))
+    } finally {
+      setStatusLoading(false)
     }
   }, [isOpen, t])
 
@@ -136,8 +140,8 @@ export default function TeXManagerPanel({ isOpen, onClose }) {
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <button onClick={loadStatus} disabled={running} className="p-2 text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg disabled:opacity-50" title={t('tex.refresh')}>
-              <RefreshCw className="w-4 h-4" />
+            <button onClick={loadStatus} disabled={running || statusLoading} className="p-2 text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg disabled:opacity-50" title={t('tex.refresh')}>
+              <RefreshCw className={`w-4 h-4 ${statusLoading ? 'animate-spin' : ''}`} />
             </button>
             <button onClick={onClose} disabled={running} className="p-2 text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg disabled:opacity-50" title={t('common.close')}>
               <X className="w-5 h-5" />

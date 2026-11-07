@@ -11,6 +11,7 @@ import { useStore } from '../store/useStore'
 import { createSSEStreamParser } from '../utils/sse'
 import { STREAM_RECOVERY_MAX_ATTEMPTS, STREAM_RECOVERY_DELAY_MS, ThinkingProcess, MemoryUsageChip, streamStatusText, withTransientHint } from './ChatShared'
 import { toastError } from './Toast'
+import { Spinner } from './ui'
 
 const MIN_WIDTH = 320
 const MIN_HEIGHT = 200
@@ -35,6 +36,12 @@ const threadMaxHeightFor = (cardHeight) =>
 export function AnnotationPopup({ annotation, projectId, filePath, editorContent, onDelete, onClose, onApplyDiff, onLocateDiff, onClearHighlight, onPersist, onConfirmAnchor, onReloadAnnotation, onSaveBeforeAnnotationChat, autoFocusReply, popupStyle, isPopupDimmed, onAnnotationChanged }) {
   const { t } = useTranslation()
   const [reply, setReply] = useState('')
+  // Reply submission spans up to three awaited calls (file save, persist /
+  // confirm, reply POST) before the stream claims the UI — the Send button
+  // spins and blocks re-entry through that window.
+  const [sending, setSending] = useState(false)
+  // Apply/restore of a suggested diff (editor dispatch + awaited save).
+  const [diffApplying, setDiffApplying] = useState(false)
   const siGMADOProcessingAnnotationId = useStore(s => s.siGMADOProcessingAnnotationId)
   const setSiGMADOProcessingAnnotationId = useStore(s => s.setSiGMADOProcessingAnnotationId)
   const [position, setPosition] = useState(() => popupStyle ? { left: popupStyle.left, top: popupStyle.top } : null)
@@ -798,7 +805,14 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   }
 
   const handleSend = async () => {
-    if (!reply.trim()) return
+    if (!reply.trim() || sending) return
+    setSending(true)
+    try {
+      await submitReply()
+    } finally { setSending(false) }
+  }
+
+  async function submitReply() {
     const saved = await saveBeforeAnnotationChat()
     if (!saved) return
 
@@ -886,9 +900,14 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
     return computeDiffState(editorContent, expandedDiff.before, expandedDiff.after)
   }, [expandedDiff, editorContent])
 
-  const handleApplyDiffFromPanel = () => {
-    if (expandedDiff && onApplyDiff && diffState.canApply) {
-      onApplyDiff(annotation.id, expandedDiff)
+  // Apply/revert runs the editor dispatch plus an awaited save — the buttons
+  // spin and disable until it settles so a double click cannot apply twice.
+  const handleApplyDiffFromPanel = async () => {
+    if (expandedDiff && onApplyDiff && diffState.canApply && !diffApplying) {
+      setDiffApplying(true)
+      try {
+        await onApplyDiff(annotation.id, expandedDiff)
+      } finally { setDiffApplying(false) }
       setExpandedDiff(null)
     }
   }
@@ -896,9 +915,12 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
   // Revert an already-applied diff: swap before/after so the applied "after"
   // text in the document is replaced back by "before". Reuses onApplyDiff —
   // no separate replace path needed.
-  const handleRevertDiffFromPanel = () => {
-    if (expandedDiff && onApplyDiff && diffState.canRevert) {
-      onApplyDiff(annotation.id, { before: expandedDiff.after, after: expandedDiff.before })
+  const handleRevertDiffFromPanel = async () => {
+    if (expandedDiff && onApplyDiff && diffState.canRevert && !diffApplying) {
+      setDiffApplying(true)
+      try {
+        await onApplyDiff(annotation.id, { before: expandedDiff.after, after: expandedDiff.before })
+      } finally { setDiffApplying(false) }
       setExpandedDiff(null)
     }
   }
@@ -1080,10 +1102,10 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
             ) : (
               <button
                 onClick={handleSend}
-                disabled={isSiGMADOProcessing || !reply.trim()}
+                disabled={isSiGMADOProcessing || sending || !reply.trim()}
                 className="p-1.5 bg-sigma-600 text-white rounded-lg hover:bg-sigma-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors shadow-sm"
               >
-                <Send className="w-3.5 h-3.5" />
+                {sending ? <Spinner size="xs" className="w-3.5 h-3.5" /> : <Send className="w-3.5 h-3.5" />}
               </button>
             )}
           </div>
@@ -1125,16 +1147,18 @@ export function AnnotationPopup({ annotation, projectId, filePath, editorContent
             {diffState.canApply ? (
               <button
                 onClick={handleApplyDiffFromPanel}
-                className="flex-1 flex items-center justify-center gap-1 py-2 bg-green-600 text-white text-xs font-bold rounded-lg hover:bg-green-700 transition-colors"
+                disabled={diffApplying}
+                className="flex-1 flex items-center justify-center gap-1 py-2 bg-green-600 text-white text-xs font-bold rounded-lg hover:bg-green-700 transition-colors disabled:opacity-60 disabled:cursor-wait"
               >
-                <Check className="w-3 h-3" /> {t('common.apply')}
+                {diffApplying ? <Spinner size="xs" /> : <Check className="w-3 h-3" />} {t('common.apply')}
               </button>
             ) : diffState.canRevert ? (
               <button
                 onClick={handleRevertDiffFromPanel}
-                className="flex-1 flex items-center justify-center gap-1 py-2 bg-amber-600 text-white text-xs font-bold rounded-lg hover:bg-amber-700 transition-colors"
+                disabled={diffApplying}
+                className="flex-1 flex items-center justify-center gap-1 py-2 bg-amber-600 text-white text-xs font-bold rounded-lg hover:bg-amber-700 transition-colors disabled:opacity-60 disabled:cursor-wait"
               >
-                <RotateCcw className="w-3 h-3" /> {t('common.restore')}
+                {diffApplying ? <Spinner size="xs" /> : <RotateCcw className="w-3 h-3" />} {t('common.restore')}
               </button>
             ) : (
               <div className="flex-1 flex items-center justify-center gap-1 py-2 bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400 text-xs font-bold rounded-lg cursor-not-allowed select-none">

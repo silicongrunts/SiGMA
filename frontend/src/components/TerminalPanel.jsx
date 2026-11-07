@@ -17,6 +17,7 @@ import { useTranslation } from 'react-i18next'
 import { X, Plus, ChevronDown } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { terminalAPI } from '../api'
+import { Spinner } from './ui'
 import TerminalInstance from './TerminalInstance'
 import { markSlotForKill } from '../hooks/useTerminal'
 
@@ -180,7 +181,19 @@ export default function TerminalPanel({ projectId, visible }) {
   }, [height])
 
   // ── Loading state ──
-  if (discovering) return null
+  // Session discovery renders null while hidden (panel is always mounted),
+  // but shows a shell with a spinner if the user opens it mid-discovery.
+  if (discovering) {
+    if (!visible) return null
+    return (
+      <div
+        className="absolute bottom-0 left-0 right-0 z-[200] flex flex-col items-center justify-center border-t border-gray-700 bg-[#1e1e1e] rounded-t-lg shadow-2xl"
+        style={{ height: DEFAULT_HEIGHT }}
+      >
+        <Spinner size="md" className="text-gray-500" />
+      </div>
+    )
+  }
 
   if (terminals.length === 0) return null
 

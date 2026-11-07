@@ -19,6 +19,7 @@ import { extractMath, restoreMath, applyMathOverflow } from '../utils/mathGuard'
 import { copyToClipboard } from '../utils/clipboard'
 import PdfPreview from './preview/PdfPreview'
 import ImageLightbox from './ImageLightbox'
+import { Spinner } from './ui'
 import { ZoomIn, ZoomOut, ArrowUp, Maximize2, FileSearch, FileText, Download, AlertTriangle, ChevronLeft, ChevronRight, List } from 'lucide-react'
 
 // Dedicated marked instance for the editor preview pipeline, fully isolated
@@ -226,6 +227,11 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
   const pdfRef = useRef(null)
   useEffect(() => { pdfRef.current = pdf }, [pdf])
   const [mdContent, setMdContent] = useState('')
+  // First-load feedback: a spinner while the markdown/PDF content fetches and
+  // parses (large PDFs take seconds), and the failure reason inline in the
+  // pane once the request gives up — "no preview" alone would look broken.
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewError, setPreviewError] = useState(null)
   const [visiblePage, setVisiblePage] = useState(1)
   const [pageInput, setPageInput] = useState('')
   const [editingPage, setEditingPage] = useState(false)
@@ -398,29 +404,45 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
       setNumPages(0)
     }
 
-    if (kind === 'none' || !path) return
+    if (kind === 'none' || !path) {
+      setPreviewLoading(false)
+      setPreviewError(null)
+      return
+    }
 
+    // First load of this document: spin until the fetch + parse settle. A
+    // failure surfaces inline in the render branch instead of the bare
+    // "no preview" placeholder.
     let cancelled = false
+    setPreviewError(null)
+    setPreviewLoading(true)
+    const settle = (err = null) => {
+      if (cancelled) return
+      setPreviewLoading(false)
+      setPreviewError(err)
+    }
     if (kind === 'markdown') {
       filesAPI.read(currentProjectId, path).then(data => {
         if (cancelled) return
         setMdContent(typeof data === 'string' ? data : (data?.content ?? ''))
-      }).catch(() => { /* leave blank — shows 'no preview' */ })
+        settle()
+      }).catch(e => { settle(e.message || t('preview.loadFailed')) })
     } else if (kind === 'pdf-compiled') {
       compileAPI.getPDF(currentProjectId, path).then(blob => {
         if (cancelled) return
-        loadPDF(URL.createObjectURL(blob))
-      }).catch(() => { /* not yet compiled — shows 'no preview' */ })
+        return loadPDF(URL.createObjectURL(blob))
+      }).then(() => settle()).catch(e => { settle(e.message || t('preview.loadFailed')) })
     } else if (kind === 'pdf-standalone') {
       compileAPI.getPDF(currentProjectId, path).then(blob => {
         if (cancelled) return
-        loadPDF(URL.createObjectURL(blob))
-      }).catch(() => {
+        return loadPDF(URL.createObjectURL(blob))
+      }).then(() => settle()).catch(e => {
+        if (cancelled) return
         // Fallback: raw download
         filesAPI.download(currentProjectId, path).then(blob => {
           if (cancelled) return
-          loadPDF(URL.createObjectURL(blob))
-        }).catch(() => { /* file unreadable — shows 'no preview' */ })
+          return loadPDF(URL.createObjectURL(blob))
+        }).then(() => settle()).catch(e2 => { settle(e2.message || t('preview.loadFailed')) })
       })
     }
     // binary-error needs no fetch — render branch shows download UI from path.
@@ -434,6 +456,7 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
     resetRenderingState,
     revokePdfUrl,
     loadPDF,
+    t,
   ])
 
   // Revoke any held object URL on unmount.
@@ -1227,12 +1250,29 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
               containerWidth={containerWidth}
               registerApi={(api) => { pdfApiRef.current = api }}
             />
+          ) : previewLoading && !compiling ? (
+            <div className="flex flex-col items-center justify-center m-auto gap-3 text-gray-400 dark:text-gray-500">
+              <Spinner size="md" className="text-sigma-600/50" />
+              <p className="text-[10px] font-black tracking-[0.3em] uppercase">{t('common.loading')}</p>
+            </div>
           ) : !compiling ? (
             <div className="flex flex-col items-center justify-center m-auto text-gray-300 dark:text-gray-600">
               <FileSearch className="w-16 h-12 mb-4 opacity-20" />
               <p className="text-[10px] font-black tracking-[0.3em] uppercase">{t('preview.noPreview')}</p>
+              {previewError && <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-2 max-w-xs text-center break-all">{previewError}</p>}
             </div>
           ) : null
+        ) : type === 'markdown' && !mdContent && previewLoading ? (
+          <div className="flex flex-col items-center justify-center m-auto gap-3 text-gray-400 dark:text-gray-500">
+            <Spinner size="md" className="text-sigma-600/50" />
+            <p className="text-[10px] font-black tracking-[0.3em] uppercase">{t('common.loading')}</p>
+          </div>
+        ) : type === 'markdown' && !mdContent ? (
+          <div className="flex flex-col items-center justify-center m-auto text-gray-300 dark:text-gray-600">
+            <FileSearch className="w-16 h-12 mb-4 opacity-20" />
+            <p className="text-[10px] font-black tracking-[0.3em] uppercase">{t('preview.noPreview')}</p>
+            {previewError && <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-2 max-w-xs text-center break-all">{previewError}</p>}
+          </div>
         ) : type === 'markdown' ? (
             <div className="w-full grow bg-white dark:bg-gray-900 flex flex-col items-center py-8 px-6">
                 <div
@@ -1298,10 +1338,11 @@ const Preview = forwardRef(({ onPageClick, onScroll, onOpenPath, onJumpToLine },
                 : t('preview.downloadName', { name: degradedName })}
             </a>
           </div>
-        ) : (!compiling && (
+        ) : (!compiling && !previewLoading && (
           <div className="flex flex-col items-center justify-center m-auto text-gray-300 dark:text-gray-600">
             <FileSearch className="w-16 h-12 mb-4 opacity-20" />
             <p className="text-[10px] font-black tracking-[0.3em] uppercase">{t('preview.noPreview')}</p>
+            {previewError && <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-2 max-w-xs text-center break-all">{previewError}</p>}
           </div>
         ))}
       </div>

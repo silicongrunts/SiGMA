@@ -14,6 +14,20 @@ import i18n from '../i18n'
 
 const API_BASE_URL = '/api/v1'
 
+// Request bounds so a hung or crashed backend surfaces an error instead of
+// leaving a spinner up forever. Every bound is overridable per call.
+//   DEFAULT — ordinary interactive calls.
+//   LONG    — heavy CRUD on large resources (session fork, project create,
+//             browser start, LLM-backed endpoints, git operations).
+//   TRANSFER — bulk uploads/imports/exports, git clones, reindexing, restart:
+//             minutes are legitimate; the bound only catches "never answers".
+// fetchWithTimeout bounds only the time until response headers, so long body
+// transfers (downloads) are never cut. request() bounds its whole round trip
+// because its JSON/text payloads are small.
+const DEFAULT_TIMEOUT_MS = 30_000
+const LONG_TIMEOUT_MS = 120_000
+const TRANSFER_TIMEOUT_MS = 600_000
+
 /** Unwrap the backend unified response format: { success, request_id, data }. */
 function unwrapResponse(json) {
   if (json && typeof json === 'object' && 'success' in json && 'request_id' in json) {
@@ -23,15 +37,57 @@ function unwrapResponse(json) {
   return json
 }
 
+/** fetch() with a bounded wait for response headers. The caller's signal is
+ *  forwarded into a dedicated internal controller — aborting either source
+ *  rejects the fetch. A timeout surfaces as a normal Error (never an
+ *  AbortError) so callers treat it as a failure, not a user abort. */
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const callerSignal = options.signal
+  if (callerSignal?.aborted) throw callerSignal.reason ?? new DOMException('Aborted', 'AbortError')
+  if (!timeoutMs || timeoutMs <= 0) return fetch(url, options)
+  const controller = new AbortController()
+  const onCallerAbort = () => controller.abort(callerSignal.reason)
+  callerSignal?.addEventListener('abort', onCallerAbort, { once: true })
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort(new Error(i18n.t('api.requestTimeout')))
+  }, timeoutMs)
+  try {
+    return await fetch(url, { ...options, signal: controller.signal })
+  } catch (err) {
+    callerSignal?.removeEventListener('abort', onCallerAbort)
+    if (timedOut && !callerSignal?.aborted) throw new Error(i18n.t('api.requestTimeout'))
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 async function request(endpoint, options = {}, isText = false) {
   const url = `${API_BASE_URL}${endpoint}`
+  // timeoutMs is ours; never forwarded to fetch itself.
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, ...fetchOptions } = options
   // Let the browser set multipart/form-data boundary for FormData uploads.
-  const isFormData = options.body instanceof FormData
+  const isFormData = fetchOptions.body instanceof FormData
   const defaultOptions = isFormData ? {} : { headers: { 'Content-Type': 'application/json' } }
-  const config = { ...defaultOptions, ...options }
+  const config = { ...defaultOptions, ...fetchOptions }
+
+  // The timer spans the whole call — headers plus body parse — so a server
+  // that sends headers and then stalls cannot hang the caller either.
+  const callerSignal = config.signal
+  if (callerSignal?.aborted) throw callerSignal.reason ?? new DOMException('Aborted', 'AbortError')
+  const controller = new AbortController()
+  const onCallerAbort = () => controller.abort(callerSignal.reason)
+  callerSignal?.addEventListener('abort', onCallerAbort, { once: true })
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort(new Error(i18n.t('api.requestTimeout')))
+  }, timeoutMs)
 
   try {
-    const response = await fetch(url, config)
+    const response = await fetch(url, { ...config, signal: controller.signal })
     const contentType = response.headers.get('content-type')
 
     if (!response.ok) {
@@ -101,8 +157,17 @@ async function request(endpoint, options = {}, isText = false) {
 
     return response
   } catch (error) {
+    // A concurrent caller abort keeps its own AbortError; only our timer
+    // becomes a plain timeout error.
+    if (timedOut && !callerSignal?.aborted) throw new Error(i18n.t('api.requestTimeout'))
     console.error(`API Error [${endpoint}]:`, error.message)
     throw error
+  } finally {
+    clearTimeout(timer)
+    // The body is fully consumed (or the raw Response handed out) by the time
+    // this runs — no endpoint reads a request() body after return, so the
+    // forwarded-abort listener has nothing left to serve.
+    callerSignal?.removeEventListener('abort', onCallerAbort)
   }
 }
 
@@ -203,17 +268,19 @@ async function fetchEventStream(url, options, failureFallback) {
 export const projectsAPI = {
   list: () => request('/projects'),
   get: (id) => request(`/projects/${id}`),
-  create: (data) => request('/projects', { method: 'POST', body: JSON.stringify(data) }),
-  import: (formData) => request('/projects/import', { method: 'POST', body: formData }),
+  create: (data) => request('/projects', { method: 'POST', body: JSON.stringify(data), timeoutMs: LONG_TIMEOUT_MS }),
+  import: (formData) => request('/projects/import', { method: 'POST', body: formData, timeoutMs: TRANSFER_TIMEOUT_MS }),
   listUnregistered: () => request('/projects/unregistered'),
   register: (data) => request('/projects/register', { method: 'POST', body: JSON.stringify(data) }),
   update: (id, data) => request(`/projects/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
-  delete: (id) => request(`/projects/${id}`, { method: 'DELETE' }),
-  resetDatabase: (id) => request(`/projects/${id}/database`, { method: 'DELETE' }),
+  delete: (id) => request(`/projects/${id}`, { method: 'DELETE', timeoutMs: LONG_TIMEOUT_MS }),
+  resetDatabase: (id) => request(`/projects/${id}/database`, { method: 'DELETE', timeoutMs: LONG_TIMEOUT_MS }),
   listTemplates: () => request('/projects/templates'),
   getConfig: (id) => request(`/projects/${id}/config`),
   updateConfig: (id, data) => request(`/projects/${id}/config`, { method: 'PATCH', body: JSON.stringify(data) }),
-  export: (id) => fetch(`${API_BASE_URL}/projects/${id}/export`).then(r => {
+  // The server builds the project zip before responding, so the header wait
+  // must tolerate large projects.
+  export: (id) => fetchWithTimeout(`${API_BASE_URL}/projects/${id}/export`, {}, TRANSFER_TIMEOUT_MS).then(r => {
       if (!r.ok) return streamResponseError(r, i18n.t('api.exportFailed'))
       return r.blob()
   }),
@@ -231,7 +298,7 @@ export const systemAPI = {
       body: JSON.stringify({ provider, base_url: baseUrl, api_key: apiKey }),
     }),
   getChatgptModels: () => request('/system/chatgpt/models'),
-  refreshChatgptModels: () => request('/system/chatgpt/models/refresh', { method: 'POST' }),
+  refreshChatgptModels: () => request('/system/chatgpt/models/refresh', { method: 'POST', timeoutMs: LONG_TIMEOUT_MS }),
   getModelContext: ({ provider = '', model = '' }) => {
     const qs = new URLSearchParams({ provider, model })
     return request(`/system/litellm/context?${qs.toString()}`)
@@ -250,7 +317,7 @@ export const systemAPI = {
     body: JSON.stringify(payload),
     signal,
   }, i18n.t('api.requestFailed')),
-  restart: () => request('/system/restart', { method: 'POST' }),
+  restart: () => request('/system/restart', { method: 'POST', timeoutMs: TRANSFER_TIMEOUT_MS }),
 }
 
 // ---------------------------------------------------------------------------
@@ -277,10 +344,10 @@ export const authAPI = {
 // Files API
 // ---------------------------------------------------------------------------
 export const filesAPI = {
-  tree: (projectId) => request(`/files/${projectId}/tree`),
+  tree: (projectId) => request(`/files/${projectId}/tree`, { timeoutMs: LONG_TIMEOUT_MS }),
   children: (projectId, path = '') => request(`/files/${projectId}/children?path=${encodeURIComponent(path)}`),
   read: async (projectId, path) => {
-    const res = await fetch(`${API_BASE_URL}/files/${projectId}/content?path=${encodeURIComponent(path)}`, { headers: { 'Content-Type': 'application/json' } })
+    const res = await fetchWithTimeout(`${API_BASE_URL}/files/${projectId}/content?path=${encodeURIComponent(path)}`, { headers: { 'Content-Type': 'application/json' } }, LONG_TIMEOUT_MS)
     if (!res.ok) {
       let data = {}
       try { data = await res.json() } catch { /* */ }
@@ -297,23 +364,25 @@ export const filesAPI = {
   delete: (projectId, path) => request(`/files/${projectId}?path=${encodeURIComponent(path)}`, { method: 'DELETE' }),
   move: (projectId, source, destination) => request(`/files/${projectId}/move`, { method: 'POST', body: JSON.stringify({ source, destination }) }),
   rename: (projectId, path, newName) => request(`/files/${projectId}/rename`, { method: 'POST', body: JSON.stringify({ path, new_name: newName }) }),
-  download: (projectId, path) => fetch(`${API_BASE_URL}/files/${projectId}/download?path=${encodeURIComponent(path)}`).then(r => {
+  download: (projectId, path) => fetchWithTimeout(`${API_BASE_URL}/files/${projectId}/download?path=${encodeURIComponent(path)}`, {}, TRANSFER_TIMEOUT_MS).then(r => {
       if (!r.ok) return streamResponseError(r, i18n.t('api.downloadFailed'))
       return r.blob()
   }),
-  upload: (projectId, formData) => fetch(`${API_BASE_URL}/files/${projectId}/upload`, { method: 'POST', body: formData }).then(async r => {
+  // The server answers only after the body is consumed, so the header bound
+  // here effectively bounds the whole upload.
+  upload: (projectId, formData) => fetchWithTimeout(`${API_BASE_URL}/files/${projectId}/upload`, { method: 'POST', body: formData }, TRANSFER_TIMEOUT_MS).then(async r => {
       const d = await r.json()
       if (!r.ok) throw new Error(d.error || d.detail || i18n.t('api.uploadFailed'))
       return unwrapResponse(d)
   }),
   extract: (projectId, path, overwrite = false, skipConflicts = false) =>
-    request(`/files/${projectId}/extract`, { method: 'POST', body: JSON.stringify({ path, overwrite, skip_conflicts: skipConflicts }) }),
+    request(`/files/${projectId}/extract`, { method: 'POST', body: JSON.stringify({ path, overwrite, skip_conflicts: skipConflicts }), timeoutMs: TRANSFER_TIMEOUT_MS }),
   batchDownload: (projectId, paths) =>
-    fetch(`${API_BASE_URL}/files/${projectId}/batch-download`, {
+    fetchWithTimeout(`${API_BASE_URL}/files/${projectId}/batch-download`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths }),
-    }).then(r => {
+    }, TRANSFER_TIMEOUT_MS).then(r => {
       if (!r.ok) return streamResponseError(r, i18n.t('api.downloadFailed'))
       return r.blob()
     }),
@@ -352,12 +421,12 @@ export const filesAPI = {
 // Compile API
 // ---------------------------------------------------------------------------
 export const compileAPI = {
-  compile: (projectId, opts = {}) => request(`/compile/${projectId}`, { method: 'POST', body: JSON.stringify(opts) }),
+  compile: (projectId, opts = {}) => request(`/compile/${projectId}`, { method: 'POST', body: JSON.stringify(opts), timeoutMs: TRANSFER_TIMEOUT_MS }),
   synctex: (projectId, data) => request(`/compile/${projectId}/synctex`, { method: 'POST', body: JSON.stringify(data) }),
   /** Fetch compiled PDF as a Blob (for preview display). */
   getPDF: (projectId, filename) => {
     const qs = filename ? `?filename=${encodeURIComponent(filename)}` : ''
-    return fetch(`${API_BASE_URL}/compile/${encodeURIComponent(projectId)}/pdf${qs}`, { cache: 'no-store' }).then(async r => {
+    return fetchWithTimeout(`${API_BASE_URL}/compile/${encodeURIComponent(projectId)}/pdf${qs}`, { cache: 'no-store' }, LONG_TIMEOUT_MS).then(async r => {
       if (!r.ok) throw new Error(i18n.t('api.pdfNotAvailable'))
       return await r.blob()
     })
@@ -368,19 +437,6 @@ export const compileAPI = {
 // Chat API — streaming + task management
 // ---------------------------------------------------------------------------
 export const chatAPI = {
-  uploadAttachment: (projectId, sessionId, file) => {
-    const formData = new FormData()
-    formData.append('file', file)
-    return fetch(`${API_BASE_URL}/chat/attachments/${projectId}?session_id=${encodeURIComponent(sessionId)}`, {
-      method: 'POST',
-      body: formData,
-    }).then(async r => {
-      const data = await r.json()
-      if (!r.ok) throw new Error(data.detail?.message || data.error || i18n.t('api.uploadFailed'))
-      return unwrapResponse(data)
-    })
-  },
-
   /** Send a message and get an SSE stream back */
   stream: (projectId, data, signal) => fetchEventStream(`${API_BASE_URL}/chat/stream/${projectId}`, {
     method: 'POST',
@@ -388,6 +444,18 @@ export const chatAPI = {
     body: JSON.stringify(data),
     signal,
   }, i18n.t('api.chatFailed')),
+  uploadAttachment: (projectId, sessionId, file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return fetchWithTimeout(`${API_BASE_URL}/chat/attachments/${projectId}?session_id=${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      body: formData,
+    }, TRANSFER_TIMEOUT_MS).then(async r => {
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.detail?.message || data.error || i18n.t('api.uploadFailed'))
+      return unwrapResponse(data)
+    })
+  },
 
   /** Check for an active (running / stale) background task for a specific session */
   getActive: (projectId, sessionId, options = {}) =>
@@ -444,18 +512,20 @@ export const chatAPI = {
 
   /** Delete a session */
   deleteSession: (projectId, sessionId) =>
-    request(`/chat/sessions/${projectId}/${sessionId}`, { method: 'DELETE' }),
+    request(`/chat/sessions/${projectId}/${sessionId}`, { method: 'DELETE', timeoutMs: LONG_TIMEOUT_MS }),
 
-  /** Fork a session from a message: copy it and everything before it */
+  /** Fork a session from a message: copy it and everything before it.
+   *  Large sessions with many agent sub-sessions take seconds to copy. */
   forkSession: (projectId, sessionId, messageId, title = '') =>
     request(`/chat/sessions/${projectId}/${sessionId}/fork`, {
       method: 'POST',
       body: JSON.stringify({ message_id: messageId, title }),
+      timeoutMs: LONG_TIMEOUT_MS,
     }),
 
   /** Generate a title for a session using AI */
   generateTitle: (projectId, sessionId) =>
-    request(`/chat/sessions/${projectId}/${sessionId}/generate-title`, { method: 'POST' }),
+    request(`/chat/sessions/${projectId}/${sessionId}/generate-title`, { method: 'POST', timeoutMs: LONG_TIMEOUT_MS }),
 
   /** Inject a completed skill_load tool turn into the session (no LLM call) */
   loadSkill: (projectId, sessionId, skillId) =>
@@ -482,21 +552,21 @@ export const chatAPI = {
 // Git API
 // ---------------------------------------------------------------------------
 export const gitsAPI = {
-  init: (projectId) => request(`/git/${projectId}/init`, { method: 'POST' }),
+  init: (projectId) => request(`/git/${projectId}/init`, { method: 'POST', timeoutMs: LONG_TIMEOUT_MS }),
   log: (projectId, limit = 50, offset = 0, before = null) => {
     const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) })
     if (before) qs.set('before', before)
-    return request(`/git/${projectId}/log?${qs.toString()}`)
+    return request(`/git/${projectId}/log?${qs.toString()}`, { timeoutMs: LONG_TIMEOUT_MS })
   },
   diff: (projectId, params) => {
     const qs = new URLSearchParams(params);
-    return request(`/git/${projectId}/diff?${qs.toString()}`);
+    return request(`/git/${projectId}/diff?${qs.toString()}`, { timeoutMs: LONG_TIMEOUT_MS });
   },
-  fileHistory: (projectId, path) => request(`/git/${projectId}/history?path=${encodeURIComponent(path)}`),
+  fileHistory: (projectId, path) => request(`/git/${projectId}/history?path=${encodeURIComponent(path)}`, { timeoutMs: LONG_TIMEOUT_MS }),
   commitFiles: (projectId, data) => {
     const params = new URLSearchParams({ commit: data.commit });
     if (data.parent_commit) params.set('parent_commit', data.parent_commit);
-    return request(`/git/${projectId}/commit-files?${params.toString()}`);
+    return request(`/git/${projectId}/commit-files?${params.toString()}`, { timeoutMs: LONG_TIMEOUT_MS });
   },
   getBlob: (projectId, data) => {
     const params = new URLSearchParams({ path: data.path, commit: data.commit });
@@ -509,14 +579,14 @@ export const gitsAPI = {
   snapshot: (projectId, commit) => {
     return `${API_BASE_URL}/git/${projectId}/snapshot?commit=${encodeURIComponent(commit)}`;
   },
-  commitNow: (projectId) => request(`/git/${projectId}/commit`, { method: 'POST' }),
+  commitNow: (projectId) => request(`/git/${projectId}/commit`, { method: 'POST', timeoutMs: LONG_TIMEOUT_MS }),
   snapshotHealth: (projectId) => request(`/git/${projectId}/health`),
-  repairSnapshot: (projectId) => request(`/git/${projectId}/repair`, { method: 'POST' }),
+  repairSnapshot: (projectId) => request(`/git/${projectId}/repair`, { method: 'POST', timeoutMs: TRANSFER_TIMEOUT_MS }),
   tags: (projectId) => request(`/git/${projectId}/tags`),
   createTag: (projectId, data) => request(`/git/${projectId}/tags`, { method: 'POST', body: JSON.stringify(data) }),
   deleteTag: (projectId, name) => request(`/git/${projectId}/tags/${encodeURIComponent(name)}`, { method: 'DELETE' }),
-  downloadSnapshot: (projectId, commitHash) => fetch(
-    `${API_BASE_URL}/git/${projectId}/snapshot?commit=${encodeURIComponent(commitHash)}`
+  downloadSnapshot: (projectId, commitHash) => fetchWithTimeout(
+    `${API_BASE_URL}/git/${projectId}/snapshot?commit=${encodeURIComponent(commitHash)}`, {}, TRANSFER_TIMEOUT_MS
   ).then(async r => {
     if (!r.ok) throw new Error(await r.text())
     return await r.blob()
@@ -530,9 +600,9 @@ export const notebooksAPI = {
   read: (projectId, path) => request(`/notebooks/${projectId}?path=${encodeURIComponent(path)}`),
   write: (projectId, path, notebook) => request(`/notebooks/${projectId}`, { method: 'POST', body: JSON.stringify({ path, notebook }) }),
   create: (projectId, path) => request(`/notebooks/${projectId}/create`, { method: 'POST', body: JSON.stringify({ path }) }),
-  getUrl: (projectId, path) => request(`/notebooks/${projectId}/url?path=${encodeURIComponent(path)}`),
+  getUrl: (projectId, path) => request(`/notebooks/${projectId}/url?path=${encodeURIComponent(path)}`, { timeoutMs: LONG_TIMEOUT_MS }),
   listKernels: () => request('/notebooks/kernels'),
-  killKernel: (kernelId) => request(`/notebooks/kernels/${kernelId}`, { method: 'DELETE' })
+  killKernel: (kernelId) => request(`/notebooks/kernels/${kernelId}`, { method: 'DELETE', timeoutMs: LONG_TIMEOUT_MS })
 }
 
 // ---------------------------------------------------------------------------
@@ -550,18 +620,18 @@ export const libraryAPI = {
   getAncestors: (projectId, docId) => request(`/library/${projectId}/documents/${docId}/ancestors`),
   create: (projectId, data) => request(`/library/${projectId}/documents`, { method: 'POST', body: JSON.stringify(data) }),
   update: (projectId, docId, data) => request(`/library/${projectId}/documents/${docId}`, { method: 'PUT', body: JSON.stringify(data) }),
-  delete: (projectId, docId) => request(`/library/${projectId}/documents/${docId}`, { method: 'DELETE' }),
-  statusSummary: (projectId) => request(`/library/${projectId}/status-summary`),
-  search: (projectId, query, options = {}) => request(`/library/${projectId}/search`, { method: 'POST', body: JSON.stringify({ query, ...options }) }),
-  ragSearch: (projectId, query, options = {}) => request(`/library/${projectId}/rag-search`, { method: 'POST', body: JSON.stringify({ query, ...options }) }),
-  rebuildIndex: (projectId) => request(`/library/${projectId}/rebuild-index`, { method: 'POST' }),
-  extractFields: (projectId, docId) => request(`/library/${projectId}/extract-fields/${docId}`, { method: 'POST' }),
-  reprocess: (projectId, docId) => request(`/library/${projectId}/reprocess/${docId}`, { method: 'POST' }),
-  reprocessAll: (projectId) => request(`/library/${projectId}/reprocess-all`, { method: 'POST' }),
+  delete: (projectId, docId) => request(`/library/${projectId}/documents/${docId}`, { method: 'DELETE', timeoutMs: LONG_TIMEOUT_MS }),
+  statusSummary: (projectId) => request(`/library/${projectId}/status-summary`, { timeoutMs: LONG_TIMEOUT_MS }),
+  search: (projectId, query, options = {}) => request(`/library/${projectId}/search`, { method: 'POST', body: JSON.stringify({ query, ...options }), timeoutMs: LONG_TIMEOUT_MS }),
+  ragSearch: (projectId, query, options = {}) => request(`/library/${projectId}/rag-search`, { method: 'POST', body: JSON.stringify({ query, ...options }), timeoutMs: LONG_TIMEOUT_MS }),
+  rebuildIndex: (projectId) => request(`/library/${projectId}/rebuild-index`, { method: 'POST', timeoutMs: TRANSFER_TIMEOUT_MS }),
+  extractFields: (projectId, docId) => request(`/library/${projectId}/extract-fields/${docId}`, { method: 'POST', timeoutMs: LONG_TIMEOUT_MS }),
+  reprocess: (projectId, docId) => request(`/library/${projectId}/reprocess/${docId}`, { method: 'POST', timeoutMs: LONG_TIMEOUT_MS }),
+  reprocessAll: (projectId) => request(`/library/${projectId}/reprocess-all`, { method: 'POST', timeoutMs: TRANSFER_TIMEOUT_MS }),
   getProcessingLog: (projectId, docId) => request(`/library/${projectId}/processing-log/${docId}`),
   createFolder: (projectId, data) => request(`/library/${projectId}/folders`, { method: 'POST', body: JSON.stringify(data) }),
-  moveItems: (projectId, data) => request(`/library/${projectId}/move`, { method: 'POST', body: JSON.stringify(data) }),
-  batchDelete: (projectId, ids) => request(`/library/${projectId}/batch-delete`, { method: 'POST', body: JSON.stringify({ ids }) }),
+  moveItems: (projectId, data) => request(`/library/${projectId}/move`, { method: 'POST', body: JSON.stringify(data), timeoutMs: LONG_TIMEOUT_MS }),
+  batchDelete: (projectId, ids) => request(`/library/${projectId}/batch-delete`, { method: 'POST', body: JSON.stringify({ ids }), timeoutMs: LONG_TIMEOUT_MS }),
   uploadFiles: (projectId, files, folderId) => {
     const formData = new FormData();
     files.forEach(item => {
@@ -571,7 +641,7 @@ export const libraryAPI = {
       formData.append('relative_paths', relativePath)
     });
     if (folderId) formData.append('folder_id', folderId);
-    return fetch(`${API_BASE_URL}/library/${projectId}/upload`, { method: 'POST', body: formData }).then(async r => {
+    return fetchWithTimeout(`${API_BASE_URL}/library/${projectId}/upload`, { method: 'POST', body: formData }, TRANSFER_TIMEOUT_MS).then(async r => {
       const d = await r.json()
       if (!r.ok) throw new Error(d.error || d.detail || i18n.t('api.uploadFailed'))
       return unwrapResponse(d)
@@ -584,9 +654,9 @@ export const libraryAPI = {
 // ---------------------------------------------------------------------------
 export const browserAPI = {
   getStatus: (projectId) => request(`/browser/${projectId}/status`),
-  start: (projectId) => request(`/browser/${projectId}/start`, { method: 'POST' }),
-  stop: (projectId) => request(`/browser/${projectId}/stop`, { method: 'POST' }),
-  clearData: (projectId) => request(`/browser/${projectId}/clear-data`, { method: 'POST' }),
+  start: (projectId) => request(`/browser/${projectId}/start`, { method: 'POST', timeoutMs: LONG_TIMEOUT_MS }),
+  stop: (projectId) => request(`/browser/${projectId}/stop`, { method: 'POST', timeoutMs: LONG_TIMEOUT_MS }),
+  clearData: (projectId) => request(`/browser/${projectId}/clear-data`, { method: 'POST', timeoutMs: LONG_TIMEOUT_MS }),
 }
 
 // ---------------------------------------------------------------------------
@@ -628,10 +698,10 @@ export const skillsAPI = {
   importZip: (file) => {
     const formData = new FormData()
     formData.append('file', file)
-    return fetch(`${API_BASE_URL}/skills/import/zip`, {
+    return fetchWithTimeout(`${API_BASE_URL}/skills/import/zip`, {
       method: 'POST',
       body: formData,
-    }).then(async r => {
+    }, TRANSFER_TIMEOUT_MS).then(async r => {
       const d = await r.json()
       if (!r.ok) throw new Error(d.error || d.detail || i18n.t('api.importFailed'))
       return unwrapResponse(d)
@@ -641,11 +711,13 @@ export const skillsAPI = {
     request('/skills/import/git/preview', {
       method: 'POST',
       body: JSON.stringify({ url }),
+      timeoutMs: TRANSFER_TIMEOUT_MS,
     }),
   importGit: (url, paths) =>
     request('/skills/import/git', {
       method: 'POST',
       body: JSON.stringify(paths ? { url, paths } : { url }),
+      timeoutMs: TRANSFER_TIMEOUT_MS,
     }),
 }
 
@@ -673,13 +745,15 @@ export const chatgptAPI = {
     body: JSON.stringify({ content }),
   }),
   logout: () => request('/chatgpt/logout', { method: 'POST' }),
-  usage: () => request('/chatgpt/usage'),
+  // Proxied calls to OpenAI's backend — bound by the remote service, not us.
+  usage: () => request('/chatgpt/usage', { timeoutMs: LONG_TIMEOUT_MS }),
   /** Available rate-limit reset credits ("reset cards") */
-  resetCredits: () => request('/chatgpt/reset-credits'),
+  resetCredits: () => request('/chatgpt/reset-credits', { timeoutMs: LONG_TIMEOUT_MS }),
   /** Redeem one reset credit to clear the current rate-limit windows */
   consumeResetCredit: (creditId) => request('/chatgpt/reset-credits/consume', {
     method: 'POST',
     body: JSON.stringify(creditId ? { credit_id: creditId } : {}),
+    timeoutMs: LONG_TIMEOUT_MS,
   }),
 }
 
@@ -701,7 +775,7 @@ export const permissionsAPI = {
 // Download helpers — blob fetch with unified error handling
 // ---------------------------------------------------------------------------
 export function fetchBlob(url) {
-  return fetch(url).then(r => {
+  return fetchWithTimeout(url, {}, TRANSFER_TIMEOUT_MS).then(r => {
     if (!r.ok) throw new Error(`${i18n.t('api.downloadFailed')}: ${r.statusText}`)
     return r.blob()
   })
