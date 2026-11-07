@@ -791,6 +791,7 @@
   "browser.connectionFailed": "連線失敗",
   "browser.vncTimeout": "瀏覽器畫面串流連線逾時",
   "browser.vncConnecting": "正在連線瀏覽器工作階段...",
+  "browser.vncLoading": "正在載入畫面...",
   "browser.starting": "正在啟動瀏覽器...",
   "browser.chromeBrowser": "Chrome 瀏覽器",
   "browser.iframeTitle": "SiGMA 瀏覽器",

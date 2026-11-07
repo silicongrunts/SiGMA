@@ -791,6 +791,7 @@
   "browser.connectionFailed": "Error de conexión",
   "browser.vncTimeout": "Tiempo de espera agotado para la transmisión del navegador",
   "browser.vncConnecting": "Conectando a la sesión del navegador...",
+  "browser.vncLoading": "Cargando la pantalla...",
   "browser.starting": "Iniciando navegador...",
   "browser.chromeBrowser": "Navegador Chrome",
   "browser.iframeTitle": "Navegador SiGMA",

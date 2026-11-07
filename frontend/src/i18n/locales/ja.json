@@ -792,6 +792,7 @@
   "browser.connectionFailed": "接続に失敗しました",
   "browser.vncTimeout": "ブラウザストリームの接続がタイムアウトしました",
   "browser.vncConnecting": "ブラウザセッションに接続中...",
+  "browser.vncLoading": "画面を読み込み中...",
   "browser.starting": "ブラウザーを起動中...",
   "browser.chromeBrowser": "Chrome ブラウザー",
   "browser.iframeTitle": "SiGMA ブラウザー",

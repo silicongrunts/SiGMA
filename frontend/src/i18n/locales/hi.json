@@ -791,6 +791,7 @@
   "browser.connectionFailed": "कनेक्शन विफल",
   "browser.vncTimeout": "ब्राउज़र स्ट्रीम कनेक्शन का समय समाप्त हो गया",
   "browser.vncConnecting": "ब्राउज़र सत्र से जुड़ रहे हैं...",
+  "browser.vncLoading": "स्क्रीन लोड हो रही है...",
   "browser.starting": "ब्राउज़र शुरू हो रहा है...",
   "browser.chromeBrowser": "Chrome ब्राउज़र",
   "browser.iframeTitle": "SiGMA ब्राउज़र",

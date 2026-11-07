@@ -791,6 +791,7 @@
   "browser.connectionFailed": "Échec de la connexion",
   "browser.vncTimeout": "Délai dépassé pour le flux du navigateur",
   "browser.vncConnecting": "Connexion à la session du navigateur...",
+  "browser.vncLoading": "Chargement de l'écran...",
   "browser.starting": "Démarrage du navigateur...",
   "browser.chromeBrowser": "Navigateur Chrome",
   "browser.iframeTitle": "Navigateur SiGMA",

@@ -22,12 +22,19 @@ const params = new URLSearchParams(location.search);
 const wsPath = params.get('ws') || '/api/v1/browser/default/vnc';
 const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsUrl = wsProto + '//' + location.host + wsPath;
-// If the VNC stream is not established within this window, treat it as dead.
+// Covers the whole journey — WS, RFB handshake, and the wait for the first
+// painted frame. RFB 'connect' only means the handshake is done; no pixel
+// has arrived at that point (cold starts can sit on a black root while
+// Chrome paints).
 const CONNECT_TIMEOUT_MS = 30000;
+// A downscaled sample whose darkest and brightest luma differ by at least
+// this counts as real content; the bare X root is uniform black.
+const CONTENT_CONTRAST = 8;
 
 import RFB from './novnc/core/rfb.js';
 let rfb;
 let connectTimer = null;
+let frameWatchRaf = null;
 
 const overlay = document.getElementById('overlay');
 const spinEl = overlay.querySelector('.spin');
@@ -37,23 +44,34 @@ const retryEl = document.getElementById('overlay-retry');
 
 // The embedding React app listens for these to sync its status dot and
 // overlays; same-origin in both dev (vite proxy) and prod (uvicorn).
+// 'connecting' → handshake in progress, 'loading' → handshake done, waiting
+// for the first frame, 'connected' → pixels on screen.
 function notifyParent(status, message) {
   if (window.parent !== window) {
     try { window.parent.postMessage({ source: 'sigma-vnc', status, message }, window.location.origin); } catch { /* parent gone */ }
   }
 }
 
+function cancelFrameWatch() {
+  if (frameWatchRaf !== null) {
+    cancelAnimationFrame(frameWatchRaf);
+    frameWatchRaf = null;
+  }
+}
+
 function showConnecting() {
   clearTimeout(connectTimer);
+  cancelFrameWatch();
   spinEl.style.display = 'block';
   errEl.style.display = 'none';
   retryEl.style.display = 'none';
-  textEl.innerHTML = 'Connecting&hellip;';
+  textEl.textContent = 'Connecting…';
   overlay.style.display = 'flex';
 }
 
 function fail(message) {
   clearTimeout(connectTimer);
+  cancelFrameWatch();
   spinEl.style.display = 'none';
   textEl.textContent = '';
   errEl.textContent = message;
@@ -63,21 +81,57 @@ function fail(message) {
   notifyParent('error', message);
 }
 
+// Stay under the overlay until actual pixels show up: sample a downscaled
+// copy of the noVNC canvas and look for contrast. The bare X root is uniform
+// black, Chrome's window is not — so the overlay can never announce a screen
+// that is still empty.
+function watchFirstFrame() {
+  textEl.textContent = 'Loading screen…';
+  notifyParent('loading');
+  const off = document.createElement('canvas');
+  off.width = 48;
+  off.height = 27;
+  const octx = off.getContext('2d', { willReadFrequently: true });
+  const tick = () => {
+    const canvas = document.querySelector('#screen canvas');
+    if (canvas && canvas.width > 0) {
+      try {
+        octx.drawImage(canvas, 0, 0, off.width, off.height);
+        const d = octx.getImageData(0, 0, off.width, off.height).data;
+        let min = 255;
+        let max = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          const luma = (d[i] + d[i + 1] + d[i + 2]) / 3;
+          if (luma < min) min = luma;
+          if (luma > max) max = luma;
+        }
+        if (max - min >= CONTENT_CONTRAST) {
+          frameWatchRaf = null;
+          clearTimeout(connectTimer);
+          overlay.style.display = 'none';
+          notifyParent('connected');
+          return;
+        }
+      } catch { /* canvas not paintable yet */ }
+    }
+    frameWatchRaf = requestAnimationFrame(tick);
+  };
+  frameWatchRaf = requestAnimationFrame(tick);
+}
+
 function connect() {
   const div = document.getElementById('screen');
   div.innerHTML = '';
+  // A retry while the previous attempt is stuck mid-handshake must detach
+  // it, or its eventual unclean disconnect would fail the new session.
+  if (rfb) { try { rfb.disconnect(); } catch { /* already gone */ } }
   showConnecting();
   notifyParent('connecting');
 
   rfb = new RFB(div, wsUrl);
   rfb.scaleViewport = true;
-  rfb.resizeSession = true;
   rfb.background = '#000';
-  rfb.addEventListener('connect', () => {
-    clearTimeout(connectTimer);
-    overlay.style.display = 'none';
-    notifyParent('connected');
-  });
+  rfb.addEventListener('connect', watchFirstFrame);
   rfb.addEventListener('disconnect', (e) => {
     if (!e.detail.clean) {
       fail(e.detail.detail || 'Connection lost.');

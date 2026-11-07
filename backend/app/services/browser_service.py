@@ -28,6 +28,14 @@ class BrowserService:
     PORT_VNC = 6180       # x11vnc (RFB)
     DISPLAY = ":99"
 
+    # Readiness budgets for _do_start. Each stage is probed instead of
+    # sleeping a guessed duration; past its budget the start fails loudly so
+    # "running" never means anything less than every stage actually being up.
+    PROBE_INTERVAL_S = 0.1
+    XVFB_SETTLE_S = 0.3
+    CHROME_READY_TIMEOUT_S = 15.0
+    SERVICE_READY_TIMEOUT_S = 5.0
+
     # Chrome crash-loop protection. If Chrome exits, the daemon relaunches it
     # up to _CHROME_MAX_RELAUNCH times, waiting _CHROME_RELAUNCH_INTERVAL
     # seconds between attempts. After the limit is hit the daemon gives up
@@ -58,6 +66,43 @@ class BrowserService:
                 return s.connect_ex(("localhost", port)) == 0
         except OSError:
             return False
+
+    @staticmethod
+    async def _cdp_ready() -> bool:
+        """True once Chrome's DevTools HTTP endpoint answers on 127.0.0.1."""
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", CHROME_CDP_PORT)
+        except OSError:
+            return False
+        try:
+            request = (
+                f"GET /json/version HTTP/1.1\r\nHost: localhost:{CHROME_CDP_PORT}\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+            status = await asyncio.wait_for(reader.readline(), timeout=1.0)
+            return b" 200" in status
+        except Exception:
+            return False
+        finally:
+            writer.close()
+
+    @staticmethod
+    async def _proc_port_ready(proc, port: int) -> bool:
+        """Probe helper: process still alive AND its port accepting."""
+        return proc.returncode is None and BrowserService._port_alive(port)
+
+    @classmethod
+    async def _wait_ready(cls, probe, timeout: float, what: str) -> None:
+        """Poll an async probe() until it passes or the budget is spent."""
+        deadline = _time.monotonic() + timeout
+        while True:
+            if await probe():
+                return
+            if _time.monotonic() >= deadline:
+                raise TimeoutError(f"{what} did not become ready within {timeout:.0f}s")
+            await asyncio.sleep(cls.PROBE_INTERVAL_S)
 
     @classmethod
     def _kill_stale(cls):
@@ -400,15 +445,18 @@ class BrowserService:
         self._clean_stale_chrome_locks(data_dir)
 
         try:
-            # 1. Xvfb
+            # 1. Xvfb — ready in well under a second and there is no cheap
+            #    probe for an X socket, so keep a short settle delay.
             xvfb = await asyncio.create_subprocess_exec(
                 "Xvfb", self.DISPLAY, "-screen", "0", "1920x1080x24", "-ac",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(self.XVFB_SETTLE_S)
 
-            # 2. Chrome
+            # 2. Chrome — wait for the DevTools endpoint to answer instead of
+            #    guessing how long the browser needs (a cold profile can take
+            #    longer than any fixed guess, a warm one needs far less).
             chrome_cmd = self._find_chrome()
             if not chrome_cmd:
                 raise FileNotFoundError("No Chrome/Chromium binary found.")
@@ -419,7 +467,13 @@ class BrowserService:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.sleep(1.5)  # give Chrome time to render
+
+            async def chrome_ready() -> bool:
+                if chrome.returncode is not None:
+                    raise RuntimeError("Chrome exited during startup")
+                return await self._cdp_ready()
+
+            await self._wait_ready(chrome_ready, self.CHROME_READY_TIMEOUT_S, "Chrome")
 
             # 3. x11vnc
             x11vnc_bin = shutil.which("x11vnc")
@@ -432,7 +486,9 @@ class BrowserService:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.sleep(0.5)
+            await self._wait_ready(
+                lambda: self._proc_port_ready(x11vnc, self.PORT_VNC),
+                self.SERVICE_READY_TIMEOUT_S, "x11vnc")
 
             # 4. websockify
             ws_bin = shutil.which("websockify")
@@ -444,7 +500,9 @@ class BrowserService:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.sleep(0.5)
+            await self._wait_ready(
+                lambda: self._proc_port_ready(websockify, self.PORT_WS),
+                self.SERVICE_READY_TIMEOUT_S, "websockify")
 
             self._procs = {
                 "xvfb": xvfb,

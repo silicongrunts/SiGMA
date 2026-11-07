@@ -27,10 +27,13 @@ export default function BrowserVNC({ projectId }) {
   const [status, setStatus] = useState('starting') // starting | connected | error
   const [error, setError] = useState(null)
   // Real VNC stream state, reported by vnc.html via postMessage. 'pending'
-  // shows a connecting overlay above the (black) iframe; 'live' means pixels
-  // are actually flowing; 'failed' means the stream died or timed out.
+  // shows a connecting overlay above the (black) iframe; vncLoading switches
+  // that overlay's copy once the handshake is done and pixels are expected
+  // next; 'live' means the first frame is actually on screen; 'failed' means
+  // the stream died or timed out.
   const [vncLive, setVncLive] = useState('pending') // pending | live | failed
   const [vncError, setVncError] = useState(null)
+  const [vncLoading, setVncLoading] = useState(false)
   // Bumped on every start attempt; stale async chains bail out so they cannot
   // call setStatus/setError after the component unmounts, projectId changes,
   // or the user presses Retry while an earlier attempt is still in flight.
@@ -97,20 +100,32 @@ export default function BrowserVNC({ projectId }) {
   useEffect(() => {
     if (status === 'connected') {
       setVncLive('pending')
+      setVncLoading(false)
       setVncError(null)
     }
   }, [status, browserDataClearedAt, reloadToken])
 
-  // vnc.html owns the connection lifecycle and reports it via postMessage;
-  // this listener mirrors it into the toolbar dot and overlays.
+  // vnc.html owns the connection lifecycle (including the wait for the first
+  // painted frame) and reports it via postMessage; this listener mirrors it
+  // into the toolbar dot and overlays.
   useEffect(() => {
     const onMessage = (e) => {
       if (e.source !== iframeRef.current?.contentWindow) return
       if (e.origin !== window.location.origin) return
       const data = e.data
       if (!data || data.source !== 'sigma-vnc') return
-      if (data.status === 'connected') setVncLive('live')
-      else if (data.status === 'connecting') setVncLive('pending')
+      if (data.status === 'connected') {
+        setVncLive('live')
+        setVncLoading(false)
+      }
+      else if (data.status === 'connecting') {
+        setVncLive('pending')
+        setVncLoading(false)
+      }
+      else if (data.status === 'loading') {
+        setVncLive('pending')
+        setVncLoading(true)
+      }
       else if (data.status === 'error') {
         setVncLive('failed')
         setVncError(data.message || t('browser.connectionFailed'))
@@ -191,7 +206,7 @@ export default function BrowserVNC({ projectId }) {
             {vncLive === 'pending' && (
               <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black text-gray-400">
                 <Loader2 className="w-10 h-10 animate-spin text-sigma-600/50" />
-                <div className="text-sm">{t('browser.vncConnecting')}</div>
+                <div className="text-sm">{vncLoading ? t('browser.vncLoading') : t('browser.vncConnecting')}</div>
               </div>
             )}
           </>
