@@ -745,6 +745,107 @@ async def test_subagent_permission_resume_executes_when_target_unchanged(project
 
 
 @pytest.mark.asyncio
+async def test_live_subagent_write_forwards_file_changed_top_level(
+    project, monkeypatch,
+):
+    """A subagent file op needing no approval (auto-approved write) must
+    refresh the frontend live: the inner file_changed reaches the stream
+    both wrapped (agent_event, for the timeline) and top-level (for the
+    existing file refresh handler) while the agent tool still runs — the
+    same dual-forwarding contract as turn_usage."""
+    project_dir = settings.get_project_path(project)
+    async with UnitOfWork(project) as uow:
+        await uow.config.set("auto_approve.file_internal", "true")
+    script_llm(monkeypatch, [
+        script_agent_tool_call(),
+        script_subagent_write(project_dir),
+        ("text", "subagent done"),
+        ("text", "main done"),
+    ])
+    session_id, task_id = await make_turn(project)
+
+    events = await collect(QueryLoop(project, session_id, task_id=task_id))
+
+    types = [e["type"] for e in events]
+    assert types[-1] == "done"
+    assert "error" not in types
+    target = project_dir / "made_by_agent_write" / "note.md"
+    assert target.is_file()
+    assert target.read_text() == "agent body"
+
+    wrapped = [
+        e for e in events
+        if e["type"] == "agent_event" and e["data"]["inner_type"] == "file_changed"
+    ]
+    assert [e["data"]["inner_data"]["paths"] for e in wrapped] == [[str(target)]]
+
+    top_level = [e for e in events if e["type"] == "file_changed"]
+    # First the live per-write event carrying the path, then the agent
+    # completion event (empty paths = refresh everything).
+    assert top_level[0]["data"] == {"paths": [str(target)]}
+    assert top_level[-1]["data"] == {"paths": []}
+    agent_end = next(
+        i for i, e in enumerate(events)
+        if e["type"] == "tool_end" and e["data"]["tool_call_id"] == "call_agent"
+    )
+    assert events.index(top_level[0]) < agent_end
+
+
+@pytest.mark.asyncio
+async def test_resumed_subagent_write_forwards_file_changed_top_level(
+    project, monkeypatch,
+):
+    """A file op executed by the RESUMED subagent loop (auto-approved write
+    after a permission approval) also reaches the stream top-level: without
+    the forwarding it arrives only wrapped, which the frontend's file
+    refresh handler ignores, so the editor stayed stale until the turn
+    ended — and the resume path emits no completion event at all."""
+    project_dir = settings.get_project_path(project)
+    async with UnitOfWork(project) as uow:
+        await uow.config.set("auto_approve.file_internal", "true")
+    script_llm(monkeypatch, [
+        script_agent_tool_call(),
+        script_subagent_bash(),  # gated mkdir parks the subagent
+        script_subagent_write(project_dir),  # auto-approved, resumed loop
+        ("text", "subagent done"),
+        ("text", "main done"),
+    ])
+    session_id, parked = await make_turn(project)
+    events = await collect(QueryLoop(project, session_id, task_id=parked))
+    assert events[-1]["type"] == "awaiting_input"
+    _, interaction, _ = await load_state(project, session_id, parked)
+    assert interaction["is_subagent_interaction"] is True
+
+    resume_task = await start_running_task(project, session_id)
+    resume_events = await collect(QueryLoop(
+        project, session_id, task_id=resume_task,
+        interaction_response=await owned_response(project, session_id, {"approved": True}),
+    ))
+
+    resume_types = [e["type"] for e in resume_events]
+    assert resume_types[-1] == "done"
+    assert "error" not in resume_types
+    # The approved mkdir ran directly on resume; the write ran inside the
+    # resumed subagent loop.
+    assert (project_dir / "made_by_agent").is_dir()
+    target = project_dir / "made_by_agent_write" / "note.md"
+    assert target.is_file()
+    assert target.read_text() == "agent body"
+
+    top_level = [e["data"] for e in resume_events if e["type"] == "file_changed"]
+    # The approved mkdir (direct execution, existing contract) refreshes with
+    # empty paths; the resumed loop's own write forwards its target path.
+    assert {"paths": []} in top_level
+    assert {"paths": [str(target)]} in top_level
+
+    wrapped = [
+        e for e in resume_events
+        if e["type"] == "agent_event" and e["data"]["inner_type"] == "file_changed"
+    ]
+    assert [e["data"]["inner_data"]["paths"] for e in wrapped] == [[str(target)]]
+
+
+@pytest.mark.asyncio
 async def test_fork_agent_permission_approval_carries_file_edit_metadata(
     project, monkeypatch,
 ):

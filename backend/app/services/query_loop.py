@@ -37,7 +37,7 @@ from app.core.chat_events import (
 )
 from app.services.llm_loop_runner import (
     LLMLoopRunner, LoopContext,
-    SSE_ERROR, SSE_DONE, SSE_TOOL_END, SSE_AGENT_EVENT,
+    SSE_ERROR, SSE_DONE, SSE_TOOL_END, SSE_AGENT_EVENT, SSE_FILE_CHANGED,
     MAX_TOOL_OUTPUT_CHARS,
 )
 from app.services.pauses import InteractiveToolPause, is_permission_pause
@@ -1446,6 +1446,20 @@ class QueryLoop:
                         final_text = f"Agent error: {item['__error__']}"
                         subagent_error = RuntimeError(final_text)
                         break
+                    elif item.get("type") == SSE_FILE_CHANGED:
+                        # Dual-forward the resumed subagent's file side
+                        # effects (wrapped + top-level), mirroring
+                        # _run_agent_tool's live contract so the frontend's
+                        # file_changed handler refreshes during the resume.
+                        yield LLMLoopRunner.sse(SSE_AGENT_EVENT, {
+                            "parent_tool_call_id": parent_tool_call_id,
+                            "agent_type": agent_type,
+                            "inner_type": item.get("type", ""),
+                            "inner_data": item.get("data", {}),
+                        })
+                        yield LLMLoopRunner.sse(
+                            SSE_FILE_CHANGED, item.get("data", {}),
+                        )
                     else:
                         # Forward subagent event wrapped in agent_event envelope
                         yield LLMLoopRunner.sse(SSE_AGENT_EVENT, {

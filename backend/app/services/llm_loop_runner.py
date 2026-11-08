@@ -1271,6 +1271,18 @@ class LLMLoopRunner:
                             "inner_data": inner_data,
                         })
                         yield self.sse(SSE_TURN_USAGE, inner_data)
+                    elif inner_type == SSE_FILE_CHANGED:
+                        # Forward file side effects as a top-level event so the
+                        # frontend's existing file_changed handler refreshes
+                        # the tree and the open file while the subagent works
+                        # (same dual-forwarding contract as turn_usage).
+                        yield self.sse(SSE_AGENT_EVENT, {
+                            "parent_tool_call_id": tool_call_id,
+                            "agent_type": tool_args.get("agent_type", ""),
+                            "inner_type": inner_type,
+                            "inner_data": inner_data,
+                        })
+                        yield self.sse(SSE_FILE_CHANGED, inner_data)
                     else:
                         yield self.sse(SSE_AGENT_EVENT, {
                             "parent_tool_call_id": tool_call_id,
