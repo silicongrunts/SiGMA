@@ -23,6 +23,11 @@ logger = get_logger(__name__)
 _MAX_EXECUTION_OUTPUT = 100_000
 _EXECUTION_INTERRUPT_GRACE = 10.0
 _EXECUTION_KILL_TIMEOUT = 5.0
+# The server log is rotated aside at startup once it exceeds this size, so a
+# long-lived deployment cannot grow it without bound across restarts.
+_SERVER_LOG_MAX_BYTES = 5 * 1024 * 1024
+# Bytes of server log included in startup-failure reports.
+_SERVER_LOG_TAIL_BYTES = 4000
 
 
 @dataclass
@@ -42,6 +47,7 @@ class JupyterService:
     def __init__(self, base_dir: str, port: int = 8890):
         self.base_dir = Path(base_dir).resolve()
         self.runtime_dir = settings.SIGMA_DIR / "jupyter"
+        self.log_path = self.runtime_dir / "jupyter_server.log"
         self.executable = settings.JUPYTER_BIN
         self.port = port
         self.token = secrets.token_hex(16)
@@ -91,14 +97,21 @@ class JupyterService:
         env['JUPYTER_CONFIG_DIR'] = str(self.runtime_dir)
         env['JUPYTER_DATA_DIR'] = str(self.runtime_dir)
 
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=str(self.base_dir),
-            env=env,
-        )
+        # Jupyter writes its logs to stderr. Redirect them to a file instead
+        # of subprocess.PIPE: nobody drains the pipes, so server logs would
+        # be invisible for troubleshooting, and once the 64KB pipe buffer
+        # fills up the server process blocks on every write and hangs.
+        log_file = self._open_server_log()
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=log_file,
+                cwd=str(self.base_dir),
+                env=env,
+            )
+        finally:
+            log_file.close()
 
         for _ in range(30):
             if self.process.poll() is not None:
@@ -111,13 +124,29 @@ class JupyterService:
         self._raise_startup_failure()
 
     def _raise_startup_failure(self):
-        stdout, stderr = "", ""
-        try:
-            stdout, stderr = self.process.communicate(timeout=1)
-        except Exception:
-            logger.debug("Failed to collect Jupyter startup output", exc_info=True)
-        logger.error("Jupyter failed to start. stdout=%s stderr=%s", stdout, stderr)
+        log_tail = self._read_server_log_tail()
+        logger.error("Jupyter failed to start. Server log tail:\n%s", log_tail)
         raise RuntimeError("Failed to start Jupyter server")
+
+    def _open_server_log(self):
+        """Open the server log for the child process to append to.
+
+        A log grown beyond ``_SERVER_LOG_MAX_BYTES`` is rotated aside (one
+        generation kept as ``jupyter_server.log.1``) so restarts cannot grow
+        it without bound.
+        """
+        if self.log_path.exists() and self.log_path.stat().st_size > _SERVER_LOG_MAX_BYTES:
+            self.log_path.replace(self.log_path.with_name(self.log_path.name + ".1"))
+        return self.log_path.open("ab")
+
+    def _read_server_log_tail(self) -> str:
+        """Best-effort tail of the server log for startup-failure reports."""
+        try:
+            data = self.log_path.read_bytes()[-_SERVER_LOG_TAIL_BYTES:]
+        except OSError:
+            logger.debug("Failed to read Jupyter server log", exc_info=True)
+            return ""
+        return data.decode("utf-8", errors="replace")
 
     async def is_running(self) -> bool:
         return await self._check_our_token()
