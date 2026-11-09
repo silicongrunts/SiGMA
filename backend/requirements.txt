@@ -38,8 +38,15 @@ tokenizers==0.22.2
 numpy==2.4.4
 onnxruntime==1.25.1
 
-# LLM proxy
-litellm==1.84.10
+# LLM proxy (1.108.x line is upstream's LTS release line)
+litellm==1.108.3
+# litellm 1.106+ imports its MCP gateway modules unguarded on every
+# tools-bearing call, and those imports need mcp 2.x names (upstream
+# issue #46045). Without this pin the request fails at import time.
+mcp==2.3.0
+# litellm's provider transport SDK (litellm allows >=2.20,<4) — pinned so
+# fresh image builds resolve the same version the env was tested with.
+openai==3.46.0
 
 # PDF processing
 docling==2.94.0

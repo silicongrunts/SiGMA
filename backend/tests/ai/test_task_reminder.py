@@ -13,7 +13,6 @@ from app.services.query_loop import QueryLoop
 from app.services.task_service import (
     TASK_REMINDER_HEADER,
     render_task_reminder_tag,
-    strip_task_reminder,
     unfinished_tasks,
 )
 from tests.ai.conftest import (
@@ -83,20 +82,6 @@ async def test_submit_content_omits_reminder_without_unfinished_tasks(monkeypatc
     )
 
     assert TASK_REMINDER_HEADER not in content
-
-
-@pytest.mark.unit
-def test_strip_restores_pre_reminder_content():
-    original = "<status>\ncurrent_time: x\n</status>\nwhat is this"
-    persisted = (
-        "<status>\ncurrent_time: x\n</status>"
-        + render_task_reminder_tag([
-            {"id": "1", "subject": "Caption figures", "status": "pending"},
-        ])
-        + "\nwhat is this"
-    )
-
-    assert strip_task_reminder(persisted) == original
 
 
 class _MsgRow:

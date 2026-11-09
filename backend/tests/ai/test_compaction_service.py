@@ -194,7 +194,7 @@ async def test_compact_messages_adds_usage_to_tracker(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_compact_messages_strips_task_reminders_from_summary_input(monkeypatch):
+async def test_compact_messages_keeps_task_reminders_and_marks_cache_anchor(monkeypatch):
     from app.services.task_service import render_task_reminder_tag
 
     captured = {}
@@ -225,36 +225,25 @@ async def test_compact_messages_strips_task_reminders_from_summary_input(monkeyp
         messages, model_role="supervisor", mode="passive", tools=[],
     )
 
-    summarized_users = [
-        m["content"] for m in captured["messages"][:-1] if m["role"] == "user"
-    ]
-    assert summarized_users == ["please continue"]
-    # The caller's live list keeps the reminder — stripping is copy-on-write.
-    assert "please continue" in messages[1]["content"]
-    assert "unfinished tasks" in messages[1]["content"]
-
-
-def test_strip_user_reminder_handles_multipart_content():
-    from app.services.compaction_service import _strip_user_reminder
-    from app.services.task_service import render_task_reminder_tag
-
-    reminder = render_task_reminder_tag([
-        {"id": "1", "subject": "Caption figures", "status": "pending"},
-    ])
-    entry = {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "what is this" + reminder},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
-        ],
-    }
-
-    stripped = _strip_user_reminder(entry)
-
-    assert stripped["content"][0]["text"] == "what is this"
-    assert stripped["content"][1] == entry["content"][1]
-    # Original entry is untouched.
-    assert "unfinished tasks" in entry["content"][0]["text"]
+    compact_request = captured["messages"]
+    # The one-off compact prompt closes the request and instructs the model
+    # to treat <status> scaffolding as ignorable.
+    assert compact_request[-1]["content"].startswith(
+        "You are compacting this SiGMA LLM session")
+    assert "<status>" in compact_request[-1]["content"]
+    # The history prefix stays byte-identical to a regular request: the
+    # persisted task reminder rides along, which is what keeps the provider
+    # prefix cache hot for this — the session's most expensive — call.
+    assert compact_request[1]["content"] == messages[1]["content"]
+    assert "unfinished tasks" in compact_request[1]["content"]
+    # Breakpoints: the system marker plus one anchor on the last real
+    # history message; the one-off prompt is never a cache-write position.
+    assert compact_request[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert compact_request[2]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert "cache_control" not in compact_request[1]
+    assert "cache_control" not in compact_request[-1]
+    # The caller's live list is untouched (copy-on-write).
+    assert all("cache_control" not in m for m in messages)
 
 
 # ---------------------------------------------------------------------------

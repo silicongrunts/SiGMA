@@ -59,7 +59,7 @@ RUN python -m venv /opt/venv-sigma \
 # Slim the venv before COPY into the final image. Everything removed here is
 # either a transitive dep SiGMA never imports at runtime, or a dev-only
 # artifact no Python import path ever reads. Verified safe via import trace
-# and `from app.main import app` (127 routes) in a clean env:
+# and `from app.main import app` in a clean env:
 #   - kubernetes (83MB): litellm's optional K8s proxy support. litellm has
 #     zero top-level `import kubernetes`; SiGMA only calls litellm's
 #     completion / acompletion / Router.

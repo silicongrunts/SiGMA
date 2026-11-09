@@ -36,14 +36,17 @@ def script_llm(monkeypatch, steps):
     The same staticmethod serves the main loop and every subagent loop, so
     one call sequence covers the whole nested turn. The exact message list
     handed to each call is captured (order frozen at call time) so tests can
-    pin what the loop sends across the LLM service boundary.
+    pin what the loop sends across the LLM service boundary. Each message
+    dict is copied too: the loop's cache-marker placement mutates message
+    dicts in place between iterations, so a list-only snapshot would show
+    later iterations' marker state when asserting an earlier call.
     """
     calls = {"n": 0, "messages": []}
 
     async def fake_stream_llm(ctx, messages, delta_queue):
         index = calls["n"]
         calls["n"] += 1
-        calls["messages"].append(list(messages))
+        calls["messages"].append([{**m} for m in messages])
         if index >= len(steps):
             raise AssertionError(f"unexpected LLM call #{index + 1}")
         kind, payload = steps[index]

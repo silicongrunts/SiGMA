@@ -176,7 +176,11 @@ class AnnotationLoop:
 
         events.append(LLMLoopRunner.sse(SSE_COMPACT_DONE, result.stats.to_dict()))
         events.append(LLMLoopRunner.sse(SSE_CONTEXT_STATS, result.stats.to_dict()))
-        LLMLoopRunner.apply_cache_control(result.messages, target_offset=1)
+        # The compacted view is [system, boundary_user]: the boundary is the
+        # only anchor candidate, so the offset must be 0 — offset=1 would
+        # leave the post-compaction request without a message-level
+        # breakpoint and it would cache nothing beyond the system prefix.
+        LLMLoopRunner.apply_cache_control(result.messages, target_offset=0)
         return result.messages, events
 
     # ------------------------------------------------------------------

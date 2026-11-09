@@ -23,9 +23,9 @@ from app.core.compaction_text import ACTIVE_SUMMARY_PREFIX, PASSIVE_SUMMARY_PREF
 from app.core.config import settings
 from app.core.utils import image_dimensions
 from app.core.logging import get_logger
+from app.core.message_format import apply_cache_control
 from app.database.unit_of_work import UnitOfWork
 from app.services.llm_service import llm_service
-from app.services.task_service import strip_task_reminder
 
 
 logger = get_logger(__name__)
@@ -35,6 +35,8 @@ IMAGE_HEADER_DECODE_BYTES = 64 * 1024
 COMPACT_PROMPT = """You are compacting this SiGMA LLM session so another call can continue with less context.
 
 Create a precise handoff summary. The next model call will receive only the original system prompt, your summary, and later messages.
+
+User messages may contain <status>...</status> blocks (unfinished-task reminders, timestamps, context warnings). These are per-turn UI scaffolding, not conversation content: ignore them entirely and never describe them or copy their text into the summary.
 
 Your summary must preserve:
 - the user's current goal and the latest user request, including exact constraints;
@@ -94,21 +96,6 @@ class CompactionResult:
     messages: list[dict]
     stats: ContextStats
     usage: dict | None = None
-
-
-def _strip_user_reminder(entry: dict) -> dict:
-    """Copy a user entry with task-reminder text removed from its content."""
-    content = entry.get("content")
-    if isinstance(content, str):
-        return {**entry, "content": strip_task_reminder(content)}
-    if isinstance(content, list):
-        return {**entry, "content": [
-            {**part, "text": strip_task_reminder(part["text"])}
-            if isinstance(part, dict) and isinstance(part.get("text"), str)
-            else part
-            for part in content
-        ]}
-    return entry
 
 
 class CompactionService:
@@ -276,9 +263,12 @@ class CompactionService:
 
         `mode` is "passive" or "active" and only affects the boundary preface.
 
-        ``session_id`` enables sticky routing for the compaction call so it can
-        read the already-cached conversation prefix for free (no cache_control
-        is created here — compaction only reads, never creates a cache entry).
+        ``session_id`` enables sticky routing for the compaction call so it
+        reads the already-cached conversation prefix. The request keeps the
+        conversation prefix byte-identical to the regular requests that
+        produced it and carries a breakpoint on the last real history
+        message — never on the one-off compact prompt — so the one-shot
+        prompt bytes are not written into the cache.
 
         ``cancel_event``, when provided, aborts the in-flight summary call the
         moment it fires (see ``_summarize_with_cancel``).
@@ -286,19 +276,23 @@ class CompactionService:
         if not messages:
             raise ValueError("Cannot compact an empty message list")
 
-        # Strip any stale cache_control carried over from a prior turn so the
-        # compaction call never creates a cache entry (it only reads). The
-        # message dicts are shared with the caller's live list, so build new
-        # dicts instead of mutating in place. Task reminders are per-turn
-        # scaffolding, not conversation content — they must not leak into
-        # the boundary summary, which outlives the tasks it describes.
-        compact_request = []
-        for m in messages:
-            entry = {k: v for k, v in m.items() if k != "cache_control"}
-            if entry.get("role") == "user":
-                entry = _strip_user_reminder(entry)
-            compact_request.append(entry)
+        # The compaction request must keep the conversation prefix byte
+        # identical to the regular requests that produced it — stripping
+        # scaffolding (cache markers, task reminders) here breaks the
+        # provider's prompt cache for exactly this call, the most expensive
+        # one of the session. Task reminders ride along: the compact prompt
+        # tells the model to treat them as scaffolding, and the boundary
+        # only ever contains the model's own summary, so they cannot leak
+        # into it. Shallow per-message copies keep the marker placement
+        # below copy-on-write (the caller's list is shared with the live
+        # loop).
+        compact_request = [{**m} for m in messages]
         compact_request.append({"role": "user", "content": COMPACT_PROMPT})
+        # Anchor one candidate before the one-off compact prompt: the
+        # request reads the already-cached prefix, and the write position
+        # coincides with the cache entry the next regular request would
+        # reuse — the compact prompt itself is never a cache-write point.
+        apply_cache_control(compact_request, target_offset=1)
 
         summary, compact_usage = await self._summarize_with_cancel(
             compact_request,

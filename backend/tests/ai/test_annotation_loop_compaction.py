@@ -4,7 +4,9 @@ Drives ``AnnotationLoop._prepare_messages`` with the real
 ``compaction_service.compact_messages`` (only the summary LLM call is
 scripted): a stop that fires while the compaction call is in flight must
 abort that call quickly, leave no orphaned provider request, and must not
-persist a compaction boundary for a turn nobody asked to continue.
+persist a compaction boundary for a turn nobody asked to continue. The
+success path pins the post-compaction cache markers: the boundary user
+message is the only anchor candidate, so it must carry the breakpoint.
 """
 
 import asyncio
@@ -16,6 +18,7 @@ import pytest
 import_module("app.agents.tools")
 import app.services.annotation_loop as annotation_loop_module
 import app.services.compaction_service as compaction_service_module
+from app.core.compaction_text import PASSIVE_SUMMARY_PREFIX
 from app.services.annotation_loop import AnnotationLoop
 from app.services.compaction_service import ContextStats
 from tests.ai.conftest import make_fake_uow
@@ -130,3 +133,45 @@ async def test_cancelled_turn_never_starts_compaction(monkeypatch):
 
     assert not state["llm_finished"]
     assert uow_cls.atomic_calls == []
+
+
+@pytest.mark.asyncio
+async def test_compaction_boundary_becomes_the_cache_anchor(monkeypatch):
+    """Success path: the compacted [system, boundary_user] view marks the
+    system prompt and anchors the boundary user message. With only one
+    candidate, an offset of 1 would silently leave the request without a
+    message-level breakpoint — the post-compaction request would cache
+    nothing beyond the system prefix."""
+    monkeypatch.setattr(
+        annotation_loop_module.compaction_service,
+        "stats_for_messages_incremental",
+        lambda *args, **kwargs: _over_threshold_stats(),
+    )
+    uow_cls = _make_uow()
+    monkeypatch.setattr(annotation_loop_module, "UnitOfWork", uow_cls)
+
+    async def fast_call_chat_text(*args, **kwargs):
+        return "x" * 80, None
+
+    monkeypatch.setattr(
+        compaction_service_module.llm_service,
+        "call_chat_text",
+        fast_call_chat_text,
+    )
+
+    loop = _make_loop(asyncio.Event())
+    prepared, events = await loop._prepare_messages([
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "annotate this"},
+    ])
+
+    assert [e.get("type") for e in events] == [
+        "context_stats", "compact_start", "compact_done", "context_stats",
+    ]
+    assert len(prepared) == 2
+    assert prepared[0]["role"] == "system"
+    assert prepared[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    boundary = prepared[1]
+    assert boundary["role"] == "user"
+    assert boundary["content"].startswith(PASSIVE_SUMMARY_PREFIX)
+    assert boundary["cache_control"] == {"type": "ephemeral", "ttl": "1h"}

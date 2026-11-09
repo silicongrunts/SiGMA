@@ -10,6 +10,11 @@ expected ``role`` / ``content`` / ``tool_calls`` / ``tool_call_id``
 attributes), so they have no service or DB dependencies and can live in
 ``core/``.  The two ``shape_*`` entry points compose the lower-level
 ``build_*`` helpers into full UI shaping and pagination.
+
+``apply_cache_control`` is the request-side counterpart: it places the
+prompt-cache breakpoints on outgoing message lists and is shared by the
+loop prepare hooks and the compaction summary request, which must not
+import the loop runner.
 """
 
 from __future__ import annotations
@@ -56,6 +61,56 @@ def is_failed_tool_result(result: str) -> bool:
         result.startswith(("Error:", "Tool cancelled by user."))
         or (result.startswith("Tool '") and " error: " in result)
     )
+
+
+def apply_cache_control(messages: list[dict], *, target_offset: int) -> None:
+    """Place the prompt-cache breakpoints for one outgoing LLM request.
+
+    Prompt caching only caches content *before* a ``cache_control`` marker,
+    so markers must move forward as the conversation grows. This helper owns
+    every marker on the list:
+
+    1. Clears ``cache_control`` from every message — stale markers from an
+       earlier request must never linger, ``messages`` is reused in place.
+    2. Marks the first ``system`` message. The tools + system prefix is
+       byte-stable for the whole session, so cold starts (a new session,
+       the first request after compaction) still hit it.
+    3. Anchors one message in the conversation tail by scanning backwards
+       over every non-system, non-``_ephemeral`` message. ``tool``,
+       ``assistant``, and real ``user`` messages are all valid anchors;
+       ``_ephemeral`` messages (in-memory images, context warnings) are
+       skipped because they are not persisted and their bytes can change
+       between requests. Re-anchoring on the last such message before every
+       LLM call is what makes each tool-loop iteration's new messages join
+       the cached prefix incrementally.
+
+    ``target_offset``: 0 = newest candidate message (main loop), 1 = the one
+    before it (annotation loop, where the annotated span migrates into the
+    newest user message each turn; compaction requests, where the one-off
+    compact prompt must not become a cache-write position). The anchor is
+    skipped when there are fewer candidates than that (e.g. a bare first
+    turn) — the system marker still applies.
+
+    At most two breakpoints per request, within Anthropic's four-breakpoint
+    limit. LiteLLM's OpenRouter handler moves message-level markers into the
+    content block; the ZAI/GLM handler passes them through; OpenAI-style
+    channels drop them (their caching is implicit prefix matching), so this
+    is safe to send everywhere.
+    """
+    for message in messages:
+        message.pop("cache_control", None)
+    for message in messages:
+        if message.get("role") == "system":
+            message["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+            break
+    candidates = [
+        i for i, m in enumerate(messages)
+        if m.get("role") != "system" and not m.get("_ephemeral")
+    ]
+    if len(candidates) > target_offset:
+        messages[candidates[-(target_offset + 1)]]["cache_control"] = {
+            "type": "ephemeral", "ttl": "1h",
+        }
 
 
 def file_edit_stats(

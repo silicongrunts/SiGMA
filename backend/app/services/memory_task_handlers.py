@@ -176,9 +176,9 @@ async def handle_memory_extract(ctx, payload: dict) -> None:
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(entry for _, entry in recent)
     messages.append({"role": "user", "content": prompt})
-    # Marker on the last *history* user message — the same byte position the
-    # main loop's request cached, so the shared prefix hits.
-    LLMLoopRunner.apply_cache_control(messages, target_offset=1)
+    # Cache markers are placed per call inside run_memory_agent_loop
+    # (extraction's anchor rests on the last history message — the byte
+    # position the main loop's request cached).
 
     logger.info(
         "Memory extraction running for %s/%s: %d new message(s), cursor=%d",
@@ -275,7 +275,9 @@ async def handle_memory_consolidate(ctx, payload: dict) -> None:
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_brief},
     ]
-    LLMLoopRunner.apply_cache_control(messages, target_offset=0)
+    # Cache markers are placed per call inside run_memory_agent_loop; this
+    # fresh synthetic session has no prior cache to read, so the first call
+    # rides on the system marker alone.
 
     logger.info("Memory consolidation running for %s: %d file(s)", project_id, len(manifest))
     result = await run_memory_agent_loop(

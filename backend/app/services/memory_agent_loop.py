@@ -28,6 +28,7 @@ from typing import Any
 
 from app.agents.tools.registry import tool_registry
 from app.core.logging import get_logger
+from app.core.message_format import apply_cache_control
 from app.services.llm_loop_runner import LLMLoopRunner
 
 logger = get_logger(__name__)
@@ -118,6 +119,13 @@ async def _call_llm(
 
     if cancel_event is not None and cancel_event.is_set():
         raise asyncio.CancelledError()
+    # No prepare hook runs inside this loop, so this call owns the cache
+    # markers: re-place them before every LLM call so the loop's growing
+    # tail joins the cached prefix incrementally. target_offset=1 keeps the
+    # anchor off the newest candidate (the one-off extraction prompt, later
+    # the in-flight tail) — extraction's anchor then rests on the last
+    # history message, the byte position the main loop's request cached.
+    apply_cache_control(messages, target_offset=1)
     text, _reasoning, tool_calls, _usage = await llm_service.stream_chat(
         messages=messages,
         model_role="supervisor",
