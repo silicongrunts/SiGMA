@@ -8,7 +8,7 @@ jupyter-server==2.20.0
 # jupyter-server's FileFindHandler never sets (its initialize() skips
 # super()). Fixed in 6.5.10; keep pinned until jupyter-server sets the
 # attribute itself.
-tornado==6.5.10
+tornado==6.6
 nbclassic==1.3.3
 nbformat==5.10.4
 nbconvert==7.17.1
