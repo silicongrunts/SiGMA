@@ -39,7 +39,7 @@
     "diff": "^8.0.4",
     "dompurify": "^3.4.13",
     "highlight.js": "^11.11.1",
-    "i18next": "^26.3.1",
+    "i18next": "^26.7.2",
     "katex": "^0.16.9",
     "lucide-react": "^0.300.0",
     "marked": "^11.1.1",
